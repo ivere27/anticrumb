@@ -1,0 +1,37 @@
+{
+  "id": "claude-web",
+  "name": "Claude Web",
+  "version": "v1",
+  "kind": "web_provider",
+  "entry_url": "https://claude.ai/new",
+  "allowed_origins": [
+    "https://claude.ai"
+  ],
+  "auth_url_substrings": [
+    "/login",
+    "/oauth",
+    "accounts.google.com",
+    "auth.anthropic.com"
+  ],
+  "chat_url_prefixes": [
+    "https://claude.ai/chat/"
+  ],
+  "reusable_path_prefixes": [
+    "/new",
+    "/chat/"
+  ],
+  "usage_url": "https://claude.ai/settings/usage",
+  "observer_binding": "anticrumbCdpChanged",
+  "requires_models_control": false,
+  "default_model": "claude-web-default",
+  "inline_prompt_chars": 2000,
+  "capabilities": {
+    "browser_auth": true,
+    "temporary_sessions": false,
+    "file_uploads": true,
+    "image_generation": false,
+    "web_usage": true,
+    "web_history_cleanup": true,
+    "native_tools": false
+  }
+}

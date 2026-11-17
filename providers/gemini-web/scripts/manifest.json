@@ -1,0 +1,9 @@
+{
+  "id": "gemini-web/v1",
+  "extractor": "extract-response.js",
+  "observer": "observer.js",
+  "features": ["chat", "temporary", "uploads", "images"],
+  "completion": "target response plus generation control and stable content",
+  "driver": "driver.js",
+  "locales": "locale-independent DOM attributes; labels are display data only"
+}

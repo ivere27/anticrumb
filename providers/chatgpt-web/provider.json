@@ -1,0 +1,34 @@
+{
+  "id": "chatgpt-web",
+  "name": "ChatGPT Web",
+  "version": "v1",
+  "kind": "web_provider",
+  "entry_url": "https://chatgpt.com/",
+  "allowed_origins": [
+    "https://chatgpt.com"
+  ],
+  "auth_url_substrings": [
+    "auth.openai.com",
+    "/auth/login"
+  ],
+  "chat_url_prefixes": [
+    "https://chatgpt.com/c/"
+  ],
+  "reusable_path_prefixes": [
+    "/",
+    "/c/"
+  ],
+  "observer_binding": "anticrumbCdpChanged",
+  "requires_models_control": false,
+  "default_model": "chatgpt-web-default",
+  "inline_prompt_chars": 2000,
+  "capabilities": {
+    "browser_auth": true,
+    "temporary_sessions": true,
+    "file_uploads": true,
+    "image_generation": false,
+    "web_usage": false,
+    "web_history_cleanup": true,
+    "native_tools": false
+  }
+}
