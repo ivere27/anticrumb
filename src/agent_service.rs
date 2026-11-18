@@ -22,9 +22,11 @@ struct AgentRuntimeSpec {
     allow_shell: bool,
     read_only: bool,
     allow_spawn_agent: bool,
+    chat_only: bool,
+    permissions: Option<ToolPermissions>,
     max_steps: usize,
     artifacts: Vec<String>,
-    continued_session: Option<(String, String, usize)>,
+    continued_session: Option<(String, Option<String>, usize)>,
 }
 
 fn build_coding_agent(
@@ -44,6 +46,7 @@ fn build_coding_agent(
         spec.thinking.clone(),
         spec.temporary,
     );
+    backend.set_chat_only(spec.chat_only);
     backend.retain_session_after_run(!spec.temporary);
     backend
         .add_artifacts(&spec.artifacts)
@@ -51,18 +54,35 @@ fn build_coding_agent(
     if let Some((session_id, compact, prior_artifacts)) = &spec.continued_session {
         backend.continue_session(session_id.clone(), compact.clone(), *prior_artifacts);
     }
-    let effective_allow_shell = spec.allow_shell && !spec.read_only;
+    let perms = spec.permissions.unwrap_or(ToolPermissions {
+        read: true,
+        edit: !spec.read_only,
+        shell: spec.allow_shell && !spec.read_only,
+        browser: true,
+        subagent: spec.allow_spawn_agent && !spec.read_only,
+    });
+    let effective_allow_shell = !spec.chat_only && perms.shell && spec.allow_shell && !spec.read_only;
     let config = AgentConfig {
         environment: spec.environment.clone(),
         workspace_root: spec.workspace.clone(),
         allow_shell: effective_allow_shell,
-        max_steps: spec.max_steps,
+        max_steps: if spec.chat_only { 1 } else { spec.max_steps },
         temp_chat: false,
         step_retries: 0,
+        load_instructions: !spec.chat_only,
         ..Default::default()
     };
+    if spec.chat_only {
+        let agent = CodingAgent::with_registry(backend, ToolRegistry::new(), config);
+        return Ok((agent, None));
+    }
     let mut registry = ToolRegistry::with_builtin_coding_tools();
-    if !spec.allow_spawn_agent {
+    if !perms.read {
+        for name in ["find_files", "grep_search", "read_file"] {
+            registry.remove(name);
+        }
+    }
+    if !perms.subagent || !spec.allow_spawn_agent {
         registry.remove("spawn_agent");
     }
     if !effective_allow_shell {
@@ -70,9 +90,14 @@ fn build_coding_agent(
             registry.remove(name);
         }
     }
-    if spec.read_only {
+    if !perms.edit || spec.read_only {
         registry.remove("edit_file");
         registry.remove("write_file");
+    }
+    if !perms.browser {
+        for name in ["web_fetch", "browser_fetch", "browser_control"] {
+            registry.remove(name);
+        }
     }
     let mcp = if let Some(path) = mcp_config {
         Some(crate::mcp_client::connect(
@@ -298,6 +323,14 @@ impl SubagentRunner {
         spec.temporary = true;
         spec.read_only = read_only;
         spec.allow_spawn_agent = false;
+        spec.chat_only = false;
+        if let Some(perms) = &mut spec.permissions {
+            perms.subagent = false;
+            if read_only {
+                perms.edit = false;
+                perms.shell = false;
+            }
+        }
         spec.artifacts.clear();
         spec.continued_session = None;
         let (mut sub_agent, _) = build_coding_agent(
@@ -507,16 +540,26 @@ impl AgentManager {
             );
             task.push_str(&excerpts_suffix);
         }
+        let has_tool_contract = !request.chat_only && self.session_has_tool_contract(request);
         let continued = continued_session.map(|session_id| {
-            let compact = format!(
-                "[USER_MESSAGE]\n{}{excerpts_suffix}\n\nContinue in this conversation using the workspace and [TOOL_CALL] / [/TOOL_CALL] tool format established earlier.",
-                request.task
-            );
+            let compact = if request.chat_only {
+                Some(format!("{}{excerpts_suffix}", request.task))
+            } else if has_tool_contract {
+                Some(format!(
+                    "[USER_MESSAGE]\n{}{excerpts_suffix}\n\nContinue in this conversation using the workspace and [TOOL_CALL] / [/TOOL_CALL] tool format established earlier.",
+                    request.task
+                ))
+            } else {
+                None
+            };
             (session_id, compact, prior_artifact_count)
         });
         let browser_fetch = build_browser_fetch(self.store.root(), &request.account_id)?;
         let browser_control =
             build_browser_control(self.store.root(), &request.account_id, &request.workspace)?;
+        let allow_subagent = !request.temporary
+            && !request.chat_only
+            && request.permissions.map_or(true, |p| p.subagent);
         let spec = AgentRuntimeSpec {
             environment: request.environment.clone(),
             workspace: request.workspace.clone(),
@@ -524,9 +567,11 @@ impl AgentManager {
             model: request.model.clone(),
             thinking: request.thinking.clone(),
             temporary: request.temporary,
-            allow_shell: !request.no_shell,
+            allow_shell: !request.no_shell && request.permissions.map_or(true, |p| p.shell),
             read_only: false,
-            allow_spawn_agent: !request.temporary,
+            allow_spawn_agent: allow_subagent,
+            chat_only: request.chat_only,
+            permissions: request.permissions,
             max_steps: request.max_steps,
             artifacts: request.artifacts.clone(),
             continued_session: continued,
@@ -538,7 +583,7 @@ impl AgentManager {
             browser_control.clone(),
             request.mcp_config.as_deref(),
         )?;
-        if !request.temporary {
+        if allow_subagent {
             let runner = Arc::new(SubagentRunner {
                 manager: self.clone(),
                 base_spec: spec,
@@ -839,6 +884,23 @@ impl AgentManager {
             }
         }
         Ok(sessions)
+    }
+
+    fn session_has_tool_contract(&self, request: &AgentRequest) -> bool {
+        let mut current = request.parent_id.clone();
+        for _ in 0..8 {
+            let Some(parent_id) = current else {
+                break;
+            };
+            let Ok(job) = self.snapshot(&parent_id) else {
+                break;
+            };
+            if job.state == "completed" && !job.request.chat_only {
+                return true;
+            }
+            current = job.request.parent_id;
+        }
+        false
     }
 
     fn continuable_parent_session(&self, request: &AgentRequest) -> Option<String> {
@@ -1164,6 +1226,8 @@ mod tests {
                     mcp_config: None,
                     artifacts: vec![],
                     parent_id: None,
+                    chat_only: false,
+                    permissions: None,
                 },
                 result: None,
                 error: None,

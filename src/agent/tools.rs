@@ -15,8 +15,9 @@ use super::cancel::CancelToken;
 use super::events::{ToolCallRequest, ToolOutput, DEFAULT_SHELL_TIMEOUT_SECS};
 use super::process::{format_report, BackgroundProcesses, CapturedProcess};
 
-const MAX_TOOL_OUTPUT_CHARS: usize = 16_000;
-const DEFAULT_READ_LINES: usize = 2_000;
+const MAX_TOOL_OUTPUT_CHARS: usize = 12_000;
+const MAX_WEB_TOOL_OUTPUT_CHARS: usize = 16_000;
+const DEFAULT_READ_LINES: usize = 500;
 const MAX_GREP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 const MAX_PROCESS_WAIT_SECS: u64 = 60;
@@ -153,6 +154,9 @@ pub struct ToolContext {
     browser_control_help_ready: AtomicBool,
     /// Optional runtime bridge for `spawn_agent` (delegating tasks to the `Worker` `TempChat` tab pool).
     pub spawn_agent: Option<SpawnAgentFn>,
+    /// Whether `read_file` should elide repeated reads of unchanged file ranges in persistent sessions.
+    pub dedup_reads: bool,
+    read_cache: Mutex<BTreeMap<(PathBuf, usize, usize), String>>,
     changed_files: Mutex<BTreeSet<String>>,
 }
 
@@ -169,6 +173,8 @@ impl ToolContext {
             browser_control: None,
             browser_control_help_ready: AtomicBool::new(false),
             spawn_agent: None,
+            dedup_reads: false,
+            read_cache: Mutex::new(BTreeMap::new()),
             changed_files: Mutex::new(BTreeSet::new()),
         }
     }
@@ -234,6 +240,9 @@ impl ToolContext {
         let rel = self.rel_to_root(path);
         if let Ok(mut set) = self.changed_files.lock() {
             set.insert(rel);
+        }
+        if let Ok(mut cache) = self.read_cache.lock() {
+            cache.retain(|(cached_path, _, _), _| cached_path != path);
         }
     }
 
@@ -341,6 +350,10 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
     pub fn list_schemas(&self) -> Vec<Value> {
         self.tools
             .values()
@@ -433,20 +446,21 @@ impl ToolRegistry {
         }
 
         // A panicking tool must never take the whole agent thread down.
+        let max_output_chars = match call.tool.as_str() {
+            "web_fetch" | "browser_fetch" | "browser_control" => MAX_WEB_TOOL_OUTPUT_CHARS,
+            _ => MAX_TOOL_OUTPUT_CHARS,
+        };
         let res = catch_unwind(AssertUnwindSafe(|| tool.execute_content(&call.args, ctx)))
             .unwrap_or_else(|_| Err("tool panicked".to_string()));
         match res {
             Ok(raw) => {
-                let mut out = make(true, truncate_tool_output(&raw.text, MAX_TOOL_OUTPUT_CHARS));
+                let mut out = make(true, truncate_tool_output(&raw.text, max_output_chars));
                 out.artifacts = raw.artifacts;
                 out
             }
             Err(err) => make(
                 false,
-                format!(
-                    "error: {}",
-                    truncate_tool_output(&err, MAX_TOOL_OUTPUT_CHARS)
-                ),
+                format!("error: {}", truncate_tool_output(&err, max_output_chars)),
             ),
         }
     }
@@ -593,10 +607,7 @@ pub fn format_tool_signature(name: &str, description: &str, schema: &Value) -> S
         params_str = formatted_args.join(", ");
     }
 
-    let clean_desc = description
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let clean_desc = description.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if clean_desc.is_empty() {
         format!("- {name}({params_str})")
@@ -946,7 +957,7 @@ impl AgentTool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read file lines (1-based start_line..end_line, default: first 2000 lines)."
+        "Read file lines (1-based start_line..end_line, default: first 500 lines)."
     }
 
     fn is_read_only(&self) -> bool {
@@ -1006,16 +1017,27 @@ impl AgentTool for ReadFileTool {
         {
             numbered.push(format!("{:>4} | {}", start + idx, line));
         }
-        let mut out = format!(
-            "File: {raw_path} (lines {start}..={end} of {total})\n{}",
-            numbered.join("\n")
-        );
+        let body = numbered.join("\n");
+        let mut out = format!("File: {raw_path} (lines {start}..={end} of {total})\n{body}");
         if end < total {
             out.push_str(&format!(
                 "\n... [{} more line(s); call read_file with start_line={}]",
                 total - end,
                 end + 1
             ));
+        }
+        if ctx.dedup_reads && out.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
+            let hash = crate::domain::digest(body.as_bytes());
+            let key = (path, start, end);
+            if let Ok(mut cache) = ctx.read_cache.lock() {
+                if cache.get(&key).is_some_and(|prev| prev == &hash) {
+                    return Ok(format!(
+                        "File: {raw_path} (lines {start}..={end} of {total}) [unchanged since earlier read in this session; sha256={}]",
+                        &hash[..12]
+                    ));
+                }
+                cache.insert(key, hash);
+            }
         }
         Ok(out)
     }

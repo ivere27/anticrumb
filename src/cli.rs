@@ -19,6 +19,12 @@ pub(crate) fn config_root() -> PathBuf {
     app_dir().join("workspace")
 }
 pub(crate) fn token(root: &Path) -> Result<String> {
+    token_with_regenerate(root, false)
+}
+pub(crate) fn regenerate_token(root: &Path) -> Result<String> {
+    token_with_regenerate(root, true)
+}
+fn token_with_regenerate(root: &Path, regenerate: bool) -> Result<String> {
     fs::create_dir_all(root).map_err(ServiceError::storage)?;
     #[cfg(unix)]
     {
@@ -35,7 +41,7 @@ pub(crate) fn token(root: &Path) -> Result<String> {
         .map_err(ServiceError::storage)?;
     lock.lock_exclusive().map_err(ServiceError::storage)?;
     let path = root.join("token");
-    if !path.exists() {
+    if regenerate || !path.exists() {
         let secret = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
@@ -117,12 +123,29 @@ impl Client {
     }
 }
 
+fn normalize_commit_head(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    let (hash, dirty) = match trimmed.strip_suffix("-dirty") {
+        Some(prefix) => (prefix, true),
+        None => (trimmed, false),
+    };
+    if hash.len() < 7 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let short: String = hash.chars().take(7).collect();
+    if dirty {
+        Some(format!("{short}-dirty"))
+    } else {
+        Some(short)
+    }
+}
+
 pub(crate) fn commit_head() -> Option<String> {
-    if let Some(hash) = option_env!("ANTICRUMB_GIT_HEAD").map(str::trim) {
-        let short: String = hash.chars().take(7).collect();
-        if short.len() >= 7 && short.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(short);
-        }
+    if let Some(normalized) = option_env!("ANTICRUMB_GIT_HEAD").and_then(normalize_commit_head) {
+        return Some(normalized);
     }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dot_git = manifest_dir.join(".git");
@@ -175,7 +198,86 @@ pub(crate) fn help_banner() -> String {
     format!("anticrumb {version} (commit: {commit}, built: {built})")
 }
 
+pub(crate) fn client_version() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let commit = commit_head().unwrap_or_else(|| "unknown".into());
+    format!("anticrumb {version} ({commit})")
+}
+
+fn is_env_truthy(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn non_empty_env(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let res = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if res == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        std::str::from_utf8(&buf[..len])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    None
+}
+
+pub(crate) fn local_hostname() -> Option<String> {
+    non_empty_env("HOSTNAME")
+        .or_else(|| non_empty_env("COMPUTERNAME"))
+        .or_else(os_hostname)
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+pub(crate) fn client_identity() -> String {
+    if is_env_truthy("ANTICRUMB_ANONYMOUS_CLIENT") || is_env_truthy("DO_NOT_TRACK") {
+        return format!("anonymous ({})", std::env::consts::OS);
+    }
+    let user = non_empty_env("USER")
+        .or_else(|| non_empty_env("USERNAME"))
+        .unwrap_or_else(|| "user".into());
+    let host = local_hostname().unwrap_or_else(|| "host".into());
+    let os = std::env::consts::OS;
+    let raw = format!("{user}@{host} ({os})");
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub fn run(args: &[String]) -> Result<()> {
+    crate::update::cleanup_old_executables();
     if let Some((connection, args)) = crate::rpc::connection::inline(args)? {
         return crate::rpc::workspace_client::with_connection(connection, || run(&args));
     }
@@ -207,6 +309,7 @@ pub fn run(args: &[String]) -> Result<()> {
   exec resume [ID | --last] PROMPT         follow up without the TUI
 
   -m, --model ID      -C, --cd DIR          model and working directory
+  --agent             --yolo                agent mode (respects /permissions) or yolo (all permissions)
   -p, --print                              noninteractive final answer
   -c, --continue     -r, --resume ID        reopen a conversation
   --file PATH        -i, --image PATH       native Gemini attachment (repeatable)
@@ -216,12 +319,13 @@ pub fn run(args: &[String]) -> Result<()> {
   --connect https://HOST:PORT --token STRING [--tls-pin SHA256]
 
 Type @path or @"path with spaces" to upload a file, never inline its contents.
-Interactive: /help /provider /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
+Interactive: /help /mode /provider /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
 Enter sends; Esc interrupts; Tab completes; Alt+Enter inserts a newline.
 
 Service and integration commands:
   update [--check]                         install or check the latest release
-  daemon [--listen IP:PORT] [OPTIONS]       persistent host (see daemon --help)
+  daemon [OPTIONS]                         persistent local IPC daemon (see daemon --help)
+  server [IP:PORT] [OPTIONS]               network browser RPC and HTTPS /v1 server (see server --help)
   browser [OPTIONS] [COMMAND]               stateful browser commands / interactive shell
   chat [--session ID] [--file PATH] PROMPT
   image [--file PATH] PROMPT
@@ -239,28 +343,30 @@ Service and integration commands:
   connect status | connect local            inspect or forget the saved connection
   cache [stats|prune [DAYS] [--dry-run]] (default: 7 days)     mcp (stdio server)
 
-Default: automatic local daemon over a Unix socket or named pipe. Remote: daemon --listen / connect.
-Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, browser/, prompts/, providers/, AGENTS.md)"#
+Default: automatic local daemon over a Unix socket or named pipe. Remote: server / connect.
+Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, server/, prompts/, providers/, AGENTS.md)"#
             );
             Ok(())
         }
         "daemon" => crate::rpc::daemon::run(&args[1..]),
+        "server" => crate::rpc::server_cmd::run(&args[1..]),
         "browser" => crate::browser_control::terminal::run(&args[1..]),
-        "serve" => Err(ServiceError::invalid("serve has been merged into daemon. Use `anticrumb` locally or `anticrumb daemon --listen IP:PORT` for network clients.")),
         "mcp" => {
             let client = Client::connect()?;
-            let result = client.runtime.block_on(crate::mcp_sdk::serve(client.rpc.clone()));
+            let result = client
+                .runtime
+                .block_on(crate::mcp_sdk::serve(client.rpc.clone()));
             client.close()?;
             result
         }
         "resume" => launch_resume(&args[1..], false),
         "connect"
             if matches!(
-                    args.get(1).map(String::as_str),
-                    Some("--help" | "-h" | "help")
-                ) =>
+                args.get(1).map(String::as_str),
+                Some("--help" | "-h" | "help")
+            ) =>
         {
-            println!("anticrumb connect https://HOST:PORT --token STRING\n  First connection: compare the SHA256 and emoji fingerprint with the daemon, then confirm.\n  --tls-pin SHA256    preverified certificate for noninteractive setup\n  --ca-file PATH      use an existing trusted CA\n  --server-name NAME override the expected TLS hostname\nanticrumb connect status | local\nanticrumb --connect URL --token STRING [TUI options]\nProvider integrations: connect opencode|codex|claude|antigravity|mcp");
+            println!("anticrumb connect https://HOST:PORT --token STRING\n  First connection: compare the SHA256 and emoji fingerprint with the server, then confirm.\n  --tls-pin SHA256    preverified certificate for noninteractive setup\n  --ca-file PATH      use an existing trusted CA\n  --server-name NAME override the expected TLS hostname\nanticrumb connect status | local\nanticrumb --connect URL --token STRING [TUI options]\nProvider integrations: connect opencode|codex|claude|antigravity|mcp");
             Ok(())
         }
         "connect" if crate::rpc::connection::handles(&args[1..]) => {
@@ -276,29 +382,42 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, bro
         "accounts" => account_command(&args[1..]),
         "knowledge" => knowledge_command(&args[1..]),
         "cache" => {
-            if matches!(args.get(1).map(String::as_str), Some("--help" | "-h" | "help")) {
+            if matches!(
+                args.get(1).map(String::as_str),
+                Some("--help" | "-h" | "help")
+            ) {
                 println!("{}", crate::store::cache::USAGE);
                 return Ok(());
             }
-            let options = crate::store::cache::Options::parse(&args[1..].iter().map(String::as_str).collect::<Vec<_>>())?;
+            let options = crate::store::cache::Options::parse(
+                &args[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+            )?;
             let client = Client::connect()?;
             let report = client.cache(options);
             client.close()?;
             let report = report?;
             print_json(&json!(report));
             if report.stores.iter().any(|store| !store.error.is_empty()) {
-                return Err(ServiceError::storage("cache maintenance was incomplete; see each store's error"));
+                return Err(ServiceError::storage(
+                    "cache maintenance was incomplete; see each store's error",
+                ));
             }
             Ok(())
         }
         "usage" => {
             let mut options = PromptOptions::parse(&args[1..])?;
             if !options.words.is_empty() {
-                return Err(ServiceError::invalid("usage [--provider ID] [--account ID]"));
+                return Err(ServiceError::invalid(
+                    "usage [--provider ID] [--account ID]",
+                ));
             }
             let client = Client::connect()?;
             options.resolve_account(&client)?;
-            print_json(&client.request("GET", &format!("/api/accounts/{}/usage", options.account), None)?);
+            print_json(&client.request(
+                "GET",
+                &format!("/api/accounts/{}/usage", options.account),
+                None,
+            )?);
             Ok(())
         }
         "doctor" | "models" => {
@@ -398,7 +517,10 @@ pub struct PromptOptions {
     pub(crate) keep: bool,
     pub(crate) files: Vec<PathBuf>,
     pub(crate) workspace: PathBuf,
+    pub(crate) agent: bool,
+    pub(crate) yolo: bool,
     pub(crate) no_shell: bool,
+    pub(crate) permissions: ToolPermissions,
     pub(crate) timeout: u64,
     pub(crate) knowledge: Option<String>,
     pub(crate) mcp: Option<PathBuf>,
@@ -415,6 +537,8 @@ impl PromptOptions {
         let mut o = Self {
             account: "default".into(),
             workspace: std::env::current_dir().map_err(ServiceError::storage)?,
+            no_shell: true,
+            permissions: ToolPermissions::read_only(),
             timeout: 120,
             ..Default::default()
         };
@@ -488,7 +612,30 @@ impl PromptOptions {
                 }
                 "--keep-session" => o.keep = true,
                 "--detach" => return Err(ServiceError::invalid("automatic daemons stop after their last client exits; keep the command running until the task finishes")),
-                "--no-shell" => o.no_shell = true,
+                "--yolo" => {
+                    o.agent = true;
+                    o.yolo = true;
+                    o.no_shell = false;
+                    o.permissions = ToolPermissions::all();
+                    o.overrides.insert("agent".into());
+                    o.overrides.insert("no_shell".into());
+                    o.overrides.insert("permissions".into());
+                }
+                "--agent" => {
+                    o.agent = true;
+                    o.yolo = false;
+                    o.overrides.insert("agent".into());
+                }
+                "--chat" => {
+                    o.agent = false;
+                    o.yolo = false;
+                    o.overrides.insert("agent".into());
+                }
+                "--no-shell" => {
+                    o.no_shell = true;
+                    o.permissions.shell = false;
+                    o.yolo = false;
+                }
                 "--file" | "-i" | "--image" => o.files.push(PathBuf::from(
                     iter.next()
                         .ok_or_else(|| ServiceError::invalid("missing file"))?,
@@ -591,6 +738,15 @@ impl PromptOptions {
         if !self.overrides.contains("thinking") {
             self.thinking = request.thinking.clone();
         }
+        if !self.overrides.contains("agent") {
+            self.agent = !request.chat_only;
+        }
+        if !self.overrides.contains("permissions") {
+            if let Some(perms) = request.permissions {
+                self.permissions = perms;
+                self.no_shell = !perms.shell;
+            }
+        }
         if !self.overrides.contains("no_shell") {
             self.no_shell = request.no_shell;
         }
@@ -675,11 +831,50 @@ impl PromptOptions {
         }
     }
 
+    pub(crate) fn load_saved_permissions(&mut self, root: &Path) {
+        if self.yolo {
+            self.permissions = ToolPermissions::all();
+            self.no_shell = false;
+            return;
+        }
+        if let Ok(prefs) = crate::tui::preferences::Preferences::open(root) {
+            if !self.overrides.contains("permissions") {
+                if let Some(mut perms) = prefs.permissions() {
+                    if self.overrides.contains("no_shell") {
+                        perms.shell = !self.no_shell;
+                    }
+                    self.no_shell = !perms.shell;
+                    self.permissions = perms;
+                    return;
+                }
+            }
+            if !self.overrides.contains("no_shell") {
+                if let Some(no_shell) = prefs.no_shell() {
+                    self.no_shell = no_shell;
+                    self.permissions.shell = !no_shell;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn effective_permissions(&self) -> ToolPermissions {
+        if self.yolo {
+            ToolPermissions::all()
+        } else {
+            let mut perms = self.permissions;
+            if self.no_shell {
+                perms.shell = false;
+            }
+            perms
+        }
+    }
+
     pub(crate) fn agent_request(
         &self,
         task: String,
         parent_id: Option<String>,
     ) -> crate::agent_service::AgentRequest {
+        let perms = self.effective_permissions();
         crate::agent_service::AgentRequest {
             environment: None,
             task,
@@ -688,12 +883,14 @@ impl PromptOptions {
             model: self.model.clone(),
             thinking: self.thinking.clone(),
             temporary: self.temporary,
-            no_shell: self.no_shell,
+            no_shell: !perms.shell,
             max_steps: 0,
             knowledge: self.knowledge.clone(),
             mcp_config: self.mcp.clone(),
             artifacts: Vec::new(),
             parent_id,
+            chat_only: !self.agent,
+            permissions: Some(perms),
         }
     }
 }
@@ -719,6 +916,7 @@ fn launch_resume(args: &[String], print: bool) -> Result<()> {
 }
 fn run_agent(mut o: PromptOptions) -> Result<()> {
     o.apply_worker_override();
+    o.load_saved_permissions(&root());
     let client = Client::connect()?;
     o.resolve_account(&client)?;
     let parent = if let Some(id) = &o.resume {
@@ -747,7 +945,14 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     let id = value["id"]
         .as_str()
         .ok_or_else(|| ServiceError::invalid("missing job id"))?;
-    eprintln!("agent: {id}");
+    let mode_desc = if !o.agent {
+        "chat".to_owned()
+    } else if o.yolo {
+        "agent (--yolo, all permissions)".to_owned()
+    } else {
+        format!("agent (permissions: {})", o.effective_permissions().summary())
+    };
+    eprintln!("mode: {mode_desc} | agent: {id}");
     follow_agent(&client, id, o.json, o.print)
 }
 fn follow_agent(client: &Client, id: &str, json: bool, quiet: bool) -> Result<()> {
@@ -1526,7 +1731,7 @@ fn connect_config(args: &[String]) -> Result<()> {
             }
 
             println!("model_provider = \"anticrumb\"\nmodel = \"gemini-web-default\"\nmodel_context_window = 24000\nmodel_auto_compact_token_limit = 18000\n[model_providers.anticrumb]\nname = \"Gemini Web Local\"\nbase_url = \"{base}/v1\"\nwire_api = \"responses\"\nenv_key = \"ANTICRUMB_TOKEN\"");
-            eprintln!("Use the token printed by `anticrumb daemon` as ANTICRUMB_TOKEN. Configure the provider client to trust the daemon certificate.");
+            eprintln!("Use the token printed by `anticrumb server` as ANTICRUMB_TOKEN. Configure the provider client to trust the server certificate.");
             return Ok(());
         }
         _ => {
@@ -1584,7 +1789,7 @@ fn connect_config(args: &[String]) -> Result<()> {
     } else {
         print_json(&value);
     }
-    eprintln!("Use the token printed by `anticrumb daemon` as ANTICRUMB_TOKEN (OpenCode/Codex), ANTHROPIC_AUTH_TOKEN (Claude), or GEMINI_API_KEY (Antigravity). Configure the provider client to trust the daemon certificate.");
+    eprintln!("Use the token printed by `anticrumb server` as ANTICRUMB_TOKEN (OpenCode/Codex), ANTHROPIC_AUTH_TOKEN (Claude), or GEMINI_API_KEY (Antigravity). Configure the provider client to trust the server certificate.");
     Ok(())
 }
 impl Client {
@@ -1728,6 +1933,28 @@ mod tests {
     }
 
     #[test]
+    fn normalize_commit_head_preserves_dirty_suffix_and_rejects_invalid() {
+        assert_eq!(normalize_commit_head("abc1234"), Some("abc1234".into()));
+        assert_eq!(
+            normalize_commit_head("abc1234def5678"),
+            Some("abc1234".into())
+        );
+        assert_eq!(
+            normalize_commit_head(" abc1234-dirty \n"),
+            Some("abc1234-dirty".into())
+        );
+        assert_eq!(
+            normalize_commit_head("abc1234def5678-dirty"),
+            Some("abc1234-dirty".into())
+        );
+        assert_eq!(normalize_commit_head("unknown"), None);
+        assert_eq!(normalize_commit_head(""), None);
+        assert_eq!(normalize_commit_head("-dirty"), None);
+        assert_eq!(normalize_commit_head("123456-dirty"), None);
+        assert_eq!(normalize_commit_head("not_hex-dirty"), None);
+    }
+
+    #[test]
     fn familiar_flags_and_resume_overrides_are_preserved() {
         let mut options = PromptOptions::parse(&[
             "-m".into(),
@@ -1742,10 +1969,12 @@ mod tests {
         ])
         .unwrap();
         assert!(options.print);
+        assert!(!options.yolo);
         assert_eq!(options.workers, Some(4));
         assert_eq!(options.pace, Some(crate::gemini::HumanPace::High));
         assert_eq!(options.words, vec!["question"]);
         let previous = options.agent_request("earlier".into(), None);
+        assert!(previous.chat_only);
         let mut previous = previous;
         previous.model = Some("old".into());
         previous.no_shell = false;
@@ -1753,6 +1982,53 @@ mod tests {
         options.inherit_from_job(&job).unwrap();
         assert_eq!(options.model.as_deref(), Some("selected"));
         assert!(options.no_shell);
+
+        let dir = tempfile::tempdir().unwrap();
+        // Default --agent permissions are read-only (read=true, edit=false, shell=false, browser=false, subagent=false)
+        let mut default_agent = PromptOptions::parse(&["--agent".into(), "task".into()]).unwrap();
+        default_agent.load_saved_permissions(dir.path());
+        assert_eq!(default_agent.effective_permissions(), ToolPermissions::read_only());
+
+        let prefs = crate::tui::preferences::Preferences::open(dir.path()).unwrap();
+        prefs
+            .set_permissions(ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: true,
+                subagent: false,
+            })
+            .unwrap();
+
+        let mut agent_opts = PromptOptions::parse(&["--agent".into(), "task".into()]).unwrap();
+        agent_opts.load_saved_permissions(dir.path());
+        assert!(agent_opts.agent);
+        assert!(!agent_opts.yolo);
+        assert!(agent_opts.no_shell, "--agent must respect saved /permissions");
+        let agent_req = agent_opts.agent_request("task".into(), None);
+        assert!(!agent_req.chat_only);
+        assert!(agent_req.no_shell);
+        assert_eq!(
+            agent_req.permissions,
+            Some(ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: true,
+                subagent: false,
+            })
+        );
+
+        let mut yolo =
+            PromptOptions::parse(&["--no-shell".into(), "--yolo".into(), "task".into()]).unwrap();
+        yolo.load_saved_permissions(dir.path());
+        assert!(yolo.agent);
+        assert!(yolo.yolo);
+        assert!(!yolo.no_shell);
+        let yolo_req = yolo.agent_request("task".into(), None);
+        assert!(!yolo_req.chat_only);
+        assert!(!yolo_req.no_shell);
+        assert_eq!(yolo_req.permissions, Some(ToolPermissions::all()));
     }
 
     #[test]
@@ -2004,5 +2280,15 @@ mod tests {
         // Chain entry uses root's first prompt as label
         assert_eq!(jobs[0]["request"]["task"], "Write hello world");
         assert_eq!(jobs[1]["request"]["task"], "Standalone question");
+    }
+
+    #[test]
+    fn test_client_identity_and_version() {
+        let v = client_version();
+        assert!(v.starts_with("anticrumb "));
+
+        let id = client_identity();
+        assert!(!id.is_empty());
+        assert!(!id.contains('\n') && !id.contains('\r'));
     }
 }

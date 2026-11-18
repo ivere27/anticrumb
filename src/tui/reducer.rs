@@ -6,6 +6,7 @@ use super::{
     editor::{Draft, Editor},
     layout::{FrameLayout, LayoutConfig},
     markdown::{self, Face},
+    mentions::{self, MentionKind, MentionMatch, MentionPopup},
     preferences::{self, Preferences},
     selection, theme,
     transcript::{clip, inline_notice_parts, Entry, Transcript},
@@ -49,6 +50,25 @@ pub(super) struct LastClick {
     pub row: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SelectionTarget {
+    Transcript,
+    Hint,
+    Composer,
+    Subagents,
+    Footer,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SelectionDrag {
+    pub anchor_viewport_row: usize,
+    pub column: u16,
+    pub row: u16,
+    pub moved: bool,
+    pub entered_top_at: Option<Instant>,
+    pub last_autoscroll: Instant,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct SubagentView {
     pub id: String,
@@ -72,6 +92,8 @@ pub(super) struct State {
     pub status: Value,
     pub last_status_at: Option<Instant>,
     pub status_disconnected: bool,
+    pub remote_tls_pin: Option<String>,
+    pub remote_tls_endpoint: Option<String>,
     pub last_login_status: Value,
     pub last_chat_cleanup: Value,
     pub web_usage: Option<Value>,
@@ -93,14 +115,27 @@ pub(super) struct State {
     pub clearing_web_history: bool,
     pub web_history_status: Value,
     pub completion: Option<Completion>,
+    pub mention: Option<MentionPopup>,
+    pub mention_dismissed: Option<(usize, String)>,
+    pub next_mention_id: u64,
     pub scroll: usize,
     pub last_response: String,
     pub copy_response: String,
     pub painted_transcript: Vec<markdown::Line>,
+    pub painted_all_transcript: Vec<markdown::Line>,
+    pub painted_transcript_start: usize,
+    pub painted_effective_scroll: usize,
+    pub painted_hint: Vec<markdown::Line>,
+    pub painted_composer: Vec<markdown::Line>,
+    pub painted_subagents: Vec<markdown::Line>,
+    pub painted_footer: Vec<markdown::Line>,
     pub painted_size: (u16, u16),
     pub painted_layout: Option<FrameLayout>,
+    pub scroll_bottom_button: Option<(u16, u16, u16)>,
     pub layout: LayoutConfig,
     pub selection: Option<selection::Selection>,
+    pub selection_target: SelectionTarget,
+    pub selection_drag: Option<SelectionDrag>,
     pub last_click: Option<LastClick>,
     pub clipboard_notice: Option<String>,
     pub stream: String,
@@ -113,6 +148,7 @@ pub(super) struct State {
 
 impl State {
     pub(super) fn new(mut options: PromptOptions) -> Self {
+        options.no_shell = !options.effective_permissions().shell;
         let files = std::mem::take(&mut options.files);
         let mut editor = Editor::default();
         editor.set(options.words.join(" "));
@@ -131,6 +167,8 @@ impl State {
             status: json!({}),
             last_status_at: None,
             status_disconnected: false,
+            remote_tls_pin: None,
+            remote_tls_endpoint: None,
             last_login_status: Value::Null,
             last_chat_cleanup: Value::Null,
             web_usage: None,
@@ -151,14 +189,27 @@ impl State {
             clearing_web_history: false,
             web_history_status: Value::Null,
             completion: None,
+            mention: None,
+            mention_dismissed: None,
+            next_mention_id: 1,
             scroll: 0,
             last_response: String::new(),
             copy_response: String::new(),
             painted_transcript: Vec::new(),
+            painted_all_transcript: Vec::new(),
+            painted_transcript_start: 0,
+            painted_effective_scroll: 0,
+            painted_hint: Vec::new(),
+            painted_composer: Vec::new(),
+            painted_subagents: Vec::new(),
+            painted_footer: Vec::new(),
             painted_size: (0, 0),
             painted_layout: None,
+            scroll_bottom_button: None,
             layout: LayoutConfig::default(),
             selection: None,
+            selection_target: SelectionTarget::Transcript,
+            selection_drag: None,
             last_click: None,
             clipboard_notice: None,
             stream: String::new(),
@@ -302,6 +353,21 @@ impl State {
             (workspace_label.clone(), Face::MUTED),
         ];
 
+        let mode_summary = if !self.options.agent {
+            "Mode: Chat (use /mode or --agent / --yolo for Agent mode)".to_owned()
+        } else if self.options.yolo {
+            "Mode: Agent (--yolo · all tools & sub-agents allowed)".to_owned()
+        } else {
+            format!(
+                "Mode: Agent (permissions: {})",
+                self.options.effective_permissions().summary()
+            )
+        };
+        let mode_face = if self.options.agent {
+            Face::HIGHLIGHT_BOLD
+        } else {
+            Face::ACCENT
+        };
         let row4 = vec![
             ("      ".into(), Face::TEXT),
             ("·".into(), Face::MUTED),
@@ -309,6 +375,8 @@ impl State {
             ("▪".into(), Face::ACCENT_BOLD),
             ("   ".into(), Face::TEXT),
             ("▪".into(), Face::CODE),
+            ("    ".into(), Face::TEXT),
+            (mode_summary.clone(), mode_face),
         ];
 
         self.log_spans("", Vec::new());
@@ -316,7 +384,7 @@ impl State {
         self.log_spans(&account_label, row1);
         self.log_spans(&model_label, row2);
         self.log_spans(&workspace_label, row3);
-        self.log_spans("", row4);
+        self.log_spans(&mode_summary, row4);
         self.log_spans("", Vec::new());
     }
 
@@ -673,6 +741,7 @@ impl State {
         self.parent = None;
         self.active_model = None;
         self.files.clear();
+        self.clear_mention();
         self.in_chars = 0;
         self.out_chars = 0;
         self.last_response.clear();
@@ -1001,15 +1070,62 @@ impl State {
         }
     }
 
+    pub(super) fn daemon_remote_addr(&self) -> Option<String> {
+        let connection = &self.status["browser_connection"];
+        if connection["transport"].as_str() != Some("grpc") {
+            return None;
+        }
+        let endpoint = connection["endpoint"].as_str()?.trim();
+        if endpoint.is_empty() || endpoint == "<invalid endpoint>" {
+            return None;
+        }
+        if let Ok(url) = crate::url_lite::Url::parse(endpoint) {
+            let host = url.host_str()?;
+            return Some(match url.port_or_known_default() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            });
+        }
+        let stripped = endpoint
+            .strip_prefix("https://")
+            .or_else(|| endpoint.strip_prefix("http://"))
+            .unwrap_or(endpoint)
+            .trim_end_matches('/');
+        (!stripped.is_empty()).then(|| stripped.to_owned())
+    }
+
+    pub(super) fn daemon_tls_emoji(&self) -> Option<String> {
+        let connection = &self.status["browser_connection"];
+        if connection["transport"].as_str() != Some("grpc") {
+            return None;
+        }
+        let pin = connection["tls_pin"].as_str().or_else(|| {
+            let endpoint = connection["endpoint"].as_str();
+            let matches = match (self.remote_tls_endpoint.as_deref(), endpoint) {
+                (Some(saved), Some(reported)) => {
+                    let norm_saved = crate::rpc::client::endpoint_description(saved);
+                    let norm_reported = crate::rpc::client::endpoint_description(reported);
+                    norm_saved != "<invalid endpoint>" && norm_saved == norm_reported
+                }
+                _ => false,
+            };
+            matches.then_some(self.remote_tls_pin.as_deref()).flatten()
+        })?;
+        crate::rpc::fingerprint::short_emoji_from_pin(pin)
+    }
+
     pub(super) fn daemon_summary(&self) -> String {
         let connection = &self.status["browser_connection"];
         let location = match connection["transport"].as_str() {
-            Some("grpc") => format!(
-                "remote {}",
-                connection["endpoint"]
+            Some("grpc") => {
+                let endpoint = connection["endpoint"]
                     .as_str()
-                    .unwrap_or("unknown endpoint")
-            ),
+                    .unwrap_or("unknown endpoint");
+                match self.daemon_tls_emoji() {
+                    Some(emoji) => format!("remote {endpoint} ({emoji})"),
+                    None => format!("remote {endpoint}"),
+                }
+            }
             Some("local") => return format!("Runtime: {}", self.daemon_label()),
             _ => return format!("Daemon: {}", self.daemon_label()),
         };
@@ -1241,6 +1357,7 @@ impl State {
         self.history_index = self.history_index.saturating_sub(1);
         self.editor
             .restore(self.history[self.history_index].clone());
+        self.clear_mention();
     }
 
     pub(super) fn next_input(&mut self) {
@@ -1254,6 +1371,7 @@ impl State {
                 .cloned()
                 .unwrap_or_else(|| self.saved_draft.clone()),
         );
+        self.clear_mention();
     }
 
     pub(super) fn paste(&mut self, text: &str) {
@@ -1261,6 +1379,176 @@ impl State {
             self.log("Paste exceeds the 48,000-byte input limit; your draft is unchanged. Save the text to a file and attach it with @path.");
         }
         self.completion = None;
+        self.clear_mention();
+    }
+
+    pub(super) fn clear_mention(&mut self) {
+        self.mention = None;
+        self.mention_dismissed = None;
+    }
+
+    pub(super) fn mention_loading(&self) -> bool {
+        self.mention.as_ref().is_some_and(|m| m.loading)
+    }
+
+    pub(super) fn mention_panel_rows(&self) -> usize {
+        if self.menu.is_some() || self.history_clear_confirmation.is_some() {
+            return 0;
+        }
+        self.mention.as_ref().map_or(0, MentionPopup::desired_rows)
+    }
+
+    pub(super) fn refresh_mention(&mut self, sink: &mut dyn EffectSink) {
+        let Some(parsed) = mentions::parse_at_cursor(&self.editor) else {
+            self.mention = None;
+            self.mention_dismissed = None;
+            return;
+        };
+        let prefix = &self.editor.text[..parsed.start];
+        if self
+            .mention_dismissed
+            .as_ref()
+            .is_some_and(|(start, dismissed_prefix)| {
+                *start == parsed.start && dismissed_prefix == prefix
+            })
+        {
+            return;
+        }
+        self.mention_dismissed = None;
+        let unchanged = self.mention.as_ref().is_some_and(|m| {
+            m.start == parsed.start
+                && m.end == parsed.end
+                && m.query == parsed.query
+                && m.quoted == parsed.quoted
+        });
+        if unchanged {
+            return;
+        }
+        let request_id = self.next_mention_id;
+        self.next_mention_id = self.next_mention_id.saturating_add(1);
+        let popup = MentionPopup::new(&parsed, request_id, self.mention.as_ref());
+        self.mention = Some(popup);
+        self.send(
+            sink,
+            Command::SearchMentions {
+                id: request_id,
+                workspace: self.options.workspace.clone(),
+                query: parsed.query,
+            },
+        );
+    }
+
+    pub(super) fn dismiss_mention(&mut self) {
+        if let Some(m) = self.mention.take() {
+            let prefix = self
+                .editor
+                .text
+                .get(..m.start)
+                .unwrap_or_default()
+                .to_owned();
+            self.mention_dismissed = Some((m.start, prefix));
+        }
+    }
+
+    pub(super) fn move_mention(&mut self, up: bool) {
+        if let Some(m) = self.mention.as_mut() {
+            m.move_selection(up);
+        }
+    }
+
+    fn apply_mention_match(
+        &mut self,
+        start: usize,
+        end: usize,
+        quoted: bool,
+        matched: &MentionMatch,
+        sink: &mut dyn EffectSink,
+    ) {
+        let insertion = matched.format_insertion(quoted);
+        self.editor.replace(start..end, &insertion);
+        self.mention_dismissed = None;
+        if matched.kind == MentionKind::Dir {
+            self.refresh_mention(sink);
+        } else {
+            self.mention = None;
+        }
+    }
+
+    pub(super) fn select_mention(&mut self, sink: &mut dyn EffectSink) -> bool {
+        let Some(m) = self.mention.as_ref() else {
+            return false;
+        };
+        let Some(matched) = m.matches.get(m.selected).cloned() else {
+            return false;
+        };
+        let (start, end, quoted) = (m.start, m.end, m.quoted);
+        self.apply_mention_match(start, end, quoted, &matched, sink);
+        true
+    }
+
+    pub(super) fn tab_complete_mention(&mut self, sink: &mut dyn EffectSink) -> bool {
+        let Some(m) = self.mention.as_ref() else {
+            return false;
+        };
+        if let Some(matched) = m.matches.get(m.selected).cloned() {
+            let (start, end, quoted) = (m.start, m.end, m.quoted);
+            self.apply_mention_match(start, end, quoted, &matched, sink);
+            return true;
+        }
+        if m.loading {
+            if let Some((matches, _)) =
+                mentions::search_mentions(&self.options.workspace, &m.query, None, m.request_id)
+            {
+                if let Some(first) = matches.first() {
+                    let (start, end, quoted) = (m.start, m.end, m.quoted);
+                    self.apply_mention_match(start, end, quoted, first, sink);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub(super) fn completion_mouse(
+        &mut self,
+        mouse: event::MouseEvent,
+        sink: &mut dyn EffectSink,
+    ) -> bool {
+        let Some(layout) = self.painted_layout else {
+            return false;
+        };
+        if !layout.completion.contains(mouse.row) || self.mention.is_none() {
+            return false;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            let rel = usize::from(mouse.row - layout.completion.start);
+            let total_rows = usize::from(layout.completion.len);
+            if rel >= 1 {
+                let item_offset = rel - 1;
+                let picked = self.mention.as_ref().and_then(|m| {
+                    let (visible, local_offset) = m.visible_window(total_rows);
+                    visible.get(item_offset).cloned().map(|matched| {
+                        (
+                            m.start,
+                            m.end,
+                            m.quoted,
+                            m.scroll + local_offset + item_offset,
+                            matched,
+                        )
+                    })
+                });
+                if let Some((start, end, quoted, idx, matched)) = picked {
+                    if let Some(m) = self.mention.as_mut() {
+                        m.selected = idx;
+                    }
+                    self.apply_mention_match(start, end, quoted, &matched, sink);
+                }
+            }
+        }
+        true
     }
 
     pub(super) fn load(&mut self, job: Value) {
@@ -1273,6 +1561,7 @@ impl State {
         }
         self.parent = Some(id.into());
         self.active_model = None;
+        self.clear_mention();
         self.in_chars = 0;
         self.out_chars = 0;
         self.last_response.clear();
@@ -1566,6 +1855,16 @@ impl State {
             }
             Update::Finished(job) => self.handle_finished(job),
             Update::Event(event) => self.handle_agent_event(event),
+            Update::MentionMatches {
+                id,
+                query,
+                matches,
+                total,
+            } => {
+                if let Some(mention) = self.mention.as_mut() {
+                    mention.apply_results(id, &query, matches, total);
+                }
+            }
         }
     }
 
@@ -2104,8 +2403,26 @@ impl State {
         .min(maximum);
     }
 
-    pub(super) fn scroll_wheel(&mut self, up: bool, width: usize, height: usize) {
+    pub(super) fn clear_selection(&mut self) {
         self.selection = None;
+        self.selection_drag = None;
+    }
+
+    pub(super) fn clear_painted_regions(&mut self) {
+        self.painted_transcript.clear();
+        self.painted_all_transcript.clear();
+        self.painted_transcript_start = 0;
+        self.painted_effective_scroll = 0;
+        self.painted_hint.clear();
+        self.painted_composer.clear();
+        self.painted_subagents.clear();
+        self.painted_footer.clear();
+        self.painted_layout = None;
+        self.scroll_bottom_button = None;
+    }
+
+    pub(super) fn scroll_wheel(&mut self, up: bool, width: usize, height: usize) {
+        self.clear_selection();
         self.last_click = None;
         self.clipboard_notice = None;
         if self.deleting_conversation.is_some() || self.history_clear_confirmation.is_some() {
@@ -2118,89 +2435,387 @@ impl State {
         }
     }
 
+    pub(super) fn scroll_wheel_at(
+        &mut self,
+        up: bool,
+        column: u16,
+        row: u16,
+        width: usize,
+        height: usize,
+    ) {
+        if self.selection.is_some()
+            && self.selection_target == SelectionTarget::Transcript
+            && self.menu.is_none()
+            && self.deleting_conversation.is_none()
+            && self.history_clear_confirmation.is_none()
+        {
+            let (_, _, viewport) = self.transcript_bounds();
+            self.scroll_selection(up, 3, viewport);
+            self.extend_transcript_selection(column, row);
+            if let Some(drag) = self.selection_drag.as_mut() {
+                drag.moved = true;
+                drag.column = column;
+                drag.row = row;
+            }
+            return;
+        }
+        if self.menu.is_none()
+            && self.deleting_conversation.is_none()
+            && self.history_clear_confirmation.is_none()
+            && self.mention.is_some()
+            && self
+                .painted_layout
+                .is_some_and(|layout| layout.completion.contains(row))
+        {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            self.move_mention(up);
+            return;
+        }
+        self.scroll_wheel(up, width, height);
+    }
+
+    fn transcript_bounds(&self) -> (u16, u16, usize) {
+        let fallback_start = u16::from(self.layout.show_header);
+        if let Some(layout) = self.painted_layout {
+            (
+                layout.transcript.start,
+                layout.transcript.end(),
+                usize::from(layout.transcript.len).max(1),
+            )
+        } else {
+            let len = self.painted_transcript.len().max(1);
+            let end = fallback_start.saturating_add(len.min(usize::from(u16::MAX)) as u16);
+            (fallback_start, end, len)
+        }
+    }
+
+    pub(super) fn selection_view_range(&self, lines_len: usize, viewport: usize) -> (usize, usize) {
+        let viewport = viewport.max(1);
+        let max_scroll = lines_len.saturating_sub(viewport);
+        let effective_scroll = self.scroll.min(max_scroll);
+        let end = lines_len.saturating_sub(effective_scroll);
+        let start = end.saturating_sub(viewport);
+        (start, end)
+    }
+
+    fn scroll_selection(&mut self, up: bool, lines: usize, viewport: usize) -> bool {
+        let Some(selection) = self.selection.as_ref() else {
+            return false;
+        };
+        if self.selection_target != SelectionTarget::Transcript {
+            return false;
+        }
+        let viewport = viewport.max(1);
+        let max_scroll = selection.lines.len().saturating_sub(viewport);
+        if max_scroll == 0 {
+            return false;
+        }
+        let current = self.scroll.min(max_scroll);
+        let next = if up {
+            current.saturating_add(lines)
+        } else {
+            current.saturating_sub(lines)
+        }
+        .min(max_scroll);
+        self.scroll = next;
+        next != current
+    }
+
+    fn extend_transcript_selection(&mut self, column: u16, row: u16) {
+        let (transcript_start, transcript_end, viewport) = self.transcript_bounds();
+        let Some(selection_len) = self.selection.as_ref().map(|s| s.lines.len()) else {
+            return;
+        };
+        let (view_start, view_end) = self.selection_view_range(selection_len, viewport);
+        let (sel_col, sel_row) = if row < transcript_start {
+            (0, view_start)
+        } else if row >= transcript_end {
+            (usize::from(self.painted_size.0), view_end.saturating_sub(1))
+        } else {
+            let abs_row = view_start + usize::from(row - transcript_start);
+            if abs_row >= selection_len {
+                (
+                    usize::from(self.painted_size.0),
+                    selection_len.saturating_sub(1),
+                )
+            } else {
+                (
+                    usize::from(column.min(self.painted_size.0.saturating_sub(1))),
+                    abs_row,
+                )
+            }
+        };
+        if let Some(selection) = self.selection.as_mut() {
+            selection.extend(sel_col, sel_row);
+        }
+    }
+
+    fn target_band(&self, target: SelectionTarget) -> Option<(u16, u16, usize)> {
+        let layout = self.painted_layout?;
+        let (span, col_offset) = match target {
+            SelectionTarget::Transcript => return None,
+            SelectionTarget::Hint => (layout.hint, 0),
+            SelectionTarget::Composer => (layout.composer, 2),
+            SelectionTarget::Subagents => (layout.subagents, 0),
+            SelectionTarget::Footer => (layout.footer, 0),
+        };
+        (span.len > 0).then_some((span.start, span.end(), col_offset))
+    }
+
+    fn extend_band_selection(&mut self, column: u16, row: u16) {
+        let Some((band_start, band_end, col_offset)) = self.target_band(self.selection_target)
+        else {
+            return;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        let (sel_col, sel_row) = if row < band_start {
+            (0, 0)
+        } else if row >= band_end || usize::from(row - band_start) >= selection.lines.len() {
+            (
+                usize::from(self.painted_size.0),
+                selection.lines.len().saturating_sub(1),
+            )
+        } else {
+            (
+                usize::from(column.min(self.painted_size.0.saturating_sub(1)))
+                    .saturating_sub(col_offset),
+                usize::from(row - band_start),
+            )
+        };
+        selection.extend(sel_col, sel_row);
+    }
+
+    fn hit_test_selection_target(&self, row: u16) -> Option<(SelectionTarget, u16, usize)> {
+        if let Some(layout) = self.painted_layout {
+            if layout.transcript.contains(row) {
+                Some((SelectionTarget::Transcript, layout.transcript.start, 0))
+            } else if layout.hint.contains(row) {
+                Some((SelectionTarget::Hint, layout.hint.start, 0))
+            } else if layout.composer.contains(row) {
+                Some((SelectionTarget::Composer, layout.composer.start, 2))
+            } else if layout.subagents.contains(row) {
+                Some((SelectionTarget::Subagents, layout.subagents.start, 0))
+            } else if layout.footer.contains(row) {
+                Some((SelectionTarget::Footer, layout.footer.start, 0))
+            } else {
+                None
+            }
+        } else {
+            let fallback_start = u16::from(self.layout.show_header);
+            (row >= fallback_start).then_some((SelectionTarget::Transcript, fallback_start, 0))
+        }
+    }
+
+    pub(super) fn tick_selection_autoscroll(&mut self) -> bool {
+        if self.selection.is_none() || self.selection_target != SelectionTarget::Transcript {
+            return false;
+        }
+        let Some(drag) = self.selection_drag else {
+            return false;
+        };
+        let (transcript_start, transcript_end, viewport) = self.transcript_bounds();
+        let now = Instant::now();
+        let interval = Duration::from_millis(50);
+        if now.saturating_duration_since(drag.last_autoscroll) < interval {
+            return false;
+        }
+        let scrolled = if drag.row < transcript_start {
+            self.scroll_selection(true, 1, viewport)
+        } else if drag.row >= transcript_end {
+            let step = if drag.row >= transcript_end.saturating_add(2) {
+                2
+            } else {
+                1
+            };
+            self.scroll_selection(false, step, viewport)
+        } else if transcript_start == 0 && drag.row == 0 && drag.moved {
+            let dwell = if drag.anchor_viewport_row > 0 {
+                Duration::from_millis(180)
+            } else {
+                Duration::from_millis(350)
+            };
+            if drag
+                .entered_top_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= dwell)
+            {
+                self.scroll_selection(true, 1, viewport)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !scrolled {
+            return false;
+        }
+        if let Some(drag) = self.selection_drag.as_mut() {
+            drag.last_autoscroll = now;
+        }
+        self.extend_transcript_selection(drag.column, drag.row);
+        true
+    }
+
     pub(super) fn transcript_mouse(&mut self, mouse: event::MouseEvent) -> Option<String> {
         if self.menu.is_some() || self.history_clear_confirmation.is_some() {
-            self.selection = None;
+            self.clear_selection();
             self.last_click = None;
             return None;
         }
-        let fallback_start = u16::from(self.layout.show_header);
-        let transcript_start = self
-            .painted_layout
-            .map_or(fallback_start, |layout| layout.transcript.start);
-        let within_transcript = self.painted_layout.map_or_else(
-            || mouse.row >= fallback_start,
-            |layout| layout.transcript.contains(mouse.row),
-        );
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.scroll_bottom_button.is_some_and(|(row, start, end)| {
+                    mouse.row == row && mouse.column >= start && mouse.column < end
+                }) {
+                    self.scroll = 0;
+                    self.clear_selection();
+                    self.last_click = None;
+                    self.clipboard_notice = None;
+                    return None;
+                }
                 self.clipboard_notice = None;
-                if within_transcript && mouse.column < self.painted_size.0 {
+                let hit = self
+                    .hit_test_selection_target(mouse.row)
+                    .filter(|(target, _, _)| {
+                        *target != SelectionTarget::Composer || !self.editor.text.is_empty()
+                    });
+                if let Some((target, band_start, col_offset)) = hit {
+                    if mouse.column >= self.painted_size.0 {
+                        self.last_click = None;
+                        self.clear_selection();
+                        return None;
+                    }
                     const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(600);
                     let is_double = self.last_click.is_some_and(|prev| {
                         prev.at.elapsed() <= DOUBLE_CLICK_WINDOW
                             && prev.row == mouse.row
                             && prev.column.abs_diff(mouse.column) <= 2
                     });
-                    let row = usize::from(mouse.row - transcript_start);
-                    let column = usize::from(mouse.column);
+                    let viewport_row = usize::from(mouse.row - band_start);
+                    let column = usize::from(mouse.column).saturating_sub(col_offset);
+                    let (lines, abs_row) = match target {
+                        SelectionTarget::Transcript => {
+                            if !self.painted_all_transcript.is_empty() {
+                                let (_, _, viewport) = self.transcript_bounds();
+                                let max_scroll =
+                                    self.painted_all_transcript.len().saturating_sub(viewport);
+                                self.scroll = self.scroll.min(max_scroll);
+                                (
+                                    self.painted_all_transcript.clone(),
+                                    self.painted_transcript_start + viewport_row,
+                                )
+                            } else {
+                                (self.painted_transcript.clone(), viewport_row)
+                            }
+                        }
+                        SelectionTarget::Hint => (self.painted_hint.clone(), viewport_row),
+                        SelectionTarget::Composer => (self.painted_composer.clone(), viewport_row),
+                        SelectionTarget::Subagents => {
+                            (self.painted_subagents.clone(), viewport_row)
+                        }
+                        SelectionTarget::Footer => (self.painted_footer.clone(), viewport_row),
+                    };
                     if is_double {
                         self.last_click = None;
-                        self.selection = selection::Selection::new_block(
-                            self.painted_transcript.clone(),
-                            column,
-                            row,
-                        );
+                        self.selection = selection::Selection::new_block(lines, column, abs_row);
                     } else {
                         self.last_click = Some(LastClick {
                             at: Instant::now(),
                             column: mouse.column,
                             row: mouse.row,
                         });
-                        self.selection =
-                            selection::Selection::new(self.painted_transcript.clone(), column, row);
+                        self.selection = selection::Selection::new(lines, column, abs_row);
+                    }
+                    if self.selection.is_some() {
+                        self.selection_target = target;
+                        self.selection_drag =
+                            (target == SelectionTarget::Transcript).then(|| SelectionDrag {
+                                anchor_viewport_row: viewport_row,
+                                column: mouse.column,
+                                row: mouse.row,
+                                moved: false,
+                                entered_top_at: None,
+                                last_autoscroll: Instant::now(),
+                            });
+                    } else {
+                        self.last_click = None;
+                        self.selection_drag = None;
                     }
                 } else {
                     self.last_click = None;
-                    self.selection = None;
-                };
+                    self.clear_selection();
+                }
             }
-            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
-                if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
-                    && self.last_click.is_some_and(|prev| {
-                        prev.row != mouse.row || prev.column.abs_diff(mouse.column) > 1
-                    })
-                {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.last_click.is_some_and(|prev| {
+                    prev.row != mouse.row || prev.column.abs_diff(mouse.column) > 1
+                }) {
                     self.last_click = None;
                 }
-                if let Some(selection) = self.selection.as_mut() {
-                    let (column, row) = if mouse.row < transcript_start {
-                        (0, 0)
-                    } else if usize::from(mouse.row - transcript_start) >= selection.lines.len() {
-                        (
-                            usize::from(self.painted_size.0),
-                            selection.lines.len().saturating_sub(1),
-                        )
-                    } else {
-                        (
-                            usize::from(mouse.column.min(self.painted_size.0.saturating_sub(1))),
-                            usize::from(mouse.row - transcript_start),
-                        )
-                    };
-                    selection.extend(column, row);
-                }
-                if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-                    let copied = self.selection.take().and_then(|selection| selection.text());
-                    let keep_arm_on_tap_jitter = self.last_click.is_some_and(|prev| {
-                        prev.at.elapsed() <= Duration::from_millis(250)
-                            && prev.row == mouse.row
-                            && prev.column.abs_diff(mouse.column) <= 1
+                self.selection.as_ref()?;
+                if self.selection_target == SelectionTarget::Transcript {
+                    let (transcript_start, transcript_end, viewport) = self.transcript_bounds();
+                    let now = Instant::now();
+                    let same_top_cell = self.selection_drag.as_ref().is_some_and(|drag| {
+                        drag.moved && drag.column == mouse.column && drag.row == mouse.row
                     });
-                    if copied.is_some() && !keep_arm_on_tap_jitter {
-                        self.last_click = None;
+                    let scrolled = if mouse.row < transcript_start {
+                        self.scroll_selection(true, 1, viewport)
+                    } else if mouse.row >= transcript_end {
+                        let step = if mouse.row >= transcript_end.saturating_add(2) {
+                            2
+                        } else {
+                            1
+                        };
+                        self.scroll_selection(false, step, viewport)
+                    } else if transcript_start == 0 && mouse.row == 0 && same_top_cell {
+                        self.scroll_selection(true, 1, viewport)
+                    } else {
+                        false
+                    };
+                    if let Some(drag) = self.selection_drag.as_mut() {
+                        let pos_changed = drag.column != mouse.column || drag.row != mouse.row;
+                        drag.moved = true;
+                        drag.column = mouse.column;
+                        drag.row = mouse.row;
+                        if transcript_start == 0 && mouse.row == 0 {
+                            if drag.entered_top_at.is_none() || pos_changed {
+                                drag.entered_top_at = Some(now);
+                            }
+                        } else {
+                            drag.entered_top_at = None;
+                        }
+                        if scrolled {
+                            drag.last_autoscroll = now;
+                        }
                     }
-                    return copied;
+                    self.extend_transcript_selection(mouse.column, mouse.row);
+                } else {
+                    self.extend_band_selection(mouse.column, mouse.row);
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection.is_some() {
+                    if self.selection_target == SelectionTarget::Transcript {
+                        self.extend_transcript_selection(mouse.column, mouse.row);
+                    } else {
+                        self.extend_band_selection(mouse.column, mouse.row);
+                    }
+                }
+                let copied = self.selection.take().and_then(|selection| selection.text());
+                self.selection_drag = None;
+                let keep_arm_on_tap_jitter = self.last_click.is_some_and(|prev| {
+                    prev.at.elapsed() <= Duration::from_millis(250)
+                        && prev.row == mouse.row
+                        && prev.column.abs_diff(mouse.column) <= 1
+                });
+                if copied.is_some() && !keep_arm_on_tap_jitter {
+                    self.last_click = None;
+                }
+                return copied;
             }
             _ => {}
         }

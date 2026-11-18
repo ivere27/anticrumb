@@ -34,9 +34,9 @@ impl Daemon {
             }
         }
         let child = command
-            .args(["daemon", "--listen", "127.0.0.1:0", "--token", TOKEN])
+            .args(["server", "127.0.0.1:0", "--token", TOKEN])
             .arg("--state-dir")
-            .arg(root.path().join("browser"))
+            .arg(root.path().join("server"))
             .env("ANTICRUMB_HOME", root.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -56,8 +56,8 @@ impl Daemon {
             if output.contains("Provider API:") {
                 daemon.endpoint = output
                     .lines()
-                    .find_map(|line| line.strip_prefix("anticrumb daemon: "))
-                    .expect("daemon must announce its TLS address")
+                    .find_map(|line| line.strip_prefix("anticrumb server: "))
+                    .expect("server must announce its TLS address")
                     .to_owned();
                 assert!(daemon.endpoint.starts_with("https://"));
                 return daemon;
@@ -68,7 +68,7 @@ impl Daemon {
     }
 
     fn certificate(&self) -> PathBuf {
-        self.root.path().join("browser/tls/certificate.pem")
+        self.root.path().join("server/tls/ca-certificate.pem")
     }
 
     fn http1(&self) -> Client {
@@ -130,7 +130,7 @@ fn same_tls_listener_serves_rpc_and_http1_with_required_authentication() {
             assert_eq!(body["error"]["code"], "invalid_daemon_token");
             assert_eq!(body["error"]["stage"], "daemon_auth");
             let hint = body["error"]["hint"].as_str().unwrap();
-            assert!(hint.contains("anticrumb daemon"));
+            assert!(hint.contains("anticrumb server"));
             assert!(hint.contains("API key"));
             assert!(hint.contains("Signing in to Chrome does not change this token"));
         }

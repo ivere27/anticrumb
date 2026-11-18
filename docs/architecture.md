@@ -8,7 +8,7 @@ flowchart LR
     Workspace --> Tools["File / shell / MCP tools"]
     Workspace --> Store["SQLite + artifact blobs"]
     Workspace -->|"Synurang FFI"| Local["Local browser service"]
-    Workspace -->|"TLS gRPC"| Remote["Remote browser daemon"]
+    Workspace -->|"TLS gRPC"| Remote["Remote browser server"]
     API["Provider API clients"] -->|"HTTPS + token"| Remote
     Local --> Pool["Provider tab pool"]
     Remote --> Pool

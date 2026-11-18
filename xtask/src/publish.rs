@@ -411,15 +411,10 @@ pub fn prepare_filtered(
 pub fn preflight(runner: &dyn Runner, root: &Path, plan: &Plan) -> Result<String, PublishError> {
     let status = run_command(
         runner,
-        &[
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>(),
+        &["git", "status", "--porcelain", "--untracked-files=no"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
         root,
     )?;
     if !status.is_empty() {

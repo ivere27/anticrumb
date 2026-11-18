@@ -43,6 +43,12 @@ pub(super) enum Update {
     },
     Accepted(usize),
     Error(String),
+    MentionMatches {
+        id: u64,
+        query: String,
+        matches: Vec<super::mentions::MentionMatch>,
+        total: usize,
+    },
 }
 
 pub(super) enum Command {
@@ -72,6 +78,11 @@ pub(super) enum Command {
     WebUsage(String),
     Browser(String, String),
     BrowserControl(crate::rpc::pb::BrowserControlRequest),
+    SearchMentions {
+        id: u64,
+        workspace: PathBuf,
+        query: String,
+    },
 }
 
 impl Command {
@@ -344,6 +355,25 @@ pub(super) fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc::Sync
                                 after = 0;
                             }
                             let _ = tx.send(Update::Loaded(job));
+                        }
+                        Command::SearchMentions {
+                            id,
+                            workspace,
+                            query,
+                        } => {
+                            let tx = tx.clone();
+                            std::thread::spawn(move || {
+                                if let Some((matches, total)) =
+                                    super::mentions::search_mentions(&workspace, &query, None, id)
+                                {
+                                    let _ = tx.try_send(Update::MentionMatches {
+                                        id,
+                                        query,
+                                        matches,
+                                        total,
+                                    });
+                                }
+                            });
                         }
                     }
                     Ok(())

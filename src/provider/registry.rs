@@ -325,7 +325,10 @@ mod tests {
             let info = registry.resolve(id).unwrap().info();
             assert_eq!(info.id, *id);
             assert_eq!(info.source, "builtin");
-            assert_eq!(info.inline_prompt_chars, 2_000);
+            assert_eq!(
+                info.inline_prompt_chars,
+                super::super::DEFAULT_INLINE_PROMPT_CHARS
+            );
             assert!(info.capabilities.file_uploads);
         }
         let mut persisted: ProviderManifest =
@@ -382,7 +385,10 @@ mod tests {
             assert_eq!(loaded.len(), 1);
             let provider = registry.resolve("gemini-web").unwrap();
             let info = provider.info();
-            assert_eq!(info.inline_prompt_chars, setting.unwrap_or(2_000));
+            assert_eq!(
+                info.inline_prompt_chars,
+                setting.unwrap_or(super::super::DEFAULT_INLINE_PROMPT_CHARS)
+            );
             assert_eq!(info.kind, "builtin_web");
             assert!(info.capabilities.file_uploads);
             assert_eq!(

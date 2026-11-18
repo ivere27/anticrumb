@@ -47,26 +47,22 @@ fn released(root: &Path) -> bool {
     if root.join("run/daemon.json").exists() {
         return false;
     }
-    [
-        "run/daemon.lock",
-        "workspace/host.lock",
-        "browser/host.lock",
-    ]
-    .iter()
-    .all(|path| {
-        let Ok(file) = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(root.join(path))
-        else {
-            return false;
-        };
-        if file.try_lock_exclusive().is_err() {
-            return false;
-        }
-        FileExt::unlock(&file).unwrap();
-        true
-    })
+    ["run/daemon.lock", "workspace/host.lock", "server/host.lock"]
+        .iter()
+        .all(|path| {
+            let Ok(file) = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(path))
+            else {
+                return false;
+            };
+            if file.try_lock_exclusive().is_err() {
+                return false;
+            }
+            FileExt::unlock(&file).unwrap();
+            true
+        })
 }
 struct Session {
     child: Child,
@@ -186,7 +182,7 @@ fn commands_use_local_ipc_without_network_credentials_and_release_leases() {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        for state in ["workspace", "browser"] {
+        for state in ["workspace", "server"] {
             assert!(!root.join(state).join("token").exists());
             assert!(!root.join(state).join("tls").exists());
         }

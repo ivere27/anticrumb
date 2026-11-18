@@ -1235,7 +1235,7 @@ fn compact_tool_signatures_rendering_contract() {
 
     // 2. read_file: path required, start_line before end_line optional
     assert!(
-        block.contains("- read_file(path: str, start_line?: int, end_line?: int) \u{2014} Read file lines (1-based start_line..end_line, default: first 2000 lines)."),
+        block.contains("- read_file(path: str, start_line?: int, end_line?: int) \u{2014} Read file lines (1-based start_line..end_line, default: first 500 lines)."),
         "actual: {block}"
     );
 
@@ -1293,4 +1293,39 @@ fn compact_tool_signatures_rendering_contract() {
         custom_sig,
         "- custom_grep(pattern: str, include_globs?: list[str]) \u{2014} Custom grep description"
     );
+}
+
+#[test]
+fn persistent_session_deduplicates_unchanged_read_file_and_invalidates_on_edit() {
+    let ws = temp_ws("dedup_read");
+    fs::write(ws.join("sample.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+    let (mock, prompts) = MockBackend::replies(vec![
+        tool_block("read_file", json!({"path": "sample.rs"})),
+        tool_block("read_file", json!({"path": "sample.rs"})),
+        tool_block(
+            "edit_file",
+            json!({"path": "sample.rs", "old_text": "fn beta() {}", "new_text": "fn gamma() {}"}),
+        ),
+        tool_block("read_file", json!({"path": "sample.rs"})),
+        "done".into(),
+    ]);
+    let mut agent = CodingAgent::new(mock, cfg(&ws));
+    let res = agent
+        .run("Inspect and update sample.rs", &RunControl::default())
+        .unwrap();
+    assert_eq!(res.status, AgentStatus::Completed);
+    let p = prompts.lock().unwrap();
+    assert!(p[1].contains("fn alpha() {}") && p[1].contains("fn beta() {}"));
+    assert!(
+        p[2].contains("[unchanged since earlier read in this session")
+            && !p[2].contains("fn alpha() {}"),
+        "actual step 2 prompt: {}",
+        p[2]
+    );
+    assert!(
+        p[4].contains("fn gamma() {}") && !p[4].contains("[unchanged"),
+        "actual step 4 prompt: {}",
+        p[4]
+    );
+    let _ = fs::remove_dir_all(&ws);
 }

@@ -1018,7 +1018,8 @@ fn preflight_checks_git_status_ignoring_untracked_files() {
     };
     let err = preflight(&dirty_runner, &f.root, &plan).unwrap_err();
     assert!(
-        err.to_string().contains("the Git working tree must be clean"),
+        err.to_string()
+            .contains("the Git working tree must be clean"),
         "{err}"
     );
 }

@@ -29,10 +29,12 @@ Run `anticrumb update` for later versions. Downloads are verified against GitHub
 Run in your project directory:
 
 ```sh
-anticrumb
+anticrumb          # starts in Chat mode (default, direct conversation)
+anticrumb --agent  # starts in Agent mode (respects saved /permissions)
+anticrumb --yolo   # starts in Agent mode with all permissions (file, shell & sub-agents)
 ```
 
-On first run, enter `/browser login`, sign in to Google in Chrome, and type your task.
+On first run, enter `/browser login`, sign in to Google in Chrome, and type your prompt. Switch modes anytime with `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`).
 
 Avoid long multi-turn sessions—keep turns short and use `/new` for each new task.
 

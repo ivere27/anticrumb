@@ -983,4 +983,232 @@ mod unix_pty {
         pty.send("/exit\r");
         assert_eq!(pty.wait_exit(), 0);
     }
+
+    #[test]
+    fn selection_autoscrolls_transcript_and_copies_composer_and_footer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = fixture_binary();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let home = root.join("home");
+        let state = home.join("workspace");
+        let workspace = root.join("project");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir(&workspace).unwrap();
+
+        let clipboard = root.join("clipboard");
+        fs::create_dir(&clipboard).unwrap();
+        let copied_file = root.join("copied.txt");
+        let copy_helper = "#!/bin/sh\ncat > \"$ANTICRUMB_TEST_COPY\"\n";
+        for helper in ["wl-copy", "xclip", "xsel", "pbcopy"] {
+            let p = clipboard.join(helper);
+            fs::write(&p, copy_helper).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_with_clipboard = format!(
+            "{}:{}",
+            clipboard.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let home_str = home.to_string_lossy().into_owned();
+        let copied_str = copied_file.to_string_lossy().into_owned();
+        let env = [
+            ("ANTICRUMB_HOME", Some(home_str.as_str())),
+            ("TERM", Some("xterm-256color")),
+            ("NO_COLOR", None),
+            ("ANTICRUMB_TEST_COPY", Some(copied_str.as_str())),
+            ("SSH_TTY", None),
+            ("SSH_CONNECTION", None),
+            ("SSH_CLIENT", None),
+            ("PATH", Some(path_with_clipboard.as_str())),
+            ("WAYLAND_DISPLAY", Some("fixture")),
+        ];
+
+        let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &env);
+        pty.wait_for("W:project");
+
+        // Build enough transcript lines to scroll off-screen (26 rows total -> 23 transcript rows).
+        pty.send("/help\r");
+        let help = pty.wait_for("exact Gemini token usage");
+        // Scroll up first so there is off-screen content below the viewport too.
+        pty.send("\x1b[<64;10;5M\x1b[<64;10;5M\x1b[<64;10;5M");
+        let scrolled = pty.wait_for("W:project");
+        let top_row_text = screen_row(&scrolled, 1).trim_end().to_string();
+        let last_help_line = screen_row(&help, 22).trim_end().to_string();
+        assert!(!top_row_text.is_empty());
+        assert!(
+            !frame(&scrolled).contains(&last_help_line),
+            "expected bottom help text to be scrolled off-screen before drag"
+        );
+
+        // 1. Click on row 1 (1-based SGR row 1) and drag past the transcript bottom (row 26 = footer)
+        //    to trigger automatic downward scrolling across off-screen transcript lines.
+        pty.send("\x1b[<0;1;1M");
+        pty.wait_for("Drag to select");
+        for _ in 0..8 {
+            pty.send("\x1b[<32;60;26M");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        pty.send("\x1b[<0;60;26m");
+        pty.wait_for("characters to clipboard.");
+        let copied_down = fs::read_to_string(&copied_file).unwrap();
+        assert!(copied_down.contains(&top_row_text));
+        assert!(copied_down.lines().count() > 23);
+
+        // 2. Scroll to bottom, drag from bottom of transcript up to row 1 (SGR 1), and hold/repeat
+        //    at row 1 so it auto-scrolls upward into off-screen history.
+        pty.send("\x1b[<65;10;5M\x1b[<65;10;5M\x1b[<65;10;5M");
+        let at_bottom = pty.wait_for("exact Gemini token usage");
+        let bottom_row_text = screen_row(&at_bottom, 22).trim_end().to_string();
+        pty.send("\x1b[<0;60;22M");
+        pty.wait_for("Drag to select");
+        for _ in 0..8 {
+            pty.send("\x1b[<32;1;1M");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        pty.send("\x1b[<0;1;1m");
+        pty.wait_for("characters to clipboard.");
+        let copied_up = fs::read_to_string(&copied_file).unwrap();
+        assert!(copied_up.contains(&bottom_row_text) || copied_up.lines().count() >= 22);
+        assert!(copied_up.lines().count() > 22);
+
+        // 3. Input prompt (composer, row 25 in 26-row terminal) selection excludes "> " gutter.
+        pty.send("composer_copy_target");
+        pty.wait_for("composer_copy_target");
+        pty.send("\x1b[<0;1;25M");
+        pty.wait_for("Drag to select");
+        pty.send("\x1b[<32;40;25M\x1b[<0;40;25m");
+        pty.wait_for("characters to clipboard.");
+        assert_eq!(
+            fs::read_to_string(&copied_file).unwrap(),
+            "composer_copy_target"
+        );
+        pty.send("\x15");
+
+        // 4. Status bar (footer, row 26 in 26-row terminal) selection copies status text.
+        let status_row = screen_row(&pty.wait_for("W:project"), 26);
+        let project_byte = status_row.find("W:project").unwrap();
+        let project_pos = cells(&status_row[..project_byte]) + 1;
+        let project_end = project_pos + cells("W:project") - 1;
+        pty.send(&format!(
+            "\x1b[<0;{project_pos};26M\x1b[<32;{project_end};26M\x1b[<0;{project_end};26m"
+        ));
+        pty.wait_for("characters to clipboard.");
+        assert_eq!(fs::read_to_string(&copied_file).unwrap(), "W:project");
+
+        // 5. Scrolling up shows centered "[ ↓ Jump to bottom ]" above prompt, and clicking it jumps back to bottom.
+        pty.send("\x1b[<64;10;5M\x1b[<64;10;5M");
+        let with_btn = pty.wait_for("[ ↓ Jump to bottom ]");
+        let hint_row_text = screen_row(&with_btn, 24);
+        assert!(
+            !frame(&with_btn).contains("exact Gemini token usage"),
+            "transcript should be scrolled away from bottom before clicking button"
+        );
+        let btn_byte = hint_row_text.find("[ ↓ Jump to bottom ]").unwrap();
+        let btn_col = cells(&hint_row_text[..btn_byte]) + 4;
+        assert!(
+            (40..=70).contains(&btn_col),
+            "expected centered button near col 55, got {btn_col} in {hint_row_text:?}"
+        );
+        pty.send(&format!("\x1b[<0;{btn_col};24M\x1b[<0;{btn_col};24m"));
+        let jumped = pty.wait_for("Alt+Enter newline");
+        assert!(frame(&jumped).contains("exact Gemini token usage"));
+
+        pty.send("/exit\r");
+        assert_eq!(pty.wait_exit(), 0);
+    }
+
+    #[test]
+    fn async_at_mention_search_renders_below_composer_and_allows_selection() {
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_anticrumb")).with_file_name("examples");
+        let binary = binary.join(if cfg!(windows) {
+            "tui_fixture.exe"
+        } else {
+            "tui_fixture"
+        });
+        assert!(
+            binary.exists(),
+            "build the fixture example first with `cargo build --example tui_fixture`"
+        );
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(workspace.join("providers")).unwrap();
+        fs::create_dir_all(workspace.join("docs")).unwrap();
+        fs::write(workspace.join("README.md"), "root readme\n").unwrap();
+        fs::write(workspace.join("providers/README.md"), "providers readme\n").unwrap();
+        fs::write(workspace.join("docs/building.md"), "build docs\n").unwrap();
+        fs::write(workspace.join("docs/rpc.md"), "rpc docs\n").unwrap();
+        fs::write(workspace.join("a b.txt"), "spaced file\n").unwrap();
+
+        let home_str = home.to_string_lossy().into_owned();
+        let env = [("HOME", Some(home_str.as_str()))];
+        let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &env);
+        pty.wait_for("W:project");
+
+        // Typing `@` shows >5 matches with `more`, and typing `dd` narrows matches without shifting composer row.
+        pty.send("@");
+        let initial_at_frame = pty.wait_for("more");
+        let initial_composer_row = (1..=26)
+            .find(|&r| screen_row(&initial_at_frame, r).contains("> @"))
+            .expect("composer row with @");
+
+        pty.send("dd");
+        let matches_frame = pty.wait_for("providers/README.md");
+        assert!(frame(&matches_frame).contains("README.md"));
+        assert!(frame(&matches_frame).contains("providers/README.md"));
+        assert!(frame(&matches_frame).contains("docs/building.md"));
+
+        let composer_row = (1..=26)
+            .find(|&r| screen_row(&matches_frame, r).contains("> @dd"))
+            .expect("composer row with @dd");
+        assert_eq!(
+            composer_row, initial_composer_row,
+            "composer prompt row must stay fixed when match count changes"
+        );
+        let readme_row = (1..=26)
+            .find(|&r| screen_row(&matches_frame, r).contains("README.md"))
+            .expect("README.md row");
+        assert!(
+            readme_row > composer_row,
+            "expected mention results below composer (composer={composer_row}, result={readme_row})"
+        );
+        assert!(
+            screen_row(&matches_frame, readme_row + 1).contains("docs/rpc.md"),
+            "expected docs/rpc.md as second match row, got {:?}",
+            screen_row(&matches_frame, readme_row + 1)
+        );
+
+        // Down arrow moves highlight, Enter inserts the selected path without submitting.
+        pty.send("\x1b[B\r");
+        let inserted = pty.wait_for("@docs/rpc.md");
+        assert!(frame(&inserted).contains("> @docs/rpc.md "));
+        assert_eq!(
+            observations_at(&state)["tasks"].as_array().unwrap().len(),
+            0
+        );
+
+        // Esc cancels/closes the mention panel cleanly while leaving typed text intact.
+        pty.send("\x15@doc");
+        pty.wait_for("docs/building.md");
+        pty.send("\x1b");
+        let dismissed = pty.wait_for("Alt+Enter newline");
+        assert!(frame(&dismissed).contains("> @doc"));
+
+        // Burst `@a\t` still completes immediately even before waiting for async frames.
+        pty.send("\x15@a\t");
+        pty.wait_for("@\"a b.txt\"");
+
+        pty.send("\x15/exit\r");
+        assert_eq!(pty.wait_exit(), 0);
+    }
+
+    fn observations_at(state: &Path) -> serde_json::Value {
+        let raw = std::fs::read(state.join("observations.json")).unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    }
 }

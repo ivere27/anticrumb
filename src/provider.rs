@@ -23,7 +23,7 @@ use crate::{agent::CancelToken, domain::*, service::Emit, store::Store};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PROVIDER_ID: &str = "gemini-web";
-pub const DEFAULT_INLINE_PROMPT_CHARS: u32 = 2_000;
+pub const DEFAULT_INLINE_PROMPT_CHARS: u32 = 4_000;
 
 pub const fn default_inline_prompt_chars() -> u32 {
     DEFAULT_INLINE_PROMPT_CHARS

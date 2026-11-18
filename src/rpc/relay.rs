@@ -264,7 +264,7 @@ pub(crate) async fn workspace_with_browser(
         super::client::Connection::Local => RpcClient::embedded(
             match browser {
                 Some(host) => host,
-                None => super::host::Host::browser(&super::daemon::state_dir())?,
+                None => super::host::Host::browser(&super::server_cmd::state_dir())?,
             },
             tokio::runtime::Handle::current(),
         )?,
@@ -288,7 +288,7 @@ pub(crate) async fn workspace_with_browser(
             ErrorCode::InvalidRequest,
             "connect",
             format!(
-                "endpoint is not a browser daemon ({}); use the address of `anticrumb daemon`",
+                "endpoint is not a browser server ({}); use the address of `anticrumb server`",
                 connection.description()
             ),
         ));

@@ -363,6 +363,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClientIo<S> {
 struct Clients {
     state: Mutex<ClientState>,
     changed: tokio::sync::Notify,
+    automatic: bool,
 }
 #[derive(Default)]
 struct ClientState {
@@ -370,16 +371,38 @@ struct ClientState {
     seen: bool,
     stopping: bool,
 }
-struct Lease(Arc<Clients>);
+struct Lease {
+    clients: Arc<Clients>,
+    started: std::time::Instant,
+}
 impl Clients {
+    fn new(automatic: bool) -> Self {
+        Self {
+            state: Mutex::new(ClientState::default()),
+            changed: tokio::sync::Notify::new(),
+            automatic,
+        }
+    }
     fn acquire(self: &Arc<Self>) -> Option<Lease> {
         let mut state = self.state.lock().unwrap();
         if state.stopping {
             return None;
         }
         state.active += 1;
+        let active = state.active;
+        drop(state);
         self.changed.notify_one();
-        Some(Lease(self.clone()))
+        if !self.automatic {
+            eprintln!(
+                "{} client connected: local [active: {}]",
+                super::server::log_timestamp(),
+                active
+            );
+        }
+        Some(Lease {
+            clients: self.clone(),
+            started: std::time::Instant::now(),
+        })
     }
     async fn idle(&self) {
         let startup = tokio::time::Instant::now() + START_TIMEOUT;
@@ -413,8 +436,21 @@ impl Clients {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().active -= 1;
-        self.0.changed.notify_one();
+        let active = {
+            let mut state = self.clients.state.lock().unwrap();
+            state.active = state.active.saturating_sub(1);
+            state.active
+        };
+        self.clients.changed.notify_one();
+        if !self.clients.automatic {
+            let duration = self.started.elapsed();
+            eprintln!(
+                "{} client disconnected: local (duration: {}) [active: {}]",
+                super::server::log_timestamp(),
+                super::server::format_duration(duration),
+                active
+            );
+        }
     }
 }
 
@@ -424,6 +460,13 @@ pub(super) struct LocalInfo {
     clients: Arc<Clients>,
     runtime: Arc<RuntimeInfo>,
     selected: Arc<tokio::sync::Mutex<Option<Binding>>>,
+    pub(super) logged_first: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LocalInfo {
+    pub(super) fn is_automatic(&self) -> bool {
+        self.clients.automatic
+    }
 }
 struct RuntimeInfo {
     started: Instant,
@@ -617,13 +660,20 @@ pub(crate) async fn run(managed: bool, browser: Option<Arc<Host>>) -> Result<()>
         ServiceError::invalid("a local daemon is already running; run `anticrumb` to connect")
     })?;
     let mut listener = platform::Listener::bind(&paths.endpoint)?;
+    if !managed && browser.is_none() {
+        eprintln!(
+            "{} {}",
+            super::server::log_timestamp(),
+            crate::cli::help_banner()
+        );
+    }
     let _cleanup = Cleanup(paths.clone());
     let workspaces = Arc::new(Workspaces {
         runtimes: Default::default(),
         browser: browser.clone(),
     });
     let host = workspaces.get(Connection::Local).await?;
-    let clients = Arc::new(Clients::default());
+    let clients = Arc::new(Clients::new(managed));
     let runtime = Arc::new(RuntimeInfo {
         started: Instant::now(),
         automatic: managed,
@@ -652,7 +702,13 @@ pub(crate) async fn run(managed: bool, browser: Option<Arc<Host>>) -> Result<()>
                     accepted = listener.accept() => {
                         let socket = match accepted { Ok(socket) => socket, Err(error) => { let _ = tx.send(Err(error)).await; break; } };
                         let Some(lease) = clients.acquire() else { break; };
-                        let info = LocalInfo { workspaces: workspaces.clone(), clients: clients.clone(), runtime: runtime.clone(), selected: Default::default() };
+                        let info = LocalInfo {
+                            workspaces: workspaces.clone(),
+                            clients: clients.clone(),
+                            runtime: runtime.clone(),
+                            selected: Default::default(),
+                            logged_first: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        };
                         let accepted = ServerIo { socket, info, _lease: lease };
                         tokio::select! {
                             _ = stop.cancelled() => break,

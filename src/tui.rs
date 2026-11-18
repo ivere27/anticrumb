@@ -7,9 +7,10 @@ mod editor;
 mod input_loop;
 mod layout;
 mod markdown;
+mod mentions;
 mod model_picker;
 mod platform;
-mod preferences;
+pub(crate) mod preferences;
 mod reducer;
 mod render;
 mod selection;
@@ -29,7 +30,7 @@ mod tests {
     use super::markdown;
     use super::model_picker::ModelChoice;
     use super::preferences::Preferences;
-    use super::reducer::{EffectSink, State};
+    use super::reducer::{EffectSink, SelectionTarget, State, SubagentView};
     use super::theme;
     use super::transcript::{clip, Entry};
     use super::worker::{Command, Update};
@@ -534,7 +535,14 @@ mod tests {
         assert!(state
             .logs()
             .contains("Daemon: remote https://browser.example:50051 · connected"));
-        assert!(state.status_text(100).contains("D:remote"));
+        let remote_footer = state.status_text(100);
+        assert!(remote_footer.ends_with("D:remote(browser.example:50051)"));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(remote_footer.as_str()),
+            100
+        );
+        let remote_spans = state.status_spans(100);
+        assert_eq!(remote_spans.last().unwrap().1, markdown::Face::MUTED);
         let (mut tx, rx) = mpsc::sync_channel(4);
         state.editor.set("/status".into());
         state.submit(&mut tx);
@@ -550,7 +558,16 @@ mod tests {
 
         state.editor.set("unfinished work".into());
         state.update(Update::StatusDisconnected);
-        assert!(state.status_text(100).contains("D:remote/offline"));
+        let offline_footer = state.status_text(100);
+        assert!(offline_footer.ends_with("D:remote/offline(browser.example:50051)"));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(offline_footer.as_str()),
+            100
+        );
+        assert_eq!(
+            state.status_spans(100).last().unwrap().1,
+            markdown::Face::DANGER_BOLD
+        );
         let details = state.daemon_details();
         assert!(details.contains("https://browser.example:50051 · disconnected"));
         assert!(details.contains("Daemon server: browser_fixture"));
@@ -568,6 +585,148 @@ mod tests {
         assert!(!state
             .daemon_details()
             .contains("Workspace status is unavailable"));
+    }
+
+    #[test]
+    fn footer_right_aligns_daemon_ip_port_and_turns_red_when_disconnected() {
+        let mut state = State::new(PromptOptions {
+            account: "default".into(),
+            workspace: "/tmp/project".into(),
+            ..Default::default()
+        });
+        state.update(Update::Status(json!({
+            "accounts": [{"id": "default", "state": "ready"}],
+            "browser_connection": {
+                "transport": "grpc",
+                "endpoint": "https://192.168.1.10:50051",
+                "connected": true
+            }
+        })));
+        let connected = state.status_text(110);
+        assert!(connected.ends_with("  D:remote(192.168.1.10:50051)"));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(connected.as_str()),
+            110
+        );
+        assert_eq!(
+            state.status_spans(110).last().unwrap().1,
+            markdown::Face::MUTED
+        );
+
+        // Remote daemon offline while workspace daemon is still reachable -> red at bottom-right.
+        state.update(Update::Status(json!({
+            "accounts": [{"id": "default", "state": "ready"}],
+            "browser_connection": {
+                "transport": "grpc",
+                "endpoint": "https://192.168.1.10:50051",
+                "connected": false
+            }
+        })));
+        let remote_down = state.status_text(110);
+        assert!(remote_down.ends_with("  D:remote/offline(192.168.1.10:50051)"));
+        assert_eq!(
+            state.status_spans(110).last().unwrap().1,
+            markdown::Face::DANGER_BOLD
+        );
+
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 110, 26).expect("render_frame");
+        let rendered = String::from_utf8_lossy(&out);
+        let footer_pos = rendered.find("\x1b[26;1H").expect("footer row");
+        let footer_ansi = &rendered[footer_pos..];
+        let danger_fg = format!(
+            "{}",
+            crossterm::style::SetForegroundColor(state.theme.danger)
+        );
+        assert!(
+            footer_ansi.contains(&danger_fg),
+            "disconnected daemon badge must use theme danger color"
+        );
+        assert!(footer_ansi.contains("D:remote/offline(192.168.1.10:50051)"));
+
+        // IPv6 endpoint and local disconnect also align right and use danger color.
+        state.update(Update::Status(json!({
+            "browser_connection": {
+                "transport": "grpc",
+                "endpoint": "https://[::1]:50051",
+                "connected": true
+            }
+        })));
+        assert!(state.status_text(110).ends_with("  D:remote([::1]:50051)"));
+
+        state.update(Update::Status(json!({
+            "browser_connection": {
+                "transport": "local",
+                "endpoint": "",
+                "connected": true
+            }
+        })));
+        assert!(state.status_text(110).ends_with("  D:local"));
+        assert_eq!(
+            state.status_spans(110).last().unwrap().1,
+            markdown::Face::MUTED
+        );
+        state.update(Update::StatusDisconnected);
+        assert!(state.status_text(110).ends_with("  D:local/offline"));
+        assert_eq!(
+            state.status_spans(110).last().unwrap().1,
+            markdown::Face::DANGER_BOLD
+        );
+
+        // Long quota notice stays untruncated on very narrow terminals (e.g. 48 cols / safe_w=47).
+        state.update(Update::WebUsage(json!({
+            "account_id": "default",
+            "limits": [
+                {"label": "Current usage", "used_percent": 25.0, "reset": "Resets at 5:41 AM"},
+                {"label": "Weekly limit", "used_percent": 0.0, "reset": "Resets Nov 20 at 3:41 PM"}
+            ]
+        })));
+        assert!(state
+            .status_text(47)
+            .starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm"));
+        // When right-aligned daemon badge is omitted on narrow terminals, remaining space renders left items.
+        let narrow_52 = state.status_text(52);
+        assert!(narrow_52.starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm · M:"));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(narrow_52.as_str()),
+            52
+        );
+    }
+
+    #[test]
+    fn daemon_startup_log_includes_four_tls_fingerprint_emojis_while_footer_stays_plain() {
+        let mut state = State::new(PromptOptions::default());
+        let pin = crate::domain::digest(b"abc");
+        state.remote_tls_pin = Some(pin);
+        state.remote_tls_endpoint = Some("https://100.121.6.125:50051".into());
+        state.update(Update::Status(json!({
+            "accounts": [{"id": "default", "state": "ready"}],
+            "browser_connection": {
+                "transport": "grpc",
+                "endpoint": "https://100.121.6.125:50051/",
+                "connected": true
+            }
+        })));
+        assert!(state
+            .logs()
+            .contains("Daemon: remote https://100.121.6.125:50051/ (🦍🐆🦇🐪) · connected"));
+        let footer = state.status_text(110);
+        assert!(footer.ends_with("  D:remote(100.121.6.125:50051)"));
+        assert!(!footer.contains("🦍"));
+
+        state.update(Update::StatusDisconnected);
+        assert!(state
+            .logs()
+            .contains("Daemon: remote https://100.121.6.125:50051/ (🦍🐆🦇🐪) · disconnected"));
+
+        // Missing reported endpoint must not match saved TLS pin.
+        state.update(Update::Status(json!({
+            "browser_connection": {
+                "transport": "grpc",
+                "connected": true
+            }
+        })));
+        assert_eq!(state.daemon_tls_emoji(), None);
     }
 
     #[test]
@@ -761,7 +920,10 @@ mod tests {
         e.set("mail x@y".into());
         assert!(complete(&e, dir.path()).is_none());
         e.set("/mo".into());
-        assert_eq!(complete(&e, dir.path()).unwrap().values, vec!["/model "]);
+        assert_eq!(
+            complete(&e, dir.path()).unwrap().values,
+            vec!["/mode ", "/model "]
+        );
         e.set("@git:".into());
         assert_eq!(
             complete(&e, dir.path()).unwrap().values,
@@ -776,8 +938,8 @@ mod tests {
 
     #[test]
     fn failed_command_delivery_cleans_up_temp_files() {
-        let patch_dir = std::env::temp_dir()
-            .join(format!("anticrumb-test-{}", uuid::Uuid::new_v4().simple()));
+        let patch_dir =
+            std::env::temp_dir().join(format!("anticrumb-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&patch_dir).unwrap();
         let patch_file = patch_dir.join("test.patch");
         std::fs::write(&patch_file, "diff").unwrap();
@@ -1521,8 +1683,9 @@ mod tests {
         let expected_version = env!("CARGO_PKG_VERSION");
         assert!(!expected_version.is_empty());
         let commit = crate::cli::commit_head().expect("git HEAD short hash in repo");
-        assert_eq!(commit.len(), 7);
-        assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
+        let sha = commit.strip_suffix("-dirty").unwrap_or(&commit);
+        assert_eq!(sha.len(), 7);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
 
         let mut frame = Vec::new();
         state.render_frame(&mut frame, 100, 24).unwrap();
@@ -1772,5 +1935,709 @@ mod tests {
             "footer printable width must be strictly less than 80 columns, got: {}",
             unicode_width::UnicodeWidthStr::width(printable.as_str())
         );
+    }
+
+    #[test]
+    fn drag_selection_autoscrolls_transcript_past_edges_and_survives_live_output() {
+        let mouse = |kind, column, row| event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut state = State::new(PromptOptions::default());
+        for i in 1..=35 {
+            state.log(&format!("row-{i:02}-alpha beta"));
+        }
+        state.scroll = 15;
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 80, 16).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        let vp = usize::from(layout.transcript.len);
+        assert!(vp >= 10);
+
+        // Anchor on the first visible line and drag below the transcript (into footer row).
+        let first_visible = state.painted_transcript_start;
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            layout.transcript.start,
+        ));
+        assert_eq!(state.selection_target, SelectionTarget::Transcript);
+
+        // Dragging >= 2 rows past transcript end scrolls down by 2 lines immediately.
+        let scroll_before = state.scroll;
+        state.transcript_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            10,
+            layout.footer.start,
+        ));
+        assert_eq!(state.scroll, scroll_before - 2);
+
+        // Live output/streaming arriving mid-drag does not alter the snapshotted selection.
+        state.log("row-36-live-arrival");
+        state.stream = "streaming mid-drag".into();
+        state.render_frame(&mut out, 80, 16).expect("render_frame");
+
+        // Wheel down while dragging scrolls further and extends selection cleanly.
+        state.scroll_wheel_at(false, 10, layout.footer.start, 80, 16);
+        assert_eq!(state.scroll, scroll_before - 5);
+
+        // Timer tick autoscroll after >50ms interval continues scrolling down.
+        state.selection_drag.as_mut().unwrap().last_autoscroll =
+            Instant::now() - Duration::from_millis(80);
+        assert!(state.tick_selection_autoscroll());
+        assert_eq!(state.scroll, scroll_before - 7);
+
+        let copied = state
+            .transcript_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                10,
+                layout.footer.start,
+            ))
+            .expect("copied multi-scroll selection");
+        let copied_lines: Vec<&str> = copied.lines().collect();
+        assert_eq!(copied_lines.len(), vp + (scroll_before - state.scroll));
+        assert!(copied.contains(&format!("row-{:02}-alpha", first_visible + 1)));
+        assert!(!copied.contains("row-36-live-arrival"));
+
+        // Default layout (show_header = false): horizontal drag along row 0 does not scroll;
+        // dwelling or repeating identical Drag(col, 0) scrolls up across earlier history.
+        state.scroll = 4;
+        state.render_frame(&mut out, 80, 16).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        assert_eq!(layout.transcript.start, 0);
+        state.transcript_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 3));
+        state.transcript_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 0));
+        assert_eq!(state.scroll, 4, "arriving on row 0 must not jump scroll");
+        state.transcript_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 8, 0));
+        assert_eq!(
+            state.scroll, 4,
+            "horizontal drag across row 0 must not scroll"
+        );
+        // Repeating the exact same top-edge cell scrolls up 1 line immediately.
+        state.transcript_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 8, 0));
+        assert_eq!(state.scroll, 5);
+        // Dwell at row 0 also triggers upward autoscroll on timer tick.
+        if let Some(drag) = state.selection_drag.as_mut() {
+            drag.entered_top_at = Some(Instant::now() - Duration::from_millis(220));
+            drag.last_autoscroll = Instant::now() - Duration::from_millis(80);
+        }
+        assert!(state.tick_selection_autoscroll());
+        assert_eq!(state.scroll, 6);
+        let top_copied = state
+            .transcript_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0))
+            .expect("upward scrolled selection");
+        assert_eq!(top_copied.lines().count(), 4 + (6 - 4));
+
+        // When show_header = true (transcript.start == 1), dragging onto row 0 scrolls up immediately.
+        state.layout.show_header = true;
+        state.scroll = 4;
+        state.render_frame(&mut out, 80, 16).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        assert_eq!(layout.transcript.start, 1);
+        state.transcript_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 3));
+        state.transcript_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0));
+        assert_eq!(state.scroll, 5);
+        state.selection_drag.as_mut().unwrap().last_autoscroll =
+            Instant::now() - Duration::from_millis(80);
+        assert!(state.tick_selection_autoscroll());
+        assert_eq!(state.scroll, 6);
+        state.transcript_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0));
+    }
+
+    #[test]
+    fn lower_ui_regions_are_independently_selectable_without_prompt_prefix() {
+        let mouse = |kind, column, row| event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut state = State::new(PromptOptions::default());
+        state.log("Transcript line one");
+        state.editor.set("prompt alpha\nprompt beta".into());
+        state.subagents.push(SubagentView {
+            id: "sub-1".into(),
+            label: "worker".into(),
+            phase: "working".into(),
+            detail: "reading files".into(),
+            started: Instant::now(),
+        });
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        assert_eq!(layout.composer.len, 2);
+        assert_eq!(layout.subagents.len, 1);
+        assert_eq!(layout.hint.len, 1);
+        assert_eq!(layout.footer.len, 1);
+
+        // 1. Composer multi-line selection strips "> " / "  " gutter and clamps on vertical drift.
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            layout.composer.start,
+        ));
+        assert_eq!(state.selection_target, SelectionTarget::Composer);
+        // Drag down past composer into footer: clamps strictly inside composer band.
+        state.transcript_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            50,
+            layout.footer.start,
+        ));
+        let mut sel_frame = Vec::new();
+        state
+            .render_frame(&mut sel_frame, 100, 20)
+            .expect("render_frame during composer selection");
+        let sel_rendered = String::from_utf8_lossy(&sel_frame);
+        let expect_col_3 = format!("\x1b[{};3H", layout.composer.start + 1);
+        assert!(
+            sel_rendered.contains(&expect_col_3),
+            "composer highlight must start after the 2-cell gutter"
+        );
+        let copied_composer = state
+            .transcript_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                50,
+                layout.footer.start,
+            ))
+            .expect("copied composer text");
+        assert_eq!(copied_composer, "prompt alpha\nprompt beta");
+
+        // Double-click inside composer selects the word under the cursor without gutter offset bugs.
+        // Column 2 is 'p' of "prompt", column 9 is 'a' of "alpha".
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            9,
+            layout.composer.start,
+        ));
+        state.transcript_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            9,
+            layout.composer.start,
+        ));
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            9,
+            layout.composer.start,
+        ));
+        assert_eq!(
+            state
+                .transcript_mouse(mouse(
+                    MouseEventKind::Up(MouseButton::Left),
+                    9,
+                    layout.composer.start,
+                ))
+                .as_deref(),
+            Some("alpha")
+        );
+
+        // 2. Footer (status bar) selection copies status text and clamps if dragged upward.
+        let expected_footer: String = state.painted_footer[0]
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            layout.footer.start,
+        ));
+        assert_eq!(state.selection_target, SelectionTarget::Footer);
+        state.transcript_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            12,
+            layout.footer.start,
+        ));
+        let copied_footer = state
+            .transcript_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                12,
+                layout.footer.start,
+            ))
+            .expect("copied footer slice");
+        let expected_slice: String = expected_footer.chars().take(13).collect();
+        assert_eq!(copied_footer, expected_slice);
+
+        // 3. Hint selection preserves hint text during drag rather than overwriting with "Drag to select".
+        state.clipboard_notice = None;
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        let expected_hint: String = state.painted_hint[0]
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            1,
+            layout.hint.start,
+        ));
+        assert_eq!(state.selection_target, SelectionTarget::Hint);
+        state.transcript_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            9,
+            layout.hint.start,
+        ));
+        let mut hint_frame = Vec::new();
+        state
+            .render_frame(&mut hint_frame, 100, 20)
+            .expect("render_frame during hint selection");
+        assert!(!String::from_utf8_lossy(&hint_frame).contains("Drag to select"));
+        let copied_hint = state
+            .transcript_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                9,
+                layout.hint.start,
+            ))
+            .expect("copied hint text");
+        let expected_hint_slice: String = expected_hint.chars().skip(1).take(9).collect();
+        assert_eq!(copied_hint, expected_hint_slice);
+
+        // 4. Subagents banner is also independently selectable.
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            layout.subagents.start,
+        ));
+        assert_eq!(state.selection_target, SelectionTarget::Subagents);
+        state.transcript_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            40,
+            layout.subagents.start,
+        ));
+        let copied_subagent = state
+            .transcript_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                40,
+                layout.subagents.start,
+            ))
+            .expect("copied subagent row");
+        assert!(copied_subagent.contains("worker"));
+
+        // 5. Empty composer ignores clicks so accidental clicks on empty prompt don't select.
+        state.editor.set(String::new());
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            layout.composer.start,
+        ));
+        assert!(state.selection.is_none());
+
+        // 6. Live transcript updates while a non-transcript region is selected still sync painted_all_transcript.
+        state.editor.set("keep composer".into());
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            layout.composer.start,
+        ));
+        assert_eq!(state.selection_target, SelectionTarget::Composer);
+        for i in 1..=30 {
+            state.log(&format!("live-after-composer-{i:02}"));
+        }
+        state
+            .render_frame(&mut out, 100, 20)
+            .expect("render_frame with live transcript during composer selection");
+        assert_eq!(
+            state.painted_all_transcript.len(),
+            state.painted_transcript_start + state.painted_transcript.len()
+        );
+        // Release composer selection and immediately click last transcript row without an intervening render.
+        state.transcript_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            2,
+            layout.composer.start,
+        ));
+        let last_row = layout.transcript.end() - 1;
+        state.transcript_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, last_row));
+        assert_eq!(state.selection_target, SelectionTarget::Transcript);
+        state.transcript_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, last_row));
+        let copied_live = state
+            .transcript_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30, last_row))
+            .expect("copied newly arrived transcript row");
+        assert!(copied_live.contains("live-after-composer-30"));
+    }
+
+    #[test]
+    fn scroll_bottom_button_appears_centered_when_scrolled_and_jumps_to_bottom_on_click() {
+        let mouse = |kind, column, row| event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut state = State::new(PromptOptions::default());
+        let mut out = Vec::new();
+
+        // Short transcript cannot scroll even if `scroll > 0`; button must stay hidden.
+        state.log("Short line");
+        state.scroll = 5;
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        assert_eq!(state.painted_effective_scroll, 0);
+        assert!(state.scroll_bottom_button.is_none());
+
+        // Add enough lines to overflow viewport, then scroll up.
+        for i in 1..=35 {
+            state.log(&format!("scroll-row-{i:02}"));
+        }
+        state.scroll = 8;
+        state.clipboard_notice = Some("Copied 12 characters to clipboard.".into());
+        out.clear();
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        let layout = state.painted_layout.unwrap();
+        assert_eq!(state.painted_effective_scroll, 8);
+        let (btn_row, btn_start, btn_end) = state
+            .scroll_bottom_button
+            .expect("jump-to-bottom button must appear when scrolled up");
+        assert_eq!(btn_row, layout.hint.start);
+        assert_eq!(layout.hint.start + 1, layout.composer.start);
+        let mid = (btn_start + btn_end) / 2;
+        assert!(
+            (45..=55).contains(&mid),
+            "button should sit above center of 100-col prompt, got {btn_start}..{btn_end}"
+        );
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(rendered.contains("[ ↓ Jump to bottom ]"));
+        assert!(rendered.contains("Copied 12 characters to clipboard."));
+
+        // Clicking outside the button does not reset scroll.
+        state.transcript_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            btn_start - 1,
+            btn_row,
+        ));
+        state.transcript_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            btn_start - 1,
+            btn_row,
+        ));
+        assert_eq!(state.scroll, 8);
+
+        // Clicking inside the button jumps immediately to bottom (`scroll = 0`) without selecting.
+        state.transcript_mouse(mouse(MouseEventKind::Down(MouseButton::Left), mid, btn_row));
+        assert_eq!(state.scroll, 0);
+        assert!(state.selection.is_none());
+        assert!(state
+            .transcript_mouse(mouse(MouseEventKind::Up(MouseButton::Left), mid, btn_row))
+            .is_none());
+
+        out.clear();
+        state.render_frame(&mut out, 100, 20).expect("render_frame");
+        assert_eq!(state.painted_effective_scroll, 0);
+        assert!(state.scroll_bottom_button.is_none());
+        assert!(!String::from_utf8_lossy(&out).contains("[ ↓ Jump to bottom ]"));
+    }
+
+    #[test]
+    fn async_mention_popup_renders_below_composer_and_supports_navigation_selection_and_dismiss() {
+        use super::mentions::{MentionKind, MentionMatch};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("a b.txt"), "spaced").unwrap();
+
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            ..Default::default()
+        });
+        let (mut tx, rx) = mpsc::sync_channel(8);
+
+        state.editor.set("open @dd".into());
+        state.refresh_mention(&mut tx);
+        assert!(state.mention_loading());
+        let Command::SearchMentions { id, query, .. } = rx.try_recv().unwrap() else {
+            panic!("expected Command::SearchMentions");
+        };
+        assert_eq!(query, "dd");
+
+        // While searching, the loading spinner and cancel hint render below the composer
+        // with the full fixed 8-row completion height so the prompt row never shifts.
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 100, 26).unwrap();
+        let loading_layout = state.painted_layout.unwrap();
+        assert_eq!(loading_layout.completion.len, 8);
+        assert!(loading_layout.completion.start >= loading_layout.composer.end());
+        let loading_screen = String::from_utf8_lossy(&out);
+        assert!(loading_screen.contains("Fetching matches for \"dd\"..."));
+        assert!(loading_screen.contains("esc Cancel"));
+
+        // Stale response with old/wrong ID is ignored.
+        state.update(Update::MentionMatches {
+            id: id + 99,
+            query: "dd".into(),
+            matches: vec![],
+            total: 0,
+        });
+        assert!(state.mention_loading());
+
+        // Deliver 7 matches -> 5 visible rows + overflow indicator ("↓ 2 more") + footer hint.
+        let matches: Vec<MentionMatch> = (0..7)
+            .map(|i| MentionMatch {
+                display: if i == 1 {
+                    "src/".into()
+                } else {
+                    format!("file_{i}_dd.rs")
+                },
+                kind: if i == 1 {
+                    MentionKind::Dir
+                } else {
+                    MentionKind::File
+                },
+                detail: dir
+                    .path()
+                    .join(format!("file_{i}_dd.rs"))
+                    .display()
+                    .to_string(),
+                score: 100 - i as i64,
+            })
+            .collect();
+        state.update(Update::MentionMatches {
+            id,
+            query: "dd".into(),
+            matches,
+            total: 7,
+        });
+        assert!(!state.mention_loading());
+
+        out.clear();
+        state.render_frame(&mut out, 100, 26).unwrap();
+        let results_layout = state.painted_layout.unwrap();
+        assert_eq!(results_layout.completion.len, 8);
+        assert_eq!(results_layout.composer, loading_layout.composer);
+        assert!(results_layout.completion.start >= results_layout.composer.end());
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(rendered.contains("file_0_dd.rs"));
+        assert!(rendered.contains("↓ 2 more"));
+        assert!(rendered.contains("↑/↓ Navigate · enter Select · tab Complete · esc Cancel"));
+
+        // Navigate down to `src/` (Dir) and select -> inserts `@src/` and triggers search inside `src/`.
+        state.move_mention(false);
+        assert_eq!(state.mention.as_ref().unwrap().selected, 1);
+        assert!(state.select_mention(&mut tx));
+        assert_eq!(state.editor.text, "open @src/");
+        let Command::SearchMentions {
+            query: sub_query, ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected directory drill-down SearchMentions");
+        };
+        assert_eq!(sub_query, "src/");
+
+        // Esc dismisses and stays dismissed for this token offset.
+        state.dismiss_mention();
+        assert!(state.mention.is_none());
+        state.refresh_mention(&mut tx);
+        assert!(state.mention.is_none());
+        assert!(rx.try_recv().is_err());
+
+        // Burst Tab while loading falls back synchronously so `@a\t` works deterministically.
+        state.editor.set("read @a".into());
+        state.refresh_mention(&mut tx);
+        let _ = rx.try_recv();
+        assert!(state.mention_loading());
+        assert!(state.tab_complete_mention(&mut tx));
+        assert_eq!(state.editor.text, "read @\"a b.txt\" ");
+        assert!(state.mention.is_none());
+
+        // Wheel inside completion band moves selection without changing transcript scroll;
+        // clicking a match row inserts it.
+        state.editor.set("@".into());
+        state.refresh_mention(&mut tx);
+        let Command::SearchMentions { id: id3, .. } = rx.try_recv().unwrap() else {
+            panic!("expected SearchMentions");
+        };
+        state.update(Update::MentionMatches {
+            id: id3,
+            query: "".into(),
+            matches: vec![
+                MentionMatch {
+                    display: "first.rs".into(),
+                    kind: MentionKind::File,
+                    detail: dir.path().join("first.rs").display().to_string(),
+                    score: 100,
+                },
+                MentionMatch {
+                    display: "second.rs".into(),
+                    kind: MentionKind::File,
+                    detail: dir.path().join("second.rs").display().to_string(),
+                    score: 90,
+                },
+            ],
+            total: 2,
+        });
+        state.render_frame(&mut out, 100, 26).unwrap();
+        let layout3 = state.painted_layout.unwrap();
+        assert_eq!(layout3.completion.len, 8);
+        assert_eq!(layout3.composer, results_layout.composer);
+        state.scroll_wheel_at(false, 10, layout3.completion.start + 1, 100, 26);
+        assert_eq!(state.mention.as_ref().unwrap().selected, 1);
+        assert_eq!(state.scroll, 0);
+
+        // Clicking an empty padded row inside the fixed completion band does not select an item.
+        let empty_click = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: layout3.completion.start + 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(state.completion_mouse(empty_click, &mut tx));
+        assert_eq!(state.editor.text, "@");
+        assert!(state.mention.is_some());
+
+        let click = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: layout3.completion.start + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!( state.completion_mouse(click, &mut tx));
+        assert_eq!(state.editor.text, "@second.rs ");
+        assert!(state.mention.is_none());
+    }
+
+    #[test]
+    fn chat_mode_is_default_and_mode_command_switches_to_agent_yolo_with_full_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+        assert!(!state.options.agent);
+        assert!(!state.options.yolo);
+        state.log_startup_banner();
+        assert!(state.logs().contains("Mode: Chat"));
+        assert!(state.status_text(120).contains(" · CHAT · "));
+
+        // 1. Default permissions are read-only (`read` only). Open `/permissions`, toggle `edit` ON, and save.
+        assert_eq!(
+            state.options.effective_permissions(),
+            crate::domain::ToolPermissions::read_only()
+        );
+        let (mut tx, rx) = mpsc::sync_channel(4);
+        state.editor.set("/permissions".into());
+        state.submit(&mut tx);
+        assert_eq!(state.menu.as_ref().unwrap().choices.len(), 5);
+        assert!(state.menu.as_ref().unwrap().choices[0].label.starts_with("[x] read"));
+        assert!(state.menu.as_ref().unwrap().choices[1].label.starts_with("[ ] edit"));
+        state.move_menu(false); // move to `edit` (index 1)
+        assert!(state.toggle_permission_menu_item()); // toggle `edit` ON
+        assert!(state.menu.as_ref().unwrap().choices[1].label.starts_with("[x] edit"));
+        state.select(&mut tx); // Enter saves permissions (read + edit, shell still disabled)
+        assert!(state.options.no_shell);
+        assert_eq!(
+            state.options.effective_permissions(),
+            crate::domain::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: false,
+                subagent: false,
+            }
+        );
+
+        // 2. Restart in `anticrumb --agent` mode: saved /permissions (read + edit, shell disabled) is respected!
+        let mut agent_state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            agent: true,
+            yolo: false,
+            ..Default::default()
+        });
+        agent_state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        agent_state.load_model_preference();
+        assert!(agent_state.options.agent);
+        assert!(!agent_state.options.yolo);
+        assert!(
+            agent_state.options.no_shell,
+            "anticrumb --agent must respect saved /permissions (no_shell = true)"
+        );
+        assert_eq!(
+            agent_state.options.effective_permissions(),
+            crate::domain::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: false,
+                subagent: false,
+            }
+        );
+        assert!(agent_state.status_text(120).contains(" · AGENT · "));
+        agent_state.editor.set("inspect files without shell".into());
+        agent_state.submit(&mut tx);
+        let Command::Start(agent_req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start command");
+        };
+        assert!(!agent_req.chat_only);
+        assert!(agent_req.no_shell, "run_shell must be disabled under --agent when /permissions disabled shell");
+        assert_eq!(
+            agent_req.permissions,
+            Some(crate::domain::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: false,
+                subagent: false,
+            })
+        );
+
+        // 3. Open interactive /mode menu and select Agent (--yolo) -> all permissions enabled.
+        state.editor.set("/mode".into());
+        state.submit(&mut tx);
+        let menu = state.menu.as_mut().expect("/mode menu opened");
+        assert_eq!(menu.selected, 0);
+        menu.selected = 2; // Agent (--yolo)
+        state.select(&mut tx);
+        assert!(state.options.agent);
+        assert!(state.options.yolo);
+        assert!(!state.options.no_shell, "--yolo enables all permissions");
+        assert_eq!(
+            state.options.effective_permissions(),
+            crate::domain::ToolPermissions::all()
+        );
+        assert!(state.status_text(120).contains(" · YOLO · "));
+
+        state.editor.set("run agent task".into());
+        state.submit(&mut tx);
+        let Command::Start(req2, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start command");
+        };
+        assert!(!req2.chat_only);
+        assert!(!req2.no_shell);
+        assert_eq!(req2.permissions, Some(crate::domain::ToolPermissions::all()));
+        state.active = None;
+        state.pending = None;
+        state.phase = "ready".into();
+
+        // 4. Direct `/mode agent` switches from YOLO to standard Agent mode and restores saved /permissions (read + edit).
+        state.editor.set("/mode agent".into());
+        state.submit(&mut tx);
+        assert!(state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(state.options.no_shell);
+        assert_eq!(
+            state.options.effective_permissions().summary(),
+            "read, edit"
+        );
+        assert!(state.status_text(120).contains(" · AGENT · "));
+
+        // 5. Shorthand `/permissions readonly` resets back to safe read-only default.
+        state.editor.set("/permissions readonly".into());
+        state.submit(&mut tx);
+        assert_eq!(
+            state.options.effective_permissions(),
+            crate::domain::ToolPermissions::read_only()
+        );
+
+        // 6. Direct `/mode chat` toggles back to Chat mode.
+        state.editor.set("/mode chat".into());
+        state.submit(&mut tx);
+        assert!(!state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(state.status_text(120).contains(" · CHAT · "));
     }
 }

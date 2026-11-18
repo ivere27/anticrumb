@@ -64,14 +64,89 @@ async fn authenticate(
                 .and_then(|v| v.to_str().ok())
         })
         .unwrap_or("");
-    if !crate::rpc::constant_time_eq(provided, &state.token) {
+    let is_valid = crate::rpc::constant_time_eq(provided, &state.token);
+
+    let ctx = request
+        .extensions()
+        .get::<crate::rpc::server::ConnectionContext>();
+    if let Some(ctx) = ctx {
+        if is_valid {
+            if !ctx
+                .logged_auth_success
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let peer_str = ctx
+                    .peer
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "remote".into());
+                let path = crate::rpc::server::sanitize_header_value(request.uri().path(), 128);
+                let method =
+                    crate::rpc::server::sanitize_header_value(request.method().as_str(), 16);
+                let ua = request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| crate::rpc::server::sanitize_header_value(s, 128))
+                    .unwrap_or_else(|| "unknown".into());
+                eprintln!(
+                    "{} client authenticated: {} [API: {} {}, {}] (auth: verified)",
+                    crate::rpc::server::log_timestamp(),
+                    peer_str,
+                    method,
+                    path,
+                    ua
+                );
+            }
+        } else {
+            let fails = ctx
+                .auth_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if fails <= 6 {
+                let peer_str = ctx
+                    .peer
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "remote".into());
+                let path = crate::rpc::server::sanitize_header_value(request.uri().path(), 128);
+                let method =
+                    crate::rpc::server::sanitize_header_value(request.method().as_str(), 16);
+                let ua = request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| crate::rpc::server::sanitize_header_value(s, 128))
+                    .unwrap_or_else(|| "unknown".into());
+                if fails <= 5 {
+                    eprintln!(
+                        "{} client auth failed: {} [API: {} {}, {}] (auth: invalid token)",
+                        crate::rpc::server::log_timestamp(),
+                        peer_str,
+                        method,
+                        path,
+                        ua
+                    );
+                } else {
+                    eprintln!(
+                        "{} client auth failed: {} [API: {} {}, {}] (further failed attempts on this connection suppressed)",
+                        crate::rpc::server::log_timestamp(),
+                        peer_str,
+                        method,
+                        path,
+                        ua
+                    );
+                }
+            }
+        }
+    }
+
+    if !is_valid {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": {
                 "message": "invalid daemon token",
                 "code": "invalid_daemon_token",
                 "stage": "daemon_auth",
-                "hint": "Use the token printed by `anticrumb daemon`, or its --token value, in the provider client's API key. Check the daemon address. Signing in to Chrome does not change this token."
+                "hint": "Use the token printed by `anticrumb server`, or its --token value, in the provider client's API key. Check the server address. Signing in to Chrome does not change this token."
             }})),
         )
             .into_response();

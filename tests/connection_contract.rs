@@ -142,7 +142,7 @@ impl Daemon {
     ) -> Self {
         let log = env.root.path().join("owned-daemon.log");
         let mut command = env.command();
-        command.args(["daemon", "--listen", listen]);
+        command.args(["server", listen]);
         if let Some(token) = provided_token {
             command.args(["--token", token]);
         }
@@ -174,7 +174,7 @@ impl Daemon {
         };
         let endpoint = text
             .lines()
-            .find_map(|line| line.strip_prefix("anticrumb daemon: "))
+            .find_map(|line| line.strip_prefix("anticrumb server: "))
             .unwrap()
             .to_owned();
         if provided_token.is_none() {
@@ -183,7 +183,7 @@ impl Daemon {
             )));
         }
         let pin = certificate_fingerprint(
-            &fs::read(env.root.path().join("browser/tls/certificate.pem")).unwrap(),
+            &fs::read(env.root.path().join("server/tls/ca-certificate.pem")).unwrap(),
         )
         .unwrap();
         assert!(text.contains(&pin));
@@ -340,18 +340,17 @@ fn default_daemon_uses_tls_and_displays_its_persistent_generated_token_only_afte
     assert!(!setup.stdout.contains(&first_token));
     assert!(!setup.stderr.contains(&first_token));
 
-    let conflicting_state = env.root.path().join("conflicting-browser");
+    let conflicting_state = env.root.path().join("conflicting-server");
     let failed = env.run(
         &[
-            "daemon",
-            "--listen",
+            "server",
             &listen,
             "--state-dir",
             conflicting_state.to_str().unwrap(),
         ],
         None,
     );
-    assert_eq!(failed.error()["error"]["stage"], "daemon_listen");
+    assert_eq!(failed.error()["error"]["stage"], "server_listen");
     assert!(!failed.stderr.contains("Connection token:"));
     assert!(!conflicting_state.join("token").exists());
 
@@ -363,7 +362,7 @@ fn default_daemon_uses_tls_and_displays_its_persistent_generated_token_only_afte
         env.run(&["connect", "status"], None).json()["saved_remote"]["fingerprint"],
         first_pin
     );
-    let insecure = env.run(&["daemon", "--insecure-http"], None);
+    let insecure = env.run(&["server", "--insecure-http"], None);
     assert_eq!(insecure.error()["error"]["code"], "invalid_request");
     assert!(!insecure.stderr.contains("Connection token:"));
 }
@@ -495,4 +494,132 @@ fn invalid_connection_flags_do_not_change_state_or_disclose_url_credentials() {
     )
     .succeeded();
     assert!(!env.saved().exists());
+}
+
+#[test]
+fn bare_listen_prints_build_banner_once_and_regenerate_token_rotates_secret() {
+    let env = Environment::new();
+    let log = env.root.path().join("bare-listen.log");
+    let mut child = OwnedChild(
+        env.command()
+            .args(["server"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let text = wait_for_log(&mut child, &log, "Connect:");
+    wait_for_log(&mut child, &log, "anticrumb local daemon:");
+    let full = fs::read_to_string(&log).unwrap();
+    let banner_prefix = format!("anticrumb {} (commit:", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        full.matches(&banner_prefix).count(),
+        1,
+        "expected build banner once in daemon log: {full}"
+    );
+    assert!(full.contains("built: "), "{full}");
+    assert!(full.contains("TLS certificate mode: self-signed"), "{full}");
+    assert!(
+        full.contains("TLS certificate subject: CN=anticrumb"),
+        "{full}"
+    );
+    assert!(full.contains("TLS certificate validity:"), "{full}");
+    assert!(full.contains("TLS certificate SANs:"), "{full}");
+
+    let endpoint = text
+        .lines()
+        .find_map(|line| line.strip_prefix("anticrumb server: "))
+        .unwrap()
+        .to_owned();
+    let port = endpoint.rsplit(':').next().unwrap();
+    let first_token = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Connection token: "))
+        .unwrap()
+        .to_owned();
+    let first_pin = certificate_fingerprint(
+        &fs::read(env.root.path().join("server/tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+
+    // Connect using loopback IP on the OS-assigned random port.
+    let local_endpoint = format!("https://127.0.0.1:{port}");
+    env.run(
+        &[
+            "--connect",
+            &local_endpoint,
+            "--token",
+            &first_token,
+            "--tls-pin",
+            &first_pin,
+            "connect",
+            "status",
+        ],
+        None,
+    )
+    .succeeded();
+    child.stop();
+
+    // Restart with --regenerate-token: TLS pin stays the same, token rotates, old token fails.
+    let log2 = env.root.path().join("rotated-token.log");
+    let mut child2 = OwnedChild(
+        env.command()
+            .args(["server", "--regenerate-token"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log2).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let text2 = wait_for_log(&mut child2, &log2, "Connect:");
+    let second_token = text2
+        .lines()
+        .find_map(|line| line.strip_prefix("Connection token: "))
+        .unwrap()
+        .to_owned();
+    assert_ne!(second_token, first_token);
+    let second_pin = certificate_fingerprint(
+        &fs::read(env.root.path().join("server/tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second_pin, first_pin);
+
+    let endpoint2 = text2
+        .lines()
+        .find_map(|line| line.strip_prefix("anticrumb server: "))
+        .unwrap()
+        .to_owned();
+    let port2 = endpoint2.rsplit(':').next().unwrap();
+    let local_endpoint2 = format!("https://127.0.0.1:{port2}");
+
+    let rejected = env.run(
+        &[
+            "--connect",
+            &local_endpoint2,
+            "--token",
+            &first_token,
+            "--tls-pin",
+            &second_pin,
+            "connect",
+            "status",
+        ],
+        None,
+    );
+    assert_eq!(rejected.error()["error"]["code"], "auth_required");
+
+    env.run(
+        &[
+            "--connect",
+            &local_endpoint2,
+            "--token",
+            &second_token,
+            "--tls-pin",
+            &second_pin,
+            "connect",
+            "status",
+        ],
+        None,
+    )
+    .succeeded();
 }

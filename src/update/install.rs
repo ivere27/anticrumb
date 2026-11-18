@@ -154,3 +154,29 @@ pub(super) fn install_with(
     }
     Ok(retained)
 }
+
+pub(super) fn cleanup_old_executables_in(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(".anticrumb-running-") && name.ends_with(".old") {
+            let path = entry.path();
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+pub(crate) fn cleanup_old_executables() {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            cleanup_old_executables_in(parent);
+        }
+    }
+}

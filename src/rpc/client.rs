@@ -36,7 +36,7 @@ impl Connection {
 
 // Connection diagnostics are local, but URLs may still contain credentials or
 // signed query parameters. Only the origin is useful for identifying the server.
-pub(super) fn endpoint_description(endpoint: &str) -> String {
+pub(crate) fn endpoint_description(endpoint: &str) -> String {
     match crate::url_lite::Url::parse(endpoint) {
         Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
             url.origin().ascii_serialization()
@@ -366,14 +366,7 @@ impl RpcClient {
                     ServiceError::new(ErrorCode::TransportDisconnected, "rpc", e.to_string())
                 })?;
                 let mut request = tonic::Request::new(cursor);
-                if let Some(token) = token {
-                    request.metadata_mut().insert(
-                        "authorization",
-                        format!("Bearer {token}")
-                            .parse()
-                            .map_err(ServiceError::storage)?,
-                    );
-                }
+                attach_client_headers(&mut request, token.as_deref())?;
                 // Limit establishing the stream without adding a gRPC deadline
                 // that would cut off a long-running turn after it starts.
                 let response = tokio::time::timeout(
@@ -448,14 +441,7 @@ where
         .map_err(|e| ServiceError::new(ErrorCode::TransportDisconnected, "rpc", e.to_string()))?;
     let mut request = tonic::Request::new(value);
     request.set_timeout(timeout);
-    if let Some(token) = token {
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {token}")
-                .parse()
-                .map_err(ServiceError::storage)?,
-        );
-    }
+    attach_client_headers(&mut request, token)?;
     let path = path
         .parse::<tonic::codegen::http::uri::PathAndQuery>()
         .map_err(ServiceError::storage)?;
@@ -464,6 +450,32 @@ where
         .await
         .map(|r| r.into_inner())
         .map_err(codec::from_status)
+}
+
+fn attach_client_headers<T>(request: &mut tonic::Request<T>, token: Option<&str>) -> Result<()> {
+    if let Some(token) = token {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}")
+                .parse()
+                .map_err(ServiceError::storage)?,
+        );
+    }
+    type AsciiHeader = Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>;
+    static CLIENT_HEADERS: std::sync::OnceLock<(AsciiHeader, AsciiHeader)> =
+        std::sync::OnceLock::new();
+    let (version, client_id) = CLIENT_HEADERS.get_or_init(|| {
+        let v = crate::cli::client_version().parse().ok();
+        let c = crate::cli::client_identity().parse().ok();
+        (v, c)
+    });
+    if let Some(v) = version.clone() {
+        request.metadata_mut().insert("x-anticrumb-version", v);
+    }
+    if let Some(c) = client_id.clone() {
+        request.metadata_mut().insert("x-anticrumb-client", c);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

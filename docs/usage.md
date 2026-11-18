@@ -5,22 +5,24 @@
 [Install anticrumb](building.md), then run in your project directory:
 
 ```sh
-anticrumb
+anticrumb          # Chat mode (default: direct chat, no tool overhead)
+anticrumb --agent  # Agent mode (coding tools, respects /permissions)
+anticrumb --yolo   # Agent mode with all permissions (file, shell & sub-agents)
 ```
 
-Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your task to begin. For Claude or ChatGPT, see [provider setup](../providers/README.md).
+Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
 
 ## CLI & Non-Interactive Commands
 
 ```sh
-anticrumb -C ./project 'Investigate the failing tests'
-anticrumb exec --json -C ./project 'Fix the reported bug'
+anticrumb --agent -C ./project 'Investigate the failing tests'
+anticrumb exec --yolo --json -C ./project 'Fix the reported bug'
 anticrumb resume --last -C ./project
 anticrumb exec resume AGENT_ID 'Add a regression test'
 anticrumb agents list
 ```
 
-Common flags: `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `-r/--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
+Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `-r/--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
 
 For browser commands, worker delegation, and external MCP setup, see [Tools](tools.md).
 
@@ -28,6 +30,7 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 
 | Command or key | Action |
 |---|---|
+| `/mode [chat\|agent\|yolo]` | Switch between Chat mode (default) and Agent (`--yolo`) mode |
 | `/model` | Pick a cached model (Up/Down) and thinking level (Left/Right) |
 | `/model refresh` | Discover models through Chrome |
 | `/provider` | Select or set up a provider account |
@@ -41,7 +44,7 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 | `/resume [ID]` | Browse or resume saved conversations |
 | `/browser clear-history`, `/resume clear-history` | Delete web chats after typing `DELETE`; local saved entries remain |
 | `/new`, `/clear` | Start a conversation; `/clear` also clears the transcript |
-| `/permissions` | Toggle shell tools for the next turn |
+| `/permissions [readonly\|edit\|all]` | Toggle tool permission groups (`read`, `edit`, `shell`, `browser`, `subagent`; default: `read` only) |
 | `/theme [ID]` | Pick and save a [theme](themes.md) |
 | `/copy`, left mouse drag | Copy the last response or selected transcript text |
 | Enter while running | Queue a steering message, optionally with `@file` |
@@ -116,7 +119,7 @@ Each owning daemon checks its store at startup and every six hours. An attachmen
 
 If protected files keep the store full, `/cache` reports usage and the upload error reports the additional space required. Cleanup does not shorten retention or remove referenced files to make an upload fit.
 
-## Remote Chrome Daemon
+## Remote Chrome Server
 
 Follow [remote TLS setup](rpc.md#network-grpc--tls-setup) to run Chrome on another machine while keeping workspace tools local.
 
@@ -124,9 +127,9 @@ Follow [remote TLS setup](rpc.md#network-grpc--tls-setup) to run Chrome on anoth
 
 ```sh
 # Terminal A
-anticrumb daemon --listen 127.0.0.1:50051
+anticrumb server 127.0.0.1:50051
 # Terminal B: choose a client below.
-export ANTICRUMB_TOKEN='TOKEN_PRINTED_BY_DAEMON'
+export ANTICRUMB_TOKEN='TOKEN_PRINTED_BY_SERVER'
 anticrumb connect opencode --install ./opencode.json
 anticrumb connect codex
 anticrumb connect claude
@@ -141,7 +144,7 @@ The gateway exposes OpenAI Chat/Responses, Anthropic Messages, and Gemini APIs o
 | Variable | Purpose |
 |---|---|
 | `ANTICRUMB_HOME` | State directory and local daemon identity; default `~/.anticrumb` |
-| `ANTICRUMB_TOKEN` | Network daemon/connection token; ignored by local IPC |
+| `ANTICRUMB_TOKEN` | Network server/connection token; ignored by local IPC |
 | `CHROME_BIN` | Chrome/Chromium executable |
 | `ANTICRUMB_ALLOW_PRIVATE_FETCH` | `1` enables [private/local browsing](tools.md#web-and-browser-tools) |
 

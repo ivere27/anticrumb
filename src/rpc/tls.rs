@@ -54,8 +54,20 @@ pub(crate) fn certificate_der_to_pem(der: &[u8]) -> String {
 #[derive(Debug)]
 struct PinnedVerifier {
     pin: String,
-    roots: Option<RootCertStore>,
+    roots: Option<Vec<CertificateDer<'static>>>,
     provider: Arc<CryptoProvider>,
+}
+
+fn verify_anchor_validity(der: &[u8], now: UnixTime) -> std::result::Result<(), rustls::Error> {
+    if let Some((not_before, not_after)) = super::daemon::certificate_validity_epochs(der) {
+        let now_secs = now.as_secs();
+        if now_secs < not_before || now_secs > not_after {
+            return Err(rustls::Error::General(
+                "TLS trust anchor certificate is not valid at current time".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ServerCertVerifier for PinnedVerifier {
@@ -67,22 +79,31 @@ impl ServerCertVerifier for PinnedVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        if crate::domain::digest(end_entity.as_ref()) != self.pin {
-            return Err(rustls::Error::General(
-                "TLS certificate fingerprint does not match the configured pin".into(),
-            ));
-        }
-        // A configured pin is explicit trust in this exact certificate. For the
-        // embedded self-signed identity, use that certificate as the trust anchor.
-        // With a supplied CA, also require the pinned leaf to chain to that CA.
-        let roots = match &self.roots {
-            Some(roots) => roots.clone(),
+        // A configured pin is explicit trust in the root trust anchor (internal CA
+        // or self-signed certificate), allowing short-lived leaf rotation.
+        let anchor = match &self.roots {
+            Some(configured) => configured
+                .iter()
+                .find(|cert| crate::domain::digest(cert.as_ref()) == self.pin)
+                .cloned()
+                .ok_or_else(|| {
+                    rustls::Error::General(
+                        "TLS certificate fingerprint does not match the configured pin".into(),
+                    )
+                })?,
             None => {
-                let mut roots = RootCertStore::empty();
-                roots.add(end_entity.clone().into_owned())?;
-                roots
+                let candidate = intermediates.last().unwrap_or(end_entity);
+                if crate::domain::digest(candidate.as_ref()) != self.pin {
+                    return Err(rustls::Error::General(
+                        "TLS certificate fingerprint does not match the configured pin".into(),
+                    ));
+                }
+                candidate.clone().into_owned()
             }
         };
+        verify_anchor_validity(anchor.as_ref(), now)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(anchor)?;
         let verifier =
             WebPkiServerVerifier::builder_with_provider(Arc::new(roots), self.provider.clone())
                 .build()
@@ -140,16 +161,17 @@ impl ServerCertVerifier for InspectionVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        // Inspect the offered certificate as a candidate trust anchor, requiring
-        // normal hostname and validity checks before it can be shown to the user.
+        let candidate = intermediates.last().unwrap_or(end_entity);
+        // Inspect the offered trust anchor (root CA or self-signed leaf), requiring
+        // normal chain, hostname, and validity checks before it can be shown to the user.
         PinnedVerifier {
-            pin: certificate_fingerprint(end_entity.as_ref()),
+            pin: certificate_fingerprint(candidate.as_ref()),
             roots: None,
             provider: self.provider.clone(),
         }
         .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
         *self.certificate.lock().map_err(|_| inspection_stopped())? =
-            Some(end_entity.as_ref().to_vec());
+            Some(candidate.as_ref().to_vec());
         // Never finish this handshake: inspection cannot send a bearer token or
         // any other application data, and does not establish certificate trust.
         Err(inspection_stopped())
@@ -281,18 +303,21 @@ pub(super) async fn connect(
     let (host, port, name) = peer_address(endpoint, server_name)?;
     let roots = if let Some(path) = ca_file {
         let bytes = std::fs::read(path).map_err(ServiceError::storage)?;
-        let mut roots = RootCertStore::empty();
+        let mut parsed = Vec::new();
+        let mut check_store = RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut bytes.as_slice()) {
-            roots
-                .add(cert.map_err(ServiceError::storage)?)
+            let cert = cert.map_err(ServiceError::storage)?;
+            check_store
+                .add(cert.clone())
                 .map_err(ServiceError::storage)?;
+            parsed.push(cert);
         }
-        if roots.is_empty() {
+        if parsed.is_empty() {
             return Err(ServiceError::invalid(
                 "TLS CA file contains no certificates",
             ));
         }
-        Some(roots)
+        Some(parsed)
     } else {
         None
     };
@@ -364,55 +389,99 @@ mod tests {
 
     #[test]
     fn pin_still_requires_matching_name_and_certificate_validity() {
-        let mut params = rcgen::CertificateParams::new(vec!["daemon.example".into()]).unwrap();
-        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2025, 1, 1);
-        let key = rcgen::KeyPair::generate().unwrap();
-        let certificate = params.self_signed(&key).unwrap();
-        let certificate = certificate.der();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        ca_params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "anticrumb Root CA");
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["daemon.example".into()]).unwrap();
+        leaf_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2025, 1, 1);
+        leaf_params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.use_authority_key_identifier_extension = true;
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let certificate = leaf_cert.der();
+        let chain = [ca_cert.der().clone()];
         let verifier = PinnedVerifier {
-            pin: crate::domain::digest(certificate.as_ref()),
+            pin: crate::domain::digest(ca_cert.der().as_ref()),
             roots: None,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
         };
         let name = ServerName::try_from("daemon.example").unwrap();
         let valid_time = UnixTime::since_unix_epoch(Duration::from_secs(1_700_000_000));
         assert!(verifier
-            .verify_server_cert(certificate, &[], &name, &[], valid_time)
+            .verify_server_cert(certificate, &chain, &name, &[], valid_time)
             .is_ok());
         let wrong_name = ServerName::try_from("wrong.example").unwrap();
         assert!(verifier
-            .verify_server_cert(certificate, &[], &wrong_name, &[], valid_time)
+            .verify_server_cert(certificate, &chain, &wrong_name, &[], valid_time)
             .is_err());
         let before_validity = UnixTime::since_unix_epoch(Duration::ZERO);
         assert!(verifier
-            .verify_server_cert(certificate, &[], &name, &[], before_validity)
+            .verify_server_cert(certificate, &chain, &name, &[], before_validity)
             .is_err());
         let after_validity = UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000));
         assert!(verifier
-            .verify_server_cert(certificate, &[], &name, &[], after_validity)
+            .verify_server_cert(certificate, &chain, &name, &[], after_validity)
             .is_err());
         let wrong_pin = PinnedVerifier {
             pin: "00".repeat(32),
             ..verifier
         };
         assert!(wrong_pin
-            .verify_server_cert(certificate, &[], &name, &[], valid_time)
+            .verify_server_cert(certificate, &chain, &name, &[], valid_time)
             .is_err());
     }
 
     #[tokio::test]
     async fn inspection_checks_hostname_and_stops_before_application_data() {
-        let certified = rcgen::generate_simple_self_signed(vec!["daemon.example".into()]).unwrap();
-        let certificate = certified.cert.der().to_vec();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "anticrumb Root CA");
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["daemon.example".into()]).unwrap();
+        leaf_params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.use_authority_key_identifier_extension = true;
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let expected_ca = ca_cert.der().to_vec();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der());
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![certified.cert.der().clone()], key.into())
+        .with_single_cert(
+            vec![leaf_cert.der().clone(), ca_cert.der().clone()],
+            key.into(),
+        )
         .unwrap();
         config.alpn_protocols = vec![b"h2".to_vec()];
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
@@ -429,13 +498,13 @@ mod tests {
         let inspected = inspect_peer(&endpoint, Some("daemon.example"))
             .await
             .unwrap();
-        assert_eq!(inspected, certificate);
+        assert_eq!(inspected, expected_ca);
         let pem = certificate_der_to_pem(&inspected);
         let decoded = rustls_pemfile::certs(&mut pem.as_bytes())
             .next()
             .unwrap()
             .unwrap();
-        assert_eq!(decoded.as_ref(), certificate);
+        assert_eq!(decoded.as_ref(), expected_ca);
         assert!(inspect_peer(&endpoint, Some("wrong.example"))
             .await
             .is_err());

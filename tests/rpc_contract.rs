@@ -1268,9 +1268,11 @@ async fn tls_requires_trust_and_matching_server_name() {
         names: vec!["daemon.example".into()],
         ..Default::default()
     };
-    let cert = root.path().join("tls/certificate.pem");
+    let cert = root.path().join("tls/ca-certificate.pem");
+    let leaf_cert = root.path().join("tls/certificate.pem");
     let identity = options.identity().unwrap();
     let first = std::fs::read(&cert).unwrap();
+    let first_leaf = std::fs::read(&leaf_cert).unwrap();
     let der = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         std::str::from_utf8(&first)
@@ -1284,7 +1286,8 @@ async fn tls_requires_trust_and_matching_server_name() {
     assert_eq!(certificate_fingerprint(&first).unwrap(), pin);
     options.identity().unwrap();
     assert_eq!(first, std::fs::read(&cert).unwrap());
-    let (endpoint, task) = network(host.clone(), identity).await;
+    assert_eq!(first_leaf, std::fs::read(&leaf_cert).unwrap());
+    let (endpoint, task) = network(host.clone(), identity.clone()).await;
     assert!(RpcClient::network(&endpoint, TOKEN, None, None)
         .await
         .is_err());
@@ -1301,6 +1304,31 @@ async fn tls_requires_trust_and_matching_server_name() {
         .await
         .unwrap();
     assert_eq!(pinned.get_info(pb::Empty {}).await.unwrap().role, "browser");
+
+    // Hot-reloading a new leaf signed by the same internal CA keeps existing and
+    // newly reconnecting CA-pinned clients working without interruption.
+    options.rotate_leaf(identity.as_ref().unwrap()).unwrap();
+    let rotated_leaf = std::fs::read(&leaf_cert).unwrap();
+    assert_ne!(rotated_leaf, first_leaf);
+    assert_eq!(first, std::fs::read(&cert).unwrap());
+    assert_eq!(pinned.get_info(pb::Empty {}).await.unwrap().role, "browser");
+    let pinned_after_rotate = RpcClient::network_pinned(
+        &endpoint,
+        TOKEN,
+        Some(&cert),
+        Some("daemon.example"),
+        Some(&pin),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pinned_after_rotate
+            .get_info(pb::Empty {})
+            .await
+            .unwrap()
+            .role,
+        "browser"
+    );
     assert!(
         RpcClient::network_pinned(&endpoint, TOKEN, None, None, Some(&"00".repeat(32)),)
             .await
@@ -1348,23 +1376,39 @@ async fn tls_requires_trust_and_matching_server_name() {
 #[test]
 fn daemon_subcommand_exposes_help_without_starting_a_host() {
     let root = tempfile::tempdir().unwrap();
-    let state = root.path().join("browser");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_anticrumb"))
+    let state = root.path().join("server");
+    let daemon_output = std::process::Command::new(env!("CARGO_BIN_EXE_anticrumb"))
         .args(["daemon", "--help"])
         .env("ANTICRUMB_HOME", root.path())
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        daemon_output.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&daemon_output.stderr)
     );
-    let help = String::from_utf8(output.stdout).unwrap();
-    assert!(help.contains("anticrumb daemon"), "{help}");
-    assert!(!help.contains("--ipc"), "{help}");
-    assert!(help.contains("--listen"), "{help}");
-    assert!(help.contains("--token"), "{help}");
-    assert!(!help.contains("--token-file"), "{help}");
+    let daemon_help = String::from_utf8(daemon_output.stdout).unwrap();
+    assert!(daemon_help.contains("anticrumb daemon"), "{daemon_help}");
+    assert!(!daemon_help.contains("--ipc"), "{daemon_help}");
+    assert!(!daemon_help.contains("--listen"), "{daemon_help}");
+    assert!(!daemon_help.contains("--token"), "{daemon_help}");
+    assert!(!state.exists());
+
+    let server_output = std::process::Command::new(env!("CARGO_BIN_EXE_anticrumb"))
+        .args(["server", "--help"])
+        .env("ANTICRUMB_HOME", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        server_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+    let server_help = String::from_utf8(server_output.stdout).unwrap();
+    assert!(server_help.contains("anticrumb server"), "{server_help}");
+    assert!(server_help.contains("--token"), "{server_help}");
+    assert!(server_help.contains("--state-dir"), "{server_help}");
+    assert!(!server_help.contains("--token-file"), "{server_help}");
     assert!(!state.exists());
 }
 
@@ -1412,22 +1456,16 @@ fn daemon_token_and_option_policy() {
         Options::parse(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
     };
     let defaults = parse(&[]).unwrap();
-    assert!(defaults.listen.is_empty());
-    assert!(!defaults.self_signed);
+    assert_eq!(defaults.listen, "0.0.0.0:0");
+    assert!(defaults.self_signed);
     assert!(defaults.token.is_none());
-    assert!(parse(&["--listen", "127.0.0.1:0"]).unwrap().self_signed);
+    assert!(parse(&["127.0.0.1:0"]).unwrap().self_signed);
     for args in [
         vec!["--ipc", "--token", TOKEN],
         vec!["--tls-cert", "cert"],
         vec!["--token-file", "file"],
-        vec!["--insecure-http", "--listen", "127.0.0.1:0"],
-        vec![
-            "--token",
-            TOKEN,
-            "--insecure-http",
-            "--listen",
-            "0.0.0.0:50051",
-        ],
+        vec!["--insecure-http", "127.0.0.1:0"],
+        vec!["--token", TOKEN, "--insecure-http", "0.0.0.0:50051"],
         vec!["--ipc", "--insecure-http"],
         vec![
             "--tls-self-signed",
@@ -1651,7 +1689,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
     };
     let identity = options.identity().unwrap();
     let pin = certificate_fingerprint(
-        &std::fs::read(browser_dir.path().join("tls/certificate.pem")).unwrap(),
+        &std::fs::read(browser_dir.path().join("tls/ca-certificate.pem")).unwrap(),
     )
     .unwrap();
     let (endpoint, task) = network(browser.clone(), identity).await;
@@ -2375,9 +2413,9 @@ async fn embedded_workspace_services_and_borrowed_clients_are_root_scoped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_service_registers_persists_binds_accounts_and_unregisters_at_runtime() {
     let dir = tempfile::tempdir().unwrap();
-    let browser_dir = dir.path().join("browser");
+    let server_dir = dir.path().join("server");
     let providers_dir = dir.path().join("providers");
-    let host = Host::browser_with_providers_dir(&browser_dir, Some(&providers_dir)).unwrap();
+    let host = Host::browser_with_providers_dir(&server_dir, Some(&providers_dir)).unwrap();
     let client = RpcClient::embedded(host.clone(), tokio::runtime::Handle::current()).unwrap();
 
     let initial = client.list_providers(pb::Empty {}).await.unwrap();
@@ -2487,7 +2525,7 @@ async fn provider_service_registers_persists_binds_accounts_and_unregisters_at_r
     drop(host);
 
     // Persisted runtime manifest survives reopening the browser host with all manifest fields intact.
-    let reopened = Host::browser_with_providers_dir(&browser_dir, Some(&providers_dir)).unwrap();
+    let reopened = Host::browser_with_providers_dir(&server_dir, Some(&providers_dir)).unwrap();
     let stored_manifest: anticrumb::provider::ProviderManifest = reopened
         .service
         .store
@@ -2546,7 +2584,7 @@ async fn provider_service_registers_persists_binds_accounts_and_unregisters_at_r
     drop(reopened);
 
     // Unregistered provider stays removed across reload.
-    let final_host = Host::browser_with_providers_dir(&browser_dir, Some(&providers_dir)).unwrap();
+    let final_host = Host::browser_with_providers_dir(&server_dir, Some(&providers_dir)).unwrap();
     let final_client =
         RpcClient::embedded(final_host.clone(), tokio::runtime::Handle::current()).unwrap();
     let final_list = final_client.list_providers(pb::Empty {}).await.unwrap();

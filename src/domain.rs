@@ -457,6 +457,78 @@ pub struct Artifact {
     pub created_at: i64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermissions {
+    #[serde(default = "default_true")]
+    pub read: bool,
+    #[serde(default)]
+    pub edit: bool,
+    #[serde(default)]
+    pub shell: bool,
+    #[serde(default)]
+    pub browser: bool,
+    #[serde(default)]
+    pub subagent: bool,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self::read_only()
+    }
+}
+
+impl ToolPermissions {
+    pub const fn read_only() -> Self {
+        Self {
+            read: true,
+            edit: false,
+            shell: false,
+            browser: false,
+            subagent: false,
+        }
+    }
+
+    pub const fn all() -> Self {
+        Self {
+            read: true,
+            edit: true,
+            shell: true,
+            browser: true,
+            subagent: true,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let mut enabled = Vec::new();
+        if self.read {
+            enabled.push("read");
+        }
+        if self.edit {
+            enabled.push("edit");
+        }
+        if self.shell {
+            enabled.push("shell");
+        }
+        if self.browser {
+            enabled.push("browser");
+        }
+        if self.subagent {
+            enabled.push("subagent");
+        }
+        if enabled.is_empty() {
+            "none".into()
+        } else if enabled.len() == 5 {
+            "all (read, edit, shell, browser, subagent)".into()
+        } else {
+            enabled.join(", ")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     #[serde(skip)]
@@ -485,6 +557,10 @@ pub struct AgentRequest {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub chat_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<ToolPermissions>,
 }
 
 fn deserialize_optional_agent_error<'de, D>(

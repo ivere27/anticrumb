@@ -37,6 +37,90 @@ fn snake(name: &str) -> String {
 fn ty(name: &str) -> &str {
     name.rsplit('.').next().unwrap()
 }
+fn git_is_dirty() -> bool {
+    let unstaged = std::process::Command::new("git")
+        .args(["diff", "--no-ext-diff", "--quiet"])
+        .status()
+        .is_ok_and(|s| s.code() == Some(1));
+    if unstaged {
+        return true;
+    }
+    std::process::Command::new("git")
+        .args(["diff", "--no-ext-diff", "--cached", "--quiet"])
+        .status()
+        .is_ok_and(|s| s.code() == Some(1))
+}
+
+fn resolve_git_head() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let git_head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if git_head.is_empty() {
+        return None;
+    }
+    if git_is_dirty() {
+        Some(format!("{git_head}-dirty"))
+    } else {
+        Some(git_head)
+    }
+}
+
+fn git_path(rel: &str) -> PathBuf {
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", rel])
+        .output()
+    {
+        if output.status.success() {
+            let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+    }
+    Path::new(".git").join(rel)
+}
+
+fn emit_git_rerun_hints() {
+    let head_path = git_path("HEAD");
+    if let Ok(head) = fs::read_to_string(&head_path) {
+        println!("cargo:rerun-if-changed={}", head_path.display());
+        if let Some(ref_path) = head.strip_prefix("ref: ").map(str::trim) {
+            let full_ref = git_path(ref_path);
+            if full_ref.exists() {
+                println!("cargo:rerun-if-changed={}", full_ref.display());
+            }
+        }
+    }
+    for rel in ["index", "refs/heads", "packed-refs"] {
+        let path = git_path(rel);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .output()
+    {
+        if output.status.success() {
+            for raw in output.stdout.split(|&b| b == 0) {
+                if raw.is_empty() {
+                    continue;
+                }
+                if let Ok(path) = std::str::from_utf8(raw) {
+                    if !path.contains(['\n', '\r']) {
+                        println!("cargo:rerun-if-changed={path}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     println!(
         "cargo:rustc-env=ANTICRUMB_BUILD_TARGET={}",
@@ -59,22 +143,17 @@ fn main() {
         });
     println!("cargo:rustc-env=ANTICRUMB_BUILD_TIME={build_time}");
 
-    if env::var("ANTICRUMB_GIT_HEAD").is_err() {
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["rev-parse", "--short=7", "HEAD"])
-            .output()
-        {
-            if output.status.success() {
-                let git_head = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !git_head.is_empty() {
-                    println!("cargo:rustc-env=ANTICRUMB_GIT_HEAD={git_head}");
-                }
-            }
-        }
+    println!("cargo:rerun-if-env-changed=ANTICRUMB_GIT_HEAD");
+    if let Some(git_head) = env::var("ANTICRUMB_GIT_HEAD")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "unknown")
+    {
+        println!("cargo:rustc-env=ANTICRUMB_GIT_HEAD={git_head}");
+    } else if let Some(git_head) = resolve_git_head() {
+        println!("cargo:rustc-env=ANTICRUMB_GIT_HEAD={git_head}");
     }
-    if Path::new(".git/HEAD").exists() {
-        println!("cargo:rerun-if-changed=.git/HEAD");
-    }
+    emit_git_rerun_hints();
     println!("cargo:rerun-if-changed=proto/anticrumb.proto");
     println!("cargo:rerun-if-changed=src/rpc/generated/anticrumb_ffi.rs");
     use sha2::{Digest, Sha256};

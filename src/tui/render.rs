@@ -3,8 +3,8 @@ use super::{
     commands::Selection,
     debug_log::DebugLogger,
     layout::FrameLayout,
-    markdown::{self, Face},
-    reducer::{State, SubagentView},
+    markdown::{self, Face, Span},
+    reducer::{SelectionTarget, State, SubagentView},
     transcript::clip,
     usage,
 };
@@ -15,7 +15,49 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::io::Write;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+fn spans_width(parts: &[(String, Face)]) -> usize {
+    parts
+        .iter()
+        .flat_map(|(text, _)| markdown::strip_controls(text, false))
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum()
+}
+
+fn clip_spans(parts: Vec<(String, Face)>, max_width: usize) -> Vec<(String, Face)> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    for (text, face) in parts {
+        let mut kept = String::new();
+        for ch in markdown::strip_controls(&text, false) {
+            let w = ch.width().unwrap_or(0);
+            if used + w > max_width {
+                truncated = true;
+                break;
+            }
+            used += w;
+            kept.push(ch);
+        }
+        if !kept.is_empty() {
+            out.push((kept, face));
+        }
+        if truncated || used >= max_width {
+            break;
+        }
+    }
+    if truncated {
+        while let Some((last, face)) = out.last() {
+            if *face == Face::MUTED && last.chars().all(|c| c == ' ' || c == '·') {
+                out.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
 
 impl State {
     fn spinner(&self) -> &'static str {
@@ -108,14 +150,22 @@ impl State {
         }
 
         let daemon = self.daemon_label();
-        let daemon_face = match daemon {
-            "remote" | "local" => Face::MUTED,
-            "checking" => Face::ACCENT,
-            _ => Face::DANGER_BOLD,
+        let daemon_face = if self.status_disconnected {
+            Face::DANGER_BOLD
+        } else {
+            match daemon {
+                "remote" | "local" => Face::MUTED,
+                "checking" => Face::ACCENT,
+                _ => Face::DANGER_BOLD,
+            }
         };
+        let daemon_text = match (daemon, self.daemon_remote_addr()) {
+            ("remote" | "remote/offline", Some(addr)) => format!("D:{daemon}({addr})"),
+            _ => format!("D:{daemon}"),
+        };
+        let priority_w = spans_width(&parts);
+
         push_sep(&mut parts);
-        parts.push((format!("D:{daemon}"), daemon_face));
-        parts.push((" · ".into(), Face::MUTED));
         parts.push((
             format!(
                 "M:{}",
@@ -125,6 +175,14 @@ impl State {
         ));
         parts.push((" · ".into(), Face::MUTED));
         parts.push((format!("E:{}", clip(self.thinking_label(), 8)), Face::MUTED));
+        parts.push((" · ".into(), Face::MUTED));
+        if !self.options.agent {
+            parts.push(("CHAT".into(), Face::ACCENT));
+        } else if self.options.yolo {
+            parts.push(("YOLO".into(), Face::HIGHLIGHT_BOLD));
+        } else {
+            parts.push(("AGENT".into(), Face::HIGHLIGHT_BOLD));
+        }
         if self.debug.level > 0 {
             parts.push((" · ".into(), Face::MUTED));
             parts.push((
@@ -190,7 +248,37 @@ impl State {
         };
         parts.push((" · ".into(), Face::MUTED));
         parts.push((acct_label, acct_face));
-        parts
+
+        if width == 0 {
+            return Vec::new();
+        }
+        let right_text = clip(&daemon_text, width);
+        let right_w = right_text.width();
+        let reserved_right = right_w + 2;
+        if priority_w > 0 && priority_w + reserved_right > width {
+            let left_max = priority_w.min(width);
+            let mut left = clip_spans(parts.clone(), left_max);
+            let left_w = spans_width(&left);
+            if left_w + 2 + right_w <= width {
+                let pad = width - left_w - right_w;
+                left.push((" ".repeat(pad), Face::MUTED));
+                left.push((right_text, daemon_face));
+                return left;
+            }
+            return clip_spans(parts, width);
+        }
+        let left_max = width.saturating_sub(reserved_right);
+        if left_max == 0 {
+            return vec![(right_text, daemon_face)];
+        }
+        let mut left = clip_spans(parts, left_max);
+        let left_w = spans_width(&left);
+        let pad = width.saturating_sub(left_w + right_w);
+        if pad > 0 {
+            left.push((" ".repeat(pad), Face::MUTED));
+        }
+        left.push((right_text, daemon_face));
+        left
     }
 
     #[cfg(test)]
@@ -212,6 +300,7 @@ impl State {
             height,
             rows.len(),
             cursor,
+            self.mention_panel_rows(),
             self.subagents.len(),
         )?;
         Some((layout, rows))
@@ -317,16 +406,22 @@ impl State {
     ) -> Result<()> {
         let w = usize::from(layout.width);
         let viewport = usize::from(layout.transcript.len);
-        let all = self.transcript_lines(w);
-        let end = all
-            .len()
-            .saturating_sub(self.scroll.min(all.len().saturating_sub(viewport)));
-        let start = end.saturating_sub(viewport);
-        let painted = self
+        let transcript_selection = self
             .selection
             .as_ref()
-            .map(|selection| selection.lines.clone())
-            .unwrap_or_else(|| all[start..end].to_vec());
+            .filter(|_| self.selection_target == SelectionTarget::Transcript);
+        let (start, effective_scroll, painted, all_snapshot) =
+            if let Some(selection) = transcript_selection {
+                let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
+                let eff = selection.lines.len().saturating_sub(end);
+                (start, eff, selection.lines[start..end].to_vec(), None)
+            } else {
+                let all = self.transcript_lines(w);
+                let (start, end) = self.selection_view_range(all.len(), viewport);
+                let eff = all.len().saturating_sub(end);
+                let painted = all[start..end].to_vec();
+                (start, eff, painted, Some(all))
+            };
         for (row, line) in painted.iter().enumerate() {
             let y = layout.transcript.start + row as u16;
             queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
@@ -339,7 +434,8 @@ impl State {
             if let Some((column, selected)) = self
                 .selection
                 .as_ref()
-                .and_then(|selection| selection.fragment_spans(row))
+                .filter(|_| self.selection_target == SelectionTarget::Transcript)
+                .and_then(|selection| selection.fragment_spans(start + row))
             {
                 if !selected.is_empty() {
                     queue!(out, cursor::MoveTo(column.min(w - 1) as u16, y))
@@ -361,16 +457,18 @@ impl State {
                 .map_err(ServiceError::storage)?;
             }
         }
+        if let Some(all) = all_snapshot {
+            self.painted_all_transcript = all;
+        }
+        self.painted_transcript_start = start;
+        self.painted_effective_scroll = effective_scroll;
         self.painted_transcript = painted;
         self.painted_size = (layout.width, layout.height);
         self.painted_layout = Some(layout);
         Ok(())
     }
 
-    fn render_hint(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
-        if layout.hint.len == 0 {
-            return Ok(());
-        }
+    fn hint_line(&self, layout: FrameLayout) -> (markdown::Line, Option<(u16, u16, String)>) {
         let w = usize::from(layout.width);
         let resume_notice = self.resume_notice.as_ref().filter(|_| {
             self.menu.as_ref().is_some_and(|menu| {
@@ -380,6 +478,91 @@ impl State {
                 )
             })
         });
+        let right_badge = if let Some(selected) = self.selection.as_ref().and_then(|s| s.text()) {
+            Some((
+                format!("{} chars selected ", selected.chars().count()),
+                Face::ACCENT,
+            ))
+        } else {
+            self.clipboard_notice.as_ref().map(|notice| {
+                let face = if notice.starts_with("Could not") {
+                    Face::DANGER
+                } else {
+                    Face::HIGHLIGHT
+                };
+                (format!("✓ {notice} "), face)
+            })
+        };
+        let safe_w = Self::safe_row_width(layout.hint.start, layout.width, layout.height);
+
+        if self.painted_effective_scroll > 0
+            && self.history_clear_confirmation.is_none()
+            && self.selection.is_none()
+            && resume_notice.is_none()
+            && safe_w > 0
+        {
+            let raw_btn = if safe_w >= 22 {
+                "[ ↓ Jump to bottom ]"
+            } else {
+                "[ ↓ Bottom ]"
+            };
+            let btn_text = clip(raw_btn, safe_w);
+            let btn_w = btn_text.width();
+            if !btn_text.is_empty() {
+                if let Some((badge, badge_face)) = right_badge.as_ref() {
+                    let badge_clipped = clip(badge, safe_w);
+                    let badge_w = badge_clipped.width();
+                    if btn_w + 2 + badge_w <= safe_w {
+                        let center_start = safe_w.saturating_sub(btn_w) / 2;
+                        let start = if center_start + btn_w + 2 + badge_w <= safe_w {
+                            center_start
+                        } else {
+                            safe_w.saturating_sub(badge_w + 2 + btn_w)
+                        };
+                        let gap = safe_w.saturating_sub(start + btn_w + badge_w);
+                        let mut line = Vec::new();
+                        if start > 0 {
+                            line.push(Span {
+                                text: " ".repeat(start),
+                                face: Face::MUTED,
+                            });
+                        }
+                        line.push(Span {
+                            text: btn_text.clone(),
+                            face: Face::ACCENT_BOLD,
+                        });
+                        if gap > 0 {
+                            line.push(Span {
+                                text: " ".repeat(gap),
+                                face: Face::MUTED,
+                            });
+                        }
+                        if !badge_clipped.is_empty() {
+                            line.push(Span {
+                                text: badge_clipped,
+                                face: *badge_face,
+                            });
+                        }
+                        return (line, Some((start as u16, (start + btn_w) as u16, btn_text)));
+                    }
+                } else {
+                    let start = safe_w.saturating_sub(btn_w) / 2;
+                    let mut line = Vec::new();
+                    if start > 0 {
+                        line.push(Span {
+                            text: " ".repeat(start),
+                            face: Face::MUTED,
+                        });
+                    }
+                    line.push(Span {
+                        text: btn_text.clone(),
+                        face: Face::ACCENT_BOLD,
+                    });
+                    return (line, Some((start as u16, (start + btn_w) as u16, btn_text)));
+                }
+            }
+        }
+
         let mut hint_is_live = false;
         let hint = if self.history_clear_confirmation.is_some() {
             " Type DELETE + Enter to confirm · Esc cancels".into()
@@ -450,28 +633,13 @@ impl State {
             " Alt+Enter newline · ↑↓ edit/history · Alt+E expand paste · Wheel/PgUp scroll · /help"
                 .into()
         };
-        let hint_color = if hint_is_live {
-            self.theme.accent
+        let hint_face = if hint_is_live {
+            Face::ACCENT
         } else {
-            self.theme.muted
+            Face::MUTED
         };
-        let right_badge = if let Some(selected) = self.selection.as_ref().and_then(|s| s.text()) {
-            Some((
-                format!("{} chars selected ", selected.chars().count()),
-                self.theme.accent,
-            ))
-        } else {
-            self.clipboard_notice.as_ref().map(|notice| {
-                let color = if notice.starts_with("Could not") {
-                    self.theme.danger
-                } else {
-                    self.theme.highlight
-                };
-                (format!("✓ {notice} "), color)
-            })
-        };
-        let safe_w = Self::safe_row_width(layout.hint.start, layout.width, layout.height);
-        let rendered_width = if let Some((badge, badge_color)) = right_badge {
+        let mut line = Vec::new();
+        if let Some((badge, badge_face)) = right_badge {
             let badge_clipped = clip(&badge, safe_w);
             let badge_w = badge_clipped.width();
             let left_max = safe_w.saturating_sub(badge_w + 2);
@@ -482,55 +650,147 @@ impl State {
             };
             let left_w = left_clipped.width();
             let pad = safe_w.saturating_sub(left_w + badge_w);
-            queue!(
-                out,
-                cursor::MoveTo(0, layout.hint.start),
-                style::Print(left_clipped.with(hint_color)),
-                style::Print(" ".repeat(pad).with(self.theme.muted)),
-                style::Print(badge_clipped.with(badge_color))
-            )
-            .map_err(ServiceError::storage)?;
-            left_w + pad + badge_w
+            if !left_clipped.is_empty() {
+                line.push(Span {
+                    text: left_clipped,
+                    face: hint_face,
+                });
+            }
+            if pad > 0 {
+                line.push(Span {
+                    text: " ".repeat(pad),
+                    face: Face::MUTED,
+                });
+            }
+            if !badge_clipped.is_empty() {
+                line.push(Span {
+                    text: badge_clipped,
+                    face: badge_face,
+                });
+            }
         } else {
             let hint_clipped = clip(&hint, safe_w);
-            let width = hint_clipped.width();
+            if !hint_clipped.is_empty() {
+                line.push(Span {
+                    text: hint_clipped,
+                    face: hint_face,
+                });
+            }
+        }
+        (line, None)
+    }
+
+    fn render_hint(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+        if layout.hint.len == 0 {
+            self.scroll_bottom_button = None;
+            if self.selection.is_none() {
+                self.painted_hint.clear();
+            }
+            return Ok(());
+        }
+        let safe_w = Self::safe_row_width(layout.hint.start, layout.width, layout.height);
+        let hint_selected =
+            self.selection.is_some() && self.selection_target == SelectionTarget::Hint;
+        let (line, button) = if hint_selected {
+            (
+                self.selection
+                    .as_ref()
+                    .and_then(|s| s.lines.first())
+                    .cloned()
+                    .unwrap_or_default(),
+                None,
+            )
+        } else {
+            let (line, button) = self.hint_line(layout);
+            if self.selection.is_none() {
+                self.painted_hint = vec![line.clone()];
+            }
+            (line, button)
+        };
+        self.scroll_bottom_button = button
+            .as_ref()
+            .map(|(start, end, _)| (layout.hint.start, *start, *end));
+        let rendered_width: usize = line.iter().map(|s| s.text.width()).sum();
+        queue!(out, cursor::MoveTo(0, layout.hint.start)).map_err(ServiceError::storage)?;
+        markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
+        Self::pad_and_clear_row(out, layout.hint.start, rendered_width, layout, self.theme)?;
+        if let Some((start, _, btn_text)) = button {
             queue!(
                 out,
-                cursor::MoveTo(0, layout.hint.start),
-                style::Print(hint_clipped.as_str().with(hint_color))
+                cursor::MoveTo(start, layout.hint.start),
+                style::Print(
+                    btn_text
+                        .with(self.theme.selected_text)
+                        .on(self.theme.selected_background)
+                        .attribute(style::Attribute::Bold)
+                ),
+                style::SetBackgroundColor(self.theme.background),
+                style::SetForegroundColor(self.theme.text),
             )
             .map_err(ServiceError::storage)?;
-            width
-        };
-        Self::pad_and_clear_row(
-            out,
-            layout.hint.start,
-            rendered_width,
-            layout,
-            self.theme,
-        )
+        }
+        if hint_selected {
+            if let Some((column, selected)) = self
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.fragment_spans(0))
+            {
+                if !selected.is_empty() && column < safe_w {
+                    queue!(out, cursor::MoveTo(column as u16, layout.hint.start))
+                        .map_err(ServiceError::storage)?;
+                    markdown::write_selection(out, &selected, self.theme)
+                        .map_err(ServiceError::storage)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn render_composer(
-        &self,
+        &mut self,
         out: &mut impl Write,
         layout: FrameLayout,
         rows: &[String],
     ) -> Result<()> {
         let w = usize::from(layout.width);
         let visible = usize::from(layout.composer.len);
-        for (i, row) in rows[layout.editor_from..layout.editor_from + visible]
-            .iter()
-            .enumerate()
-        {
+        let composer_selected =
+            self.selection.is_some() && self.selection_target == SelectionTarget::Composer;
+        let lines: Vec<markdown::Line> = if composer_selected {
+            self.selection
+                .as_ref()
+                .map(|s| s.lines.iter().take(visible).cloned().collect())
+                .unwrap_or_default()
+        } else {
+            let lines: Vec<markdown::Line> = rows[layout.editor_from..layout.editor_from + visible]
+                .iter()
+                .map(|row| {
+                    if row.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Span {
+                            text: row.clone(),
+                            face: Face::TEXT,
+                        }]
+                    }
+                })
+                .collect();
+            if self.selection.is_none() {
+                self.painted_composer = lines.clone();
+            }
+            lines
+        };
+        for (i, line) in lines.iter().enumerate() {
+            let y = layout.composer.start + i as u16;
+            let row_width: usize = line.iter().map(|s| s.text.width()).sum();
             queue!(
                 out,
-                cursor::MoveTo(0, layout.composer.start + i as u16),
+                cursor::MoveTo(0, y),
                 style::Print(if i == 0 { "> " } else { "  " }.with(self.theme.accent)),
-                style::Print(row.as_str().with(self.theme.text))
             )
             .map_err(ServiceError::storage)?;
-            if 2 + row.width() < w {
+            markdown::write_line(out, line, self.theme).map_err(ServiceError::storage)?;
+            if 2 + row_width < w {
                 queue!(
                     out,
                     style::SetBackgroundColor(self.theme.background),
@@ -538,7 +798,250 @@ impl State {
                 )
                 .map_err(ServiceError::storage)?;
             }
+            if composer_selected {
+                if let Some((column, selected)) = self
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.fragment_spans(i))
+                {
+                    if !selected.is_empty() && 2 + column < w {
+                        queue!(out, cursor::MoveTo((2 + column) as u16, y))
+                            .map_err(ServiceError::storage)?;
+                        markdown::write_selection(out, &selected, self.theme)
+                            .map_err(ServiceError::storage)?;
+                    }
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn render_completion(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+        let Some(mention) = &self.mention else {
+            return Ok(());
+        };
+        if layout.completion.len == 0 {
+            return Ok(());
+        }
+        let start_row = layout.completion.start;
+        let total_rows = usize::from(layout.completion.len);
+
+        // Top horizontal divider separating composer from the mention panel.
+        let divider_w = Self::safe_row_width(start_row, layout.width, layout.height);
+        queue!(
+            out,
+            cursor::MoveTo(0, start_row),
+            style::Print(
+                "─"
+                    .repeat(divider_w)
+                    .with(self.theme.subtle)
+                    .on(self.theme.background)
+            ),
+            style::SetBackgroundColor(self.theme.background),
+            terminal::Clear(ClearType::UntilNewLine)
+        )
+        .map_err(ServiceError::storage)?;
+
+        if total_rows == 1 {
+            return Ok(());
+        }
+
+        let has_hint = total_rows >= 3;
+        let body_end = total_rows - usize::from(has_hint);
+
+        if mention.matches.is_empty() {
+            let status_row = start_row + 1;
+            let safe_w = Self::safe_row_width(status_row, layout.width, layout.height);
+            queue!(out, cursor::MoveTo(0, status_row)).map_err(ServiceError::storage)?;
+            if mention.loading {
+                let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                    [(mention.started_at.elapsed().as_millis() / 120 % 10) as usize];
+                let msg = if mention.query.is_empty() {
+                    " Fetching matches...".to_owned()
+                } else {
+                    format!(" Fetching matches for \"{}\"...", mention.query)
+                };
+                let line = markdown::spans(
+                    &[
+                        (" ", Face::MUTED),
+                        (spinner, Face::ACCENT),
+                        (&msg, Face::MUTED),
+                    ],
+                    safe_w.max(1),
+                )
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+                let rendered_w: usize = line.iter().map(|s| s.text.width()).sum();
+                markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, status_row, rendered_w, layout, self.theme)?;
+            } else {
+                let msg = if mention.query.is_empty() {
+                    "   No workspace files found".to_owned()
+                } else {
+                    format!("   No matches for \"{}\"", mention.query)
+                };
+                let text = clip(&msg, safe_w);
+                let rendered_w = text.width();
+                queue!(
+                    out,
+                    style::Print(text.with(self.theme.muted).on(self.theme.background))
+                )
+                .map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, status_row, rendered_w, layout, self.theme)?;
+            }
+            for empty_idx in 2..body_end {
+                let row = start_row + empty_idx as u16;
+                queue!(out, cursor::MoveTo(0, row)).map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, row, 0, layout, self.theme)?;
+            }
+            if has_hint {
+                let hint_row = start_row + total_rows as u16 - 1;
+                let hint_w = Self::safe_row_width(hint_row, layout.width, layout.height);
+                let hint = clip(" esc Cancel", hint_w);
+                let rendered_w = hint.width();
+                queue!(
+                    out,
+                    cursor::MoveTo(0, hint_row),
+                    style::Print(hint.with(self.theme.muted).on(self.theme.background))
+                )
+                .map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, hint_row, rendered_w, layout, self.theme)?;
+            }
+            return Ok(());
+        }
+
+        let avail = body_end - 1;
+        let has_overflow = mention.has_overflow_row() && avail >= 2;
+        let (visible, local_offset) = mention.visible_window(total_rows);
+
+        let first_row_w = Self::safe_row_width(start_row + 1, layout.width, layout.height);
+        let max_display_cap = (first_row_w * 42 / 100).max(16);
+        let display_col_w = visible
+            .iter()
+            .map(|m| m.display.width())
+            .max()
+            .unwrap_or(16)
+            .clamp(12, max_display_cap)
+            .min(first_row_w.saturating_sub(10).max(8));
+
+        for (i, matched) in visible.iter().enumerate() {
+            let row = start_row + 1 + i as u16;
+            let safe_w = Self::safe_row_width(row, layout.width, layout.height);
+            let selected = mention.scroll + local_offset + i == mention.selected;
+            let indicator = if selected { "›" } else { " " };
+            let display_text = clip(&matched.display, display_col_w);
+            let display_pad = " ".repeat(display_col_w.saturating_sub(display_text.width()));
+            let kind_label = format!("{:<4}", matched.kind.label());
+
+            let prefix_w = 3 + display_text.width() + display_pad.len() + 2 + kind_label.width();
+            let detail_budget = safe_w.saturating_sub(prefix_w + 2);
+            let detail_text = if detail_budget >= 8 {
+                clip(&matched.detail, detail_budget)
+            } else {
+                String::new()
+            };
+
+            queue!(out, cursor::MoveTo(0, row)).map_err(ServiceError::storage)?;
+            if selected {
+                let mut full = format!(" {indicator} {display_text}{display_pad}  {kind_label}");
+                if !detail_text.is_empty() {
+                    full.push_str("  ");
+                    full.push_str(&detail_text);
+                }
+                let full = clip(&full, safe_w);
+                let fill = " ".repeat(safe_w.saturating_sub(full.width()));
+                queue!(
+                    out,
+                    style::Print(
+                        format!("{full}{fill}")
+                            .with(self.theme.selected_text)
+                            .on(self.theme.selected_background)
+                    ),
+                    style::SetBackgroundColor(self.theme.background),
+                    terminal::Clear(ClearType::UntilNewLine)
+                )
+                .map_err(ServiceError::storage)?;
+            } else {
+                let mut parts: Vec<(&str, Face)> = vec![
+                    ("   ", Face::TEXT),
+                    (&display_text, Face::TEXT),
+                    (&display_pad, Face::TEXT),
+                    ("  ", Face::MUTED),
+                    (
+                        &kind_label,
+                        match matched.kind {
+                            super::mentions::MentionKind::Dir => Face::ACCENT,
+                            super::mentions::MentionKind::Git => Face::HIGHLIGHT,
+                            super::mentions::MentionKind::File => Face::MUTED,
+                        },
+                    ),
+                ];
+                if !detail_text.is_empty() {
+                    parts.push(("  ", Face::MUTED));
+                    parts.push((&detail_text, Face::MUTED));
+                }
+                let line = markdown::spans(&parts, safe_w.max(1))
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let rendered_w: usize = line.iter().map(|s| s.text.width()).sum();
+                markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, row, rendered_w, layout, self.theme)?;
+            }
+        }
+
+        if has_overflow {
+            let overflow_row = start_row + 1 + visible.len() as u16;
+            let safe_w = Self::safe_row_width(overflow_row, layout.width, layout.height);
+            let above = mention.hidden_above() + local_offset;
+            let shown_end = (mention.scroll + local_offset + visible.len()).min(mention.total);
+            let below = mention.total.saturating_sub(shown_end);
+            let overflow_text = match (above > 0, below > 0) {
+                (true, true) => format!("   ↑ {above} more · ↓ {below} more"),
+                (false, true) => format!("   ↓ {below} more"),
+                (true, false) => format!("   ↑ {above} more"),
+                (false, false) => String::new(),
+            };
+            let overflow_text = clip(&overflow_text, safe_w);
+            let rendered_w = overflow_text.width();
+            queue!(
+                out,
+                cursor::MoveTo(0, overflow_row),
+                style::Print(
+                    overflow_text
+                        .with(self.theme.muted)
+                        .on(self.theme.background)
+                )
+            )
+            .map_err(ServiceError::storage)?;
+            Self::pad_and_clear_row(out, overflow_row, rendered_w, layout, self.theme)?;
+        }
+
+        let used_body_end = 1 + visible.len() + usize::from(has_overflow);
+        for empty_idx in used_body_end..body_end {
+            let row = start_row + empty_idx as u16;
+            queue!(out, cursor::MoveTo(0, row)).map_err(ServiceError::storage)?;
+            Self::pad_and_clear_row(out, row, 0, layout, self.theme)?;
+        }
+
+        if has_hint {
+            let hint_row = start_row + total_rows as u16 - 1;
+            let hint_w = Self::safe_row_width(hint_row, layout.width, layout.height);
+            let hint = clip(
+                " ↑/↓ Navigate · enter Select · tab Complete · esc Cancel",
+                hint_w,
+            );
+            let rendered_w = hint.width();
+            queue!(
+                out,
+                cursor::MoveTo(0, hint_row),
+                style::Print(hint.with(self.theme.muted).on(self.theme.background))
+            )
+            .map_err(ServiceError::storage)?;
+            Self::pad_and_clear_row(out, hint_row, rendered_w, layout, self.theme)?;
+        }
+
         Ok(())
     }
 
@@ -813,26 +1316,61 @@ impl State {
         )))
     }
 
-    fn render_subagents(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+    fn render_subagents(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
         let w = usize::from(layout.width);
         let count = usize::from(layout.subagents.len);
-        for (idx, sub) in self.subagents.iter().take(count).enumerate() {
-            let sub_row = layout.subagents.start + idx as u16;
-            let sub_parts = self.subagent_line_spans(idx, sub, w);
-            let sub_refs: Vec<(&str, Face)> = sub_parts
+        let subagents_selected =
+            self.selection.is_some() && self.selection_target == SelectionTarget::Subagents;
+        let lines: Vec<markdown::Line> = if subagents_selected {
+            self.selection
+                .as_ref()
+                .map(|s| s.lines.iter().take(count).cloned().collect())
+                .unwrap_or_default()
+        } else {
+            let lines: Vec<markdown::Line> = self
+                .subagents
                 .iter()
-                .map(|(text, face)| (text.as_str(), *face))
+                .take(count)
+                .enumerate()
+                .map(|(idx, sub)| {
+                    let sub_parts = self.subagent_line_spans(idx, sub, w);
+                    let sub_refs: Vec<(&str, Face)> = sub_parts
+                        .iter()
+                        .map(|(text, face)| (text.as_str(), *face))
+                        .collect();
+                    markdown::spans(&sub_refs, w.max(1))
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default()
+                })
                 .collect();
-            let sub_line = markdown::spans(&sub_refs, w.max(1))
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+            if self.selection.is_none() {
+                self.painted_subagents = lines.clone();
+            }
+            lines
+        };
+        for (idx, sub_line) in lines.iter().enumerate() {
+            let sub_row = layout.subagents.start + idx as u16;
             queue!(out, cursor::MoveTo(0, sub_row)).map_err(ServiceError::storage)?;
-            markdown::write_line(out, &sub_line, self.theme).map_err(ServiceError::storage)?;
+            markdown::write_line(out, sub_line, self.theme).map_err(ServiceError::storage)?;
             let sub_width: usize = sub_line.iter().map(|s| s.text.width()).sum();
             if sub_width < w {
                 queue!(out, terminal::Clear(ClearType::UntilNewLine))
                     .map_err(ServiceError::storage)?;
+            }
+            if subagents_selected {
+                if let Some((column, selected)) = self
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.fragment_spans(idx))
+                {
+                    if !selected.is_empty() {
+                        queue!(out, cursor::MoveTo(column.min(w - 1) as u16, sub_row))
+                            .map_err(ServiceError::storage)?;
+                        markdown::write_selection(out, &selected, self.theme)
+                            .map_err(ServiceError::storage)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -885,30 +1423,56 @@ impl State {
         Ok(())
     }
 
-    fn render_footer(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+    fn render_footer(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
         if layout.footer.len == 0 {
+            if self.selection.is_none() {
+                self.painted_footer.clear();
+            }
             return Ok(());
         }
         let safe_w = Self::safe_row_width(layout.footer.start, layout.width, layout.height);
-        let status_parts = self.status_spans(safe_w);
-        let status_refs: Vec<(&str, Face)> = status_parts
-            .iter()
-            .map(|(text, face)| (text.as_str(), *face))
-            .collect();
-        let status_line = markdown::spans(&status_refs, safe_w.max(1))
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let footer_selected =
+            self.selection.is_some() && self.selection_target == SelectionTarget::Footer;
+        let status_line = if footer_selected {
+            self.selection
+                .as_ref()
+                .and_then(|s| s.lines.first())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            let status_parts = self.status_spans(safe_w);
+            let status_refs: Vec<(&str, Face)> = status_parts
+                .iter()
+                .map(|(text, face)| (text.as_str(), *face))
+                .collect();
+            let line = markdown::spans(&status_refs, safe_w.max(1))
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            if self.selection.is_none() {
+                self.painted_footer = vec![line.clone()];
+            }
+            line
+        };
         let rendered_width: usize = status_line.iter().map(|span| span.text.width()).sum();
         queue!(out, cursor::MoveTo(0, layout.footer.start)).map_err(ServiceError::storage)?;
         markdown::write_line(out, &status_line, self.theme).map_err(ServiceError::storage)?;
-        Self::pad_and_clear_row(
-            out,
-            layout.footer.start,
-            rendered_width,
-            layout,
-            self.theme,
-        )
+        Self::pad_and_clear_row(out, layout.footer.start, rendered_width, layout, self.theme)?;
+        if footer_selected {
+            if let Some((column, selected)) = self
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.fragment_spans(0))
+            {
+                if !selected.is_empty() && column < safe_w {
+                    queue!(out, cursor::MoveTo(column as u16, layout.footer.start))
+                        .map_err(ServiceError::storage)?;
+                    markdown::write_selection(out, &selected, self.theme)
+                        .map_err(ServiceError::storage)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn render_frame(
@@ -918,9 +1482,8 @@ impl State {
         height: u16,
     ) -> Result<()> {
         let Some((layout, editor_rows)) = self.compute_layout(width, height) else {
-            self.painted_transcript.clear();
-            self.painted_layout = None;
-            self.selection = None;
+            self.clear_painted_regions();
+            self.clear_selection();
             return Ok(());
         };
         let full_clear = self.selection.is_none();
@@ -946,6 +1509,7 @@ impl State {
         self.render_transcript(out, layout, full_clear)?;
         self.render_hint(out, layout)?;
         self.render_composer(out, layout, &editor_rows)?;
+        self.render_completion(out, layout)?;
         self.render_menu_overlay(out, layout)?;
         let cursor_position = self
             .render_history_clear_overlay(out, layout)?

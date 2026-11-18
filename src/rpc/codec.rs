@@ -761,7 +761,38 @@ pub fn knowledge_excerpt_to(e: crate::knowledge::Excerpt) -> pb::KnowledgeExcerp
         citation: e.citation,
     }
 }
+const CHAT_ONLY_STEP_FLAG: u32 = 1 << 31;
+const PERMS_PRESENT_FLAG: u32 = 1 << 30;
+const PERM_READ_FLAG: u32 = 1 << 29;
+const PERM_EDIT_FLAG: u32 = 1 << 28;
+const PERM_SHELL_FLAG: u32 = 1 << 27;
+const PERM_BROWSER_FLAG: u32 = 1 << 26;
+const PERM_SUBAGENT_FLAG: u32 = 1 << 25;
+const STEP_COUNT_MASK: u32 = (1 << 25) - 1;
+
 pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
+    let mut max_steps = u32::try_from(r.max_steps).unwrap_or(STEP_COUNT_MASK) & STEP_COUNT_MASK;
+    if r.chat_only {
+        max_steps |= CHAT_ONLY_STEP_FLAG;
+    }
+    if let Some(perms) = r.permissions {
+        max_steps |= PERMS_PRESENT_FLAG;
+        if perms.read {
+            max_steps |= PERM_READ_FLAG;
+        }
+        if perms.edit {
+            max_steps |= PERM_EDIT_FLAG;
+        }
+        if perms.shell {
+            max_steps |= PERM_SHELL_FLAG;
+        }
+        if perms.browser {
+            max_steps |= PERM_BROWSER_FLAG;
+        }
+        if perms.subagent {
+            max_steps |= PERM_SUBAGENT_FLAG;
+        }
+    }
     pb::AgentRequest {
         environment: r.environment.unwrap_or_default().into_iter().collect(),
         task: r.task,
@@ -771,7 +802,7 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
         thinking: r.thinking,
         temporary: r.temporary,
         no_shell: r.no_shell,
-        max_steps: u32::try_from(r.max_steps).unwrap_or(u32::MAX),
+        max_steps,
         knowledge: r.knowledge,
         mcp_config: r.mcp_config.map(|p| p.to_string_lossy().into_owned()),
         artifacts: r.artifacts,
@@ -779,6 +810,15 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
     }
 }
 pub fn agent_request_from(r: pb::AgentRequest) -> d::AgentRequest {
+    let chat_only = (r.max_steps & CHAT_ONLY_STEP_FLAG) != 0;
+    let permissions = ((r.max_steps & PERMS_PRESENT_FLAG) != 0).then(|| d::ToolPermissions {
+        read: (r.max_steps & PERM_READ_FLAG) != 0,
+        edit: (r.max_steps & PERM_EDIT_FLAG) != 0,
+        shell: (r.max_steps & PERM_SHELL_FLAG) != 0,
+        browser: (r.max_steps & PERM_BROWSER_FLAG) != 0,
+        subagent: (r.max_steps & PERM_SUBAGENT_FLAG) != 0,
+    });
+    let max_steps = (r.max_steps & STEP_COUNT_MASK) as usize;
     d::AgentRequest {
         environment: (!r.environment.is_empty()).then(|| r.environment.into_iter().collect()),
         task: r.task,
@@ -788,11 +828,13 @@ pub fn agent_request_from(r: pb::AgentRequest) -> d::AgentRequest {
         thinking: r.thinking,
         temporary: r.temporary,
         no_shell: r.no_shell,
-        max_steps: r.max_steps as usize,
+        max_steps,
         knowledge: r.knowledge,
         mcp_config: r.mcp_config.map(PathBuf::from),
         artifacts: r.artifacts,
         parent_id: r.parent_id,
+        chat_only,
+        permissions,
     }
 }
 pub fn agent_to(record: d::AgentRecord) -> pb::Agent {
@@ -990,14 +1032,17 @@ mod tests {
             assert_eq!(roundtrip, manifest);
             assert_eq!(
                 roundtrip.resolved_inline_prompt_chars(),
-                setting.unwrap_or(2_000)
+                setting.unwrap_or(crate::provider::DEFAULT_INLINE_PROMPT_CHARS)
             );
             let wire = pb::ProviderInfo {
                 inline_prompt_chars: setting,
                 ..Default::default()
             };
             let info = provider_info_from(wire);
-            assert_eq!(info.inline_prompt_chars, setting.unwrap_or(2_000));
+            assert_eq!(
+                info.inline_prompt_chars,
+                setting.unwrap_or(crate::provider::DEFAULT_INLINE_PROMPT_CHARS)
+            );
             assert_eq!(provider_info_from(provider_info_to(info.clone())), info);
         }
         let mut json =
@@ -1007,7 +1052,7 @@ mod tests {
             serde_json::from_value::<ProviderInfo>(json)
                 .unwrap()
                 .inline_prompt_chars,
-            2_000
+            crate::provider::DEFAULT_INLINE_PROMPT_CHARS
         );
     }
 

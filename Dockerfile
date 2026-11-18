@@ -9,6 +9,8 @@ FROM build-base AS linux-build
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 RUN rustup target add ${RUST_TARGET}
 COPY . .
+ARG ANTICRUMB_GIT_HEAD=unknown
+ENV ANTICRUMB_GIT_HEAD=${ANTICRUMB_GIT_HEAD}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo run --locked -q -p xtask -- package --target ${RUST_TARGET}
 RUN mkdir /out && cp dist/anticrumb-${RUST_TARGET}/anticrumb dist/anticrumb-${RUST_TARGET}/LICENSE /out/
 FROM scratch AS artifacts
@@ -19,6 +21,8 @@ ARG RUST_TARGET=x86_64-pc-windows-gnu
 RUN test "${RUST_TARGET}" = x86_64-pc-windows-gnu && apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 && rm -rf /var/lib/apt/lists/*
 RUN rustup target add ${RUST_TARGET}
 COPY . .
+ARG ANTICRUMB_GIT_HEAD=unknown
+ENV ANTICRUMB_GIT_HEAD=${ANTICRUMB_GIT_HEAD}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo run --locked -q -p xtask -- package --target ${RUST_TARGET}
 FROM scratch AS windows-artifacts
 COPY --from=windows-build /src/dist/ /
@@ -35,6 +39,8 @@ RUN cd /opt/osxcross && UNATTENDED=1 BUILD_FLAVOR=stable ENABLE_ARCHS="arm64 x86
 ENV PATH="/opt/osxcross/target/bin:${PATH}" MACOSX_DEPLOYMENT_TARGET=11.0
 RUN rustup target add ${RUST_TARGET}
 COPY . .
+ARG ANTICRUMB_GIT_HEAD=unknown
+ENV ANTICRUMB_GIT_HEAD=${ANTICRUMB_GIT_HEAD}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo run --locked -q -p xtask -- macos-cross ${RUST_TARGET}
 FROM scratch AS macos-artifacts
 COPY --from=macos-build /src/dist/ /

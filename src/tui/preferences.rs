@@ -24,7 +24,7 @@ impl Preferences {
                 .as_bytes(),
         )
     }
-    pub fn history(&self, account: &str, workspace: &Path) -> Result<Vec<Draft>> {
+    pub(super) fn history(&self, account: &str, workspace: &Path) -> Result<Vec<Draft>> {
         match self
             .store
             .get::<Vec<Draft>>("ui", "history", &Self::key(account, workspace))
@@ -34,7 +34,12 @@ impl Preferences {
             Err(error) => Err(error),
         }
     }
-    pub fn record(&self, account: &str, workspace: &Path, input: &Draft) -> Result<Vec<Draft>> {
+    pub(super) fn record(
+        &self,
+        account: &str,
+        workspace: &Path,
+        input: &Draft,
+    ) -> Result<Vec<Draft>> {
         let key = Self::key(account, workspace);
         self.store
             .update_immediate("ui", "history", &key, |history| append(history, input))
@@ -56,6 +61,28 @@ impl Preferences {
     pub fn set_debug_level(&self, level: u8) -> Result<()> {
         self.store
             .put("ui", "settings", "debug_level", &level.min(2))
+    }
+    pub fn permissions(&self) -> Option<ToolPermissions> {
+        if let Ok(perms) = self.store.get::<ToolPermissions>("ui", "settings", "permissions") {
+            return Some(perms);
+        }
+        self.no_shell().map(|no_shell| ToolPermissions {
+            read: true,
+            edit: false,
+            shell: !no_shell,
+            browser: false,
+            subagent: false,
+        })
+    }
+    pub fn set_permissions(&self, perms: ToolPermissions) -> Result<()> {
+        self.store.put("ui", "settings", "no_shell", &!perms.shell)?;
+        self.store.put("ui", "settings", "permissions", &perms)
+    }
+    pub fn no_shell(&self) -> Option<bool> {
+        if let Ok(perms) = self.store.get::<ToolPermissions>("ui", "settings", "permissions") {
+            return Some(!perms.shell);
+        }
+        self.store.get::<bool>("ui", "settings", "no_shell").ok()
     }
     pub fn model_selection(&self, account: &str) -> ModelPreference {
         self.store
@@ -79,7 +106,7 @@ impl Preferences {
         )
     }
 }
-pub fn append(history: &mut Vec<Draft>, input: &Draft) {
+pub(super) fn append(history: &mut Vec<Draft>, input: &Draft) {
     if input.text.is_empty() || history.last().is_some_and(|s| s == input) {
         return;
     }

@@ -16,6 +16,10 @@ use std::time::Instant;
 pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Keyboard shortcuts and commands"),
     (
+        "/mode",
+        "Switch between Chat mode (default) and Agent mode (--yolo)",
+    ),
+    (
         "/copy",
         "Copy the last assistant response, including Markdown",
     ),
@@ -48,7 +52,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/new", "Start a fresh conversation"),
     ("/clear", "Clear the screen and start fresh"),
-    ("/permissions", "Choose whether shell tools are available"),
+    (
+        "/permissions",
+        "Configure tool permissions (read, edit, shell, browser, subagent)",
+    ),
     (
         "/pace",
         "Set anti-bot humanization pace (/pace fast|low|high)",
@@ -63,6 +70,15 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/exit", "Exit and stop this application's running work"),
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PermissionKind {
+    Read,
+    Edit,
+    Shell,
+    Browser,
+    Subagent,
+}
 
 pub(super) enum Selection {
     Provider {
@@ -79,6 +95,15 @@ pub(super) enum Selection {
     Resume(String),
     DeleteConversation(String),
     CancelDelete,
+    Mode {
+        agent: bool,
+        yolo: bool,
+    },
+    Permission {
+        kind: PermissionKind,
+        perms: crate::domain::ToolPermissions,
+    },
+    #[allow(dead_code)]
     Shell(bool),
     Pace(crate::gemini::HumanPace),
     Debug(u8),
@@ -202,6 +227,7 @@ impl State {
             typed: String::new(),
         });
         self.completion = None;
+        self.clear_mention();
     }
 
     pub(super) fn history_clear_key(&mut self, key: event::KeyEvent, sink: &mut dyn EffectSink) {
@@ -503,6 +529,23 @@ impl State {
         {
             self.options.thinking = pref.thinking;
         }
+        if self.options.yolo {
+            self.options.permissions = crate::domain::ToolPermissions::all();
+            self.options.no_shell = false;
+        } else if !self.options.overrides.contains("permissions") {
+            if let Some(mut perms) = data.permissions() {
+                if self.options.overrides.contains("no_shell") {
+                    perms.shell = !self.options.no_shell;
+                }
+                self.options.no_shell = !perms.shell;
+                self.options.permissions = perms;
+            } else if !self.options.overrides.contains("no_shell") {
+                if let Some(no_shell) = data.no_shell() {
+                    self.options.no_shell = no_shell;
+                    self.options.permissions.shell = !no_shell;
+                }
+            }
+        }
     }
 
     fn log_help(&mut self) {
@@ -516,14 +559,8 @@ impl State {
                 "@path",
                 "Attach file through Gemini's picker (@\"path with spaces\")",
             ),
-            (
-                "@git:diff",
-                "Attach unstaged git diff as a patch file",
-            ),
-            (
-                "@git:staged",
-                "Attach staged git diff as a patch file",
-            ),
+            ("@git:diff", "Attach unstaged git diff as a patch file"),
+            ("@git:staged", "Attach staged git diff as a patch file"),
             ("Tab", "Complete slash commands or @path"),
             (
                 "Up / Down",
@@ -574,12 +611,30 @@ impl State {
             .map(String::as_str)
             .unwrap_or("new")
             .to_owned();
-        let shell_enabled = !self.options.no_shell;
+        let perms = self.options.effective_permissions();
         let store = crate::store::Store::open(&crate::cli::root()).ok();
         let pace = self
             .options
             .pace
             .unwrap_or_else(|| crate::gemini::load_human_pace(store.as_ref()));
+        let mode_text = if !self.options.agent {
+            "Chat (direct conversation, no tools)".to_owned()
+        } else if self.options.yolo {
+            "Agent (--yolo · all tools & sub-agents allowed)".to_owned()
+        } else {
+            format!("Agent (permissions: {})", perms.summary())
+        };
+        self.log_kv(
+            "· ",
+            Face::ACCENT,
+            "Mode",
+            &mode_text,
+            if self.options.agent {
+                Face::HIGHLIGHT_BOLD
+            } else {
+                Face::ACCENT
+            },
+        );
         self.log_kv("· ", Face::ACCENT, "Model", &model, Face::ACCENT_BOLD);
         self.log_kv("· ", Face::ACCENT, "Thinking", &thinking, Face::HIGHLIGHT);
         self.log_kv(
@@ -635,12 +690,12 @@ impl State {
         self.log_kv(
             "· ",
             Face::ACCENT,
-            "Shell tools",
-            if shell_enabled { "enabled" } else { "disabled" },
-            if shell_enabled {
+            "Permissions",
+            &perms.summary(),
+            if perms.shell || perms.edit {
                 Face::HIGHLIGHT_BOLD
             } else {
-                Face::DANGER
+                Face::ACCENT
             },
         );
         let in_c = self.in_chars.to_string();
@@ -680,6 +735,121 @@ impl State {
         );
     }
 
+    pub(super) fn open_permissions(
+        &mut self,
+        perms: crate::domain::ToolPermissions,
+        selected: usize,
+    ) {
+        let mark = |on: bool| if on { "[x]" } else { "[ ]" };
+        let items = [
+            (
+                PermissionKind::Read,
+                perms.read,
+                "read      File search & read (find_files, grep_search, read_file)",
+            ),
+            (
+                PermissionKind::Edit,
+                perms.edit,
+                "edit      File modify & create (edit_file, write_file)",
+            ),
+            (
+                PermissionKind::Shell,
+                perms.shell,
+                "shell     Shell & processes (run_shell, start_process, …)",
+            ),
+            (
+                PermissionKind::Browser,
+                perms.browser,
+                "browser   Web fetch & Chrome control (web_fetch, browser_control, …)",
+            ),
+            (
+                PermissionKind::Subagent,
+                perms.subagent,
+                "subagent  Parallel worker sub-agents (spawn_agent)",
+            ),
+        ];
+        let choices = items
+            .into_iter()
+            .map(|(kind, on, desc)| Choice {
+                label: format!("{} {desc}", mark(on)),
+                value: Selection::Permission { kind, perms },
+            })
+            .collect();
+        self.menu = Some(Menu {
+            title: "Permissions · ↑↓ move · Space/←→ toggle · Enter save · Esc cancel".into(),
+            choices,
+            selected: selected.min(4),
+        });
+    }
+
+    pub(super) fn toggle_permission_menu_item(&mut self) -> bool {
+        let Some(menu) = self.menu.as_ref() else {
+            return false;
+        };
+        let selected = menu.selected;
+        let Some(Choice {
+            value: Selection::Permission { kind, mut perms },
+            ..
+        }) = menu.choices.get(selected)
+        else {
+            return false;
+        };
+        match kind {
+            PermissionKind::Read => perms.read = !perms.read,
+            PermissionKind::Edit => perms.edit = !perms.edit,
+            PermissionKind::Shell => perms.shell = !perms.shell,
+            PermissionKind::Browser => perms.browser = !perms.browser,
+            PermissionKind::Subagent => perms.subagent = !perms.subagent,
+        }
+        self.open_permissions(perms, selected);
+        true
+    }
+
+    pub(super) fn apply_permissions(&mut self, perms: crate::domain::ToolPermissions) {
+        self.options.overrides.insert("permissions".into());
+        self.options.overrides.insert("no_shell".into());
+        self.options.permissions = perms;
+        self.options.no_shell = !perms.shell;
+        if perms != crate::domain::ToolPermissions::all() {
+            self.options.yolo = false;
+        }
+        if let Some(data) = &self.preferences {
+            if let Err(e) = data.set_permissions(perms) {
+                self.log_error(&format!("Permission setting could not be saved: {e}"));
+            }
+        }
+        self.log(&format!("Tool permissions saved: {}.", perms.summary()));
+    }
+
+    pub(super) fn set_agent_mode(&mut self, agent: bool, yolo: bool) {
+        self.options.overrides.insert("agent".into());
+        self.options.agent = agent;
+        self.options.yolo = agent && yolo;
+        if !agent {
+            self.log("Mode set to Chat: direct conversation without tools for the next turn.");
+        } else if yolo {
+            self.options.overrides.insert("no_shell".into());
+            self.options.no_shell = false;
+            self.log(
+                "Mode set to Agent (--yolo): all file, shell, browser, and sub-agent tools allowed for the next turn.",
+            );
+        } else {
+            if let Some(data) = &self.preferences {
+                if let Some(saved_perms) = data.permissions() {
+                    self.options.permissions = saved_perms;
+                    self.options.no_shell = !saved_perms.shell;
+                } else if let Some(saved_no_shell) = data.no_shell() {
+                    self.options.no_shell = saved_no_shell;
+                    self.options.permissions.shell = !saved_no_shell;
+                }
+            }
+            self.log(&format!(
+                "Mode set to Agent (permissions: {}).",
+                self.options.effective_permissions().summary()
+            ));
+        }
+    }
+
     pub(super) fn submit(&mut self, sink: &mut dyn EffectSink) -> bool {
         let draft = self.editor.draft();
         let input = draft.text.trim();
@@ -695,6 +865,7 @@ impl State {
             let arg = arg.trim();
             self.editor.set(String::new());
             self.completion = None;
+            self.clear_mention();
             match command {
                 "/exit" | "/quit" => {
                     if self.pending.is_none() {
@@ -704,6 +875,58 @@ impl State {
                     self.log("Finishing submission before stopping…");
                 }
                 "/help" => self.log_help(),
+                "/mode" => match arg {
+                    "" => {
+                        let current = if !self.options.agent {
+                            "chat"
+                        } else if self.options.yolo {
+                            "agent (--yolo)"
+                        } else {
+                            "agent"
+                        };
+                        let selected = if !self.options.agent {
+                            0
+                        } else if self.options.yolo {
+                            2
+                        } else {
+                            1
+                        };
+                        self.menu = Some(Menu {
+                            title: format!("Mode · current: {current}"),
+                            choices: vec![
+                                Choice {
+                                    label: "Chat · direct conversation (no tools, minimal tokens)"
+                                        .into(),
+                                    value: Selection::Mode {
+                                        agent: false,
+                                        yolo: false,
+                                    },
+                                },
+                                Choice {
+                                    label: "Agent · coding tools (respects /permissions)".into(),
+                                    value: Selection::Mode {
+                                        agent: true,
+                                        yolo: false,
+                                    },
+                                },
+                                Choice {
+                                    label:
+                                        "Agent (--yolo) · all file, shell & sub-agent tools allowed"
+                                            .into(),
+                                    value: Selection::Mode {
+                                        agent: true,
+                                        yolo: true,
+                                    },
+                                },
+                            ],
+                            selected,
+                        });
+                    }
+                    "chat" | "normal" | "off" => self.set_agent_mode(false, false),
+                    "agent" | "on" => self.set_agent_mode(true, false),
+                    "yolo" => self.set_agent_mode(true, true),
+                    _ => self.log("Usage: /mode [chat|agent|yolo]"),
+                },
                 "/copy" => {
                     if arg.is_empty() {
                         self.copy_last_response(sink);
@@ -881,20 +1104,56 @@ impl State {
                     self.log("New conversation. Saved conversations are available in /resume.");
                 }
                 "/permissions" => {
-                    self.menu = Some(Menu {
-                        title: "Tools · next turn (no OS sandbox)".into(),
-                        choices: vec![
-                            Choice {
-                                label: "File tools only · shell disabled".into(),
-                                value: Selection::Shell(false),
-                            },
-                            Choice {
-                                label: "File and shell tools · commands run as your user".into(),
-                                value: Selection::Shell(true),
-                            },
-                        ],
-                        selected: usize::from(!self.options.no_shell),
-                    });
+                    use crate::domain::ToolPermissions;
+                    if arg.is_empty() {
+                        let current = self.options.effective_permissions();
+                        self.open_permissions(current, 0);
+                    } else {
+                        match arg {
+                            "readonly" | "read-only" | "read" | "default" | "safe" => {
+                                self.apply_permissions(ToolPermissions::read_only());
+                            }
+                            "edit" | "write" => {
+                                self.apply_permissions(ToolPermissions {
+                                    read: true,
+                                    edit: true,
+                                    ..ToolPermissions::read_only()
+                                });
+                            }
+                            "all" | "full" => {
+                                self.apply_permissions(ToolPermissions::all());
+                            }
+                            _ => {
+                                let mut perms = self.options.effective_permissions();
+                                let mut ok = true;
+                                for token in arg.split_whitespace() {
+                                    let (enable, name) = if let Some(n) = token.strip_prefix('+') {
+                                        (true, n)
+                                    } else if let Some(n) = token.strip_prefix('-') {
+                                        (false, n)
+                                    } else {
+                                        (true, token)
+                                    };
+                                    match name {
+                                        "read" => perms.read = enable,
+                                        "edit" | "write" => perms.edit = enable,
+                                        "shell" => perms.shell = enable,
+                                        "browser" | "web" => perms.browser = enable,
+                                        "subagent" | "subagents" => perms.subagent = enable,
+                                        _ => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if ok {
+                                    self.apply_permissions(perms);
+                                } else {
+                                    self.log("Usage: /permissions [readonly|edit|all | +read|-read +edit|-edit +shell|-shell +browser|-browser +subagent|-subagent]");
+                                }
+                            }
+                        }
+                    }
                 }
                 "/pace" => {
                     use crate::gemini::HumanPace;
@@ -1114,6 +1373,7 @@ impl State {
         self.pending = Some((draft, std::mem::take(&mut self.files)));
         self.editor.set(String::new());
         self.completion = None;
+        self.clear_mention();
         let command = if let Some(id) = &self.active {
             Command::Steer {
                 id: id.clone(),
@@ -1275,14 +1535,12 @@ impl State {
                 );
             }
             Selection::Theme(theme) => self.choose_theme(theme),
+            Selection::Mode { agent, yolo } => self.set_agent_mode(agent, yolo),
+            Selection::Permission { perms, .. } => self.apply_permissions(perms),
             Selection::Shell(allow) => {
-                self.options.overrides.insert("no_shell".into());
-                self.options.no_shell = !allow;
-                self.log(if allow {
-                    "Tool selection saved for the next turn: file + shell tools."
-                } else {
-                    "Tool selection saved for the next turn: file tools only."
-                });
+                let mut perms = self.options.effective_permissions();
+                perms.shell = allow;
+                self.apply_permissions(perms);
             }
             Selection::Pace(pace) => {
                 let store = crate::store::Store::open(&crate::cli::root()).ok();

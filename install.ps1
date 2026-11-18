@@ -52,7 +52,7 @@
         }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [IO.Compression.ZipFile]::OpenRead($archive)
-        $installDir = if ($env:ANTICRUMB_INSTALL_DIR) { $env:ANTICRUMB_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\anticrumb\bin' }
+        $installDir = if ($env:ANTICRUMB_INSTALL_DIR) { $env:ANTICRUMB_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.local\bin' }
         [IO.Directory]::CreateDirectory($installDir) | Out-Null
         # Read only named regular entries. Archive directory paths are never extracted.
         foreach ($name in @('anticrumb.exe')) {

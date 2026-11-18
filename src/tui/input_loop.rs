@@ -3,6 +3,7 @@ use super::{
     clipboard,
     commands::{complete, Choice, Selection},
     layout::FrameLayout,
+    mentions::MentionSearchHandle,
     platform,
     preferences::Preferences,
     reducer::{EffectSink, State},
@@ -83,10 +84,20 @@ impl Drop for Terminal {
 
 struct TerminalSink<'a> {
     commands: &'a mpsc::SyncSender<Command>,
+    mentions: &'a MentionSearchHandle,
 }
 
 impl EffectSink for TerminalSink<'_> {
     fn send_command(&mut self, command: Command) -> std::result::Result<(), String> {
+        if let Command::SearchMentions {
+            id,
+            workspace,
+            query,
+        } = command
+        {
+            self.mentions.schedule(id, workspace, query);
+            return Ok(());
+        }
         self.commands.try_send(command).map_err(|e| {
             let cmd = match &e {
                 mpsc::TrySendError::Full(c) | mpsc::TrySendError::Disconnected(c) => c,
@@ -119,7 +130,8 @@ fn render_stdout(state: &mut State) -> Result<()> {
 fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> Result<bool> {
     match input {
         Input::Key(key) if key.kind != event::KeyEventKind::Release => {
-            let had_selection = state.selection.take().is_some();
+            let had_selection = state.selection.is_some();
+            state.clear_selection();
             state.last_click = None;
             state.clipboard_notice = None;
             if had_selection && key.code == KeyCode::Esc {
@@ -152,14 +164,21 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                     }
                     KeyCode::Up => state.move_menu(true),
                     KeyCode::Down | KeyCode::Tab => state.move_menu(false),
+                    KeyCode::Char(' ')
+                        if key.modifiers.is_empty() && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.toggle_permission_menu_item();
+                    }
                     KeyCode::Left | KeyCode::Right => {
-                        let menu = state.menu.as_mut().unwrap();
-                        if let Some(Choice {
-                            value: Selection::Model(model),
-                            ..
-                        }) = menu.choices.get_mut(menu.selected)
-                        {
-                            model.shift(key.code == KeyCode::Right);
+                        if !state.toggle_permission_menu_item() {
+                            let menu = state.menu.as_mut().unwrap();
+                            if let Some(Choice {
+                                value: Selection::Model(model),
+                                ..
+                            }) = menu.choices.get_mut(menu.selected)
+                            {
+                                model.shift(key.code == KeyCode::Right);
+                            }
                         }
                     }
                     KeyCode::Enter => state.select(sink),
@@ -184,6 +203,7 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                         state.saved_draft = state.editor.draft();
                         state.editor.set(String::new());
                         state.files.clear();
+                        state.clear_mention();
                         state.last_ctrl_c = Some(Instant::now());
                         state.log("Press Ctrl+C again to exit.");
                     }
@@ -219,6 +239,10 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                     state.editor.word_right();
                 }
                 KeyCode::Esc => {
+                    if state.mention.is_some() {
+                        state.dismiss_mention();
+                        return Ok(false);
+                    }
                     if state.completion.is_some() {
                         state.completion = None;
                         return Ok(false);
@@ -239,6 +263,10 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                     state.editor.insert("\n");
                 }
                 KeyCode::Enter => {
+                    if state.select_mention(sink) {
+                        state.completion = None;
+                        return Ok(false);
+                    }
                     if state.submit(sink) {
                         return Ok(true);
                     }
@@ -274,13 +302,19 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                 KeyCode::Backspace => state.editor.backspace(),
                 KeyCode::Delete => state.editor.delete(),
                 KeyCode::Tab => {
-                    if let Some(c) = complete(&state.editor, &state.options.workspace) {
-                        if let Some(value) = c.values.first() {
-                            state.editor.replace(c.start..c.end, value);
+                    if !state.tab_complete_mention(sink) {
+                        if let Some(c) = complete(&state.editor, &state.options.workspace) {
+                            if let Some(value) = c.values.first() {
+                                state.editor.replace(c.start..c.end, value);
+                            }
                         }
                     }
                 }
                 KeyCode::Up | KeyCode::Down => {
+                    if state.mention.is_some() && key.modifiers.is_empty() {
+                        state.move_mention(key.code == KeyCode::Up);
+                        return Ok(false);
+                    }
                     let (width, _) = terminal::size().map_err(ServiceError::storage)?;
                     let down = key.code == KeyCode::Down;
                     if !state
@@ -305,11 +339,15 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                 }
                 _ => {}
             }
-            state.completion =
-                complete(&state.editor, &state.options.workspace).filter(|c| !c.values.is_empty());
+            state.refresh_mention(sink);
+            state.completion = if state.mention.is_some() {
+                None
+            } else {
+                complete(&state.editor, &state.options.workspace).filter(|c| !c.values.is_empty())
+            };
         }
         Input::Paste(text) => {
-            state.selection = None;
+            state.clear_selection();
             state.last_click = None;
             state.clipboard_notice = None;
             if let Some(confirmation) = state.history_clear_confirmation.as_mut() {
@@ -328,20 +366,23 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             ) {
                 let (width, height) = terminal::size().map_err(ServiceError::storage)?;
-                state.scroll_wheel(
+                state.scroll_wheel_at(
                     mouse.kind == MouseEventKind::ScrollUp,
+                    mouse.column,
+                    mouse.row,
                     width.into(),
                     height.into(),
                 );
-            } else if let Some(text) = state.transcript_mouse(mouse) {
-                state.copy_text(&text, true, sink);
+            } else if !state.completion_mouse(mouse, sink) {
+                if let Some(text) = state.transcript_mouse(mouse) {
+                    state.copy_text(&text, true, sink);
+                }
             }
         }
         Input::Resize(_, _) => {
-            state.selection = None;
+            state.clear_selection();
             state.last_click = None;
-            state.painted_transcript.clear();
-            state.painted_layout = None;
+            state.clear_painted_regions();
         }
         _ => {}
     }
@@ -381,9 +422,17 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     };
     let (commands, rx) = mpsc::sync_channel(32);
     let (tx, updates) = mpsc::sync_channel(128);
+    let mention_search = MentionSearchHandle::spawn(tx.clone());
     worker_guard.thread = Some(std::thread::spawn(move || worker(client, rx, tx)));
     let mut terminal = Terminal::enter()?;
     let mut state = State::new(options);
+    if let crate::rpc::client::Connection::Grpc {
+        endpoint, tls_pin, ..
+    } = crate::rpc::workspace_client::selected_connection()
+    {
+        state.remote_tls_pin = tls_pin;
+        state.remote_tls_endpoint = Some(crate::rpc::client::endpoint_description(&endpoint));
+    }
     let prefs = Preferences::open(&crate::cli::root())?;
     // Resolve saved model IDs to display names before the immutable startup banner.
     state.catalog =
@@ -395,6 +444,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     state.load_history();
     let mut sink = TerminalSink {
         commands: &commands,
+        mentions: &mention_search,
     };
     state.send(
         &mut sink,
@@ -452,17 +502,26 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
             state.submit(&mut sink);
             initial = false;
         }
+        if state.tick_selection_autoscroll() {
+            dirty = true;
+        }
         // Drain burst input before repainting, keeping paste/fast typing responsive on slow terminals.
         // The Unix tty reader skips queued input for a zero timeout (#839).
         let input_pending = event::poll(Duration::from_millis(1)).map_err(ServiceError::storage)?;
+        let animating = state.busy() || state.mention_loading();
         if !input_pending
-            && (dirty || (state.busy() && last_render.elapsed() > Duration::from_millis(120)))
+            && (dirty || (animating && last_render.elapsed() > Duration::from_millis(120)))
         {
             render_stdout(&mut state)?;
             dirty = false;
             last_render = Instant::now();
         }
-        if !event::poll(Duration::from_millis(60)).map_err(ServiceError::storage)? {
+        let poll_wait = if state.mention_loading() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(60)
+        };
+        if !event::poll(poll_wait).map_err(ServiceError::storage)? {
             continue;
         }
         let input = event::read().map_err(ServiceError::storage)?;
@@ -476,6 +535,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         }
     }
     drop(terminal);
+    drop(mention_search);
     drop(commands);
     drop(updates);
     drop(worker_guard);

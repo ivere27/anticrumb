@@ -14,6 +14,7 @@ mod host_sync;
 pub(crate) mod local;
 pub mod relay;
 pub mod server;
+pub mod server_cmd;
 pub(crate) mod tls;
 pub mod workspace_client;
 pub const MAX_MESSAGE: usize = 48 * 1024 * 1024;

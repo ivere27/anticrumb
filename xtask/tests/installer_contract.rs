@@ -627,7 +627,7 @@ mod powershell_installer {
         Command::new("pwsh")
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&wrapper)
-            .env("LOCALAPPDATA", root.path().join("local"))
+            .env("USERPROFILE", root.path().join("home"))
             .env("PROCESSOR_ARCHITECTURE", "AMD64")
             .env_remove("ANTICRUMB_INSTALL_DIR")
             .output()
@@ -647,11 +647,7 @@ mod powershell_installer {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
-            fs::read(
-                root.path()
-                    .join("local/Programs/anticrumb/bin/anticrumb.exe")
-            )
-            .unwrap(),
+            fs::read(root.path().join("home/.local/bin/anticrumb.exe")).unwrap(),
             BINARY
         );
         assert!(!root.path().join("outside").exists());

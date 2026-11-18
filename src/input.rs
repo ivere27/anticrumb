@@ -132,7 +132,9 @@ pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
                 let _ = child.wait();
                 drop(file);
                 cleanup();
-                return Err(ServiceError::invalid(format!("failed to read git diff: {e}")));
+                return Err(ServiceError::invalid(format!(
+                    "failed to read git diff: {e}"
+                )));
             }
         };
         total_bytes += n as u64;

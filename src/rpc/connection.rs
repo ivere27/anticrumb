@@ -193,7 +193,7 @@ fn configure(setup: Setup) -> Result<Connection> {
                 {
                     eprintln!("The server certificate has changed since the previous connection.");
                 }
-                eprint!("Compare with the fingerprint displayed by the daemon. Trust this certificate? [y/N] ");
+                eprint!("Compare with the fingerprint displayed by the server. Trust this certificate? [y/N] ");
                 io::stderr().flush().map_err(ServiceError::storage)?;
                 let mut answer = String::new();
                 io::stdin()
@@ -228,7 +228,7 @@ fn configure(setup: Setup) -> Result<Connection> {
         })?;
     if info.role != "browser" {
         return Err(ServiceError::invalid(
-            "the endpoint is not a browser daemon; use the address of `anticrumb daemon`",
+            "the endpoint is not a browser server; use the address of `anticrumb server`",
         ));
     }
     let mut ca_file = setup.ca_file;

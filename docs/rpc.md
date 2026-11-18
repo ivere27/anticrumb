@@ -8,8 +8,8 @@
 |---|---|
 | `anticrumb` | Opens a TUI and starts or joins the local daemon |
 | `anticrumb daemon` | Runs a persistent local daemon without a TCP listener |
-| `anticrumb daemon --listen IP:PORT` | Adds authenticated browser RPC and provider HTTPS APIs |
-| `anticrumb connect` | Uses the local daemon for workspace tools and a remote host for Chrome |
+| `anticrumb server [IP:PORT]` | Exposes authenticated browser RPC and provider HTTPS APIs (defaults to `0.0.0.0:0`) |
+| `anticrumb connect` | Uses the local daemon for workspace tools and a remote server for Chrome |
 
 File, shell, and external MCP tools stay on the workspace machine. Network listeners do not expose `WorkspaceService`. Attachments cross hosts as content-addressed artifacts.
 
@@ -30,7 +30,7 @@ State under `ANTICRUMB_HOME`:
 | `run/` | Runtime locks, endpoint, `daemon.json`, and `daemon.log` |
 | `workspace/` | Local-browser workspace store and saved remote `connection.json` |
 | `workspaces/<server-key>/` | Workspace stores for remote browser backends |
-| `browser/` | Browser-host store; network token and TLS credentials when enabled |
+| `server/` | Browser-host store; network token and TLS credentials when enabled |
 
 ## Runtime Status
 
@@ -44,15 +44,23 @@ Replace the example address with your Chrome host's address:
 
 ```sh
 # Chrome host
-anticrumb daemon --listen 192.0.2.10:50051 --workers 3
+anticrumb server 192.0.2.10:50051 --workers 3
 
 # Workspace machine
-anticrumb connect https://192.0.2.10:50051 --token TOKEN_PRINTED_BY_DAEMON
+anticrumb connect https://192.0.2.10:50051 --token TOKEN_PRINTED_BY_SERVER
 ```
 
 Compare the displayed certificate fingerprints on first connection. The client saves the endpoint and pinned certificate; later `anticrumb connect` reuses them. Plain `anticrumb` uses the local browser. `connect status` inspects the saved profile; `connect local` removes it.
 
-The daemon persists a generated token and self-signed certificate. `--token` or `ANTICRUMB_TOKEN` overrides the token; `--tls-san DNS_OR_IP` adds a hostname/address, `--regenerate-tls` rotates the certificate, and client `--tls-pin SHA256` supports non-interactive trust setup. Host network options require `--listen`; even loopback TCP requires TLS and a bearer token. Local IPC remains available.
+The server persists a generated token, a long-lived Ed25519 internal Root CA (`ca-certificate.pem`, valid for 5 years), and a short-lived Ed25519 leaf certificate (`certificate.pem`, valid for 3 months and automatically renewed and hot-reloaded 3 days before expiration). Clients pin the internal Root CA so leaf rotation and SAN updates require no client re-trust. `--token` or `ANTICRUMB_TOKEN` overrides the token, `--regenerate-token` rotates the generated token, `--tls-san DNS_OR_IP` adds a hostname/address, `--regenerate-tls` rotates the Root CA and leaf identity, and client `--tls-pin SHA256` supports non-interactive trust setup. Bare `anticrumb server` (or `0.0.0.0:PORT` / `[::]:PORT`) automatically includes the machine's hostname and active matching-family interface IPs in the generated certificate SANs. Even loopback TCP requires TLS and a bearer token. Local IPC remains available.
+
+On Windows, if the firewall prompt was cancelled or virtual VPN adapters are classified under the Public profile, allow inbound connections for a VPN/virtual private range (such as `100.64.0.0/10` or `10.0.0.0/8`) in Administrator PowerShell:
+
+```powershell
+$exe = "$env:USERPROFILE\.local\bin\anticrumb.exe"
+Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName 'anticrumb server (VPN)' -Direction Inbound -Program $exe -LocalAddress 100.64.0.0/10 -RemoteAddress 100.64.0.0/10 -Action Allow -Profile Any
+```
 
 ## Key RPC Behaviors
 

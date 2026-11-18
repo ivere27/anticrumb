@@ -11,6 +11,7 @@ BUILD_JOBS ?= $(shell (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || ech
 DRY_RUN ?= 0
 VERSION ?= $(shell awk -F ' = ' '$$1=="version" { gsub(/"/, "", $$2); print $$2; exit }' Cargo.toml)
 DIST_DIR ?= dist/v$(VERSION)
+GIT_HEAD ?= $(shell head=$$(git rev-parse --short=7 HEAD 2>/dev/null); if [ -n "$$head" ]; then if ! git diff --no-ext-diff --quiet 2>/dev/null || ! git diff --no-ext-diff --cached --quiet 2>/dev/null; then printf '%s-dirty' "$$head"; else printf '%s' "$$head"; fi; else echo unknown; fi)
 
 FAST_RELEASE ?= 1
 
@@ -57,14 +58,14 @@ build-windows:
 build-macos:
 	cargo run --locked -q -p xtask -- package --profile $(PROFILE) --target $(MACOS_TARGET)
 docker-linux:
-	docker buildx build --platform $(LINUX_PLATFORM) --target artifacts --build-arg RUST_TARGET=$(LINUX_TARGET) --output type=local,dest=$(DIST_DIR)/docker-linux .
+	docker buildx build --platform $(LINUX_PLATFORM) --target artifacts --build-arg RUST_TARGET=$(LINUX_TARGET) --build-arg ANTICRUMB_GIT_HEAD=$(GIT_HEAD) --output type=local,dest=$(DIST_DIR)/docker-linux .
 docker-windows:
-	docker buildx build --platform linux/amd64 --target windows-artifacts --build-arg RUST_TARGET=$(WINDOWS_TARGET) --output type=local,dest=$(DIST_DIR)/docker-windows .
+	docker buildx build --platform linux/amd64 --target windows-artifacts --build-arg RUST_TARGET=$(WINDOWS_TARGET) --build-arg ANTICRUMB_GIT_HEAD=$(GIT_HEAD) --output type=local,dest=$(DIST_DIR)/docker-windows .
 docker-macos:
 	@test -n "$(APPLE_SDK_DIR)" && test -d "$(APPLE_SDK_DIR)" || { echo "Set APPLE_SDK_DIR to a directory containing your packaged Apple SDK" >&2; exit 1; }
-	docker buildx build --platform linux/amd64 --target macos-artifacts --build-context apple-sdk="$(APPLE_SDK_DIR)" --build-arg RUST_TARGET=$(MACOS_TARGET) --output type=local,dest=$(DIST_DIR)/docker-macos .
+	docker buildx build --platform linux/amd64 --target macos-artifacts --build-context apple-sdk="$(APPLE_SDK_DIR)" --build-arg RUST_TARGET=$(MACOS_TARGET) --build-arg ANTICRUMB_GIT_HEAD=$(GIT_HEAD) --output type=local,dest=$(DIST_DIR)/docker-macos .
 docker-runtime:
-	docker build --platform $(LINUX_PLATFORM) --target runtime --build-arg RUST_TARGET=$(LINUX_TARGET) -t anticrumb .
+	docker build --platform $(LINUX_PLATFORM) --target runtime --build-arg RUST_TARGET=$(LINUX_TARGET) --build-arg ANTICRUMB_GIT_HEAD=$(GIT_HEAD) -t anticrumb .
 clean:
 	cargo clean
 clean-dist:

@@ -9,6 +9,7 @@ use fs2::FileExt;
 use semver::Version;
 use std::fs;
 
+pub(crate) use install::cleanup_old_executables;
 pub const TARGET: &str = env!("ANTICRUMB_BUILD_TARGET");
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/ivere27/anticrumb/releases/latest";
 const REPOSITORY: &str = "ivere27/anticrumb";
@@ -503,5 +504,23 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(executable).unwrap(), "old");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cleanup_old_executables_removes_only_stale_running_old_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join(".anticrumb-running-1234.old");
+        let exe = directory.path().join("anticrumb.exe");
+        let other = directory.path().join("other.old");
+        let lock = directory.path().join(".anticrumb-update.lock");
+        fs::write(&old, "old running binary").unwrap();
+        fs::write(&exe, "current binary").unwrap();
+        fs::write(&other, "unrelated file").unwrap();
+        fs::write(&lock, "").unwrap();
+        cleanup_old_executables_in(directory.path());
+        assert!(!old.exists());
+        assert!(exe.exists());
+        assert!(other.exists());
+        assert!(lock.exists());
     }
 }

@@ -419,9 +419,9 @@ async fn api_auth_diagnostics_do_not_expose_secrets_or_submit_requests() {
         let hint = value["error"]["hint"].as_str().unwrap();
         for guidance in [
             "API key",
-            "anticrumb daemon",
+            "anticrumb server",
             "--token",
-            "daemon address",
+            "server address",
             "Chrome",
         ] {
             assert!(hint.contains(guidance));

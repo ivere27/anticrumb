@@ -78,6 +78,9 @@ impl<B: AgentBackend> CodingAgent<B> {
     }
 
     pub fn build_initial_prompt(&self, user_task: &str) -> String {
+        if self.registry.is_empty() {
+            return user_task.to_string();
+        }
         let workspace_for_instructions = self
             .config
             .load_instructions
@@ -160,6 +163,7 @@ impl<B: AgentBackend> CodingAgent<B> {
         ctx.browser_fetch = self.browser_fetch.clone();
         ctx.browser_control = self.browser_control.clone();
         ctx.spawn_agent = self.spawn_agent.clone();
+        ctx.dedup_reads = !self.config.temp_chat;
         let scope = RunScope {
             task,
             start,
@@ -390,9 +394,7 @@ impl<B: AgentBackend> CodingAgent<B> {
                     "\n\n[WARNING] You are repeating the same tool call(s) with the same arguments. Change your approach (re-read the error, inspect other files) or give your final answer.",
                 );
             }
-            feedback.push_str(
-                "\n\nContinue with the next tool call or provide the final answer if done.",
-            );
+            feedback.push_str("\n\nNext tool call or final answer:");
             transcript.push_user(feedback.clone(), true);
             outgoing.push(feedback);
 
