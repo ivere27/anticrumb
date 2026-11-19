@@ -1189,7 +1189,7 @@ fn check_inbound_firewall_warning(address: &std::net::SocketAddr) -> Option<Stri
             .ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let vpn_cidr = detected_vpn_cidr(&local_interface_ips());
-        return evaluate_windows_firewall_rules(&stdout, &exe_norm, address.port(), vpn_cidr);
+        evaluate_windows_firewall_rules(&stdout, &exe_norm, address.port(), vpn_cidr)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1204,11 +1204,11 @@ fn check_inbound_firewall_warning(address: &std::net::SocketAddr) -> Option<Stri
             .args(["--getappblocked", exe_str.as_ref()])
             .output()
             .ok()?;
-        return evaluate_macos_firewall_status(
+        evaluate_macos_firewall_status(
             &String::from_utf8_lossy(&global.stdout),
             &String::from_utf8_lossy(&blocked.stdout),
             exe_str.as_ref(),
-        );
+        )
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -1272,7 +1272,11 @@ pub fn run(args: &[String]) -> Result<()> {
                 certificate_der(&fs::read(anchor_path).map_err(ServiceError::storage)?)?;
             let token = options.network_token()?;
             let address = listener.local_addr().map_err(ServiceError::storage)?;
-            eprintln!("{} {}", server::log_timestamp(), crate::cli::help_banner());
+            eprintln!(
+                "{} {}",
+                server::log_timestamp(),
+                crate::build_info::help_banner()
+            );
             eprintln!("anticrumb server: https://{address}");
             eprintln!("Provider API: https://{address}/v1 (same TLS certificate and token)");
             let fingerprint = tls::certificate_fingerprint(&anchor_der);

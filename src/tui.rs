@@ -1748,9 +1748,9 @@ mod tests {
         });
         state.log_startup_banner();
 
-        let expected_version = env!("CARGO_PKG_VERSION");
+        let expected_version = crate::build_info::display_version();
         assert!(!expected_version.is_empty());
-        let commit = crate::cli::commit_head().expect("git HEAD short hash in repo");
+        let commit = crate::build_info::commit_head().expect("git HEAD short hash in repo");
         let sha = commit.strip_suffix("-dirty").unwrap_or(&commit);
         assert_eq!(sha.len(), 7);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1760,7 +1760,7 @@ mod tests {
         let rendered = String::from_utf8(frame).unwrap();
         assert!(rendered.contains("▄██████▄"));
         assert!(rendered.contains("▀████▀"));
-        assert!(rendered.contains(expected_version));
+        assert!(rendered.contains(&expected_version));
         assert!(rendered.contains(&format!("({commit})")));
         assert!(rendered.contains("Gemini Web · default"));
         assert!(rendered.contains("/tmp/fixture-proj"));

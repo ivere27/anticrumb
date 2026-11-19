@@ -8,9 +8,68 @@ mod unix_pty {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use unicode_width::UnicodeWidthStr;
+
+    fn lock_pty_test() -> MutexGuard<'static, ()> {
+        static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+        PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    unsafe fn set_cloexec(fd: libc::c_int) {
+        assert_eq!(
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC),
+            0,
+            "fcntl(F_SETFD, FD_CLOEXEC) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    unsafe fn set_nonblocking(fd: libc::c_int) {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0,
+            "fcntl(F_SETFL, O_NONBLOCK) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn wait_ready(fd: libc::c_int, write: bool, timeout_ms: i32) {
+        if fd >= 0 && (fd as usize) < libc::FD_SETSIZE {
+            unsafe {
+                let mut set: libc::fd_set = std::mem::zeroed();
+                libc::FD_ZERO(&mut set);
+                libc::FD_SET(fd, &mut set);
+                let mut tv = libc::timeval {
+                    tv_sec: (timeout_ms / 1000) as libc::time_t,
+                    tv_usec: ((timeout_ms % 1000) * 1000) as libc::suseconds_t,
+                };
+                let (readfds, writefds) = if write {
+                    (std::ptr::null_mut(), &mut set as *mut libc::fd_set)
+                } else {
+                    (&mut set as *mut libc::fd_set, std::ptr::null_mut())
+                };
+                let _ = libc::select(fd + 1, readfds, writefds, std::ptr::null_mut(), &mut tv);
+            }
+            return;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: if write { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        };
+        let _ = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    }
 
     struct PtyHarness {
         master: libc::c_int,
@@ -51,13 +110,22 @@ mod unix_pty {
             };
             assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
             unsafe {
-                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+                set_cloexec(master);
+                set_nonblocking(master);
+                set_cloexec(slave);
             }
 
             let fd_in = unsafe { libc::dup(slave) };
             let fd_out = unsafe { libc::dup(slave) };
             let fd_err = unsafe { libc::dup(slave) };
             assert!(fd_in >= 0 && fd_out >= 0 && fd_err >= 0);
+            unsafe {
+                for fd in [fd_in, fd_out, fd_err] {
+                    if fd > 2 {
+                        set_cloexec(fd);
+                    }
+                }
+            }
 
             let mut cmd = Command::new(binary);
             cmd.arg(state).args(["-C"]).arg(workspace);
@@ -90,6 +158,7 @@ mod unix_pty {
                 });
             }
             let child = cmd.spawn().expect("spawn tui_fixture");
+            drop(cmd);
             unsafe { libc::close(slave) };
 
             Self {
@@ -129,43 +198,85 @@ mod unix_pty {
             }
         }
 
+        fn drain_output(&mut self) -> bool {
+            if self.master < 0 {
+                return true;
+            }
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        self.master,
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    self.pump_utf8(&buf[..n as usize]);
+                    continue;
+                }
+                if n == 0 {
+                    return true;
+                }
+                let err = std::io::Error::last_os_error();
+                match err.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => return false,
+                    _ if err.raw_os_error() == Some(libc::EIO) => return true,
+                    _ => panic!("read from pty master failed: {err}"),
+                }
+            }
+        }
+
+        fn close_master(&mut self) {
+            if self.master >= 0 {
+                unsafe {
+                    libc::close(self.master);
+                }
+                self.master = -1;
+            }
+        }
+
         fn wait_for(&mut self, text: &str) -> String {
             let start = self.output.len();
             let until = Instant::now() + Duration::from_secs(5);
-            let mut buf = [0u8; 65536];
-            while Instant::now() < until {
-                let mut pfd = libc::pollfd {
-                    fd: self.master,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ready = unsafe { libc::poll(&mut pfd, 1, 30) };
-                if ready > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0 {
-                    let n = unsafe {
-                        libc::read(
-                            self.master,
-                            buf.as_mut_ptr().cast::<libc::c_void>(),
-                            buf.len(),
-                        )
-                    };
-                    if n > 0 {
-                        self.pump_utf8(&buf[..n as usize]);
-                    }
-                }
+            loop {
+                let eof = self.drain_output();
                 let complete_frame =
                     self.output.rfind("\x1b[?2026h") <= self.output.rfind("\x1b[?2026l");
                 if self.output[start..].contains(text) && complete_frame {
                     return self.output[start..].to_string();
                 }
+                if eof {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= until {
+                    break;
+                }
+                let remaining_ms = until
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .clamp(1, 30) as i32;
+                wait_ready(self.master, false, remaining_ms);
             }
+            let exit_note = match self.child.try_wait() {
+                Ok(Some(status)) => format!(" (child exited with {status})"),
+                Ok(None) => String::new(),
+                Err(err) => format!(" (try_wait failed: {err})"),
+            };
             let tail_start = self.output.len().saturating_sub(1800);
             let tail_start = (tail_start..=self.output.len())
                 .find(|&i| self.output.is_char_boundary(i))
                 .unwrap_or(self.output.len());
-            panic!("Missing {text:?}: {}", &self.output[tail_start..]);
+            panic!(
+                "Missing {text:?}{exit_note}: {}",
+                &self.output[tail_start..]
+            );
         }
 
         fn send(&self, text: &str) {
+            let until = Instant::now() + Duration::from_secs(5);
             let mut data = text.as_bytes();
             while !data.is_empty() {
                 let written = unsafe {
@@ -175,8 +286,38 @@ mod unix_pty {
                         data.len(),
                     )
                 };
-                assert!(written > 0, "write to pty master failed");
-                data = &data[written as usize..];
+                if written > 0 {
+                    data = &data[written as usize..];
+                    continue;
+                }
+                if written == 0 {
+                    let now = Instant::now();
+                    assert!(
+                        now < until,
+                        "timed out writing {} remaining bytes to pty master",
+                        data.len()
+                    );
+                    wait_ready(self.master, true, 10);
+                    continue;
+                }
+                let err = std::io::Error::last_os_error();
+                match err.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => {
+                        let now = Instant::now();
+                        assert!(
+                            now < until,
+                            "timed out writing {} remaining bytes to pty master",
+                            data.len()
+                        );
+                        let remaining_ms = until
+                            .saturating_duration_since(now)
+                            .as_millis()
+                            .clamp(1, 30) as i32;
+                        wait_ready(self.master, true, remaining_ms);
+                    }
+                    _ => panic!("write to pty master failed: {err}"),
+                }
             }
         }
 
@@ -194,24 +335,55 @@ mod unix_pty {
         }
 
         fn wait_exit(&mut self) -> i32 {
-            let until = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < until {
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut eof = false;
+            loop {
+                // Keep draining PTY output so slave shutdown does not block on
+                // unread bytes (notably XNU ptsclose/ttywait while exiting).
+                if !eof {
+                    eof = self.drain_output();
+                }
                 if let Some(status) = self.child.try_wait().unwrap() {
+                    if !eof {
+                        let _ = self.drain_output();
+                    }
                     return status.code().unwrap_or(1);
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                let now = Instant::now();
+                if now >= until {
+                    break;
+                }
+                if eof {
+                    std::thread::sleep(Duration::from_millis(10));
+                } else {
+                    let remaining_ms = until
+                        .saturating_duration_since(now)
+                        .as_millis()
+                        .clamp(1, 20) as i32;
+                    wait_ready(self.master, false, remaining_ms);
+                }
             }
-            panic!("tui_fixture did not exit within timeout");
+            let tail_start = self.output.len().saturating_sub(1800);
+            let tail_start = (tail_start..=self.output.len())
+                .find(|&i| self.output.is_char_boundary(i))
+                .unwrap_or(self.output.len());
+            panic!(
+                "tui_fixture did not exit within timeout (eof={eof}): {}",
+                &self.output[tail_start..]
+            );
         }
     }
 
     impl Drop for PtyHarness {
         fn drop(&mut self) {
-            if self.child.try_wait().ok().flatten().is_none() {
+            let already_exited = self.child.try_wait().ok().flatten().is_some();
+            // Close the PTY master before killing/reaping so a child closing the
+            // slave in kernel exit teardown cannot wedge waitpid on unread output.
+            self.close_master();
+            if !already_exited {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
             }
-            unsafe { libc::close(self.master) };
         }
     }
 
@@ -297,25 +469,53 @@ mod unix_pty {
         if let Some(path) = std::env::var_os("ANTICRUMB_TUI_FIXTURE") {
             return PathBuf::from(path);
         }
-        let exe = std::env::current_exe().unwrap();
-        let profile_dir = exe.parent().unwrap().parent().unwrap();
-        let candidate = profile_dir.join("examples/tui_fixture");
-        if candidate.is_file() {
-            return candidate;
-        }
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let status = Command::new("cargo")
-            .current_dir(&root)
-            .args(["build", "--locked", "--example", "tui_fixture"])
-            .status()
-            .expect("build tui_fixture");
-        assert!(status.success(), "cargo build --example tui_fixture failed");
-        root.join("target/debug/examples/tui_fixture")
+        static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let exe = std::env::current_exe().unwrap();
+                let profile_dir = exe.parent().unwrap().parent().unwrap();
+                let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .map(|p| if p.is_absolute() { p } else { root.join(p) })
+                    .unwrap_or_else(|| root.join("target"));
+                let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+                let mut cmd = Command::new(cargo);
+                cmd.current_dir(&root)
+                    .args(["build", "--locked", "--example", "tui_fixture"]);
+                if profile_dir.file_name().is_some_and(|n| n == "release") {
+                    cmd.arg("--release");
+                }
+                if let Some(parent) = profile_dir.parent() {
+                    if let (Ok(parent_canon), Ok(target_canon)) =
+                        (fs::canonicalize(parent), fs::canonicalize(&target_dir))
+                    {
+                        if parent_canon != target_canon {
+                            if let Some(triple) = parent.file_name().and_then(|n| n.to_str()) {
+                                cmd.args(["--target", triple]);
+                            }
+                        }
+                    }
+                }
+                let status = cmd.status().expect("build tui_fixture");
+                assert!(status.success(), "cargo build --example tui_fixture failed");
+                let built = profile_dir
+                    .join("examples")
+                    .join(format!("tui_fixture{}", std::env::consts::EXE_SUFFIX));
+                assert!(
+                    built.is_file(),
+                    "expected built fixture binary at {}",
+                    built.display()
+                );
+                built
+            })
+            .clone()
     }
 
     #[test]
     fn modified_arrows_move_composer_by_words_and_folded_pastes() {
         let binary = fixture_binary();
+        let _pty_guard = lock_pty_test();
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let state = home.join("workspace");
@@ -415,6 +615,7 @@ mod unix_pty {
         use std::os::unix::fs::PermissionsExt;
 
         let binary = fixture_binary();
+        let _pty_guard = lock_pty_test();
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let home = root.join("home");
@@ -468,7 +669,10 @@ mod unix_pty {
         ];
 
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &base_env);
-        pty.wait_for(&format!("anticrumb {}", env!("CARGO_PKG_VERSION")));
+        pty.wait_for(&format!(
+            "anticrumb {}",
+            anticrumb::build_info::display_version()
+        ));
         pty.wait_for("W:project");
         pty.send("/copy\r");
         pty.wait_for("No assistant response to copy yet.");
@@ -566,9 +770,11 @@ mod unix_pty {
         }
 
         pty.send("/permissions\r");
-        pty.wait_for("shell disabled");
-        pty.send("\x1b[B\r");
-        pty.wait_for("file + shell tools");
+        pty.wait_for("[ ] shell");
+        pty.send("\x1b[B\x1b[B ");
+        pty.wait_for("[x] shell");
+        pty.send("\r");
+        pty.wait_for("Tool permissions saved: read, shell.");
         pty.send("Read @\"a b.txt\"\r");
         pty.wait_for("Attachment turn 1 completed.");
         let highlighted = pty.wait_for("let answer = 42;");
@@ -637,7 +843,15 @@ mod unix_pty {
         fs::File::create(&copied_fail).unwrap();
         pty.send("/copy\r");
         let failure = pty.wait_for("Could not copy:");
-        assert!(failure.contains("wl-copy"));
+        let expected_helper = if cfg!(target_os = "macos") {
+            "pbcopy"
+        } else {
+            "wl-copy"
+        };
+        assert!(
+            failure.contains(expected_helper),
+            "expected {expected_helper} in failure message: {failure:?}"
+        );
         fs::remove_file(&copied_fail).unwrap();
         pty.send("/copy\r");
         pty.wait_for("characters to clipboard.");
@@ -667,6 +881,8 @@ mod unix_pty {
         assert_eq!(tasks.last().unwrap()["parent_id"], "agent_fixture");
         assert_eq!(tasks.last().unwrap()["thinking"], "Medium");
 
+        pty.send("/new\r");
+        pty.wait_for("New conversation");
         pty.send("one\x1b\rthree\x1b[AX\x1b[BY\r");
         pty.wait_for("Attachment turn 3 completed.");
         assert_eq!(
@@ -818,12 +1034,12 @@ mod unix_pty {
         pty.send("d");
         pty.wait_for("Delete conversation?");
         pty.send("d");
-        let removed = pty.wait_for("Deleted saved conversation agent_fixture_3.");
+        let removed = pty.wait_for("Deleted saved conversation agent_fixture_2.");
         assert!(removed.contains("Resume conversation"));
-        assert!(screen_row(&removed, 24).contains("Deleted saved conversation agent_fixture_3."));
+        assert!(screen_row(&removed, 24).contains("Deleted saved conversation agent_fixture_2."));
         assert_eq!(
             observations()["deleted_ids"],
-            serde_json::json!(["agent_fixture_3"])
+            serde_json::json!(["agent_fixture_2"])
         );
         let remaining_ids: BTreeSet<String> = observations()["saved_agents"]
             .as_array()
@@ -832,7 +1048,7 @@ mod unix_pty {
             .map(|j| j["id"].as_str().unwrap().to_string())
             .collect();
         let expected_ids: BTreeSet<String> =
-            ["agent_fixture", "agent_fixture_2", "agent_fixture_4"]
+            ["agent_fixture", "agent_fixture_3", "agent_fixture_4"]
                 .into_iter()
                 .map(str::to_string)
                 .collect();
@@ -854,7 +1070,7 @@ mod unix_pty {
         pty.wait_for("Conversation: new");
         pty.send("/resume\r");
         pty.wait_for("Resume conversation");
-        for job_id in ["agent_fixture_2", "agent_fixture"] {
+        for job_id in ["agent_fixture_3", "agent_fixture"] {
             pty.send("d");
             pty.wait_for("Delete conversation?");
             pty.send("d");
@@ -864,9 +1080,9 @@ mod unix_pty {
         assert_eq!(
             observations()["deleted_ids"],
             serde_json::json!([
-                "agent_fixture_3",
-                "agent_fixture_4",
                 "agent_fixture_2",
+                "agent_fixture_4",
+                "agent_fixture_3",
                 "agent_fixture"
             ])
         );
@@ -881,7 +1097,10 @@ mod unix_pty {
         drop(pty);
 
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &base_env);
-        pty.wait_for(&format!("anticrumb {}", env!("CARGO_PKG_VERSION")));
+        pty.wait_for(&format!(
+            "anticrumb {}",
+            anticrumb::build_info::display_version()
+        ));
         pty.wait_for("W:project");
         pty.send("/resume\r");
         pty.wait_for("No saved conversations in this directory.");
@@ -989,6 +1208,7 @@ mod unix_pty {
         use std::os::unix::fs::PermissionsExt;
 
         let binary = fixture_binary();
+        let _pty_guard = lock_pty_test();
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let home = root.join("home");
@@ -1121,16 +1341,8 @@ mod unix_pty {
 
     #[test]
     fn async_at_mention_search_renders_below_composer_and_allows_selection() {
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_anticrumb")).with_file_name("examples");
-        let binary = binary.join(if cfg!(windows) {
-            "tui_fixture.exe"
-        } else {
-            "tui_fixture"
-        });
-        assert!(
-            binary.exists(),
-            "build the fixture example first with `cargo build --example tui_fixture`"
-        );
+        let binary = fixture_binary();
+        let _pty_guard = lock_pty_test();
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let state = temp.path().join("state");
@@ -1146,7 +1358,11 @@ mod unix_pty {
         fs::write(workspace.join("a b.txt"), "spaced file\n").unwrap();
 
         let home_str = home.to_string_lossy().into_owned();
-        let env = [("HOME", Some(home_str.as_str()))];
+        let env = [
+            ("HOME", Some(home_str.as_str())),
+            ("TERM", Some("xterm-256color")),
+            ("NO_COLOR", None),
+        ];
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &env);
         pty.wait_for("W:project");
 

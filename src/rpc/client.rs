@@ -1172,7 +1172,7 @@ fn attach_client_headers<T>(request: &mut tonic::Request<T>, token: Option<&str>
     static CLIENT_HEADERS: std::sync::OnceLock<(AsciiHeader, AsciiHeader)> =
         std::sync::OnceLock::new();
     let (version, client_id) = CLIENT_HEADERS.get_or_init(|| {
-        let v = crate::cli::client_version().parse().ok();
+        let v = crate::build_info::client_version().parse().ok();
         let c = crate::cli::client_identity().parse().ok();
         (v, c)
     });

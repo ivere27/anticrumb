@@ -115,11 +115,21 @@ fn write_zip_package(path: &Path, target: &str, entries: Option<&[ZipEntrySpec<'
     let file = File::create(path).unwrap();
     let mut writer = ZipWriter::new(file);
     for spec in entries {
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored)
-            .unix_permissions(spec.mode);
-        writer.start_file(spec.name, options).unwrap();
-        writer.write_all(spec.data).unwrap();
+        if (spec.mode & 0o170000) == 0o120000 {
+            writer
+                .add_symlink(
+                    spec.name,
+                    std::str::from_utf8(spec.data).unwrap(),
+                    SimpleFileOptions::default().unix_permissions(spec.mode),
+                )
+                .unwrap();
+        } else {
+            let options = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(spec.mode);
+            writer.start_file(spec.name, options).unwrap();
+            writer.write_all(spec.data).unwrap();
+        }
     }
     writer.finish().unwrap();
 }
@@ -612,6 +622,25 @@ fn zip_rejects_links_traversal_and_corrupt_member_bytes() {
             "{name} should fail"
         );
     }
+
+    write_zip_package(
+        &path,
+        target,
+        Some(&[
+            ZipEntrySpec {
+                name: &format!("{base}/anticrumb.exe"),
+                data: b"../../outside",
+                mode: 0o120644,
+            },
+            ZipEntrySpec {
+                name: &format!("{base}/LICENSE"),
+                data: b"license",
+                mode: 0o100644,
+            },
+        ]),
+    );
+    let err = validate_archive(&path, target).unwrap_err();
+    assert!(err.to_string().contains("special ZIP member"), "{err}");
 
     write_zip_package(&path, target, None);
     let mut data = fs::read(&path).unwrap();
@@ -1424,6 +1453,9 @@ fn release_ci_nightly_creates_initial_prerelease_and_rolls_existing_release() {
                     assert!(strs.contains(&"--prerelease"));
                     assert!(strs.contains(&"--latest=false"));
                     assert!(strs.contains(&"anticrumb nightly (abcdef1)"));
+                    assert!(strs
+                        .iter()
+                        .any(|s| s.contains("Version: 1.2.3-nightly (abcdef1)")));
                     create_events.borrow_mut().push("create-draft".into());
                     Ok(ProcessOutput {
                         status: 0,

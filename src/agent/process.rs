@@ -234,9 +234,10 @@ mod tests {
                     }
                     assert_eq!(process.poll_exit(), Some(0));
                     process.join_readers();
+                    let expected_dir = std::fs::canonicalize(directory).unwrap();
                     assert_eq!(
                         process.output_since(0, 0).0,
-                        format!("{name}\n{}\nunset\n", directory.display())
+                        format!("{name}\n{}\nunset\n", expected_dir.display())
                     );
                 });
             }

@@ -115,87 +115,6 @@ impl Client {
     }
 }
 
-fn normalize_commit_head(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "unknown" {
-        return None;
-    }
-    let (hash, dirty) = match trimmed.strip_suffix("-dirty") {
-        Some(prefix) => (prefix, true),
-        None => (trimmed, false),
-    };
-    if hash.len() < 7 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let short: String = hash.chars().take(7).collect();
-    if dirty {
-        Some(format!("{short}-dirty"))
-    } else {
-        Some(short)
-    }
-}
-
-pub(crate) fn commit_head() -> Option<String> {
-    if let Some(normalized) = option_env!("ANTICRUMB_GIT_HEAD").and_then(normalize_commit_head) {
-        return Some(normalized);
-    }
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dot_git = manifest_dir.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else if dot_git.is_file() {
-        let content = std::fs::read_to_string(&dot_git).ok()?;
-        let raw = content.trim().strip_prefix("gitdir:")?.trim();
-        let path = Path::new(raw);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            manifest_dir.join(path)
-        }
-    } else {
-        return None;
-    };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let trimmed = head.trim();
-    let full_sha = if let Some(reference) = trimmed.strip_prefix("ref: ") {
-        let reference = reference.trim();
-        let ref_path = git_dir.join(reference);
-        if let Ok(sha) = std::fs::read_to_string(ref_path) {
-            sha.trim().to_string()
-        } else {
-            let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
-            packed
-                .lines()
-                .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
-                .find_map(|line| {
-                    let (sha, name) = line.split_once(' ')?;
-                    (name.trim() == reference).then(|| sha.trim().to_string())
-                })?
-        }
-    } else {
-        trimmed.to_string()
-    };
-    let short: String = full_sha.chars().take(7).collect();
-    (short.len() == 7 && short.chars().all(|c| c.is_ascii_hexdigit())).then_some(short)
-}
-
-pub(crate) fn build_time() -> &'static str {
-    option_env!("ANTICRUMB_BUILD_TIME").unwrap_or("unknown")
-}
-
-pub(crate) fn help_banner() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let commit = commit_head().unwrap_or_else(|| "unknown".into());
-    let built = build_time();
-    format!("anticrumb {version} (commit: {commit}, built: {built})")
-}
-
-pub(crate) fn client_version() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let commit = commit_head().unwrap_or_else(|| "unknown".into());
-    format!("anticrumb {version} ({commit})")
-}
-
 fn is_env_truthy(var: &str) -> bool {
     std::env::var(var)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -276,24 +195,12 @@ pub fn run(args: &[String]) -> Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("");
     match command {
         "--version" | "-V" => {
-            match commit_head() {
-                Some(head) => println!(
-                    "anticrumb {} ({}, {})",
-                    env!("CARGO_PKG_VERSION"),
-                    head,
-                    crate::update::TARGET
-                ),
-                None => println!(
-                    "anticrumb {} ({})",
-                    env!("CARGO_PKG_VERSION"),
-                    crate::update::TARGET
-                ),
-            }
+            println!("{}", crate::build_info::cli_version());
             Ok(())
         }
         "update" => crate::update::run(&args[1..]),
         "help" | "--help" | "-h" => {
-            println!("{}\n", help_banner());
+            println!("{}\n", crate::build_info::help_banner());
             println!(
                 r#"anticrumb [OPTIONS] [PROMPT]              interactive coding agent
   exec [OPTIONS] PROMPT                    run a task and print the answer
@@ -2047,32 +1954,13 @@ mod tests {
 
     #[test]
     fn help_banner_contains_version_commit_and_build_time() {
-        let banner = help_banner();
-        assert!(banner.starts_with(&format!("anticrumb {}", env!("CARGO_PKG_VERSION"))));
+        let banner = crate::build_info::help_banner();
+        assert!(banner.starts_with(&format!(
+            "anticrumb {}",
+            crate::build_info::display_version()
+        )));
         assert!(banner.contains("commit: "));
         assert!(banner.contains("built: "));
-    }
-
-    #[test]
-    fn normalize_commit_head_preserves_dirty_suffix_and_rejects_invalid() {
-        assert_eq!(normalize_commit_head("abc1234"), Some("abc1234".into()));
-        assert_eq!(
-            normalize_commit_head("abc1234def5678"),
-            Some("abc1234".into())
-        );
-        assert_eq!(
-            normalize_commit_head(" abc1234-dirty \n"),
-            Some("abc1234-dirty".into())
-        );
-        assert_eq!(
-            normalize_commit_head("abc1234def5678-dirty"),
-            Some("abc1234-dirty".into())
-        );
-        assert_eq!(normalize_commit_head("unknown"), None);
-        assert_eq!(normalize_commit_head(""), None);
-        assert_eq!(normalize_commit_head("-dirty"), None);
-        assert_eq!(normalize_commit_head("123456-dirty"), None);
-        assert_eq!(normalize_commit_head("not_hex-dirty"), None);
     }
 
     #[test]
@@ -2411,8 +2299,11 @@ mod tests {
 
     #[test]
     fn test_client_identity_and_version() {
-        let v = client_version();
-        assert!(v.starts_with("anticrumb "));
+        let v = crate::build_info::client_version();
+        assert!(v.starts_with(&format!(
+            "anticrumb {} ",
+            crate::build_info::display_version()
+        )));
 
         let id = client_identity();
         assert!(!id.is_empty());

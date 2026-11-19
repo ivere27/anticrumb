@@ -6,6 +6,7 @@ pub mod agent_service;
 pub mod browser_control;
 pub mod browser_host;
 mod browser_network;
+pub mod build_info;
 pub mod cdp;
 pub mod cli;
 pub mod domain;

@@ -4,9 +4,9 @@
 
 [Build, test, and release](../.github/workflows/build.yml) builds, tests, and packages Linux (`x86_64`, `aarch64` on Ubuntu 22.04 for glibc 2.35+ compatibility, plus native `ubuntu-24.04-arm` verification), Windows (`x86_64` MSVC), and macOS (`aarch64`, `x86_64`):
 
-- **Pull requests & non-master branches**: run checks, tests, and package validation only.
-- **`master` push**: updates the rolling `nightly` pre-release (`tag: nightly`, `prerelease: true`), replacing platform archives with the latest verified build without changing `latest`.
-- **Version tag push (`vX.Y.Z`)**: set `[package].version` in `Cargo.toml` to `X.Y.Z`, commit to `master`, then push only that tag:
+- **Pull requests & non-master branches**: built as `X.Y.Z-dev` (`ANTICRUMB_BUILD_CHANNEL=dev`); run checks, tests, and package validation only.
+- **`master` push**: built as `X.Y.Z-nightly` (`ANTICRUMB_BUILD_CHANNEL=nightly`) and updates the rolling `nightly` pre-release (`tag: nightly`, `prerelease: true`), replacing platform archives with the latest verified build without changing `latest`.
+- **Version tag push (`vX.Y.Z`)**: set `[package].version` in `Cargo.toml` to `X.Y.Z`, commit to `master`, then push only that tag (built as clean `X.Y.Z` with `ANTICRUMB_BUILD_CHANNEL=stable`):
 
 ```sh
 git tag v1.0.0 && git push origin v1.0.0
@@ -14,13 +14,13 @@ git tag v1.0.0 && git push origin v1.0.0
 
 Push the specific tag rather than `git push --tags` so local copies of the moving `nightly` tag never conflict or get pushed.
 
-The tag workflow verifies that `vX.Y.Z` matches `Cargo.toml`, validates all platform archives, creates a draft release, verifies uploaded sizes and GitHub SHA-256 digests, and publishes it as the latest stable release.
+The tag workflow verifies that `vX.Y.Z` matches `Cargo.toml`, validates all platform archives, creates a draft release, verifies uploaded sizes and GitHub SHA-256 digests, and publishes it as the latest stable release. Because GitHub Actions injects `ANTICRUMB_BUILD_CHANNEL`, public `stable` (`X.Y.Z`) and `nightly` (`X.Y.Z-nightly`) binaries come transparently from clean CI runs while local/source builds default to `X.Y.Z-dev`.
 
-Users can update to stable releases with `anticrumb update`, or switch to/update the rolling `master` pre-release with `anticrumb update --nightly` (add `--check` to inspect or `--force` to reinstall).
+Users update to stable releases by default with `anticrumb update`; developers/testers who want the rolling `master` pre-release opt in explicitly with `anticrumb update --nightly` (add `--check` to inspect or `--force` to reinstall).
 
-## Manual Docker Release
+## Manual Docker Release (Fallback)
 
-Build fresh [packages](building.md#development-and-packaging) from the commit being released, inspect the dry run, then publish:
+Prefer GitHub Actions above so published releases come from clean, public CI builds. As a fallback, build fresh [packages](building.md#development-and-packaging) from the commit being released, inspect the dry run, then publish:
 
 ```sh
 make package

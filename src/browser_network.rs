@@ -335,8 +335,14 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok((stream, _)) = listener.accept() {
+                // macOS/BSD sockets inherit O_NONBLOCK from the listener; restore
+                // blocking I/O so read/write calls honor the configured timeouts.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 return stream;
             }

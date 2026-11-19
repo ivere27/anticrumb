@@ -121,10 +121,46 @@ fn emit_git_rerun_hints() {
     }
 }
 
+fn canonical_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn resolve_build_channel() -> &'static str {
+    match env::var("ANTICRUMB_BUILD_CHANNEL") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "dev" => "dev",
+            "nightly" => "nightly",
+            "stable" => "stable",
+            other => panic!(
+                "invalid ANTICRUMB_BUILD_CHANNEL {other:?} (expected stable, nightly, or dev)"
+            ),
+        },
+        Err(env::VarError::NotPresent) => "dev",
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("ANTICRUMB_BUILD_CHANNEL must be valid UTF-8 (stable, nightly, or dev)")
+        }
+    }
+}
+
 fn main() {
     println!(
         "cargo:rustc-env=ANTICRUMB_BUILD_TARGET={}",
         env::var("TARGET").expect("Cargo build target")
+    );
+    println!("cargo:rerun-if-env-changed=ANTICRUMB_BUILD_CHANNEL");
+    println!(
+        "cargo:rustc-env=ANTICRUMB_BUILD_CHANNEL={}",
+        resolve_build_channel()
     );
     let build_time = env::var("ANTICRUMB_BUILD_TIME")
         .or_else(|_| {
@@ -161,7 +197,7 @@ fn main() {
         &fs::read("src/rpc/generated/manifest.json").expect("run make proto first"),
     )
     .unwrap();
-    let schema = fs::read("proto/anticrumb.proto").unwrap();
+    let schema = canonical_lf(&fs::read("proto/anticrumb.proto").unwrap());
     let schema_hex: String = Sha256::digest(&schema)
         .iter()
         .map(|b| format!("{b:02x}"))

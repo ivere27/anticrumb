@@ -30,7 +30,7 @@ make package                  # Native archive in dist/
 make proto                    # Regenerate RPC bindings
 ```
 
-Packages contain one executable with SQLite and all provider resources bundled. `make clean` removes Cargo output, not user state or packages.
+Packages contain one executable with SQLite and all provider resources bundled. Local source and Docker builds default to the `dev` build channel (`X.Y.Z-dev`), while official GitHub Actions builds produce `stable` (`X.Y.Z`) and `nightly` (`X.Y.Z-nightly`) releases. `make clean` removes Cargo output, not user state or packages.
 
 See [Testing](testing.md), [daemon debugging](usage.md#runtime-health-and-debugging), and [Releasing](releasing.md). Command definitions: [Makefile](../Makefile) and [xtask](../xtask/src/build.rs).
 

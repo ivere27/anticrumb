@@ -11,6 +11,8 @@ RUN rustup target add ${RUST_TARGET}
 COPY . .
 ARG ANTICRUMB_GIT_HEAD=unknown
 ENV ANTICRUMB_GIT_HEAD=${ANTICRUMB_GIT_HEAD}
+ARG ANTICRUMB_BUILD_CHANNEL=dev
+ENV ANTICRUMB_BUILD_CHANNEL=${ANTICRUMB_BUILD_CHANNEL}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo run --locked -q -p xtask -- package --target ${RUST_TARGET}
 RUN mkdir /out && cp dist/anticrumb-${RUST_TARGET}/anticrumb dist/anticrumb-${RUST_TARGET}/LICENSE /out/
 FROM scratch AS artifacts
@@ -23,6 +25,8 @@ RUN rustup target add ${RUST_TARGET}
 COPY . .
 ARG ANTICRUMB_GIT_HEAD=unknown
 ENV ANTICRUMB_GIT_HEAD=${ANTICRUMB_GIT_HEAD}
+ARG ANTICRUMB_BUILD_CHANNEL=dev
+ENV ANTICRUMB_BUILD_CHANNEL=${ANTICRUMB_BUILD_CHANNEL}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo run --locked -q -p xtask -- package --target ${RUST_TARGET}
 FROM scratch AS windows-artifacts
 COPY --from=windows-build /src/dist/ /
@@ -41,6 +45,8 @@ RUN rustup target add ${RUST_TARGET}
 COPY . .
 ARG ANTICRUMB_GIT_HEAD=unknown
 ENV ANTICRUMB_GIT_HEAD=${ANTICRUMB_GIT_HEAD}
+ARG ANTICRUMB_BUILD_CHANNEL=dev
+ENV ANTICRUMB_BUILD_CHANNEL=${ANTICRUMB_BUILD_CHANNEL}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo run --locked -q -p xtask -- macos-cross ${RUST_TARGET}
 FROM scratch AS macos-artifacts
 COPY --from=macos-build /src/dist/ /

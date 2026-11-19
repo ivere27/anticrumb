@@ -493,6 +493,12 @@ fn invalid_connection_flags_do_not_change_state_or_disclose_url_credentials() {
         None,
     )
     .succeeded();
+    let version_out = env.run(&["--version"], None);
+    version_out.succeeded();
+    assert_eq!(
+        version_out.stdout.trim(),
+        anticrumb::build_info::cli_version()
+    );
     assert!(!env.saved().exists());
 }
 
@@ -512,7 +518,10 @@ fn bare_listen_prints_build_banner_once_and_regenerate_token_rotates_secret() {
     let text = wait_for_log(&mut child, &log, "Connect:");
     wait_for_log(&mut child, &log, "anticrumb local daemon:");
     let full = fs::read_to_string(&log).unwrap();
-    let banner_prefix = format!("anticrumb {} (commit:", env!("CARGO_PKG_VERSION"));
+    let banner_prefix = format!(
+        "anticrumb {} (commit:",
+        anticrumb::build_info::display_version()
+    );
     assert_eq!(
         full.matches(&banner_prefix).count(),
         1,
