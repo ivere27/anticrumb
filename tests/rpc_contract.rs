@@ -1480,38 +1480,224 @@ fn daemon_token_and_option_policy() {
 }
 
 async fn artifact_contract(client: &RpcClient) {
+    let info = client.get_info(pb::Empty {}).await.unwrap();
+    assert_eq!(info.max_artifact_bytes, MAX_ARTIFACT_BYTES as u32);
+
     let data = b"private bytes that must never be expanded into a prompt".to_vec();
-    let request = pb::PutArtifactRequest {
-        account_id: "default".into(),
-        name: "sample file.txt".into(),
-        mime: "text/plain".into(),
-        sha256: digest(&data),
-        data: data.clone(),
-    };
-    let a = client.put_artifact(request.clone()).await.unwrap();
-    assert_eq!(client.put_artifact(request.clone()).await.unwrap().id, a.id);
+    let a = client
+        .put_artifact_bytes("default", "sample file.txt", "text/plain", data.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .put_artifact_bytes("default", "sample file.txt", "text/plain", data.clone())
+            .await
+            .unwrap()
+            .id,
+        a.id
+    );
     let downloaded = client
-        .get_artifact(pb::ArtifactRef {
+        .get_artifact_bytes(pb::ArtifactRef {
             account_id: "default".into(),
             id: a.id,
         })
         .await
         .unwrap();
     assert_eq!(downloaded.data, data);
-    for name in ["../secret", "C:\\secret.txt", "..", "a/b", "a\\b"] {
-        let mut invalid = request.clone();
-        invalid.name = name.into();
+
+    // Zero-byte and multi-chunk (> 256 KiB) artifacts stream identically.
+    let empty = client
+        .put_artifact_bytes(
+            "default",
+            "empty.bin",
+            "application/octet-stream",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.size, 0);
+    let downloaded_empty = client
+        .get_artifact_bytes(pb::ArtifactRef {
+            account_id: "default".into(),
+            id: empty.id,
+        })
+        .await
+        .unwrap();
+    assert!(downloaded_empty.data.is_empty());
+
+    let multi_chunk: Vec<u8> = (0..(600 * 1024)).map(|i| (i % 251) as u8).collect();
+    let chunked = client
+        .put_artifact_bytes(
+            "default",
+            "chunked.bin",
+            "application/octet-stream",
+            multi_chunk.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunked.size, multi_chunk.len() as u64);
+    let downloaded_chunked = client
+        .get_artifact_bytes(pb::ArtifactRef {
+            account_id: "default".into(),
+            id: chunked.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(downloaded_chunked.data, multi_chunk);
+
+    for name in ["", ".", "../secret", "C:\\secret.txt", "..", "a/b", "a\\b"] {
+        let chunk = pb::PutArtifactChunk {
+            payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                account_id: "default".into(),
+                name: name.into(),
+                mime: "text/plain".into(),
+                sha256: digest(&data),
+                size: data.len() as u64,
+            })),
+        };
         assert_eq!(
-            client.put_artifact(invalid).await.unwrap_err().code,
+            client
+                .put_artifact_stream(futures_util::stream::iter([chunk]))
+                .await
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidRequest
         );
     }
-    let mut invalid = request;
-    invalid.sha256 = "bad".into();
+
+    let bad_sha = pb::PutArtifactChunk {
+        payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+            account_id: "default".into(),
+            name: "sample.txt".into(),
+            mime: "text/plain".into(),
+            sha256: "bad".into(),
+            size: data.len() as u64,
+        })),
+    };
     assert_eq!(
-        client.put_artifact(invalid).await.unwrap_err().code,
+        client
+            .put_artifact_stream(futures_util::stream::iter([bad_sha]))
+            .await
+            .unwrap_err()
+            .code,
         ErrorCode::InvalidRequest
     );
+
+    let too_large = pb::PutArtifactChunk {
+        payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+            account_id: "default".into(),
+            name: "too-big.bin".into(),
+            mime: "application/octet-stream".into(),
+            sha256: "00".repeat(32),
+            size: MAX_ARTIFACT_BYTES + 1,
+        })),
+    };
+    assert_eq!(
+        client
+            .put_artifact_stream(futures_util::stream::iter([too_large]))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+
+    // Malformed chunk sequences are rejected.
+    let malformed_cases: Vec<Vec<pb::PutArtifactChunk>> = vec![
+        vec![],
+        vec![pb::PutArtifactChunk {
+            payload: Some(pb::put_artifact_chunk::Payload::Data(b"orphan".to_vec())),
+        }],
+        vec![
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                    account_id: "default".into(),
+                    name: "dup.txt".into(),
+                    mime: "text/plain".into(),
+                    sha256: digest(b"hi"),
+                    size: 2,
+                })),
+            },
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                    account_id: "default".into(),
+                    name: "dup.txt".into(),
+                    mime: "text/plain".into(),
+                    sha256: digest(b"hi"),
+                    size: 2,
+                })),
+            },
+        ],
+        vec![
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                    account_id: "default".into(),
+                    name: "short.txt".into(),
+                    mime: "text/plain".into(),
+                    sha256: digest(b"hello"),
+                    size: 5,
+                })),
+            },
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Data(b"he".to_vec())),
+            },
+        ],
+        vec![
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                    account_id: "default".into(),
+                    name: "long.txt".into(),
+                    mime: "text/plain".into(),
+                    sha256: digest(b"he"),
+                    size: 2,
+                })),
+            },
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Data(b"hello".to_vec())),
+            },
+        ],
+        vec![
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                    account_id: "default".into(),
+                    name: "wronghash.txt".into(),
+                    mime: "text/plain".into(),
+                    sha256: "ff".repeat(32),
+                    size: 2,
+                })),
+            },
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Data(b"hi".to_vec())),
+            },
+        ],
+        vec![
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                    account_id: "default".into(),
+                    name: "empty-chunk.txt".into(),
+                    mime: "text/plain".into(),
+                    sha256: digest(b"hi"),
+                    size: 2,
+                })),
+            },
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Data(Vec::new())),
+            },
+            pb::PutArtifactChunk {
+                payload: Some(pb::put_artifact_chunk::Payload::Data(b"hi".to_vec())),
+            },
+        ],
+    ];
+    for chunks in malformed_cases {
+        assert_eq!(
+            client
+                .put_artifact_stream(futures_util::stream::iter(chunks))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
     assert_eq!(
         client
             .get_turn(pb::TurnRef {
@@ -2593,4 +2779,565 @@ async fn provider_service_registers_persists_binds_accounts_and_unregisters_at_r
         .iter()
         .any(|p| p.id == "test-claude-web"));
     final_client.close().await.unwrap();
+}
+
+fn sha256_file(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::{fmt::Write as _, io::Read};
+
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut out = String::with_capacity(64);
+    for b in hasher.finalize() {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_streaming_artifacts_exceed_unary_limit_across_transports_and_clean_up_failures() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let src_50mib = temp.path().join("payload-50mib.bin");
+    let target_len = 50 * 1024 * 1024usize;
+    {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&src_50mib).unwrap());
+        let block: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+        let mut remaining = target_len;
+        while remaining > 0 {
+            let chunk = remaining.min(block.len());
+            out.write_all(&block[..chunk]).unwrap();
+            remaining -= chunk;
+        }
+        out.flush().unwrap();
+    }
+    let expected_hash = sha256_file(&src_50mib);
+
+    let net_dir = temp.path().join("net-host");
+    std::fs::create_dir_all(&net_dir).unwrap();
+    let (host, _) = fixture(&net_dir);
+    let options = Options {
+        root: net_dir.clone(),
+        listen: "127.0.0.1:0".into(),
+        self_signed: true,
+        ..Default::default()
+    };
+    let identity = options.identity().unwrap();
+    let pin =
+        certificate_fingerprint(&std::fs::read(net_dir.join("tls/ca-certificate.pem")).unwrap())
+            .unwrap();
+    let (endpoint, task) = network(host.clone(), identity).await;
+    let net_client = RpcClient::network_pinned(&endpoint, TOKEN, None, None, Some(&pin))
+        .await
+        .unwrap();
+
+    // 50 MiB (> 48 MiB unary MAX_MESSAGE) streams cleanly over TLS gRPC.
+    let uploaded_net = net_client
+        .put_artifact_file(
+            "default",
+            &src_50mib,
+            "payload-50mib.bin",
+            "application/octet-stream",
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded_net.size, target_len as u64);
+    assert_eq!(uploaded_net.hash, expected_hash);
+
+    let download_dir = temp.path().join("downloads");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    let existing = download_dir.join("existing.bin");
+    std::fs::write(&existing, b"keep-me").unwrap();
+    let overwrite_err = net_client
+        .get_artifact_to_file(
+            pb::ArtifactRef {
+                account_id: "default".into(),
+                id: uploaded_net.id.clone(),
+            },
+            &existing,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(overwrite_err.code, ErrorCode::StorageFailure);
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+
+    let downloaded_net = download_dir.join("net-50mib.bin");
+    let got_net = net_client
+        .get_artifact_to_file(
+            pb::ArtifactRef {
+                account_id: "default".into(),
+                id: uploaded_net.id.clone(),
+            },
+            &downloaded_net,
+        )
+        .await
+        .unwrap();
+    assert_eq!(got_net.size, target_len as u64);
+    assert_eq!(sha256_file(&downloaded_net), expected_hash);
+
+    // 100 MiB + 1 rejects before streaming.
+    let too_big = temp.path().join("too-big.bin");
+    std::fs::File::create(&too_big)
+        .unwrap()
+        .set_len(MAX_ARTIFACT_BYTES + 1)
+        .unwrap();
+    assert_eq!(
+        net_client
+            .put_artifact_file(
+                "default",
+                &too_big,
+                "too-big.bin",
+                "application/octet-stream",
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+
+    // Same-length disk corruption on multi-chunk artifact fails download cleanly and leaves no temp file.
+    let multi: Vec<u8> = (0..(600 * 1024)).map(|i| (i % 199) as u8).collect();
+    let stored_multi = net_client
+        .put_artifact_bytes(
+            "default",
+            "corrupt-multi.bin",
+            "application/octet-stream",
+            multi.clone(),
+        )
+        .await
+        .unwrap();
+    let (_, corrupt_path) = host
+        .service
+        .store
+        .artifact_path("default", &stored_multi.id)
+        .unwrap();
+    let mut flipped = multi;
+    flipped[500 * 1024] ^= 0xff;
+    std::fs::write(&corrupt_path, &flipped).unwrap();
+
+    let failed_dest = download_dir.join("corrupted.bin");
+    let corrupt_err = net_client
+        .get_artifact_to_file(
+            pb::ArtifactRef {
+                account_id: "default".into(),
+                id: stored_multi.id,
+            },
+            &failed_dest,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(corrupt_err.code, ErrorCode::StorageFailure);
+    assert!(!failed_dest.exists());
+    let leftover_download_tmps: Vec<_> = std::fs::read_dir(&download_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".anticrumb-tmp-")
+        })
+        .collect();
+    assert!(leftover_download_tmps.is_empty());
+
+    // Zero leftover staging blobs on the server after failed/malformed uploads.
+    let leftover_server_tmps: Vec<_> = std::fs::read_dir(net_dir.join("blobs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("tmp_"))
+        .collect();
+    assert!(leftover_server_tmps.is_empty());
+    let leftover_staging: Vec<_> = std::fs::read_dir(net_dir.join("blobs").join(".tmp"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(leftover_staging.is_empty());
+
+    // Nonexistent destination parent directory fails fast before streaming download.
+    let missing_parent_dest = download_dir.join("does-not-exist").join("out.bin");
+    let missing_parent_err = net_client
+        .get_artifact_to_file(
+            pb::ArtifactRef {
+                account_id: "default".into(),
+                id: uploaded_net.id.clone(),
+            },
+            &missing_parent_dest,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing_parent_err.code, ErrorCode::StorageFailure);
+
+    // Mid-stream append to local source file rejects and never commits a partial artifact on server.
+    for (label, initial) in [
+        ("append-empty.bin", Vec::new()),
+        (
+            "append-multi.bin",
+            (0..(600 * 1024))
+                .map(|i| (i % 173) as u8)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let src_append = temp.path().join(label);
+        std::fs::write(&src_append, &initial).unwrap();
+        let initial_hash = sha256_file(&src_append);
+        let opened = std::fs::File::open(&src_append).unwrap();
+        {
+            use std::io::Write as _;
+            let mut appender = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src_append)
+                .unwrap();
+            appender.write_all(b"trailing-bytes").unwrap();
+        }
+        let append_err = net_client
+            .put_artifact_verified_file(
+                "default",
+                label,
+                "application/octet-stream",
+                &initial_hash,
+                initial.len() as u64,
+                opened,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(append_err.code, ErrorCode::StorageFailure);
+        let committed: Vec<Artifact> = host
+            .service
+            .store
+            .list("default", "artifact")
+            .unwrap()
+            .into_iter()
+            .filter(|a: &Artifact| a.name == label)
+            .collect();
+        assert!(committed.is_empty(), "{label} must not commit on append");
+    }
+    let post_append_staging: Vec<_> = std::fs::read_dir(net_dir.join("blobs").join(".tmp"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(post_append_staging.is_empty());
+
+    // Relay multi-chunk streaming transfer & local corruption detection over TLS gRPC.
+    let relay_local_dir = temp.path().join("relay-local");
+    std::fs::create_dir_all(&relay_local_dir).unwrap();
+    let workspace = relay::workspace(
+        &relay_local_dir,
+        Connection::Grpc {
+            endpoint: endpoint.clone(),
+            token: TOKEN.into(),
+            ca_file: None,
+            server_name: None,
+            tls_pin: Some(pin),
+        },
+    )
+    .await
+    .unwrap();
+    let relay_payload: Vec<u8> = (0..(700 * 1024)).map(|i| (i % 241) as u8).collect();
+    let local_art = workspace
+        .service
+        .store
+        .artifact(
+            "default",
+            "relay-multi.bin",
+            "application/octet-stream",
+            &relay_payload,
+            "input",
+        )
+        .unwrap();
+    let mut relay_req = request();
+    relay_req.artifacts.push(local_art.id.clone());
+    let run_id = workspace.service.submit_async(relay_req).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let value = workspace.service.snapshot(&run_id).unwrap();
+            if let Some(error) = value.error {
+                panic!("{error:?}");
+            }
+            if let Some(result) = value.result {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.text, "complete");
+    let (_, relay_corrupt_path) = workspace
+        .service
+        .store
+        .artifact_path("default", &local_art.id)
+        .unwrap();
+    let mut tampered_local = relay_payload;
+    tampered_local[0] ^= 0xff;
+    std::fs::write(&relay_corrupt_path, &tampered_local).unwrap();
+    let mut bad_relay_req = request();
+    bad_relay_req.artifacts.push(local_art.id);
+    let bad_run_id = workspace.service.submit_async(bad_relay_req).await.unwrap();
+    let failed_turn = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let value = workspace.service.snapshot(&bad_run_id).unwrap();
+            if !value.is_active() {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed_turn.state, "failed");
+    assert_eq!(failed_turn.error.unwrap().code, ErrorCode::StorageFailure);
+
+    workspace.shutdown();
+    drop(workspace);
+    drop(net_client);
+    host.shutdown();
+    task.await.unwrap();
+
+    // 50 MiB streams cleanly over Embedded Synurang FFI as well.
+    let ffi_dir = temp.path().join("ffi-host");
+    std::fs::create_dir_all(&ffi_dir).unwrap();
+    let (ffi_host, _) = fixture(&ffi_dir);
+    let ffi_client =
+        RpcClient::embedded(ffi_host.clone(), tokio::runtime::Handle::current()).unwrap();
+    let uploaded_ffi = ffi_client
+        .put_artifact_file(
+            "default",
+            &src_50mib,
+            "payload-50mib.bin",
+            "application/octet-stream",
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded_ffi.size, target_len as u64);
+    assert_eq!(uploaded_ffi.hash, expected_hash);
+    let downloaded_ffi = download_dir.join("ffi-50mib.bin");
+    let got_ffi = ffi_client
+        .get_artifact_to_file(
+            pb::ArtifactRef {
+                account_id: "default".into(),
+                id: uploaded_ffi.id,
+            },
+            &downloaded_ffi,
+        )
+        .await
+        .unwrap();
+    assert_eq!(got_ffi.size, target_len as u64);
+    assert_eq!(sha256_file(&downloaded_ffi), expected_hash);
+
+    // Aborted/cancelled FFI client stream leaves no staging leftovers under blobs/.tmp.
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+    let stall_stream = futures_util::stream::once(async move {
+        pb::PutArtifactChunk {
+            payload: Some(pb::put_artifact_chunk::Payload::Meta(pb::PutArtifactMeta {
+                account_id: "default".into(),
+                name: "stalled.bin".into(),
+                mime: "application/octet-stream".into(),
+                sha256: digest(&[0xaa; 1024]),
+                size: 1024,
+            })),
+        }
+    })
+    .chain(futures_util::stream::once(async move {
+        let _ = gate_tx.send(());
+        futures_util::future::pending::<pb::PutArtifactChunk>().await
+    }));
+    let mut upload_fut = Box::pin(ffi_client.put_artifact_stream(stall_stream));
+    tokio::select! {
+        res = &mut upload_fut => panic!("stalled stream finished unexpectedly: {res:?}"),
+        _ = gate_rx => {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    drop(upload_fut);
+    let mut ffi_staging_cleared = false;
+    for _ in 0..40 {
+        let empty = std::fs::read_dir(ffi_dir.join("blobs").join(".tmp"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .is_none();
+        if empty {
+            ffi_staging_cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        ffi_staging_cleared,
+        "aborted FFI upload left staging files under blobs/.tmp"
+    );
+
+    ffi_client.close().await.unwrap();
+    drop(ffi_host);
+}
+
+#[tokio::test]
+async fn download_stream_rejects_invalid_name_and_empty_data_chunk() {
+    use tokio_stream::wrappers::ReceiverStream;
+
+    enum Mode {
+        InvalidName,
+        EmptyDataChunk,
+    }
+    struct MaliciousArtifactServer {
+        mode: std::sync::Arc<std::sync::Mutex<Mode>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[tonic::async_trait]
+    impl pb::artifact_service_server::ArtifactService for MaliciousArtifactServer {
+        async fn put_artifact(
+            &self,
+            _request: tonic::Request<tonic::Streaming<pb::PutArtifactChunk>>,
+        ) -> std::result::Result<tonic::Response<pb::Artifact>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+        type GetArtifactStream =
+            ReceiverStream<std::result::Result<pb::GetArtifactChunk, tonic::Status>>;
+        async fn get_artifact(
+            &self,
+            request: tonic::Request<pb::ArtifactRef>,
+        ) -> std::result::Result<tonic::Response<Self::GetArtifactStream>, tonic::Status> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let target = request.into_inner();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let payload = b"ok".to_vec();
+            let name = match *self.mode.lock().unwrap() {
+                Mode::InvalidName => "../evil.txt",
+                Mode::EmptyDataChunk => "valid.txt",
+            };
+            let include_empty = matches!(*self.mode.lock().unwrap(), Mode::EmptyDataChunk);
+            let art = pb::Artifact {
+                id: target.id,
+                scope: target.account_id,
+                hash: digest(&payload),
+                mime: "text/plain".into(),
+                name: name.into(),
+                size: payload.len() as u64,
+                origin: "generated".into(),
+                created_at: now_ms(),
+            };
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(pb::GetArtifactChunk {
+                        payload: Some(pb::get_artifact_chunk::Payload::Artifact(art)),
+                    }))
+                    .await;
+                if include_empty {
+                    let _ = tx
+                        .send(Ok(pb::GetArtifactChunk {
+                            payload: Some(pb::get_artifact_chunk::Payload::Data(Vec::new())),
+                        }))
+                        .await;
+                }
+                let _ = tx
+                    .send(Ok(pb::GetArtifactChunk {
+                        payload: Some(pb::get_artifact_chunk::Payload::Data(payload)),
+                    }))
+                    .await;
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mode = Arc::new(Mutex::new(Mode::InvalidName));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server_mode = mode.clone();
+    let server_calls = calls.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(pb::artifact_service_server::ArtifactServiceServer::new(
+                MaliciousArtifactServer {
+                    mode: server_mode,
+                    calls: server_calls,
+                },
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let client = RpcClient::network(&endpoint, TOKEN, None, None)
+        .await
+        .unwrap();
+    let local_store = Store::open(&temp.path().join("local-store")).unwrap();
+    let dest_dir = temp.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let target = pb::ArtifactRef {
+        account_id: "default".into(),
+        id: "art_1".into(),
+    };
+
+    let trailing_sep = format!("{}/", dest_dir.display());
+    for invalid_dest in ["", ".", "..", "/", &trailing_sep] {
+        assert_eq!(
+            client
+                .get_artifact_to_file(target.clone(), std::path::Path::new(invalid_dest))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest,
+            "expected InvalidRequest for {invalid_dest:?}"
+        );
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "invalid destination path must fail before opening RPC stream"
+    );
+
+    for expected_mode in [Mode::InvalidName, Mode::EmptyDataChunk] {
+        *mode.lock().unwrap() = expected_mode;
+        assert_eq!(
+            client
+                .get_artifact_bytes(target.clone())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        let dest_file = dest_dir.join("out.txt");
+        assert_eq!(
+            client
+                .get_artifact_to_file(target.clone(), &dest_file)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert!(!dest_file.exists());
+        assert_eq!(
+            client
+                .download_artifact_to_store(&local_store, "default", "art_1", "remote")
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    let tmps: Vec<_> = std::fs::read_dir(&dest_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(tmps.is_empty());
+
+    drop(client);
+    stop.send(()).unwrap();
+    server.await.unwrap();
 }

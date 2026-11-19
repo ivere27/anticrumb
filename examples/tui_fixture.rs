@@ -43,6 +43,7 @@ struct State {
 #[derive(Clone)]
 struct Fixture {
     api: GrpcApi,
+    host: Arc<Host>,
     state: Arc<Mutex<State>>,
     observations_path: PathBuf,
 }
@@ -71,7 +72,6 @@ impl Fixture {
             last_verified_sign_in: Some(true),
             checked_at: Some(1),
             login: self
-                .api
                 .host
                 .service
                 .store
@@ -84,8 +84,7 @@ impl Fixture {
     fn cache_models(&self, state: &mut State) {
         state.observations["model_probes"] =
             json!(state.observations["model_probes"].as_u64().unwrap() + 1);
-        self.api
-            .host
+        self.host
             .service
             .store
             .put(
@@ -246,7 +245,7 @@ impl AccountService for Fixture {
     async fn open_login(&self, r: Request<pb::AccountRef>) -> Reply<pb::Empty> {
         self.api.authorize(r.metadata())?;
         assert_eq!(r.into_inner().account_id, "default");
-        let store = &self.api.host.service.store;
+        let store = &self.host.service.store;
         let mut account: Account = store.get("local", "account", "default").unwrap();
         account.state = "awaiting_human".into();
         store.put("local", "account", "default", &account).unwrap();
@@ -267,7 +266,7 @@ impl AccountService for Fixture {
                 .join("login-complete");
             for _ in 0..800 {
                 if completed.exists() {
-                    let store = &fixture.api.host.service.store;
+                    let store = &fixture.host.service.store;
                     fixture.cache_models(&mut fixture.state.lock().unwrap());
                     account.state = "ready".into();
                     store.put("local", "account", "default", &account).unwrap();
@@ -329,9 +328,21 @@ impl ModelService for Fixture {
 }
 #[tonic::async_trait]
 impl ArtifactService for Fixture {
-    async fn put_artifact(&self, r: Request<pb::PutArtifactRequest>) -> Reply<pb::Artifact> {
-        let content = String::from_utf8_lossy(&r.get_ref().data).into_owned();
+    type GetArtifactStream = anticrumb::rpc::server::TypedStream<pb::GetArtifactChunk>;
+
+    async fn put_artifact(
+        &self,
+        r: Request<tonic::Streaming<pb::PutArtifactChunk>>,
+    ) -> Reply<pb::Artifact> {
         let response = self.api.put_artifact(r).await?;
+        let artifact = response.get_ref();
+        let (_, bytes) = self
+            .host
+            .service
+            .store
+            .artifact_bytes(&artifact.scope, &artifact.id)
+            .map_err(codec::status)?;
+        let content = String::from_utf8_lossy(&bytes).into_owned();
         let mut state = self.state.lock().unwrap();
         state.observations["uploads"]
             .as_array_mut()
@@ -340,11 +351,11 @@ impl ArtifactService for Fixture {
         state.observations["uploaded_ids"]
             .as_array_mut()
             .unwrap()
-            .push(json!(response.get_ref().id));
+            .push(json!(artifact.id));
         self.save(&state);
         Ok(response)
     }
-    async fn get_artifact(&self, r: Request<pb::ArtifactRef>) -> Reply<pb::ArtifactData> {
+    async fn get_artifact(&self, r: Request<pb::ArtifactRef>) -> Reply<Self::GetArtifactStream> {
         self.api.get_artifact(r).await
     }
 }
@@ -531,6 +542,7 @@ async fn start(root: PathBuf) -> (Arc<Host>, String, tokio::task::JoinHandle<()>
     let jobs = serde_json::from_value(observations["saved_agents"].clone()).unwrap_or_default();
     let fixture = Fixture {
         api: GrpcApi::new(host.clone(), Some(FIXTURE_TOKEN.into())),
+        host: host.clone(),
         state: Arc::new(Mutex::new(State {
             observations,
             jobs,

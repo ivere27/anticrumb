@@ -525,8 +525,23 @@ async fn idempotent_result_survives_account_pause() {
 
 #[tokio::test]
 async fn sdk_mcp_negotiates_lists_and_calls_the_same_service() {
-    use rmcp::{model::CallToolRequestParams, ServiceExt};
+    use base64::Engine as _;
+    use rmcp::{
+        model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents},
+        ServiceExt,
+    };
     let (_dir, service, _) = fixture();
+    let payload: Vec<u8> = (0..600 * 1024).map(|i| ((i * 29) % 251) as u8).collect();
+    let stored = service
+        .store
+        .artifact(
+            "default",
+            "mcp-multi.bin",
+            "application/octet-stream",
+            &payload,
+            "generated",
+        )
+        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let http = tokio::spawn(async move {
@@ -556,6 +571,37 @@ async fn sdk_mcp_negotiates_lists_and_calls_the_same_service() {
     let client = ().serve(client_io).await.unwrap();
     let tools = client.list_all_tools().await.unwrap();
     assert!(tools.iter().any(|t| t.name == "gemini_ask"));
+    let templates = client.list_all_resource_templates().await.unwrap();
+    assert!(templates.iter().any(|t| {
+        t.uri_template == "gemini://artifacts/{account}/{id}"
+            && t.description
+                .as_deref()
+                .is_some_and(|d| d.contains("100 MiB"))
+    }));
+    let resource = client
+        .read_resource(ReadResourceRequestParams::new(format!(
+            "gemini://artifacts/default/{}",
+            stored.id
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resource.contents.len(), 1);
+    match &resource.contents[0] {
+        ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            ..
+        } => {
+            assert_eq!(uri, &format!("gemini://artifacts/default/{}", stored.id));
+            assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .unwrap();
+            assert_eq!(decoded, payload);
+        }
+        other => panic!("expected blob resource contents, got {other:?}"),
+    }
     let result = client
         .call_tool(
             CallToolRequestParams::new("gemini_ask").with_arguments(

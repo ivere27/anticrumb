@@ -2,6 +2,20 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::{fmt, path::PathBuf};
 
+pub const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_ARTIFACT_LABEL: &str = "100 MiB";
+
+pub fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub fn is_valid_artifact_name(name: &str) -> bool {
+    !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', '\0', ':'])
+}
+
 pub fn id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
@@ -818,10 +832,13 @@ pub struct PruneSummary {
 pub struct CacheStats {
     pub retention_days: u32,
     pub blob_bytes: u64,
+    /// Total bytes across temporary staging directories (`uploads/`, `media/`, `blobs/.tmp`),
+    /// including active staging; reduced by reclaimed directories when `pruned` is true.
     pub temporary_bytes: u64,
     pub reclaimable_bytes: u64,
     pub reclaimed_bytes: u64,
     pub eligible_artifacts: u64,
+    /// Count of reclaimable temporary staging directories eligible for cleanup.
     pub temporary_entries: u64,
     pub orphan_blobs: u64,
     pub expired_cache: u64,

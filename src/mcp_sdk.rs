@@ -233,7 +233,8 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<ListResourceTemplatesResult, ErrorData> {
-        serde_json::from_value(json!({"resourceTemplates":[{"uriTemplate":"gemini://artifacts/{account}/{id}","name":"Gemini artifact","description":"Scoped generated or uploaded artifact, max 32 MiB."}]})).map_err(|e|ErrorData::internal_error(e.to_string(),None))
+        serde_json::from_value(json!({"resourceTemplates":[{"uriTemplate":"gemini://artifacts/{account}/{id}","name":"Gemini artifact","description":format!("Scoped generated or uploaded artifact, max {}.", crate::domain::MAX_ARTIFACT_LABEL)}]}))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
     async fn read_resource(
         &self,
@@ -249,29 +250,21 @@ impl ServerHandler for Server {
         if parts.len() != 2 || parts.iter().any(|id| validate_id(id).is_err()) {
             return Err(ErrorData::invalid_params("invalid artifact URI", None));
         }
-        let response = self
+        let downloaded = self
             .rpc
-            .get_artifact(crate::rpc::pb::ArtifactRef {
+            .get_artifact_bytes(crate::rpc::pb::ArtifactRef {
                 account_id: parts[0].into(),
                 id: parts[1].into(),
             })
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let artifact = response
-            .artifact
-            .ok_or_else(|| ErrorData::internal_error("missing artifact metadata", None))?;
-        if artifact.hash != crate::domain::digest(&response.data)
-            || artifact.size != response.data.len() as u64
-        {
-            return Err(ErrorData::internal_error(
-                "artifact integrity mismatch",
-                None,
-            ));
-        }
-        let mime = artifact.mime;
-        let bytes = response.data;
         use base64::Engine;
-        let result:ReadResourceResult=serde_json::from_value(json!({"contents":[{"uri":request.uri,"mimeType":mime,"blob":base64::engine::general_purpose::STANDARD.encode(bytes)}]})).map_err(|e|ErrorData::internal_error(e.to_string(),None))?;
+        let mime = downloaded.artifact.mime;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&downloaded.data);
+        drop(downloaded.data);
+        let result = ReadResourceResult::new(vec![
+            ResourceContents::blob(encoded, request.uri).with_mime_type(mime)
+        ]);
         Ok(result.into())
     }
 }

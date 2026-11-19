@@ -195,8 +195,13 @@ impl GeminiTab {
                 .ok_or("missing filename")?
                 .to_string_lossy()
                 .to_string();
-            if std::fs::metadata(&file).map_err(|e| e.to_string())?.len() > 32 * 1024 * 1024 {
-                return Err("attachment exceeds 32 MiB".into());
+            if std::fs::metadata(&file).map_err(|e| e.to_string())?.len()
+                > crate::input::MAX_FILE_BYTES
+            {
+                return Err(format!(
+                    "attachment exceeds {}",
+                    crate::domain::MAX_ARTIFACT_LABEL
+                ));
             }
             let extension = file
                 .extension()

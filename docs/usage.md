@@ -62,13 +62,14 @@ Command handling: [commands.rs](../src/tui/commands.rs). Input and rendering: [t
 anticrumb -C ./project --file ./notes.txt
 anticrumb exec -C ./project 'Implement @docs/spec.md and @"design notes.txt"'
 anticrumb exec -C ./project 'Review @git:diff and suggest tests'
+anticrumb exec -C ./project 'Review @git:HEAD~1 and check for regressions'
 anticrumb image 'Draw a minimalist rust gear icon'
 anticrumb artifact get default ARTIFACT_ID ./result.webp
 ```
 
-- `@path`, `@git:diff`, `@git:staged`, `--file PATH`, and `-i/--image PATH` upload through the provider: 32 MiB per file, 10 files per conversation. `@git:diff` and `@git:staged` generate temporary patch attachments (`git-diff.patch` / `git-staged.patch`) directly from the workspace git repository.
+- `@path`, `@git:diff`, `@git:staged`, `@git:<commit>`, `--file PATH`, and `-i/--image PATH` upload through the provider: 100 MiB per file, 10 files per conversation. `@git:diff`, `@git:staged`, and `@git:<commit>` (commit SHA, `HEAD`, `HEAD~1`, branch, or tag) generate temporary patch attachments (`git-diff.patch` / `git-staged.patch` / `git-<sha>.patch`) directly from the workspace git repository. If an `@` mention in prompt text cannot be attached (for example, missing prose like `@username`, a directory, an oversized file, or an unresolvable `@git:...`), anticrumb logs a warning and keeps the `@...` text literal so the prompt still sends.
 - When uploads are supported, the first agent prompt is a text attachment. Later turns send only new content; messages above the [provider threshold](../providers/README.md#prompt-attachment-threshold) also become attachments. Providers without uploads use inline text.
-- An automatic prompt file uses one upload slot for that turn but is not retained as a user attachment. It has the same 32 MiB limit. Conversations keep their session; file transport does not increase model context capacity.
+- An automatic prompt file uses one upload slot for that turn but is not retained as a user attachment. It has the same 100 MiB limit. Conversations keep their session; file transport does not increase model context capacity.
 - [Browser screenshots](tools.md#visual-browser-control) are also sent only with the next model turn. They share that turn's upload slots but do not count toward the retained user attachment set.
 
 ## Local Daemon

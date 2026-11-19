@@ -1135,6 +1135,8 @@ fn evaluate_windows_firewall_rules(
         return Some(format!(
             "Warning: Windows Firewall only allows inbound connections for {exe_norm} on profile(s): {allowed_list} (Public profile is not allowed).\n\
              Connections over VPN or public networks may time out. To allow VPN/virtual private subnet ({vpn_cidr}) in Administrator PowerShell:\n  \
+             Get-NetFirewallApplicationFilter -Program '{ps_escaped}' -ErrorAction SilentlyContinue | Get-NetFirewallRule | Remove-NetFirewallRule\n  \
+             # Allow VPN/virtual private subnet only ({vpn_cidr}), or omit -LocalAddress/-RemoteAddress for all networks:\n  \
              New-NetFirewallRule -DisplayName 'anticrumb server (VPN)' -Direction Inbound -Program '{ps_escaped}' -LocalAddress {vpn_cidr} -RemoteAddress {vpn_cidr} -Action Allow -Profile Any"
         ));
     }
@@ -1791,6 +1793,7 @@ HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\Fir
 "#;
         let warn = evaluate_windows_firewall_rules(private_only_output, exe, 50303, cidr).unwrap();
         assert!(warn.contains("Public profile is not allowed"), "{warn}");
+        assert!(warn.contains("Remove-NetFirewallRule"), "{warn}");
         assert!(!warn.to_ascii_lowercase().contains("tailscale"), "{warn}");
 
         // 4. Allowed on all profiles (no Profile= restriction or includes Public) -> no warning.

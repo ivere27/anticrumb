@@ -69,7 +69,7 @@ struct Removal {
     lease: Option<fs::File>,
 }
 
-fn owned_name(name: &str, prefix: &str) -> bool {
+pub(super) fn owned_name(name: &str, prefix: &str) -> bool {
     name.strip_prefix(prefix)
         .is_some_and(|id| id.len() == 32 && id.bytes().all(|ch| ch.is_ascii_hexdigit()))
 }
@@ -82,12 +82,26 @@ fn old(metadata: &fs::Metadata, cutoff: i64) -> bool {
         .is_some_and(|age| age.as_millis() < cutoff.max(0) as u128)
 }
 
-fn entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+pub(super) fn entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => fs::read_dir(path)
-            .map_err(ServiceError::storage)?
-            .collect::<std::io::Result<_>>()
-            .map_err(ServiceError::storage),
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            let dir = match fs::read_dir(path) {
+                Ok(dir) => dir,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(ServiceError::storage(error)),
+            };
+            let mut items = Vec::new();
+            for entry in dir {
+                match entry {
+                    Ok(entry) => items.push(entry),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ServiceError::storage(error)),
+                }
+            }
+            Ok(items)
+        }
         Ok(_) => Err(ServiceError::invalid(
             "cache directory must not be a symlink or a file",
         )),
@@ -96,7 +110,7 @@ fn entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
     }
 }
 
-fn metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+pub(super) fn metadata(path: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -105,7 +119,7 @@ fn metadata(path: &Path) -> Result<Option<fs::Metadata>> {
 }
 
 // Refuse to traverse links, including links inside an abandoned directory.
-fn directory_size(path: &Path, newest: &mut SystemTime) -> Result<Option<u64>> {
+pub(super) fn directory_size(path: &Path, newest: &mut SystemTime) -> Result<Option<u64>> {
     let mut bytes = 0;
     for entry in entries(path)? {
         let Some(meta) = metadata(&entry.path())? else {
@@ -241,7 +255,9 @@ impl Store {
         };
         let mut removals = Vec::new();
         for entry in entries(&self.root.join("blobs"))? {
-            let meta = fs::symlink_metadata(entry.path()).map_err(ServiceError::storage)?;
+            let Some(meta) = metadata(&entry.path())? else {
+                continue;
+            };
             if !meta.is_file() || meta.file_type().is_symlink() {
                 continue;
             }
@@ -307,6 +323,63 @@ impl Store {
                     lease,
                 });
             }
+        }
+        // Staging entries under `blobs/.tmp` always hold a `.lease` before `blob_lease`
+        // is dropped, so any unlocked entry is an abandoned crash leftover and can be
+        // reclaimed immediately regardless of `busy` or age.
+        // Consistent with `uploads/` and `media/`, `temporary_bytes` tracks total staging
+        // usage (including active writers), while `temporary_entries` counts reclaimable
+        // entries queued in `removals`.
+        for entry in entries(&self.root.join("blobs").join(".tmp"))? {
+            let Some(meta) = metadata(&entry.path())? else {
+                continue;
+            };
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let mut newest = meta.modified().map_err(ServiceError::storage)?;
+            let Some(bytes) = directory_size(&entry.path(), &mut newest)? else {
+                continue;
+            };
+            stats.temporary_bytes += bytes;
+            if !owned_name(&entry.file_name().to_string_lossy(), "tmp_") {
+                continue;
+            }
+            let lock = entry.path().join(".lease");
+            let lease = match fs::symlink_metadata(&lock) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                    let file = match fs::OpenOptions::new().read(true).write(true).open(lock) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if metadata(&entry.path())?.is_none() {
+                                stats.temporary_bytes = stats.temporary_bytes.saturating_sub(bytes);
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(ServiceError::storage(error)),
+                    };
+                    if file.try_lock_exclusive().is_err() {
+                        continue;
+                    }
+                    Some(file)
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if metadata(&entry.path())?.is_none() {
+                        stats.temporary_bytes = stats.temporary_bytes.saturating_sub(bytes);
+                        continue;
+                    }
+                    None
+                }
+                Err(e) => return Err(ServiceError::storage(e)),
+            };
+            stats.temporary_entries += 1;
+            removals.push(Removal {
+                path: entry.path(),
+                bytes,
+                directory: true,
+                lease,
+            });
         }
         stats.reclaimable_bytes = removals.iter().map(|file| file.bytes).sum();
         if options.prune && !options.dry_run {
@@ -517,6 +590,55 @@ mod tests {
     }
 
     #[test]
+    fn cache_reclaims_abandoned_blob_staging_under_busy_while_protecting_live_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .put("local", "agent", "active", &json!({"state":"running"}))
+            .unwrap();
+
+        let mut live = store
+            .artifact_writer(
+                "default",
+                "live.bin",
+                "application/octet-stream",
+                Some(10),
+                None,
+                "input",
+            )
+            .unwrap();
+        live.write_chunk(b"12345").unwrap();
+
+        let crashed = dir.path().join("blobs").join(".tmp").join(id("tmp"));
+        fs::create_dir_all(&crashed).unwrap();
+        fs::write(crashed.join(".lease"), b"").unwrap();
+        fs::write(crashed.join("data"), b"crashed upload bytes").unwrap();
+
+        let stats = store
+            .cache_at(
+                Options {
+                    prune: true,
+                    ..Default::default()
+                },
+                now_ms(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(stats.busy);
+        assert!(!crashed.exists());
+        assert_eq!(stats.temporary_entries, 1);
+        assert_eq!(stats.reclaimed_bytes, b"crashed upload bytes".len() as u64);
+
+        live.write_chunk(b"67890").unwrap();
+        let art = live.finish().unwrap();
+        assert_eq!(
+            store.artifact_bytes("default", &art.id).unwrap().1,
+            b"1234567890"
+        );
+    }
+
+    #[test]
     fn cache_automatic_interval_and_pressure_reclaim_only_eligible_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -654,5 +776,43 @@ mod tests {
             store.artifact_bytes("default", &image.id).unwrap().1,
             b"input"
         );
+    }
+
+    #[test]
+    fn cache_entries_handles_missing_dir_and_concurrent_staging_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(entries(&dir.path().join("does-not-exist"))
+            .unwrap()
+            .is_empty());
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_dropper = stop.clone();
+        let dropper_store = store.clone();
+        let dropper = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if stop_dropper.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let mut writer = dropper_store
+                    .artifact_writer(
+                        "default",
+                        "ephemeral.bin",
+                        "application/octet-stream",
+                        Some(32),
+                        None,
+                        "input",
+                    )
+                    .unwrap();
+                writer.write_chunk(&[7; 16]).unwrap();
+                drop(writer);
+            }
+        });
+        for _ in 0..40 {
+            let stats = store.cache_report(Options::default()).unwrap();
+            assert!(!stats.pruned);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        dropper.join().unwrap();
     }
 }

@@ -1,19 +1,21 @@
 //! File mentions are references to native uploads, never expanded file contents.
 use crate::domain::{Result, ServiceError};
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
 
 pub const MAX_FILES: usize = 10;
-pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = crate::domain::MAX_ARTIFACT_BYTES;
 
 #[derive(Clone, Debug, Default)]
 pub struct PreparedInput {
     pub text: String,
     pub files: Vec<PathBuf>,
     pub temp_files: Vec<PathBuf>,
+    pub warnings: Vec<String>,
 }
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -64,29 +66,26 @@ pub fn file(workspace: &Path, path: &Path) -> Result<PathBuf> {
         .map_err(|e| ServiceError::invalid(format!("cannot attach {}: {e}", path.display())))?;
     let metadata = path.metadata().map_err(ServiceError::storage)?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-        return Err(ServiceError::invalid(
-            "attachments must be regular files of at most 32 MiB",
-        ));
+        return Err(ServiceError::invalid(format!(
+            "attachments must be regular files of at most {}",
+            crate::domain::MAX_ARTIFACT_LABEL
+        )));
     }
     Ok(path)
 }
 
-pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
+fn run_git_patch(
+    workspace: &Path,
+    args: &[&str],
+    filename: &str,
+    operation: &str,
+    empty_err: &str,
+) -> Result<PathBuf> {
     let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(workspace);
-    if staged {
-        cmd.args(["diff", "--staged", "--no-color", "--no-ext-diff"]);
-    } else {
-        cmd.args(["diff", "--no-color", "--no-ext-diff"]);
-    }
+    cmd.current_dir(workspace).args(args);
     let temp_dir =
         std::env::temp_dir().join(format!("anticrumb-git-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&temp_dir).map_err(ServiceError::storage)?;
-    let filename = if staged {
-        "git-staged.patch"
-    } else {
-        "git-diff.patch"
-    };
     let patch_path = temp_dir.join(filename);
 
     let mut child = match cmd
@@ -133,7 +132,7 @@ pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
                 drop(file);
                 cleanup();
                 return Err(ServiceError::invalid(format!(
-                    "failed to read git diff: {e}"
+                    "failed to read {operation}: {e}"
                 )));
             }
         };
@@ -159,9 +158,10 @@ pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
         let _ = child.wait();
         drop(file);
         cleanup();
-        return Err(ServiceError::invalid(
-            "attachments must be regular files of at most 32 MiB",
-        ));
+        return Err(ServiceError::invalid(format!(
+            "attachments must be regular files of at most {}",
+            crate::domain::MAX_ARTIFACT_LABEL
+        )));
     }
 
     if let Err(e) = file.flush() {
@@ -176,9 +176,13 @@ pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
     if let Some(mut stderr) = child.stderr.take() {
         let _ = stderr.read_to_end(&mut stderr_bytes);
     }
-    let status = child
-        .wait()
-        .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            cleanup();
+            return Err(ServiceError::invalid(format!("git command failed: {e}")));
+        }
+    };
 
     if !status.success() {
         cleanup();
@@ -187,21 +191,93 @@ pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
             return Err(ServiceError::invalid("not a git repository"));
         }
         return Err(ServiceError::invalid(format!(
-            "git diff failed: {}",
+            "{operation} failed: {}",
             stderr.trim()
         )));
     }
 
     if total_bytes == 0 || !has_non_whitespace {
         cleanup();
-        return Err(ServiceError::invalid(if staged {
-            "no staged git changes to attach"
-        } else {
-            "no unstaged git changes to attach"
-        }));
+        return Err(ServiceError::invalid(empty_err));
     }
 
     Ok(patch_path)
+}
+
+pub fn git_diff_file(workspace: &Path, staged: bool) -> Result<PathBuf> {
+    if staged {
+        run_git_patch(
+            workspace,
+            &["diff", "--staged", "--no-color", "--no-ext-diff"],
+            "git-staged.patch",
+            "git diff",
+            "no staged git changes to attach",
+        )
+    } else {
+        run_git_patch(
+            workspace,
+            &["diff", "--no-color", "--no-ext-diff"],
+            "git-diff.patch",
+            "git diff",
+            "no unstaged git changes to attach",
+        )
+    }
+}
+
+fn resolve_git_commit(workspace: &Path, rev: &str) -> Result<String> {
+    if rev.is_empty() {
+        return Err(ServiceError::invalid("missing git commit id after git:"));
+    }
+    if rev.starts_with('-') || rev.chars().any(char::is_control) {
+        return Err(ServiceError::invalid(format!("invalid git commit: {rev}")));
+    }
+    let output = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_ascii_lowercase().contains("not a git repository") {
+            return Err(ServiceError::invalid("not a git repository"));
+        }
+        return Err(ServiceError::invalid(format!("unknown git commit: {rev}")));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ServiceError::invalid(format!("unknown git commit: {rev}")));
+    }
+    Ok(sha)
+}
+
+fn git_commit_patch_for_sha(workspace: &Path, full_sha: &str) -> Result<PathBuf> {
+    let short = &full_sha[..full_sha.len().min(12)];
+    let filename = format!("git-{short}.patch");
+    run_git_patch(
+        workspace,
+        &[
+            "show",
+            "-m",
+            "--first-parent",
+            "--no-color",
+            "--no-ext-diff",
+            full_sha,
+        ],
+        &filename,
+        "git show",
+        "git commit produced empty output",
+    )
+}
+
+pub fn git_commit_file(workspace: &Path, rev: &str) -> Result<PathBuf> {
+    let full_sha = resolve_git_commit(workspace, rev)?;
+    git_commit_patch_for_sha(workspace, &full_sha)
 }
 
 pub fn cleanup_temp_files(temp_files: &[PathBuf]) {
@@ -216,40 +292,37 @@ pub fn cleanup_temp_files(temp_files: &[PathBuf]) {
     }
 }
 
-fn resolve_mention(
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum GitPatchTarget {
+    Diff,
+    Staged,
+    Commit(String),
+}
+
+fn resolve_git_mention(
     workspace: &Path,
-    path: &str,
-    unstaged_patch: &mut Option<PathBuf>,
-    staged_patch: &mut Option<PathBuf>,
+    spec: &str,
+    git_cache: &mut HashMap<GitPatchTarget, PathBuf>,
     temp_files: &mut Vec<PathBuf>,
 ) -> Result<PathBuf> {
-    match path {
-        "git:diff" => {
-            if let Some(existing) = unstaged_patch {
-                Ok(existing.clone())
-            } else {
-                let p = git_diff_file(workspace, false)?;
-                *unstaged_patch = Some(p.clone());
-                if !temp_files.contains(&p) {
-                    temp_files.push(p.clone());
-                }
-                Ok(p)
-            }
-        }
-        "git:staged" => {
-            if let Some(existing) = staged_patch {
-                Ok(existing.clone())
-            } else {
-                let p = git_diff_file(workspace, true)?;
-                *staged_patch = Some(p.clone());
-                if !temp_files.contains(&p) {
-                    temp_files.push(p.clone());
-                }
-                Ok(p)
-            }
-        }
-        _ => file(workspace, Path::new(path)),
+    let target = match spec {
+        "diff" => GitPatchTarget::Diff,
+        "staged" => GitPatchTarget::Staged,
+        rev => GitPatchTarget::Commit(resolve_git_commit(workspace, rev)?),
+    };
+    if let Some(existing) = git_cache.get(&target) {
+        return Ok(existing.clone());
     }
+    let patch = match &target {
+        GitPatchTarget::Diff => git_diff_file(workspace, false)?,
+        GitPatchTarget::Staged => git_diff_file(workspace, true)?,
+        GitPatchTarget::Commit(full_sha) => git_commit_patch_for_sha(workspace, full_sha)?,
+    };
+    git_cache.insert(target, patch.clone());
+    if !temp_files.contains(&patch) {
+        temp_files.push(patch.clone());
+    }
+    Ok(patch)
 }
 
 pub fn prepare(text: &str, workspace: &Path, explicit: &[PathBuf]) -> Result<PreparedInput> {
@@ -265,15 +338,22 @@ pub fn prepare_with_literals(
 ) -> Result<PreparedInput> {
     let mut temp_files = Vec::new();
     match prepare_internal(text, workspace, explicit, literals, &mut temp_files) {
-        Ok((text, files)) => Ok(PreparedInput {
+        Ok((text, files, warnings)) => Ok(PreparedInput {
             text,
             files,
             temp_files,
+            warnings,
         }),
         Err(e) => {
             cleanup_temp_files(&temp_files);
             Err(e)
         }
+    }
+}
+
+fn push_warning(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
     }
 }
 
@@ -283,17 +363,17 @@ fn prepare_internal(
     explicit: &[PathBuf],
     literals: &[Range<usize>],
     temp_files: &mut Vec<PathBuf>,
-) -> Result<(String, Vec<PathBuf>)> {
+) -> Result<(String, Vec<PathBuf>, Vec<String>)> {
     let is_literal = |position| literals.iter().any(|range| range.contains(&position));
     let mut files = Vec::new();
+    let mut warnings = Vec::new();
     for path in explicit {
         add(&mut files, file(workspace, path)?)?;
     }
     let mut output = String::new();
     let mut fenced = None;
     let mut line_offset = 0;
-    let mut unstaged_patch = None;
-    let mut staged_patch = None;
+    let mut git_cache = HashMap::new();
     for line in text.split_inclusive('\n') {
         let offset = line_offset;
         line_offset += line.len();
@@ -327,30 +407,50 @@ fn prepare_internal(
                 pos += 2;
                 continue;
             }
-            let (path, end_rel) = parse_mention(&line[pos..])
-                .map_err(ServiceError::invalid)?
-                .expect("starts with @");
+            let (path, end_rel) = match parse_mention(&line[pos..]) {
+                Ok(Some(parsed)) => parsed,
+                Ok(None) => unreachable!("starts with @"),
+                Err(msg) => {
+                    push_warning(&mut warnings, format!("{msg}; keeping literal @ text"));
+                    output.push('@');
+                    pos += 1;
+                    continue;
+                }
+            };
             if path.is_empty() {
                 output.push('@');
                 pos += 1;
                 continue;
             }
-            let path = resolve_mention(
-                workspace,
-                path,
-                &mut unstaged_patch,
-                &mut staged_patch,
-                temp_files,
-            )?;
-            output.push_str(&format!(
-                "[Attached file: {}]",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            add(&mut files, path)?;
+            let raw_mention = &line[pos..pos + end_rel];
+            let resolved = if let Some(spec) = path.strip_prefix("git:") {
+                resolve_git_mention(workspace, spec, &mut git_cache, temp_files)
+            } else {
+                file(workspace, Path::new(path))
+            };
+            match resolved {
+                Ok(resolved_path) => {
+                    output.push_str(&format!(
+                        "[Attached file: {}]",
+                        resolved_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    ));
+                    add(&mut files, resolved_path)?;
+                }
+                Err(e) => {
+                    push_warning(
+                        &mut warnings,
+                        format!("{e}; keeping {raw_mention} as prompt text"),
+                    );
+                    output.push_str(raw_mention);
+                }
+            }
             pos += end_rel;
         }
     }
-    Ok((output, files))
+    Ok((output, files, warnings))
 }
 
 fn add(files: &mut Vec<PathBuf>, path: PathBuf) -> Result<()> {
@@ -395,10 +495,61 @@ mod tests {
         assert!(p.text.contains("@no-file"));
     }
     #[test]
-    fn missing_files_and_directories_are_rejected_before_submission() {
+    fn missing_files_directories_and_unclosed_quotes_warn_and_keep_literal_text() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(prepare("@missing", dir.path(), &[]).is_err());
-        assert!(prepare("@.", dir.path(), &[]).is_err());
+        std::fs::write(dir.path().join("real.txt"), "file").unwrap();
+
+        let missing = prepare("@missing", dir.path(), &[]).unwrap();
+        assert!(missing.files.is_empty());
+        assert_eq!(missing.text, "@missing");
+        assert_eq!(missing.warnings.len(), 1);
+        assert!(missing.warnings[0].contains("cannot attach"));
+        assert!(missing.warnings[0].contains("keeping @missing as prompt text"));
+
+        let prose = prepare("@fdsjifdsoidsf fdsijdsf", dir.path(), &[]).unwrap();
+        assert!(prose.files.is_empty());
+        assert_eq!(prose.text, "@fdsjifdsoidsf fdsijdsf");
+        assert_eq!(prose.warnings.len(), 1);
+        assert!(prose.warnings[0].contains("cannot attach"));
+        assert!(prose.warnings[0].contains("keeping @fdsjifdsoidsf as prompt text"));
+
+        let directory = prepare("@.", dir.path(), &[]).unwrap();
+        assert!(directory.files.is_empty());
+        assert_eq!(directory.text, "@.");
+        assert_eq!(directory.warnings.len(), 1);
+        assert!(directory.warnings[0].contains("regular files"));
+        assert!(directory.warnings[0].contains("keeping @. as prompt text"));
+
+        let unclosed = prepare("@\"unclosed quote", dir.path(), &[]).unwrap();
+        assert!(unclosed.files.is_empty());
+        assert_eq!(unclosed.text, "@\"unclosed quote");
+        assert_eq!(unclosed.warnings.len(), 1);
+        assert!(unclosed.warnings[0].contains("unclosed quoted attachment path"));
+
+        let repeated = prepare("@missing and @missing", dir.path(), &[]).unwrap();
+        assert!(repeated.files.is_empty());
+        assert_eq!(repeated.text, "@missing and @missing");
+        assert_eq!(repeated.warnings.len(), 1);
+
+        let mixed = prepare("Read @real.txt and @missing", dir.path(), &[]).unwrap();
+        assert_eq!(mixed.files.len(), 1);
+        assert_eq!(mixed.text, "Read [Attached file: real.txt] and @missing");
+        assert_eq!(mixed.warnings.len(), 1);
+
+        let huge_path = dir.path().join("huge.bin");
+        std::fs::File::create(&huge_path)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let oversized = prepare("Inspect @huge.bin", dir.path(), &[]).unwrap();
+        assert!(oversized.files.is_empty());
+        assert_eq!(oversized.text, "Inspect @huge.bin");
+        assert_eq!(oversized.warnings.len(), 1);
+        assert!(oversized.warnings[0].contains("100 MiB"));
+        assert!(oversized.warnings[0].contains("keeping @huge.bin as prompt text"));
+
+        assert!(prepare("hi", dir.path(), &[PathBuf::from("missing")]).is_err());
+        assert!(prepare("hi", dir.path(), &[PathBuf::from("huge.bin")]).is_err());
     }
     #[test]
     fn pasted_mentions_stay_exact_while_typed_mentions_attach() {
@@ -524,9 +675,61 @@ mod tests {
         // Make an unstaged change so @git:diff would generate a patch
         std::fs::write(dir.path().join("code.rs"), "fn main() { 1; }\n").unwrap();
 
-        // Mention @git:diff followed by a non-existent file
-        let err = prepare("Check @git:diff and @missing.txt", dir.path(), &[]).unwrap_err();
-        assert!(err.to_string().contains("cannot attach"));
+        // Missing regular file mention emits warning while keeping @git:diff attached
+        let with_missing = prepare("Check @git:diff and @missing.txt", dir.path(), &[]).unwrap();
+        assert_eq!(with_missing.files.len(), 1);
+        assert_eq!(with_missing.temp_files.len(), 1);
+        assert_eq!(with_missing.files[0].file_name().unwrap(), "git-diff.patch");
+        assert_eq!(
+            with_missing.text,
+            "Check [Attached file: git-diff.patch] and @missing.txt"
+        );
+        assert_eq!(with_missing.warnings.len(), 1);
+        assert!(with_missing.warnings[0].contains("keeping @missing.txt as prompt text"));
+        cleanup_temp_files(&with_missing.temp_files);
+        assert!(!with_missing.files[0].exists());
+
+        // Failing @git: mention also warns and keeps @git:nonexistent literal while keeping @git:diff attached
+        let with_bad_git =
+            prepare("Check @git:diff and @git:nonexistent", dir.path(), &[]).unwrap();
+        assert_eq!(with_bad_git.files.len(), 1);
+        assert_eq!(with_bad_git.temp_files.len(), 1);
+        assert_eq!(with_bad_git.files[0].file_name().unwrap(), "git-diff.patch");
+        assert_eq!(
+            with_bad_git.text,
+            "Check [Attached file: git-diff.patch] and @git:nonexistent"
+        );
+        assert_eq!(with_bad_git.warnings.len(), 1);
+        assert!(with_bad_git.warnings[0].contains("unknown git commit"));
+        assert!(with_bad_git.warnings[0].contains("keeping @git:nonexistent as prompt text"));
+        cleanup_temp_files(&with_bad_git.temp_files);
+        assert!(!with_bad_git.files[0].exists());
+
+        // Exceeding MAX_FILES after @git:diff errors cleanly and cleans up prior temp patch files
+        let mut explicit = Vec::new();
+        for i in 0..MAX_FILES {
+            let p = dir.path().join(format!("limit_{i}.txt"));
+            std::fs::write(&p, "x").unwrap();
+            explicit.push(p);
+        }
+        let err = prepare("Check @git:diff", dir.path(), &explicit).unwrap_err();
+        assert!(err.to_string().contains("at most 10 attachments"));
+
+        let mut recorded_temps = Vec::new();
+        let err = prepare_internal(
+            "Check @git:diff",
+            dir.path(),
+            &explicit,
+            &[],
+            &mut recorded_temps,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most 10 attachments"));
+        assert_eq!(recorded_temps.len(), 1);
+        assert!(recorded_temps[0].exists());
+        cleanup_temp_files(&recorded_temps);
+        assert!(!recorded_temps[0].exists());
+        assert!(!recorded_temps[0].parent().unwrap().exists());
     }
     #[test]
     fn cleanup_temp_files_safe_with_non_empty_dirs() {
@@ -541,11 +744,18 @@ mod tests {
         assert!(dir.path().exists());
     }
     #[test]
-    fn git_diff_rejects_empty_diff_and_non_git_repo() {
+    fn git_diff_warns_on_empty_diff_and_non_git_repo_while_direct_helper_errors() {
         let dir = tempfile::tempdir().unwrap();
-        // Non-git repo
-        let err = prepare("@git:diff", dir.path(), &[]).unwrap_err();
+        // Non-git repo: direct helper errors, prompt prepare warns and keeps literal text
+        let err = git_diff_file(dir.path(), false).unwrap_err();
         assert!(err.to_string().contains("not a git repository"));
+        let non_git_prompt = prepare("@git:diff", dir.path(), &[]).unwrap();
+        assert!(non_git_prompt.files.is_empty());
+        assert!(non_git_prompt.temp_files.is_empty());
+        assert_eq!(non_git_prompt.text, "@git:diff");
+        assert_eq!(non_git_prompt.warnings.len(), 1);
+        assert!(non_git_prompt.warnings[0].contains("not a git repository"));
+        assert!(non_git_prompt.warnings[0].contains("keeping @git:diff as prompt text"));
 
         let run = |args: &[&str]| {
             let status = std::process::Command::new("git")
@@ -562,11 +772,212 @@ mod tests {
         run(&["add", "file.txt"]);
         run(&["commit", "-m", "init"]);
 
-        // Empty diffs
-        let err = prepare("@git:diff", dir.path(), &[]).unwrap_err();
+        // Empty diffs: direct helpers error, prompt prepare warns and keeps literal text
+        let err = git_diff_file(dir.path(), false).unwrap_err();
         assert!(err.to_string().contains("no unstaged git changes"));
+        let clean_diff = prepare("@git:diff", dir.path(), &[]).unwrap();
+        assert!(clean_diff.files.is_empty());
+        assert_eq!(clean_diff.text, "@git:diff");
+        assert_eq!(clean_diff.warnings.len(), 1);
+        assert!(clean_diff.warnings[0].contains("no unstaged git changes"));
 
-        let err = prepare("@git:staged", dir.path(), &[]).unwrap_err();
+        let err = git_diff_file(dir.path(), true).unwrap_err();
         assert!(err.to_string().contains("no staged git changes"));
+        let clean_staged = prepare("@git:staged", dir.path(), &[]).unwrap();
+        assert!(clean_staged.files.is_empty());
+        assert_eq!(clean_staged.text, "@git:staged");
+        assert_eq!(clean_staged.warnings.len(), 1);
+        assert!(clean_staged.warnings[0].contains("no staged git changes"));
+    }
+
+    #[test]
+    fn git_commit_mentions_attach_dedup_and_support_refs_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("code.rs"), "fn main() {}\n").unwrap();
+        run_out(&["add", "code.rs"]);
+        run_out(&["commit", "-m", "initial commit"]);
+        let first_full = run_out(&["rev-parse", "HEAD"]);
+        let first_short = run_out(&["rev-parse", "--short", "HEAD"]);
+
+        run_out(&["checkout", "-b", "feat/login"]);
+        std::fs::write(dir.path().join("login.rs"), "pub fn login() {}\n").unwrap();
+        run_out(&["add", "login.rs"]);
+        run_out(&["commit", "-m", "add login"]);
+        let branch_full = run_out(&["rev-parse", "HEAD"]);
+        let expected_branch_file = format!("git-{}.patch", &branch_full[..12]);
+
+        // Switch back to initial branch and create a clean merge commit.
+        run_out(&["checkout", "-"]);
+        std::fs::write(dir.path().join("README.md"), "# docs\n").unwrap();
+        run_out(&["add", "README.md"]);
+        run_out(&["commit", "-m", "add docs"]);
+        run_out(&["merge", "--no-ff", "feat/login", "-m", "merge feat/login"]);
+        let merge_full = run_out(&["rev-parse", "HEAD"]);
+        let expected_merge_file = format!("git-{}.patch", &merge_full[..12]);
+        let expected_first_file = format!("git-{}.patch", &first_full[..12]);
+
+        // 1. HEAD, short SHA, full SHA, and slash branch name resolve and deduplicate properly.
+        let p = prepare(
+            &format!("Compare @git:HEAD @git:{merge_full} and @git:feat/login"),
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(p.files.len(), 2);
+        assert_eq!(p.temp_files.len(), 2);
+        assert_eq!(
+            p.files[0].file_name().unwrap().to_string_lossy(),
+            expected_merge_file
+        );
+        assert_eq!(
+            p.files[1].file_name().unwrap().to_string_lossy(),
+            expected_branch_file
+        );
+        assert_eq!(
+            p.text,
+            format!(
+                "Compare [Attached file: {expected_merge_file}] [Attached file: {expected_merge_file}] and [Attached file: {expected_branch_file}]"
+            )
+        );
+        let merge_patch = std::fs::read_to_string(&p.files[0]).unwrap();
+        assert!(merge_patch.contains("merge feat/login"));
+        assert!(
+            merge_patch.contains("+pub fn login() {}"),
+            "merge commit patch should include first-parent diff"
+        );
+        cleanup_temp_files(&p.temp_files);
+        assert!(!p.files[0].exists());
+        assert!(!p.files[1].exists());
+
+        // 2. Short SHA and full SHA for an older commit deduplicate to one patch file.
+        let dedup = prepare(
+            &format!("@git:{first_short} and @git:{first_full}"),
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(dedup.files.len(), 1);
+        assert_eq!(
+            dedup.files[0].file_name().unwrap().to_string_lossy(),
+            expected_first_file
+        );
+        let first_patch = std::fs::read_to_string(&dedup.files[0]).unwrap();
+        assert!(first_patch.contains("initial commit"));
+        assert!(first_patch.contains("+fn main() {}"));
+        cleanup_temp_files(&dedup.temp_files);
+        assert!(!dedup.files[0].exists());
+
+        // 3. Direct git_commit_file validates and supports refs with slashes safely.
+        let direct = git_commit_file(dir.path(), "feat/login").unwrap();
+        assert_eq!(
+            direct.file_name().unwrap().to_string_lossy(),
+            expected_branch_file
+        );
+        cleanup_temp_files(&[direct]);
+    }
+
+    #[test]
+    fn git_commit_warns_on_invalid_inputs_in_prompts_and_cleans_up_on_max_files() {
+        let non_git = tempfile::tempdir().unwrap();
+        assert!(git_commit_file(non_git.path(), "HEAD")
+            .unwrap_err()
+            .to_string()
+            .contains("not a git repository"));
+        let non_git_prompt = prepare("@git:HEAD", non_git.path(), &[]).unwrap();
+        assert!(non_git_prompt.files.is_empty());
+        assert_eq!(non_git_prompt.text, "@git:HEAD");
+        assert_eq!(non_git_prompt.warnings.len(), 1);
+        assert!(non_git_prompt.warnings[0].contains("not a git repository"));
+        assert!(non_git_prompt.warnings[0].contains("keeping @git:HEAD as prompt text"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        run_out(&["add", "file.txt"]);
+        run_out(&["commit", "-m", "init"]);
+        let blob_sha = run_out(&["rev-parse", "HEAD:file.txt"]);
+
+        for (raw, expected_err) in [
+            ("@git:", "missing git commit id"),
+            ("@git:nonexistent", "unknown git commit"),
+            ("@git:--help", "invalid git commit"),
+            ("@git:HEAD^{tree}", "unknown git commit"),
+        ] {
+            let prepared = prepare(raw, dir.path(), &[]).unwrap();
+            assert!(prepared.files.is_empty(), "{raw} should not attach files");
+            assert!(prepared.temp_files.is_empty());
+            assert_eq!(prepared.text, raw);
+            assert_eq!(prepared.warnings.len(), 1);
+            assert!(
+                prepared.warnings[0].contains(expected_err),
+                "warning {:?} should contain {:?}",
+                prepared.warnings[0],
+                expected_err
+            );
+            assert!(prepared.warnings[0].contains(&format!("keeping {raw} as prompt text")));
+        }
+
+        let blob_mention = format!("@git:{blob_sha}");
+        let blob_prepared = prepare(&blob_mention, dir.path(), &[]).unwrap();
+        assert!(blob_prepared.files.is_empty());
+        assert_eq!(blob_prepared.text, blob_mention);
+        assert_eq!(blob_prepared.warnings.len(), 1);
+        assert!(blob_prepared.warnings[0].contains("unknown git commit"));
+
+        // Direct API still strictly rejects invalid commits and blocks flag injection.
+        assert!(git_commit_file(dir.path(), "").is_err());
+        assert!(git_commit_file(dir.path(), "nonexistent").is_err());
+        assert!(git_commit_file(dir.path(), "--output=/tmp/pwn").is_err());
+        assert!(git_commit_file(dir.path(), "HEAD^{tree}").is_err());
+        assert!(git_commit_file(dir.path(), &blob_sha).is_err());
+
+        // Exceeding MAX_FILES after @git:HEAD records the temp patch for cleanup on Err.
+        let mut explicit = Vec::new();
+        for i in 0..MAX_FILES {
+            let p = dir.path().join(format!("extra_{i}.txt"));
+            std::fs::write(&p, "x").unwrap();
+            explicit.push(p);
+        }
+        let err = prepare("@git:HEAD", dir.path(), &explicit).unwrap_err();
+        assert!(err.to_string().contains("at most 10 attachments"));
+
+        let mut recorded_temps = Vec::new();
+        let err = prepare_internal("@git:HEAD", dir.path(), &explicit, &[], &mut recorded_temps)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 10 attachments"));
+        assert_eq!(recorded_temps.len(), 1);
+        assert!(recorded_temps[0].exists());
+        cleanup_temp_files(&recorded_temps);
+        assert!(!recorded_temps[0].exists());
+        assert!(!recorded_temps[0].parent().unwrap().exists());
     }
 }

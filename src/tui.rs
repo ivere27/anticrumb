@@ -937,6 +937,74 @@ mod tests {
     }
 
     #[test]
+    fn completion_lists_recent_git_commits_chronologically_and_handles_slash_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("f.txt"), "1\n").unwrap();
+        run_out(&["add", "f.txt"]);
+        run_out(&["commit", "-m", "first"]);
+        let sha1 = run_out(&["rev-parse", "--short", "HEAD"]);
+        std::fs::write(dir.path().join("f.txt"), "2\n").unwrap();
+        run_out(&["add", "f.txt"]);
+        run_out(&["commit", "-m", "second"]);
+        let sha2 = run_out(&["rev-parse", "--short", "HEAD"]);
+
+        let mut e = Editor::default();
+        e.set("@git:".into());
+        assert_eq!(
+            complete(&e, dir.path()).unwrap().values,
+            vec![
+                "@git:diff ".to_owned(),
+                "@git:staged ".to_owned(),
+                format!("@git:{sha2} "),
+                format!("@git:{sha1} "),
+            ]
+        );
+
+        e.set(format!("@\"git:{}", &sha1[..3]));
+        let quoted_vals = complete(&e, dir.path()).unwrap().values;
+        assert!(quoted_vals.contains(&format!("@\"git:{sha1}\" ")));
+
+        e.set("@git:D".into());
+        assert!(complete(&e, dir.path())
+            .unwrap()
+            .values
+            .contains(&"@git:diff ".to_owned()));
+
+        e.set("@git:first".into());
+        assert_eq!(
+            complete(&e, dir.path()).unwrap().values,
+            vec![format!("@git:{sha1} ")]
+        );
+
+        // Push sha1 beyond the recent 20-commit window and verify Tab completion still resolves it.
+        for i in 3..=24 {
+            std::fs::write(dir.path().join("f.txt"), format!("{i}\n")).unwrap();
+            run_out(&["add", "f.txt"]);
+            run_out(&["commit", "-m", &format!("commit {i}")]);
+        }
+        e.set(format!("@git:{sha1}"));
+        assert_eq!(
+            complete(&e, dir.path()).unwrap().values,
+            vec![format!("@git:{sha1} ")]
+        );
+
+        e.set("@git:feat/login".into());
+        assert!(complete(&e, dir.path()).unwrap().values.is_empty());
+    }
+
+    #[test]
     fn failed_command_delivery_cleans_up_temp_files() {
         let patch_dir =
             std::env::temp_dir().join(format!("anticrumb-test-{}", uuid::Uuid::new_v4().simple()));
@@ -2495,6 +2563,29 @@ mod tests {
         assert!( state.completion_mouse(click, &mut tx));
         assert_eq!(state.editor.text, "@second.rs ");
         assert!(state.mention.is_none());
+
+        // Git commits without a subject keep empty `detail` for search and display "Git commit" on render.
+        state.editor.set("@git:".into());
+        state.refresh_mention(&mut tx);
+        let Command::SearchMentions { id: id4, .. } = rx.try_recv().unwrap() else {
+            panic!("expected SearchMentions");
+        };
+        state.update(Update::MentionMatches {
+            id: id4,
+            query: "git:".into(),
+            matches: vec![MentionMatch {
+                display: "git:abc1234".into(),
+                kind: MentionKind::Git,
+                detail: String::new(),
+                score: 100_000,
+            }],
+            total: 1,
+        });
+        out.clear();
+        state.render_frame(&mut out, 100, 26).unwrap();
+        let git_rendered = String::from_utf8_lossy(&out);
+        assert!(git_rendered.contains("git:abc1234"));
+        assert!(git_rendered.contains("Git commit"));
     }
 
     #[test]
@@ -2639,5 +2730,119 @@ mod tests {
         assert!(!state.options.agent);
         assert!(!state.options.yolo);
         assert!(state.status_text(120).contains(" · CHAT · "));
+    }
+
+    #[test]
+    fn status_update_skips_redraw_when_only_runtime_uptime_changes() {
+        let mut state = State::new(PromptOptions {
+            account: "default".into(),
+            ..Default::default()
+        });
+        let base_status = |uptime_ms: u64, account_state: &str| {
+            serde_json::json!({
+                "runtime": {
+                    "uptime_ms": uptime_ms,
+                    "running_jobs": 0
+                },
+                "browser_connection": {
+                    "connected": true,
+                    "transport": "local"
+                },
+                "accounts": [{
+                    "id": "default",
+                    "provider": "gemini-web",
+                    "state": account_state,
+                    "models": []
+                }]
+            })
+        };
+
+        assert!(state.update(Update::Status(base_status(1000, "ready"))));
+        assert!(!state.update(Update::Status(base_status(2000, "ready"))));
+        assert!(state.update(Update::Status(base_status(3000, "busy"))));
+
+        assert!(state.update(Update::StatusDisconnected));
+        assert!(!state.update(Update::StatusDisconnected));
+        assert!(state.update(Update::Status(base_status(4000, "busy"))));
+    }
+
+    #[test]
+    fn missing_at_mention_warns_and_submits_prompt_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), "hello").unwrap();
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        let (mut tx, rx) = mpsc::sync_channel(4);
+
+        // 1. Standalone unresolvable @mention logs a warning and still submits literal text.
+        state.editor.set("@fdsjifdsoidsf fdsijdsf".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.editor.text.is_empty());
+        let logs = state.logs();
+        assert!(logs.contains("Warning:"));
+        assert!(logs.contains("cannot attach"));
+        assert!(logs.contains("@fdsjifdsoidsf"));
+        assert!(!logs.contains("! cannot attach"));
+        let Command::Start(req, files, temp_files) = rx.try_recv().unwrap() else {
+            panic!("expected Command::Start");
+        };
+        assert_eq!(req.task, "@fdsjifdsoidsf fdsijdsf");
+        assert!(files.is_empty());
+        assert!(temp_files.is_empty());
+
+        // 2. Mixed valid file + missing @mention attaches valid file, warns on missing, preserves text.
+        state.active = None;
+        state.pending = None;
+        state.phase = "ready".into();
+        state
+            .editor
+            .set("Check @real.txt with @fdsjifdsoidsf".into());
+        assert!(!state.submit(&mut tx));
+        let Command::Start(req2, files2, _) = rx.try_recv().unwrap() else {
+            panic!("expected Command::Start");
+        };
+        assert_eq!(req2.task, "Check [Attached file: real.txt] with @fdsjifdsoidsf");
+        assert_eq!(files2.len(), 1);
+        assert_eq!(files2[0].file_name().unwrap(), "real.txt");
+
+        // 3. Invalid or unresolvable @git: mentions warn and keep literal prompt text too.
+        state.active = None;
+        state.pending = None;
+        state.phase = "ready".into();
+        state.editor.set("@git:nonexistent hello".into());
+        assert!(!state.submit(&mut tx));
+        let git_logs = state.logs();
+        assert!(
+            git_logs.contains("not a git repository") || git_logs.contains("unknown git commit"),
+            "unexpected git warning logs: {git_logs}"
+        );
+        assert!(git_logs.contains("keeping @git:nonexistent as prompt text"));
+        let Command::Start(req_git, files_git, temp_git) = rx.try_recv().unwrap() else {
+            panic!("expected Command::Start");
+        };
+        assert_eq!(req_git.task, "@git:nonexistent hello");
+        assert!(files_git.is_empty());
+        assert!(temp_git.is_empty());
+
+        // 4. Steering an active turn also warns cleanly and keeps literal text.
+        state.active = Some("active-run".into());
+        state.pending = None;
+        state.phase = "running".into();
+        state.editor.set("@missing_steer keep going".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.logs().contains("@missing_steer"));
+        let Command::Steer {
+            message,
+            files: steer_files,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected Command::Steer");
+        };
+        assert_eq!(message, "@missing_steer keep going");
+        assert!(steer_files.is_empty());
     }
 }

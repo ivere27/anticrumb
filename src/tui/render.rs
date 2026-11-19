@@ -416,10 +416,12 @@ impl State {
                 let eff = selection.lines.len().saturating_sub(end);
                 (start, eff, selection.lines[start..end].to_vec(), None)
             } else {
-                let all = self.transcript_lines(w);
+                // Release the previous snapshot first so the cache appends in place.
+                self.painted_all_transcript.clear();
+                let all = self.transcript.lines(&self.stream, w);
                 let (start, end) = self.selection_view_range(all.len(), viewport);
                 let eff = all.len().saturating_sub(end);
-                let painted = all[start..end].to_vec();
+                let painted = all.slice(start, end);
                 (start, eff, painted, Some(all))
             };
         for (row, line) in painted.iter().enumerate() {
@@ -936,8 +938,14 @@ impl State {
 
             let prefix_w = 3 + display_text.width() + display_pad.len() + 2 + kind_label.width();
             let detail_budget = safe_w.saturating_sub(prefix_w + 2);
+            let detail_src =
+                if matched.detail.is_empty() && matched.kind == super::mentions::MentionKind::Git {
+                    "Git commit"
+                } else {
+                    matched.detail.as_str()
+                };
             let detail_text = if detail_budget >= 8 {
-                clip(&matched.detail, detail_budget)
+                clip(detail_src, detail_budget)
             } else {
                 String::new()
             };

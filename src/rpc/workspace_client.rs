@@ -220,15 +220,21 @@ impl Client {
             ))
         }
     }
-    pub(crate) fn set_pace(&self, pace: crate::gemini::HumanPace) -> Result<()> {
-        self.runtime.block_on(self.rpc.set_pace(pace))
-    }
-    pub fn artifact(&self, account: &str, id: &str) -> Result<pb::ArtifactData> {
+    pub fn artifact(&self, account: &str, id: &str) -> Result<super::client::ArtifactBytes> {
         self.runtime
-            .block_on(self.rpc.get_artifact(pb::ArtifactRef {
+            .block_on(self.rpc.get_artifact_bytes(pb::ArtifactRef {
                 account_id: account.into(),
                 id: id.into(),
             }))
+    }
+    pub fn download_artifact(&self, account: &str, id: &str, dest: &Path) -> Result<pb::Artifact> {
+        self.runtime.block_on(self.rpc.get_artifact_to_file(
+            pb::ArtifactRef {
+                account_id: account.into(),
+                id: id.into(),
+            },
+            dest,
+        ))
     }
     pub fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         self.runtime
@@ -240,13 +246,21 @@ impl Client {
         Ok(())
     }
     pub fn put_file(&self, account: &str, path: &Path, mime: &str) -> Result<String> {
-        let bytes = fs::read(path).map_err(ServiceError::storage)?;
-        self.put_bytes(
-            account,
-            &path.file_name().unwrap_or_default().to_string_lossy(),
-            mime,
-            bytes,
-        )
+        // Reject oversized files before starting a streaming upload.
+        if fs::metadata(path).map_err(ServiceError::storage)?.len() > crate::input::MAX_FILE_BYTES {
+            return Err(ServiceError::invalid(format!(
+                "attachment exceeds {MAX_ARTIFACT_LABEL}"
+            )));
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let value = self
+            .runtime
+            .block_on(self.rpc.put_artifact_file(account, path, &name, mime))?;
+        Ok(value.id)
     }
     pub(crate) fn put_bytes(
         &self,
@@ -256,17 +270,13 @@ impl Client {
         bytes: Vec<u8>,
     ) -> Result<String> {
         if bytes.len() as u64 > crate::input::MAX_FILE_BYTES {
-            return Err(ServiceError::invalid("attachment exceeds 32 MiB"));
+            return Err(ServiceError::invalid(format!(
+                "attachment exceeds {MAX_ARTIFACT_LABEL}"
+            )));
         }
         let value = self
             .runtime
-            .block_on(self.rpc.put_artifact(pb::PutArtifactRequest {
-                account_id: account.into(),
-                name: name.into(),
-                mime: mime.into(),
-                sha256: digest(&bytes),
-                data: bytes,
-            }))?;
+            .block_on(self.rpc.put_artifact_bytes(account, name, mime, bytes))?;
         Ok(value.id)
     }
     pub(crate) fn provider_for_account(
@@ -340,6 +350,20 @@ impl Client {
             exec()
         }
     }
+}
+
+/// Start an agent with the caller's environment. The environment crosses the
+/// local RPC boundary only; the service never persists or returns it.
+pub(crate) async fn start_agent(
+    rpc: &RpcClient,
+    mut request: AgentRequest,
+) -> Result<pb::AgentRef> {
+    request.environment = Some(
+        std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
+    );
+    rpc.start_agent(codec::agent_request_to(request)).await
 }
 
 pub async fn presentation(
@@ -512,32 +536,19 @@ pub async fn presentation(
                 )
                 .map_err(ServiceError::storage)?;
             Ok(json!(
-                rpc.put_artifact(pb::PutArtifactRequest {
-                    account_id: value["account_id"].as_str().unwrap_or("default").into(),
-                    name: value["name"].as_str().unwrap_or("upload.bin").into(),
-                    mime: value["mime"]
-                        .as_str()
-                        .unwrap_or("application/octet-stream")
-                        .into(),
-                    sha256: digest(&bytes),
-                    data: bytes
-                })
+                rpc.put_artifact_bytes(
+                    value["account_id"].as_str().unwrap_or("default"),
+                    value["name"].as_str().unwrap_or("upload.bin"),
+                    value["mime"].as_str().unwrap_or("application/octet-stream"),
+                    bytes,
+                )
                 .await?
             ))
         }
         ("POST", ["api", "agents"]) => {
-            let mut request: AgentRequest =
+            let request: AgentRequest =
                 serde_json::from_value(value).map_err(ServiceError::storage)?;
-            request.environment = Some(
-                std::env::vars_os()
-                    .filter_map(|(key, value)| {
-                        Some((key.into_string().ok()?, value.into_string().ok()?))
-                    })
-                    .collect(),
-            );
-            Ok(json!(
-                rpc.start_agent(codec::agent_request_to(request)).await?
-            ))
+            Ok(json!(start_agent(rpc, request).await?))
         }
         ("GET", ["api", "agents"]) => Ok(json!(rpc
             .list_agents(pb::Empty {})

@@ -1,8 +1,13 @@
-use super::{client::RpcClient, codec, host_sync, pb, MAX_ARTIFACT, MAX_MESSAGE};
+use super::{
+    client::RpcClient, codec, host_sync, pb, stream_chunks_to_sink, ChunkPayload, ChunkStreamSpec,
+    ARTIFACT_CHUNK_BYTES, MAX_ARTIFACT, MAX_MESSAGE, MAX_MESSAGE_LABEL,
+};
 use crate::{domain::*, provider::ProviderRegistry, service::Service, store::Store};
 use fs2::FileExt;
+use futures_util::{Stream, StreamExt};
 use prost::Message;
-use std::{fs, path::Path, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{fmt::Write as _, fs, io::Read as _, path::Path, sync::Arc};
 
 pub struct Host {
     pub service: Arc<Service>,
@@ -175,6 +180,20 @@ impl Host {
         }
         self.service.begin_shutdown();
     }
+    pub fn shutdown_managed_browsers(&self) {
+        if self.role != "browser" {
+            return;
+        }
+        let accounts = self
+            .service
+            .store
+            .list::<Account>("local", "account")
+            .unwrap_or_default();
+        let closed_ids = crate::browser_host::shutdown_managed_browsers(&accounts);
+        for id in closed_ids {
+            let _ = crate::account::invalidate_account_sessions(&self.service.store, &id);
+        }
+    }
     pub fn info(&self) -> pb::HostInfo {
         let mut services = vec![
             "PlatformService",
@@ -265,7 +284,9 @@ impl Host {
     }
     pub async fn dispatch(self: &Arc<Self>, path: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
         if bytes.len() > MAX_MESSAGE {
-            return Err(ServiceError::invalid("RPC message exceeds 48 MiB"));
+            return Err(ServiceError::invalid(format!(
+                "RPC message exceeds {MAX_MESSAGE_LABEL}"
+            )));
         }
         if path.starts_with("/anticrumb.v1.WorkspaceService/") && self.role != "workspace" {
             return Err(ServiceError::new(
@@ -787,35 +808,6 @@ impl Host {
                     .map(codec::session_to)
                     .collect()
             }),
-            "/anticrumb.v1.ArtifactService/PutArtifact" => {
-                let r = decode!(pb::PutArtifactRequest);
-                let _: Account = store.get("local", "account", &r.account_id)?;
-                if r.data.len() > MAX_ARTIFACT
-                    || r.name.is_empty()
-                    || matches!(r.name.as_str(), "." | "..")
-                    || r.name.contains(['/', '\\', '\0', ':'])
-                {
-                    return Err(ServiceError::invalid("invalid artifact name or size"));
-                }
-                if digest(&r.data) != r.sha256 {
-                    return Err(ServiceError::invalid("artifact SHA-256 mismatch"));
-                }
-                reply!(codec::artifact_to(store.artifact(
-                    &r.account_id,
-                    &r.name,
-                    &r.mime,
-                    &r.data,
-                    "input"
-                )?))
-            }
-            "/anticrumb.v1.ArtifactService/GetArtifact" => {
-                let r = decode!(pb::ArtifactRef);
-                let (meta, data) = store.artifact_bytes(&r.account_id, &r.id)?;
-                reply!(pb::ArtifactData {
-                    artifact: Some(codec::artifact_to(meta)),
-                    data
-                })
-            }
             "/anticrumb.v1.WorkspaceService/StartAgent" => reply!(pb::AgentRef {
                 id: self
                     .agents()?
@@ -873,6 +865,204 @@ impl Host {
             )),
         }
     }
+    pub async fn put_artifact_stream(
+        self: &Arc<Self>,
+        stream: impl Stream<Item = Result<pb::PutArtifactChunk>> + Send,
+    ) -> Result<pb::Artifact> {
+        tokio::pin!(stream);
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| ServiceError::invalid("missing artifact metadata chunk"))??;
+        let Some(pb::put_artifact_chunk::Payload::Meta(meta)) = first.payload else {
+            return Err(ServiceError::invalid(
+                "first upload chunk must contain artifact metadata",
+            ));
+        };
+        if !is_valid_artifact_name(&meta.name) {
+            return Err(ServiceError::invalid("invalid artifact name"));
+        }
+        if meta.size > MAX_ARTIFACT as u64 {
+            return Err(ServiceError::invalid(format!(
+                "artifact exceeds {MAX_ARTIFACT_LABEL}"
+            )));
+        }
+        if !is_valid_sha256_hex(&meta.sha256) {
+            return Err(ServiceError::invalid("invalid artifact SHA-256"));
+        }
+        let store = self.service.store.clone();
+        let meta_account = meta.account_id.clone();
+        let meta_name = meta.name.clone();
+        let meta_mime = meta.mime.clone();
+        let meta_sha256 = meta.sha256.clone();
+        let expected_size = meta.size;
+        let writer = store
+            .blocking(move |s| {
+                let _: Account = s.get("local", "account", &meta_account)?;
+                s.artifact_writer(
+                    &meta_account,
+                    &meta_name,
+                    &meta_mime,
+                    Some(expected_size),
+                    Some(&meta_sha256),
+                    "input",
+                )
+            })
+            .await?;
+
+        let saved = stream_chunks_to_sink(
+            stream,
+            writer,
+            ChunkStreamSpec {
+                expected_size,
+                max_chunk_bytes: Some(MAX_MESSAGE),
+                duplicate_meta_msg: "duplicate artifact metadata chunk",
+                empty_chunk_msg: "empty artifact upload chunk",
+                empty_data_msg: "empty artifact upload data chunk",
+                chunk_limit_msg: format!("RPC chunk exceeds {MAX_MESSAGE_LABEL}").into(),
+                overflow_msg: "artifact byte count exceeds declared size",
+                size_mismatch_msg: "artifact size mismatch",
+                aborted_msg: "artifact upload aborted",
+            },
+            |chunk| match chunk.payload {
+                Some(pb::put_artifact_chunk::Payload::Meta(_)) => ChunkPayload::Meta,
+                Some(pb::put_artifact_chunk::Payload::Data(data)) => ChunkPayload::Data(data),
+                None => ChunkPayload::Empty,
+            },
+        )
+        .await?;
+        Ok(codec::artifact_to(saved))
+    }
+
+    pub async fn get_artifact_stream(
+        self: &Arc<Self>,
+        req: pb::ArtifactRef,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<pb::GetArtifactChunk>>> {
+        let store = self.service.store.clone();
+        let (art, mut file) = store
+            .blocking(move |s| s.open_artifact(&req.account_id, &req.id))
+            .await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(Ok(pb::GetArtifactChunk {
+            payload: Some(pb::get_artifact_chunk::Payload::Artifact(
+                codec::artifact_to(art.clone()),
+            )),
+        }))
+        .map_err(|_| ServiceError::storage("artifact response channel closed"))?;
+        tokio::task::spawn_blocking(move || {
+            let mut hasher = Sha256::new();
+            let mut total = 0u64;
+            let mut buf = vec![0u8; ARTIFACT_CHUNK_BYTES];
+            loop {
+                if tx.is_closed() {
+                    return;
+                }
+                let n = match file.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(ServiceError::storage(e)));
+                        return;
+                    }
+                };
+                if n == 0 {
+                    if total != art.size {
+                        let _ = tx.blocking_send(Err(ServiceError::new(
+                            ErrorCode::StorageFailure,
+                            "blob",
+                            "artifact integrity check failed",
+                        )));
+                        return;
+                    }
+                    let mut actual_hash = String::with_capacity(64);
+                    for byte in hasher.finalize() {
+                        let _ = write!(&mut actual_hash, "{byte:02x}");
+                    }
+                    if actual_hash != art.hash {
+                        let _ = tx.blocking_send(Err(ServiceError::new(
+                            ErrorCode::StorageFailure,
+                            "blob",
+                            "artifact integrity check failed",
+                        )));
+                    }
+                    return;
+                }
+                hasher.update(&buf[..n]);
+                let Some(next) = total.checked_add(n as u64) else {
+                    let _ = tx.blocking_send(Err(ServiceError::new(
+                        ErrorCode::StorageFailure,
+                        "blob",
+                        "artifact integrity check failed",
+                    )));
+                    return;
+                };
+                total = next;
+                if total > art.size {
+                    let _ = tx.blocking_send(Err(ServiceError::new(
+                        ErrorCode::StorageFailure,
+                        "blob",
+                        "artifact integrity check failed",
+                    )));
+                    return;
+                }
+                if total == art.size {
+                    // Verify no trailing bytes and full digest before releasing the final chunk.
+                    let mut extra = [0u8; 1];
+                    let trailing = loop {
+                        match file.read(&mut extra) {
+                            Ok(m) => break Ok(m),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    match trailing {
+                        Ok(0) => {
+                            let mut actual_hash = String::with_capacity(64);
+                            for byte in hasher.finalize() {
+                                let _ = write!(&mut actual_hash, "{byte:02x}");
+                            }
+                            if actual_hash != art.hash {
+                                let _ = tx.blocking_send(Err(ServiceError::new(
+                                    ErrorCode::StorageFailure,
+                                    "blob",
+                                    "artifact integrity check failed",
+                                )));
+                                return;
+                            }
+                            let _ = tx.blocking_send(Ok(pb::GetArtifactChunk {
+                                payload: Some(pb::get_artifact_chunk::Payload::Data(
+                                    buf[..n].to_vec(),
+                                )),
+                            }));
+                            return;
+                        }
+                        Ok(_) => {
+                            let _ = tx.blocking_send(Err(ServiceError::new(
+                                ErrorCode::StorageFailure,
+                                "blob",
+                                "artifact integrity check failed",
+                            )));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(ServiceError::storage(e)));
+                            return;
+                        }
+                    }
+                }
+                if tx
+                    .blocking_send(Ok(pb::GetArtifactChunk {
+                        payload: Some(pb::get_artifact_chunk::Payload::Data(buf[..n].to_vec())),
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
     pub async fn watch(
         self: &Arc<Self>,
         cursor: pb::EventCursor,

@@ -82,8 +82,16 @@ impl Service {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        // Only notify when the loop is already running. The first spawn does not
+        // need a permit; it starts with a fresh DB query immediately.
         if self.cleanup_running.swap(true, Ordering::SeqCst) {
+            self.cleanup_notify.notify_one();
             return;
+        }
+        enum NextCleanup {
+            RunNow,
+            WaitUntil(i64),
+            Idle,
         }
         let weak = Arc::downgrade(self);
         runtime.spawn(async move {
@@ -92,9 +100,16 @@ impl Service {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
-                if service.stopping.load(Ordering::SeqCst) {
+                if service.stopping.load(Ordering::SeqCst) || service.cleanup_cancel.is_cancelled() {
                     break;
                 }
+                let notify = service.cleanup_notify.clone();
+                let cancel = service.cleanup_cancel.clone();
+                // Register interest in the notification BEFORE the DB query so
+                // we never miss a notify_one() that fires while we read the store.
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 let result = async {
                     if !recovered {
                         for mut job in service.store.list::<Job>("local", "chat_cleanup")? {
@@ -107,22 +122,55 @@ impl Service {
                         }
                         recovered = true;
                     }
-                    let job = service
-                        .store
-                        .list::<Job>("local", "chat_cleanup")?
-                        .into_iter()
-                        .find(|j| j.state == "pending" && j.next_attempt <= now_ms());
-                    if let Some(job) = job {
+                    let now = now_ms();
+                    let jobs = service.store.list::<Job>("local", "chat_cleanup")?;
+                    if let Some(job) = jobs
+                        .iter()
+                        .find(|j| j.state == "pending" && j.next_attempt <= now)
+                        .cloned()
+                    {
                         service.run_chat_cleanup(job).await?;
+                        return Ok::<_, ServiceError>(NextCleanup::RunNow);
                     }
-                    Ok::<_, ServiceError>(())
+                    if let Some(next_attempt) = jobs
+                        .iter()
+                        .filter(|j| j.state == "pending")
+                        .map(|j| j.next_attempt)
+                        .min()
+                    {
+                        return Ok(NextCleanup::WaitUntil(next_attempt));
+                    }
+                    Ok(NextCleanup::Idle)
                 }
                 .await;
-                if let Err(error) = result {
-                    eprintln!("web chat cleanup: {error}");
-                }
                 drop(service);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                match result {
+                    Ok(NextCleanup::RunNow) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(NextCleanup::WaitUntil(next_attempt)) => {
+                        let delay_ms = (next_attempt - now_ms()).max(1) as u64;
+                        tokio::select! {
+                            _ = &mut notified => {}
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                        }
+                    }
+                    Ok(NextCleanup::Idle) => {
+                        tokio::select! {
+                            _ = &mut notified => {}
+                            _ = cancel.cancelled() => break,
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("web chat cleanup: {error}");
+                        tokio::select! {
+                            _ = &mut notified => {}
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                    }
+                }
             }
         });
     }

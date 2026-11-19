@@ -21,13 +21,15 @@ use crossterm::{
 };
 use std::{
     io::{self, IsTerminal, Write},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 struct Terminal {
     _console_guard: platform::ConsoleGuard,
-    last_input_mode_refresh: Instant,
 }
 
 impl Terminal {
@@ -36,7 +38,6 @@ impl Terminal {
         terminal::enable_raw_mode().map_err(ServiceError::storage)?;
         let guard = Self {
             _console_guard: console_guard,
-            last_input_mode_refresh: Instant::now(),
         };
         execute!(
             io::stdout(),
@@ -50,10 +51,8 @@ impl Terminal {
         Ok(guard)
     }
 
+    /// Called from the main loop's `INPUT_MODE_REFRESH` interval.
     fn refresh_input_modes(&mut self) -> Result<()> {
-        if self.last_input_mode_refresh.elapsed() < Duration::from_millis(500) {
-            return Ok(());
-        }
         // An emulator reset can disable mouse reporting without notifying the
         // child process. Restore input modes while idle as well as during work.
         execute!(
@@ -61,9 +60,7 @@ impl Terminal {
             event::EnableBracketedPaste,
             event::EnableMouseCapture
         )
-        .map_err(ServiceError::storage)?;
-        self.last_input_mode_refresh = Instant::now();
-        Ok(())
+        .map_err(ServiceError::storage)
     }
 }
 
@@ -83,7 +80,7 @@ impl Drop for Terminal {
 }
 
 struct TerminalSink<'a> {
-    commands: &'a mpsc::SyncSender<Command>,
+    commands: &'a tokio::sync::mpsc::Sender<Command>,
     mentions: &'a MentionSearchHandle,
 }
 
@@ -100,7 +97,8 @@ impl EffectSink for TerminalSink<'_> {
         }
         self.commands.try_send(command).map_err(|e| {
             let cmd = match &e {
-                mpsc::TrySendError::Full(c) | mpsc::TrySendError::Disconnected(c) => c,
+                tokio::sync::mpsc::error::TrySendError::Full(c)
+                | tokio::sync::mpsc::error::TrySendError::Closed(c) => c,
             };
             crate::input::cleanup_temp_files(cmd.temp_files());
             e.to_string()
@@ -113,6 +111,35 @@ impl EffectSink for TerminalSink<'_> {
             .and_then(|_| out.flush())
             .map_err(|e| e.to_string())
     }
+}
+
+/// Re-enable mouse/paste reporting this often (emulator resets drop them silently).
+const INPUT_MODE_REFRESH: Duration = Duration::from_millis(500);
+/// Upper bound on how long the input thread blocks before re-checking shutdown.
+const INPUT_POLL: Duration = Duration::from_millis(200);
+/// Minimum gap between repaints caused by background updates (~30 fps).
+/// Keyboard/mouse input always repaints immediately.
+const UPDATE_FRAME: Duration = Duration::from_millis(33);
+/// Spinner frame period while busy.
+const ANIMATION_FRAME: Duration = Duration::from_millis(120);
+/// Selection autoscroll period while dragging.
+const DRAG_FRAME: Duration = Duration::from_millis(50);
+/// How long shutdown waits for an in-flight worker command before aborting it.
+const WORKER_GRACE: Duration = Duration::from_secs(1);
+
+fn is_ignored_input(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::Mouse(mouse)
+            if !matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+            )
+    )
 }
 
 fn render_stdout(state: &mut State) -> Result<()> {
@@ -405,25 +432,46 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     let auto_created = options.resolve_or_create_account(&client, true)?;
     struct WorkerGuard {
         client: Client,
-        thread: Option<std::thread::JoinHandle<()>>,
+        runtime: tokio::runtime::Handle,
+        task: Option<tokio::task::JoinHandle<()>>,
     }
     impl Drop for WorkerGuard {
         fn drop(&mut self) {
+            let Some(mut task) = self.task.take() else {
+                let _ = self.client.close();
+                return;
+            };
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Cannot block inside a runtime; the queue guard still cleans up.
+                let _ = self.client.close();
+                task.abort();
+                return;
+            }
+            // The command channel is already closed, so an idle worker exits at
+            // once; give an in-flight command (upload, steer, cancel) a short
+            // grace period with the RPC still open before tearing it down.
+            let finished = self
+                .runtime
+                .block_on(async { tokio::time::timeout(WORKER_GRACE, &mut task).await })
+                .is_ok();
             let _ = self.client.close();
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+            if !finished {
+                task.abort();
+                let _ = self.runtime.block_on(task);
             }
         }
     }
-    // Declared before channels: every early return disconnects them before joining.
+    let runtime = client.runtime.clone();
+    // Declared before channels: every early return disconnects them before awaiting.
     let mut worker_guard = WorkerGuard {
         client: client.clone(),
-        thread: None,
+        runtime: runtime.clone(),
+        task: None,
     };
-    let (commands, rx) = mpsc::sync_channel(32);
-    let (tx, updates) = mpsc::sync_channel(128);
+    let (commands, rx) = tokio::sync::mpsc::channel(32);
+    let (tx, mut updates) = tokio::sync::mpsc::channel(128);
     let mention_search = MentionSearchHandle::spawn(tx.clone());
-    worker_guard.thread = Some(std::thread::spawn(move || worker(client, rx, tx)));
+    worker_guard.task = Some(runtime.spawn(worker(client, rx, tx)));
     let mut terminal = Terminal::enter()?;
     let mut state = State::new(options);
     if let crate::rpc::client::Connection::Grpc {
@@ -480,65 +528,169 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         state.submit(&mut sink);
         initial = false;
     }
-    let mut dirty = true;
-    let mut last_render = Instant::now();
-    loop {
-        terminal.refresh_input_modes()?;
-        while let Ok(update) = updates.try_recv() {
-            if initial && matches!(&update, Update::Error(_)) {
-                initial = false;
+
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<io::Result<Input>>(64);
+    let stop_reader = Arc::clone(&stop_input);
+    // crossterm's level-triggered reader (`use-dev-tty`) drains paste bursts
+    // without another keypress (#1142). A bounded poll (instead of a bare
+    // blocking read) lets shutdown stop and join this thread, so it never keeps
+    // crossterm's global event reader or swallows input after the TUI exits.
+    let reader = std::thread::spawn(move || {
+        while !stop_reader.load(Ordering::Relaxed) {
+            match event::poll(INPUT_POLL) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(err) => {
+                    let _ = input_tx.blocking_send(Err(err));
+                    break;
+                }
             }
-            state.update(update);
-            dirty = true;
+            match event::read() {
+                Ok(input) => {
+                    if stop_reader.load(Ordering::Relaxed)
+                        || input_tx.blocking_send(Ok(input)).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = input_tx.blocking_send(Err(err));
+                    break;
+                }
+            }
         }
-        if state.exit_requested && state.pending.is_none() {
-            break;
+    });
+
+    let loop_result: Result<()> = runtime.block_on(async {
+        // `dirty`: something changed; `urgent`: user input, repaint immediately.
+        let mut dirty = true;
+        let mut urgent = true;
+        let mut last_render = Instant::now();
+        let mut mode_refresh = tokio::time::interval_at(
+            tokio::time::Instant::now() + INPUT_MODE_REFRESH,
+            INPUT_MODE_REFRESH,
+        );
+        mode_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            while let Ok(update) = updates.try_recv() {
+                if initial && matches!(&update, Update::Error(_)) {
+                    initial = false;
+                }
+                if state.update(update) {
+                    dirty = true;
+                }
+            }
+            if state.exit_requested && state.pending.is_none() {
+                break;
+            }
+            if initial
+                && state.phase != "loading"
+                && state.menu.is_none()
+                && state.history_clear_confirmation.is_none()
+            {
+                state.submit(&mut sink);
+                initial = false;
+                dirty = true;
+                urgent = true;
+            }
+            // Coalesce bursts of background updates (streamed events) into at
+            // most one repaint per UPDATE_FRAME; input repaints right away.
+            if dirty && (urgent || last_render.elapsed() >= UPDATE_FRAME) {
+                render_stdout(&mut state)?;
+                dirty = false;
+                urgent = false;
+                last_render = Instant::now();
+            }
+
+            let dragging = state.selection_drag.is_some();
+            let animating = state.busy() || state.mention_loading();
+            let deadline = [
+                dirty.then(|| last_render + UPDATE_FRAME),
+                animating.then(|| last_render + ANIMATION_FRAME),
+                dragging.then(|| Instant::now() + DRAG_FRAME),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(tokio::time::Instant::from_std);
+
+            tokio::select! {
+                _ = mode_refresh.tick() => {
+                    terminal.refresh_input_modes()?;
+                }
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if dragging && state.tick_selection_autoscroll() {
+                        dirty = true;
+                        urgent = true;
+                    }
+                    if animating && last_render.elapsed() >= ANIMATION_FRAME {
+                        dirty = true;
+                    }
+                }
+                maybe_update = updates.recv() => {
+                    let Some(update) = maybe_update else {
+                        break;
+                    };
+                    if initial && matches!(&update, Update::Error(_)) {
+                        initial = false;
+                    }
+                    if state.update(update) {
+                        dirty = true;
+                    }
+                }
+                maybe_input = input_rx.recv() => {
+                    let Some(first) = maybe_input else {
+                        break;
+                    };
+                    let mut should_exit = false;
+                    let mut handle_one = |res: io::Result<Input>| -> Result<bool> {
+                        let input = res.map_err(ServiceError::storage)?;
+                        if is_ignored_input(&input) {
+                            return Ok(false);
+                        }
+                        dirty = true;
+                        urgent = true;
+                        handle_input(&mut state, input, &mut sink)
+                    };
+                    if handle_one(first)? {
+                        should_exit = true;
+                    } else {
+                        // Drain ALL queued burst input (paste / fast typing / mouse
+                        // drags) before repainting. try_recv returns only what is
+                        // already buffered, so this cannot loop forever.
+                        while let Ok(next) = input_rx.try_recv() {
+                            if handle_one(next)? {
+                                should_exit = true;
+                                break;
+                            }
+                        }
+                    }
+                    if should_exit {
+                        break;
+                    }
+                }
+            }
         }
-        if initial
-            && state.phase != "loading"
-            && state.menu.is_none()
-            && state.history_clear_confirmation.is_none()
-        {
-            state.submit(&mut sink);
-            initial = false;
-        }
-        if state.tick_selection_autoscroll() {
-            dirty = true;
-        }
-        // Drain burst input before repainting, keeping paste/fast typing responsive on slow terminals.
-        // The Unix tty reader skips queued input for a zero timeout (#839).
-        let input_pending = event::poll(Duration::from_millis(1)).map_err(ServiceError::storage)?;
-        let animating = state.busy() || state.mention_loading();
-        if !input_pending
-            && (dirty || (animating && last_render.elapsed() > Duration::from_millis(120)))
-        {
-            render_stdout(&mut state)?;
-            dirty = false;
-            last_render = Instant::now();
-        }
-        let poll_wait = if state.mention_loading() {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_millis(60)
-        };
-        if !event::poll(poll_wait).map_err(ServiceError::storage)? {
-            continue;
-        }
-        let input = event::read().map_err(ServiceError::storage)?;
-        if matches!(&input, Input::Mouse(mouse) if !matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)))
-        {
-            continue;
-        }
-        dirty = true;
-        if handle_input(&mut state, input, &mut sink)? {
-            break;
-        }
-    }
+        Ok(())
+    });
+
+    stop_input.store(true, Ordering::Relaxed);
+    drop(input_rx);
+    // Bounded by INPUT_POLL; must finish before raw mode is disabled.
+    let _ = reader.join();
     drop(terminal);
     drop(mention_search);
     drop(commands);
     drop(updates);
     drop(worker_guard);
+    loop_result?;
     if let Some(id) = state.active.or(state.parent) {
         if state.status["browser_connection"]["transport"] == "grpc" {
             eprintln!(

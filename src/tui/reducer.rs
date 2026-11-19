@@ -9,7 +9,7 @@ use super::{
     mentions::{self, MentionKind, MentionMatch, MentionPopup},
     preferences::{self, Preferences},
     selection, theme,
-    transcript::{clip, inline_notice_parts, Entry, Transcript},
+    transcript::{clip, inline_notice_parts, Entry, Transcript, TranscriptLines},
     usage,
     worker::{Command, Update},
 };
@@ -122,7 +122,7 @@ pub(super) struct State {
     pub last_response: String,
     pub copy_response: String,
     pub painted_transcript: Vec<markdown::Line>,
-    pub painted_all_transcript: Vec<markdown::Line>,
+    pub painted_all_transcript: TranscriptLines,
     pub painted_transcript_start: usize,
     pub painted_effective_scroll: usize,
     pub painted_hint: Vec<markdown::Line>,
@@ -144,6 +144,14 @@ pub(super) struct State {
     pub debug: DebugLogger,
     pub exit_requested: bool,
     pub last_ctrl_c: Option<Instant>,
+}
+
+fn status_visible_changed(prev: &Value, next: &Value) -> bool {
+    let (Some(p), Some(n)) = (prev.as_object(), next.as_object()) else {
+        return prev != next;
+    };
+    p.iter().any(|(k, v)| k != "runtime" && n.get(k) != Some(v))
+        || n.iter().any(|(k, v)| k != "runtime" && p.get(k) != Some(v))
 }
 
 impl State {
@@ -196,7 +204,7 @@ impl State {
             last_response: String::new(),
             copy_response: String::new(),
             painted_transcript: Vec::new(),
-            painted_all_transcript: Vec::new(),
+            painted_all_transcript: TranscriptLines::default(),
             painted_transcript_start: 0,
             painted_effective_scroll: 0,
             painted_hint: Vec::new(),
@@ -418,6 +426,20 @@ impl State {
             self.write_debug_log("error", text);
         }
         self.push_entry(text, Entry::Error(text.into()));
+    }
+
+    pub(super) fn log_warning(&mut self, text: &str) {
+        if self.debug.level > 0 {
+            self.write_debug_log("warning", text);
+        }
+        let plain = format!("  Warning: {text}");
+        self.log_spans(
+            &plain,
+            vec![
+                ("  Warning: ".into(), Face::HEADING),
+                (text.to_owned(), Face::MUTED),
+            ],
+        );
     }
 
     pub(super) fn log_tool(&mut self, tool: &str, detail: &str) {
@@ -1608,7 +1630,10 @@ impl State {
         }
     }
 
-    fn apply_status(&mut self, status: Value) {
+    fn apply_status(&mut self, status: Value) -> bool {
+        let was_disconnected = self.status_disconnected;
+        let prev_rev = self.transcript.revision();
+        let visible_changed = was_disconnected || status_visible_changed(&self.status, &status);
         self.last_status_at = Some(Instant::now());
         self.status_disconnected = false;
         let was_blocked = self.human_required();
@@ -1637,21 +1662,31 @@ impl State {
         {
             self.log("Account is available again. Review the recorded outcome, then send your draft or resume explicitly.");
         }
+        let mut catalog_changed = false;
         if let Some(account) = self
             .account()
             .filter(|a| a["models"].as_array().is_some_and(|m| !m.is_empty()))
         {
-            self.catalog = account.clone();
+            // Compare before cloning: status polls usually repeat the same catalog.
+            if self.catalog != *account {
+                self.catalog = account.clone();
+                catalog_changed = true;
+            }
         }
+        visible_changed || catalog_changed || self.transcript.revision() != prev_rev
     }
 
-    pub(super) fn update(&mut self, update: Update) {
+    pub(super) fn update(&mut self, update: Update) -> bool {
         match update {
-            Update::Status(status) => self.apply_status(status),
+            Update::Status(status) => return self.apply_status(status),
             Update::StatusReport(status) => {
                 match status {
-                    Some(status) => self.apply_status(status),
-                    None => self.update(Update::StatusDisconnected),
+                    Some(status) => {
+                        self.apply_status(status);
+                    }
+                    None => {
+                        self.update(Update::StatusDisconnected);
+                    }
                 }
                 let details = self.runtime_details();
                 self.log_daemon_rows(&details);
@@ -1690,6 +1725,9 @@ impl State {
                 }
             }
             Update::StatusDisconnected => {
+                let was_disconnected = self.status_disconnected;
+                let prev_rev = self.transcript.revision();
+                let prev_conn = self.status["browser_connection"].clone();
                 self.status_disconnected = true;
                 let previous_connection = self.daemon_summary();
                 if !self.status["browser_connection"].is_object() {
@@ -1702,6 +1740,9 @@ impl State {
                 if connection != previous_connection {
                     self.log_daemon_rows(&connection);
                 }
+                return !was_disconnected
+                    || self.transcript.revision() != prev_rev
+                    || self.status["browser_connection"] != prev_conn;
             }
             Update::Accepted(count) => {
                 self.pending = None;
@@ -1861,11 +1902,13 @@ impl State {
                 matches,
                 total,
             } => {
-                if let Some(mention) = self.mention.as_mut() {
-                    mention.apply_results(id, &query, matches, total);
-                }
+                return self
+                    .mention
+                    .as_mut()
+                    .is_some_and(|mention| mention.apply_results(id, &query, matches, total));
             }
         }
+        true
     }
 
     fn log_browser_status(&mut self, browser: &Value) {
@@ -2379,6 +2422,7 @@ impl State {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn transcript_lines(&self, width: usize) -> Vec<markdown::Line> {
         self.transcript.render_lines(&self.stream, width)
     }
@@ -2393,7 +2437,14 @@ impl State {
         let viewport = self
             .compute_layout(width as u16, height as u16)
             .map_or(1, |(layout, _)| usize::from(layout.transcript.len).max(1));
-        let maximum = self.transcript_lines(width).len().saturating_sub(viewport);
+        // Release the previous frame's Rc snapshot so the cache can append new
+        // items in-place (Rc refcount → 1) instead of deep-copying everything.
+        self.painted_all_transcript.clear();
+        let maximum = self
+            .transcript
+            .lines(&self.stream, width)
+            .len()
+            .saturating_sub(viewport);
         let current = self.scroll.min(maximum);
         self.scroll = if up {
             current.saturating_add(lines)
@@ -2704,7 +2755,7 @@ impl State {
                                     self.painted_all_transcript.len().saturating_sub(viewport);
                                 self.scroll = self.scroll.min(max_scroll);
                                 (
-                                    self.painted_all_transcript.clone(),
+                                    self.painted_all_transcript.to_vec(),
                                     self.painted_transcript_start + viewport_row,
                                 )
                             } else {

@@ -287,8 +287,12 @@ pub fn which_xvfb_run() -> Option<PathBuf> {
     }
 }
 
+fn cdp_meta_path_in(home: &Path, port: u16) -> PathBuf {
+    home.join(format!("cdp-port-{port}.json"))
+}
+
 fn cdp_meta_path(port: u16) -> PathBuf {
-    anticrumb_home().join(format!("cdp-port-{port}.json"))
+    cdp_meta_path_in(&anticrumb_home(), port)
 }
 
 pub fn save_running_meta(meta: &RunningCdpMeta) {
@@ -301,8 +305,12 @@ pub fn save_running_meta(meta: &RunningCdpMeta) {
     }
 }
 
+fn remove_running_meta_in(home: &Path, port: u16) {
+    let _ = fs::remove_file(cdp_meta_path_in(home, port));
+}
+
 pub fn remove_running_meta(port: u16) {
-    let _ = fs::remove_file(cdp_meta_path(port));
+    remove_running_meta_in(&anticrumb_home(), port);
 }
 
 #[cfg(any(unix, test))]
@@ -504,8 +512,8 @@ fn linux_pid_matches_cdp_port(port: u16, pid: u32) -> Option<RunningCdpMeta> {
     parse_browser_args(port, pid, &args)
 }
 
-fn inspect_running_cdp_alive(port: u16) -> Option<RunningCdpMeta> {
-    let cached: Option<RunningCdpMeta> = fs::read_to_string(cdp_meta_path(port))
+fn inspect_running_cdp_alive_in(home: &Path, port: u16) -> Option<RunningCdpMeta> {
+    let cached: Option<RunningCdpMeta> = fs::read_to_string(cdp_meta_path_in(home, port))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok());
     #[cfg(target_os = "linux")]
@@ -527,11 +535,19 @@ fn inspect_running_cdp_alive(port: u16) -> Option<RunningCdpMeta> {
     cached
 }
 
-pub fn inspect_running_cdp(port: u16) -> Option<RunningCdpMeta> {
+fn inspect_running_cdp_alive(port: u16) -> Option<RunningCdpMeta> {
+    inspect_running_cdp_alive_in(&anticrumb_home(), port)
+}
+
+fn inspect_running_cdp_in(home: &Path, port: u16) -> Option<RunningCdpMeta> {
     if port == 0 || !is_port_alive(port) {
         return None;
     }
-    inspect_running_cdp_alive(port)
+    inspect_running_cdp_alive_in(home, port)
+}
+
+pub fn inspect_running_cdp(port: u16) -> Option<RunningCdpMeta> {
+    inspect_running_cdp_in(&anticrumb_home(), port)
 }
 
 pub fn fetch_version(port: u16) -> Result<BrowserVersionInfo, String> {
@@ -986,23 +1002,212 @@ pub fn focus_browser_tab(port: u16) -> Result<(), String> {
     Ok(())
 }
 
-pub fn close_browser_port(port: u16) -> Result<(), String> {
+fn close_browser_port_in(home: &Path, port: u16) -> Result<(), String> {
     let version = fetch_version(port)?;
     let ws_path = ws_path_from_url(&version.ws_url)?;
     let mut cdp = CdpClient::connect(port, &ws_path)?;
+    cdp.set_control(
+        crate::agent::CancelToken::new(),
+        Instant::now() + Duration::from_secs(3),
+    );
     let _ = cdp.call("Browser.close", json!({}));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if !is_port_alive(port) {
-            remove_running_meta(port);
+            remove_running_meta_in(home, port);
             sleep(Duration::from_millis(250));
             return Ok(());
         }
         sleep(Duration::from_millis(100));
     }
-    remove_running_meta(port);
+    remove_running_meta_in(home, port);
     Ok(())
+}
+
+pub fn close_browser_port(port: u16) -> Result<(), String> {
+    close_browser_port_in(&anticrumb_home(), port)
+}
+
+#[cfg(unix)]
+fn pid_matches_browser_port(port: u16, pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    if !alive {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_pid_matches_cdp_port(port, pid).is_some()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        inspect_native_cdp(port).is_some_and(|m| m.pid == pid)
+    }
+}
+
+#[cfg(unix)]
+fn terminate_browser_pid_if_matching(port: u16, pid: u32) {
+    if !pid_matches_browser_port(port, pid) {
+        return;
+    }
+    // If CDP already closed, give the browser a brief moment to finish flushing and exit.
+    if !is_port_alive(port) {
+        let grace = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < grace {
+            if !pid_matches_browser_port(port, pid) {
+                return;
+            }
+            sleep(Duration::from_millis(50));
+        }
+    }
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !pid_matches_browser_port(port, pid) {
+            return;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    if pid_matches_browser_port(port, pid) {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_browser_pid_if_matching(port: u16, pid: u32) {
+    if pid == 0 || !is_port_alive(port) {
+        return;
+    }
+    if inspect_native_cdp(port).is_some_and(|m| m.pid == pid) {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x08000000)
+            .status();
+    }
+}
+
+fn graceful_shutdown_browser_in(home: &Path, port: u16, pid: u32, profile_dir: Option<&Path>) {
+    let _ = close_browser_port_in(home, port);
+    terminate_browser_pid_if_matching(port, pid);
+    remove_running_meta_in(home, port);
+    if let Some(dir) = profile_dir {
+        wait_for_profile_unlock(dir, Duration::from_secs(2));
+    }
+}
+
+/// Gracefully shuts down any running Chrome instances launched for managed profiles
+/// under `anticrumb_home()`, leaving externally attached browsers untouched.
+/// Returns the IDs of accounts whose running browser was closed.
+pub fn shutdown_managed_browsers(accounts: &[crate::domain::Account]) -> Vec<String> {
+    shutdown_managed_browsers_in(&anticrumb_home(), accounts)
+}
+
+fn shutdown_managed_browsers_in(home: &Path, accounts: &[crate::domain::Account]) -> Vec<String> {
+    if !home.exists() {
+        return Vec::new();
+    }
+    struct ShutdownTarget {
+        account_id: Option<String>,
+        port: u16,
+        pid: u32,
+        profile_dir: PathBuf,
+    }
+
+    let mut seen_ports = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+
+    for account in accounts {
+        if account.port == 0 || validate_profile_under(home, &account.profile).is_err() {
+            continue;
+        }
+        let Some(meta) = inspect_running_cdp_in(home, account.port) else {
+            continue;
+        };
+        if !meta.matches_account(account) {
+            continue;
+        }
+        if seen_ports.insert(account.port) {
+            targets.push(ShutdownTarget {
+                account_id: Some(account.id.clone()),
+                port: account.port,
+                pid: meta.pid,
+                profile_dir: account.profile.clone(),
+            });
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(home) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("cdp-port-") && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(cached) = serde_json::from_str::<RunningCdpMeta>(&raw) else {
+                continue;
+            };
+            if cached.port == 0 || seen_ports.contains(&cached.port) {
+                continue;
+            }
+            let profile_dir = PathBuf::from(&cached.user_data_dir);
+            if validate_profile_under(home, &profile_dir).is_err() {
+                continue;
+            }
+            let Some(live) = inspect_running_cdp_in(home, cached.port) else {
+                remove_running_meta_in(home, cached.port);
+                continue;
+            };
+            if !same_dir(Path::new(&live.user_data_dir), &profile_dir)
+                || !live.profile_dir.eq_ignore_ascii_case(&cached.profile_dir)
+            {
+                continue;
+            }
+            if seen_ports.insert(cached.port) {
+                targets.push(ShutdownTarget {
+                    account_id: None,
+                    port: cached.port,
+                    pid: live.pid,
+                    profile_dir,
+                });
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let closed_ids = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for target in &targets {
+            scope.spawn(|| {
+                graceful_shutdown_browser_in(
+                    home,
+                    target.port,
+                    target.pid,
+                    Some(&target.profile_dir),
+                );
+                if let Some(id) = &target.account_id {
+                    if let Ok(mut ids) = closed_ids.lock() {
+                        ids.push(id.clone());
+                    }
+                }
+            });
+        }
+    });
+    closed_ids.into_inner().unwrap_or_default()
 }
 
 pub fn wait_for_profile_unlock(profile_dir: &Path, timeout: Duration) {
@@ -1782,5 +1987,106 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn shutdown_managed_browsers_closes_only_matching_managed_profiles() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let managed_profile = home.path().join("accounts/work-claude/profile");
+        fs::create_dir_all(&managed_profile).unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+
+        let managed_closed = Arc::new(AtomicBool::new(false));
+        let managed_alive = Arc::new(AtomicBool::new(true));
+        let managed_closed_srv = managed_closed.clone();
+        let managed_alive_srv = managed_alive.clone();
+        let managed_srv = MockHttpServer::spawn(move |stream, req_str, port| {
+            if !managed_alive_srv.load(Ordering::SeqCst) {
+                return;
+            }
+            if req_str.starts_with("GET /json/version ") {
+                let body = json!({
+                    "Browser": "Chrome/130.0.0.0",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/browser/test")
+                })
+                .to_string();
+                MockHttpServer::write_json(stream, &body);
+            } else if req_str.contains("/devtools/browser/test") {
+                let mut ws = MockHttpServer::accept_ws(stream, req_str);
+                if let Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) = ws.read() {
+                    let req: Value = serde_json::from_str(&txt).unwrap();
+                    if req["method"] == "Browser.close" {
+                        managed_closed_srv.store(true, Ordering::SeqCst);
+                        let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id": req["id"], "result": {}}).to_string().into(),
+                        ));
+                        managed_alive_srv.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+
+        let external_closed = Arc::new(AtomicBool::new(false));
+        let external_closed_srv = external_closed.clone();
+        let external_srv = MockHttpServer::spawn(move |stream, req_str, port| {
+            if req_str.starts_with("GET /json/version ") {
+                let body = json!({
+                    "Browser": "Chrome/130.0.0.0",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/browser/ext")
+                })
+                .to_string();
+                MockHttpServer::write_json(stream, &body);
+            } else if req_str.contains("/devtools/browser/ext") {
+                external_closed_srv.store(true, Ordering::SeqCst);
+                let _ = MockHttpServer::accept_ws(stream, req_str);
+            }
+        });
+
+        let managed_meta = RunningCdpMeta {
+            port: managed_srv.port,
+            user_data_dir: managed_profile.to_string_lossy().into_owned(),
+            profile_dir: "Default".into(),
+            mode: "headless".into(),
+            headless: true,
+            xvfb: false,
+            pid: 0,
+        };
+        fs::write(
+            cdp_meta_path_in(home.path(), managed_srv.port),
+            serde_json::to_string_pretty(&managed_meta).unwrap(),
+        )
+        .unwrap();
+
+        let accounts = vec![
+            crate::domain::Account {
+                id: "work-claude".into(),
+                provider: "claude-web".into(),
+                profile: managed_profile,
+                subprofile: None,
+                port: managed_srv.port,
+                headless: true,
+                state: "ready".into(),
+            },
+            crate::domain::Account {
+                id: "attached".into(),
+                provider: "gemini-web".into(),
+                profile: external_dir.path().to_path_buf(),
+                subprofile: None,
+                port: external_srv.port,
+                headless: false,
+                state: "ready".into(),
+            },
+        ];
+
+        let closed = shutdown_managed_browsers_in(home.path(), &accounts);
+        assert_eq!(closed, vec!["work-claude".to_string()]);
+        assert!(managed_closed.load(Ordering::SeqCst));
+        assert!(!external_closed.load(Ordering::SeqCst));
+        assert!(!cdp_meta_path_in(home.path(), managed_srv.port).exists());
     }
 }

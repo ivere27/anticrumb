@@ -146,7 +146,10 @@ impl RemoteBackend {
             ));
         }
         if prompt.len() as u64 > crate::input::MAX_FILE_BYTES {
-            return Err(ServiceError::invalid("prompt attachment exceeds 32 MiB"));
+            return Err(ServiceError::invalid(format!(
+                "prompt attachment exceeds {}",
+                crate::domain::MAX_ARTIFACT_LABEL
+            )));
         }
         let name = format!("anticrumb-prompt-{}.txt", &digest(prompt.as_bytes())[..16]);
         let artifact = self.client.put_bytes(
@@ -802,7 +805,7 @@ mod tests {
             let error = limits
                 .prepare_turn_request(&"x".repeat(crate::input::MAX_FILE_BYTES as usize + 1))
                 .unwrap_err();
-            assert!(error.message.contains("32 MiB"));
+            assert!(error.message.contains("100 MiB"));
             // Providers without uploads keep their original inline behavior and cap.
             limits.provider.as_mut().unwrap().capabilities.file_uploads = false;
             limits.set_step_artifacts(&["shot-test".into()]).unwrap();

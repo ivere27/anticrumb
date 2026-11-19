@@ -1077,7 +1077,7 @@ pub trait ArtifactServiceService: synurang_call::Service + 'static {
 
     fn put_artifact(&self, context: Context,
 
-        request: PutArtifactRequest,
+        requests: Receiver<PutArtifactChunk>,
 
 
     ) -> impl synurang_call::ServiceFuture<Result<Artifact>>;
@@ -1088,7 +1088,8 @@ pub trait ArtifactServiceService: synurang_call::Service + 'static {
         request: ArtifactRef,
 
 
-    ) -> impl synurang_call::ServiceFuture<Result<ArtifactData>>;
+        responses: Sender<GetArtifactChunk>,
+    ) -> impl synurang_call::ServiceFuture<Result<()>>;
 
 
 }
@@ -1097,19 +1098,18 @@ pub fn register_artifact_service<S: ArtifactServiceService>(instance: &mut Insta
     {
         let service = service.clone();
         instance.register("/anticrumb.v1.ArtifactService/PutArtifact",
-            false,
+            true,
             false,
             move |context, requests, responses| {
                 let service = service.clone();
                 Box::pin(async move {
-                    let mut requests = requests.typed::<PutArtifactRequest>();
+                    let requests = requests.typed::<PutArtifactChunk>();
                     let responses = responses.typed::<Artifact>();
 
-                    let request = requests.one().await?;
 
 
                     let response = service.put_artifact(context,
-                        request).await?;
+                        requests).await?;
                     responses.send(response).await
 
                 })
@@ -1120,19 +1120,18 @@ pub fn register_artifact_service<S: ArtifactServiceService>(instance: &mut Insta
         let service = service.clone();
         instance.register("/anticrumb.v1.ArtifactService/GetArtifact",
             false,
-            false,
+            true,
             move |context, requests, responses| {
                 let service = service.clone();
                 Box::pin(async move {
                     let mut requests = requests.typed::<ArtifactRef>();
-                    let responses = responses.typed::<ArtifactData>();
+                    let responses = responses.typed::<GetArtifactChunk>();
 
                     let request = requests.one().await?;
 
 
-                    let response = service.get_artifact(context,
-                        request).await?;
-                    responses.send(response).await
+                    service.get_artifact(context,
+                        request, responses).await
 
                 })
             })?;

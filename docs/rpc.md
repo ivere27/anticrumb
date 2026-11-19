@@ -66,6 +66,7 @@ New-NetFirewallRule -DisplayName 'anticrumb server (VPN)' -Direction Inbound -Pr
 
 - **Catalog:** `GetCatalog` reads cached SQLite data; `RefreshCatalog` discovers models through Chrome.
 - **Submission:** `CreateTurn` records an idempotency key before sending. A disconnect after possible submission returns `submission_outcome_unknown` and is never retried automatically.
+- **Artifacts:** `PutArtifact` and `GetArtifact` stream chunked transfers up to `100 MiB`.
 - **Verification:** `awaiting_human` retains the sign-in or CAPTCHA tab. Resolve it on the Chrome host, then run `/browser refresh` or `/model refresh`.
 - **Browser actions:** Commands are typed, validated, serialized per session, and never replayed automatically. See the [browser interface](tools.md#browser-api); direct RPC callers must supply valid bounds from the schema.
 

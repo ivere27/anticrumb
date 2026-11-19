@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::Instant,
@@ -111,11 +111,36 @@ pub(super) struct MentionPopup {
 impl MentionPopup {
     pub(super) fn new(parsed: &MentionQuery, request_id: u64, prev: Option<&Self>) -> Self {
         let keep_previous = prev.is_some();
+        let git_prefix = parsed.query.strip_prefix("git:");
+        let git_prefix_lower = git_prefix.map(str::to_ascii_lowercase);
         let previous_matches = prev
             .map(|p| {
                 p.matches
                     .iter()
                     .filter(|m| {
+                        if let (Some(raw_git), Some(low_git)) =
+                            (git_prefix, git_prefix_lower.as_deref())
+                        {
+                            return match m.kind {
+                                MentionKind::Git => match m.display.as_str() {
+                                    "git:diff" => "diff".starts_with(low_git),
+                                    "git:staged" => "staged".starts_with(low_git),
+                                    _ => {
+                                        let sha =
+                                            m.display.strip_prefix("git:").unwrap_or(&m.display);
+                                        sha.to_ascii_lowercase().starts_with(low_git)
+                                            || (!m.detail.is_empty()
+                                                && fuzzy_score(raw_git, &m.detail).is_some())
+                                    }
+                                },
+                                _ => false,
+                            };
+                        }
+                        if m.kind == MentionKind::Git
+                            && !matches!(m.display.as_str(), "git:diff" | "git:staged")
+                        {
+                            return false;
+                        }
                         parsed.query.is_empty() || fuzzy_score(&parsed.query, &m.display).is_some()
                     })
                     .cloned()
@@ -351,6 +376,63 @@ pub(super) fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     Some(score)
 }
 
+fn parse_git_commit_line(line: &str) -> Option<(String, String)> {
+    let (sha, subject) = line.split_once('\t').unwrap_or((line, ""));
+    let sha = sha.trim();
+    if sha.is_empty() {
+        return None;
+    }
+    let subject: String = subject.trim().chars().filter(|c| !c.is_control()).collect();
+    Some((sha.to_owned(), subject))
+}
+
+pub(super) fn recent_git_commits(workspace: &Path, limit: usize) -> Vec<(String, String)> {
+    let limit_arg = limit.to_string();
+    let Ok(output) = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["log", "-n", &limit_arg, "--format=%h%x09%s"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_git_commit_line)
+        .collect()
+}
+
+pub(super) fn resolve_git_commit_entry(workspace: &Path, rev: &str) -> Option<(String, String)> {
+    if rev.len() < 4 || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let verified = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+        .output()
+        .ok()?;
+    if !verified.status.success() {
+        return None;
+    }
+    let full_sha = String::from_utf8_lossy(&verified.stdout).trim().to_owned();
+    if full_sha.is_empty() || !full_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let logged = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["log", "-n", "1", "--format=%h%x09%s", &full_sha])
+        .output()
+        .ok()?;
+    if !logged.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&logged.stdout)
+        .lines()
+        .find_map(parse_git_commit_line)
+}
+
 pub(super) fn search_mentions(
     workspace: &Path,
     query: &str,
@@ -365,6 +447,79 @@ pub(super) fn search_mentions(
 
     let include_hidden = query.starts_with('.') || query.contains("/.");
     let mut results: Vec<MentionMatch> = Vec::new();
+
+    if let Some(git_prefix) = query.strip_prefix("git:") {
+        let git_prefix_lower = git_prefix.to_ascii_lowercase();
+        for (idx, (name, suffix, desc)) in [
+            ("git:diff", "diff", "Unstaged git diff"),
+            ("git:staged", "staged", "Staged git diff"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if suffix.starts_with(&git_prefix_lower) {
+                results.push(MentionMatch {
+                    display: name.to_owned(),
+                    kind: MentionKind::Git,
+                    detail: desc.to_owned(),
+                    score: 200_000 - idx as i64,
+                });
+            }
+        }
+
+        let commits = recent_git_commits(workspace, 20);
+        if is_cancelled() {
+            return None;
+        }
+        let is_hex = !git_prefix_lower.is_empty()
+            && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
+        let mut matched_recent_sha = false;
+        for (idx, (sha, subject)) in commits.into_iter().enumerate() {
+            let score = if git_prefix_lower.is_empty()
+                || (is_hex && sha.to_ascii_lowercase().starts_with(&git_prefix_lower))
+            {
+                matched_recent_sha = true;
+                Some(100_000 - idx as i64)
+            } else if !git_prefix.is_empty() && !subject.is_empty() {
+                fuzzy_score(git_prefix, &subject)
+                    .map(|subj_score| 1_200 + subj_score.clamp(-400, 500) - idx as i64)
+            } else {
+                None
+            };
+            if let Some(score) = score {
+                results.push(MentionMatch {
+                    display: format!("git:{sha}"),
+                    kind: MentionKind::Git,
+                    detail: subject,
+                    score,
+                });
+            }
+        }
+
+        if is_hex && !matched_recent_sha {
+            if let Some((old_sha, old_subject)) = resolve_git_commit_entry(workspace, git_prefix) {
+                let display = format!("git:{old_sha}");
+                if !results.iter().any(|m| m.display == display) {
+                    results.push(MentionMatch {
+                        display,
+                        kind: MentionKind::Git,
+                        detail: old_subject,
+                        score: 100_000,
+                    });
+                }
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.display.len().cmp(&b.display.len()))
+                .then_with(|| a.display.cmp(&b.display))
+        });
+        let total = results.len();
+        results.truncate(MAX_STORED_MATCHES);
+        return Some((results, total));
+    }
 
     if !query.starts_with("~/") {
         for (name, desc) in [
@@ -529,7 +684,7 @@ pub(super) struct MentionSearchHandle {
 }
 
 impl MentionSearchHandle {
-    pub(super) fn spawn(updates: mpsc::SyncSender<super::worker::Update>) -> Self {
+    pub(super) fn spawn(updates: tokio::sync::mpsc::Sender<super::worker::Update>) -> Self {
         let pending = Arc::new((Mutex::new(None::<SearchJob>), Condvar::new()));
         let latest_id = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -715,12 +870,19 @@ mod tests {
         let root = temp_workspace("async");
         fs::write(root.join("alpha_file.rs"), "").unwrap();
         fs::write(root.join("beta_file.rs"), "").unwrap();
-        let (tx, rx) = mpsc::sync_channel(16);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let handle = MentionSearchHandle::spawn(tx);
         handle.schedule(1, root.clone(), "beta".into());
 
-        let update = rx
-            .recv_timeout(Duration::from_secs(2))
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let update = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            })
+            .expect("timed out waiting for async mention matches")
             .expect("expected async mention matches");
         match update {
             super::super::worker::Update::MentionMatches {
@@ -737,6 +899,202 @@ mod tests {
             _ => panic!("unexpected update variant"),
         }
         drop(handle);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_mentions_lists_recent_git_commits_in_chronological_order() {
+        let root = temp_workspace("git-commits");
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+
+        fs::write(root.join("a.txt"), "1\n").unwrap();
+        run_out(&["add", "a.txt"]);
+        run_out(&["commit", "-m", "first commit subject"]);
+        let sha1 = run_out(&["rev-parse", "--short", "HEAD"]);
+
+        fs::write(root.join("a.txt"), "2\n").unwrap();
+        run_out(&["add", "a.txt"]);
+        run_out(&["commit", "-m", "second commit subject"]);
+        let sha2 = run_out(&["rev-parse", "--short", "HEAD"]);
+
+        let (matches, _) = search_mentions(&root, "git:", None, 1).unwrap();
+        let displays: Vec<_> = matches.iter().map(|m| m.display.as_str()).collect();
+        assert_eq!(
+            displays,
+            vec![
+                "git:diff",
+                "git:staged",
+                &format!("git:{sha2}"),
+                &format!("git:{sha1}"),
+            ]
+        );
+        assert_eq!(matches[2].kind, MentionKind::Git);
+        assert_eq!(matches[2].detail, "second commit subject");
+        assert_eq!(matches[3].detail, "first commit subject");
+
+        // Prefix filtering on commit hash preserves matches.
+        let prefix = format!("git:{}", &sha1[..3]);
+        let (filtered, _) = search_mentions(&root, &prefix, None, 1).unwrap();
+        assert!(filtered
+            .iter()
+            .any(|m| m.display == format!("git:{sha1}")));
+
+        // Hex digits like a/e/f must not falsely float git:diff or git:staged above commits;
+        // 'd' matches git:diff by prefix only (not git:staged).
+        for hex_ch in ["a", "e", "f"] {
+            let (hex_matches, _) =
+                search_mentions(&root, &format!("git:{hex_ch}"), None, 1).unwrap();
+            assert!(
+                !hex_matches
+                    .iter()
+                    .any(|m| matches!(m.display.as_str(), "git:diff" | "git:staged")),
+                "git:{hex_ch} should not include git:diff or git:staged, got {:?}",
+                hex_matches.iter().map(|m| &m.display).collect::<Vec<_>>()
+            );
+        }
+        let (d_matches, _) = search_mentions(&root, "git:d", None, 1).unwrap();
+        assert!(d_matches.iter().any(|m| m.display == "git:diff"));
+        assert!(!d_matches.iter().any(|m| m.display == "git:staged"));
+
+        // Subject search finds commits by commit message, while SHA prefix matches rank higher.
+        let (subj_matches, _) = search_mentions(&root, "git:second", None, 1).unwrap();
+        assert_eq!(subj_matches.len(), 1);
+        assert_eq!(subj_matches[0].display, format!("git:{sha2}"));
+
+        // Optimistic popup cache filtering drops git:staged immediately on @git:e and keeps subject matches.
+        let popup_base = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 5,
+                query: "git:".into(),
+                quoted: false,
+            },
+            1,
+            None,
+        );
+        let mut popup_base = popup_base;
+        popup_base.apply_results(1, "git:", matches, 4);
+        let popup_e = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 6,
+                query: "git:e".into(),
+                quoted: false,
+            },
+            2,
+            Some(&popup_base),
+        );
+        assert!(!popup_e
+            .matches
+            .iter()
+            .any(|m| matches!(m.display.as_str(), "git:diff" | "git:staged")));
+        assert!(popup_e
+            .matches
+            .iter()
+            .any(|m| m.display == format!("git:{sha2}")));
+
+        // Unmatched slash names don't error or leak filesystem matches.
+        let (slash_matches, _) = search_mentions(&root, "git:feat/login", None, 1).unwrap();
+        assert!(slash_matches.is_empty());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_mentions_skips_empty_commit_messages_and_resolves_commits_older_than_window() {
+        let root = temp_workspace("git-old-empty");
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+
+        // Oldest commit (will fall outside the 20-commit recent window).
+        fs::write(root.join("a.txt"), "0\n").unwrap();
+        run_out(&["add", "a.txt"]);
+        run_out(&["commit", "-m", "very old ancestor"]);
+        let old_short = run_out(&["rev-parse", "--short", "HEAD"]);
+
+        for i in 1..=20 {
+            fs::write(root.join("a.txt"), format!("{i}\n")).unwrap();
+            run_out(&["add", "a.txt"]);
+            run_out(&["commit", "-m", &format!("commit {i}")]);
+        }
+
+        // Empty-message commit sits at HEAD inside the recent 20 window.
+        fs::write(root.join("a.txt"), "empty\n").unwrap();
+        run_out(&["add", "a.txt"]);
+        run_out(&["commit", "--allow-empty-message", "-m", ""]);
+        let empty_short = run_out(&["rev-parse", "--short", "HEAD"]);
+
+        let (base_matches, _) = search_mentions(&root, "git:", None, 1).unwrap();
+        let empty_entry = base_matches
+            .iter()
+            .find(|m| m.display == format!("git:{empty_short}"))
+            .expect("empty commit present in @git: base list");
+        assert_eq!(empty_entry.detail, "");
+        assert!(!base_matches
+            .iter()
+            .any(|m| m.display == format!("git:{old_short}")));
+
+        // Empty-message commit must not match "commit" in either search_mentions or MentionPopup::new.
+        let (subj_matches, _) = search_mentions(&root, "git:commit", None, 1).unwrap();
+        assert!(!subj_matches
+            .iter()
+            .any(|m| m.display == format!("git:{empty_short}")));
+
+        let mut popup = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 5,
+                query: "git:".into(),
+                quoted: false,
+            },
+            1,
+            None,
+        );
+        popup.apply_results(1, "git:", base_matches, 22);
+        let filtered_popup = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 11,
+                query: "git:commit".into(),
+                quoted: false,
+            },
+            2,
+            Some(&popup),
+        );
+        if !empty_short.to_ascii_lowercase().starts_with("commit") {
+            assert!(!filtered_popup
+                .matches
+                .iter()
+                .any(|m| m.display == format!("git:{empty_short}")));
+        }
+
+        // Unambiguous >=4-hex prefix of a commit >20 commits ago still resolves via git rev-parse.
+        let (old_matches, _) = search_mentions(&root, &format!("git:{old_short}"), None, 1).unwrap();
+        assert_eq!(old_matches.len(), 1);
+        assert_eq!(old_matches[0].display, format!("git:{old_short}"));
+        assert_eq!(old_matches[0].detail, "very old ancestor");
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

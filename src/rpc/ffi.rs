@@ -17,6 +17,56 @@ impl<T> Drop for AbortTask<T> {
         self.0.abort();
     }
 }
+trait FfiServerStream: Sized + Send + 'static {
+    type Item: Message + Default + Send + 'static;
+    fn open(
+        self,
+        host: Arc<Host>,
+    ) -> impl std::future::Future<
+        Output = crate::domain::Result<
+            tokio::sync::mpsc::Receiver<crate::domain::Result<Self::Item>>,
+        >,
+    > + Send;
+}
+
+impl FfiServerStream for pb::EventCursor {
+    type Item = pb::Event;
+    async fn open(
+        self,
+        host: Arc<Host>,
+    ) -> crate::domain::Result<tokio::sync::mpsc::Receiver<crate::domain::Result<Self::Item>>> {
+        host.watch(self).await
+    }
+}
+
+impl FfiServerStream for pb::ArtifactRef {
+    type Item = pb::GetArtifactChunk;
+    async fn open(
+        self,
+        host: Arc<Host>,
+    ) -> crate::domain::Result<tokio::sync::mpsc::Receiver<crate::domain::Result<Self::Item>>> {
+        host.get_artifact_stream(self).await
+    }
+}
+
+trait FfiClientStream: Message + Default + Send + 'static {
+    type Resp: Message + Default + Send + 'static;
+    fn handle(
+        host: Arc<Host>,
+        stream: tokio_stream::wrappers::ReceiverStream<crate::domain::Result<Self>>,
+    ) -> impl std::future::Future<Output = crate::domain::Result<Self::Resp>> + Send;
+}
+
+impl FfiClientStream for pb::PutArtifactChunk {
+    type Resp = pb::Artifact;
+    async fn handle(
+        host: Arc<Host>,
+        stream: tokio_stream::wrappers::ReceiverStream<crate::domain::Result<Self>>,
+    ) -> crate::domain::Result<Self::Resp> {
+        host.put_artifact_stream(stream).await
+    }
+}
+
 impl FfiApi {
     async fn call<Req: Message, Resp: Message + Default>(
         &self,
@@ -37,15 +87,15 @@ impl FfiApi {
         };
         Resp::decode(bytes.as_slice()).map_err(|e| synurang_call::RpcError::new(13, e.to_string()))
     }
-    async fn stream(
+    async fn stream<Req: FfiServerStream>(
         &self,
         context: synurang_call::Context,
         _path: &str,
-        request: pb::EventCursor,
-        responses: synurang_call::Sender<pb::Event>,
+        request: Req,
+        responses: synurang_call::Sender<Req::Item>,
     ) -> synurang_call::Result<()> {
         let host = self.host.clone();
-        let mut task = AbortTask(self.runtime.spawn(async move { host.watch(request).await }));
+        let mut task = AbortTask(self.runtime.spawn(async move { request.open(host).await }));
         let mut receiver = tokio::select! {
             error=context.cancelled()=>return Err(error),
             result=&mut task.0=>result.map_err(|e|synurang_call::RpcError::new(13,e.to_string()))?.map_err(codec::module_error)?,
@@ -58,6 +108,106 @@ impl FfiApi {
             responses.send(value.map_err(codec::module_error)?).await?;
         }
     }
+    async fn client_stream<Req: FfiClientStream>(
+        &self,
+        context: synurang_call::Context,
+        _path: &str,
+        mut requests: synurang_call::Receiver<Req>,
+    ) -> synurang_call::Result<Req::Resp> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut tx = Some(tx);
+        let host = self.host.clone();
+        let mut task = AbortTask(self.runtime.spawn(async move {
+            Req::handle(host, tokio_stream::wrappers::ReceiverStream::new(rx)).await
+        }));
+        let mut pending: Option<Req> = None;
+        loop {
+            if pending.is_none() && tx.is_none() {
+                return tokio::select! {
+                    error = context.cancelled() => {
+                        abort_client_stream::<Req>(None, &mut task, error).await
+                    }
+                    result = &mut task.0 => result
+                        .map_err(|e| synurang_call::RpcError::new(13, e.to_string()))?
+                        .map_err(codec::module_error),
+                };
+            }
+            if pending.is_some() {
+                enum Step<R> {
+                    Cancelled(synurang_call::RpcError),
+                    Finished(R),
+                    Sent,
+                    Closed,
+                }
+                let step = {
+                    let sender = tx.as_ref().expect("sender present while item pending");
+                    tokio::select! {
+                        error = context.cancelled() => Step::Cancelled(error),
+                        result = &mut task.0 => Step::Finished(result),
+                        permit = sender.reserve() => match permit {
+                            Ok(permit) => {
+                                permit.send(Ok(pending.take().unwrap()));
+                                Step::Sent
+                            }
+                            Err(_) => Step::Closed,
+                        }
+                    }
+                };
+                match step {
+                    Step::Cancelled(error) => {
+                        return abort_client_stream(tx.take(), &mut task, error).await;
+                    }
+                    Step::Finished(result) => {
+                        return result
+                            .map_err(|e| synurang_call::RpcError::new(13, e.to_string()))?
+                            .map_err(codec::module_error);
+                    }
+                    Step::Closed => {
+                        pending = None;
+                        tx.take();
+                    }
+                    Step::Sent => {}
+                }
+            } else {
+                tokio::select! {
+                    error = context.cancelled() => {
+                        return abort_client_stream(tx.take(), &mut task, error).await;
+                    }
+                    result = &mut task.0 => return result
+                        .map_err(|e| synurang_call::RpcError::new(13, e.to_string()))?
+                        .map_err(codec::module_error),
+                    next = requests.recv() => match next {
+                        Ok(Some(item)) => pending = Some(item),
+                        Ok(None) => {
+                            tx.take();
+                        }
+                        Err(error) => {
+                            return abort_client_stream(tx.take(), &mut task, error).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn abort_client_stream<Req: FfiClientStream>(
+    tx: Option<tokio::sync::mpsc::Sender<crate::domain::Result<Req>>>,
+    task: &mut AbortTask<crate::domain::Result<Req::Resp>>,
+    error: synurang_call::RpcError,
+) -> synurang_call::Result<Req::Resp> {
+    if let Some(sender) = tx {
+        let _ = sender
+            .send(Err(crate::domain::ServiceError::new(
+                crate::domain::ErrorCode::Cancelled,
+                "ffi",
+                error.to_string(),
+            )))
+            .await;
+        drop(sender);
+    }
+    let _ = (&mut task.0).await;
+    Err(error)
 }
 impl Drop for FfiApi {
     fn drop(&mut self) {

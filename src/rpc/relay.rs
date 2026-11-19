@@ -17,16 +17,17 @@ pub struct Relay {
 }
 impl Relay {
     fn artifact_to_remote(&self, account: &str, id: &str) -> Result<String> {
-        let (artifact, data) = self.store.artifact_bytes(account, id)?;
+        let (artifact, file) = self.store.open_artifact(account, id)?;
         let value = self
             .runtime
-            .block_on(self.client.put_artifact(pb::PutArtifactRequest {
-                account_id: account.into(),
-                name: artifact.name,
-                mime: artifact.mime,
-                sha256: artifact.hash,
-                data,
-            }))?;
+            .block_on(self.client.put_artifact_verified_file(
+                account,
+                &artifact.name,
+                &artifact.mime,
+                &artifact.hash,
+                artifact.size,
+                file,
+            ))?;
         Ok(value.id)
     }
     fn artifact_to_local(&self, account: &str, id: &str) -> Result<String> {
@@ -41,33 +42,10 @@ pub(super) async fn download_artifact(
     account: &str,
     id: &str,
 ) -> Result<String> {
-    let value = client
-        .get_artifact(pb::ArtifactRef {
-            account_id: account.into(),
-            id: id.into(),
-        })
-        .await?;
-    let meta = value
-        .artifact
-        .ok_or_else(|| ServiceError::invalid("missing artifact metadata"))?;
-    if meta.id != id || meta.scope != account {
-        return Err(ServiceError::invalid(
-            "downloaded artifact identity mismatch",
-        ));
-    }
-    let account = account.to_owned();
-    store
-        .blocking(move |store| {
-            if meta.hash != digest(&value.data) || meta.size != value.data.len() as u64 {
-                return Err(ServiceError::invalid(
-                    "downloaded artifact integrity mismatch",
-                ));
-            }
-            Ok(store
-                .artifact(&account, &meta.name, &meta.mime, &value.data, "remote")?
-                .id)
-        })
-        .await
+    Ok(client
+        .download_artifact_to_store(store, account, id, "remote")
+        .await?
+        .id)
 }
 
 impl Backend for Relay {

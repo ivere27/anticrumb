@@ -3,8 +3,12 @@ use crate::domain::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsStr,
+    fmt::Write as _,
     fs,
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -51,13 +55,27 @@ impl Store {
         Ok(file)
     }
     pub fn open(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root.join("blobs")).map_err(ServiceError::storage)?;
+        let tmp_root = Self::ensure_blob_tmp_root_at(root)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(root, fs::Permissions::from_mode(0o700))
                 .map_err(ServiceError::storage)?;
+            fs::set_permissions(&tmp_root, fs::Permissions::from_mode(0o700))
+                .map_err(ServiceError::storage)?;
         }
+        use fs2::FileExt;
+        let _init_lock = {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join("state.lock"))
+                .map_err(ServiceError::storage)?;
+            file.lock_exclusive().map_err(ServiceError::storage)?;
+            file
+        };
         let conn = Connection::open(root.join("state.sqlite3")).map_err(ServiceError::storage)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(ServiceError::storage)?;
@@ -450,6 +468,248 @@ impl Store {
         raw.map(|s| serde_json::from_str(&s).map_err(ServiceError::storage))
             .transpose()
     }
+    fn blob_tmp_root(&self) -> PathBuf {
+        self.root.join("blobs").join(".tmp")
+    }
+    fn ensure_blob_tmp_root_at(root: &Path) -> Result<PathBuf> {
+        let blobs_dir = root.join("blobs");
+        fs::create_dir_all(&blobs_dir).map_err(ServiceError::storage)?;
+        let blobs_meta = fs::symlink_metadata(&blobs_dir).map_err(ServiceError::storage)?;
+        if !blobs_meta.is_dir() || blobs_meta.file_type().is_symlink() {
+            return Err(ServiceError::invalid(
+                "blob directory must not be a symlink or a file",
+            ));
+        }
+        let tmp_root = blobs_dir.join(".tmp");
+        let validate_tmp_dir = || -> Result<()> {
+            let meta = fs::symlink_metadata(&tmp_root).map_err(ServiceError::storage)?;
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                Ok(())
+            } else {
+                Err(ServiceError::invalid(
+                    "blob staging directory must not be a symlink or a file",
+                ))
+            }
+        };
+        match fs::symlink_metadata(&tmp_root) {
+            Ok(_) => validate_tmp_dir()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&tmp_root) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            fs::set_permissions(&tmp_root, fs::Permissions::from_mode(0o700))
+                                .map_err(ServiceError::storage)?;
+                        }
+                    }
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        validate_tmp_dir()?;
+                    }
+                    Err(create_err) => return Err(ServiceError::storage(create_err)),
+                }
+            }
+            Err(error) => return Err(ServiceError::storage(error)),
+        }
+        Ok(tmp_root)
+    }
+    fn ensure_blob_tmp_root(&self) -> Result<PathBuf> {
+        Self::ensure_blob_tmp_root_at(&self.root)
+    }
+    fn clean_abandoned_blob_staging_locked(&self, _lease: &fs::File) -> Result<()> {
+        use fs2::FileExt;
+        let tmp_root = self.blob_tmp_root();
+        for entry in cache::entries(&tmp_root)? {
+            let path = entry.path();
+            let Some(meta) = cache::metadata(&path)? else {
+                continue;
+            };
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !cache::owned_name(&name, "tmp_") {
+                continue;
+            }
+            let lock_path = path.join(".lease");
+            let held_lock = match fs::symlink_metadata(&lock_path) {
+                Ok(lock_meta) if lock_meta.is_file() && !lock_meta.file_type().is_symlink() => {
+                    let file = match fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&lock_path)
+                    {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(ServiceError::storage(error)),
+                    };
+                    if file.try_lock_exclusive().is_err() {
+                        continue;
+                    }
+                    Some(file)
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(ServiceError::storage(error)),
+            };
+            // Remove payload before unlocking/dropping the lease handle (required on Windows)
+            // while still holding `_lease` (`blobs.lock`).
+            let _ = fs::remove_file(path.join("data"));
+            drop(held_lock);
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ServiceError::storage(error)),
+            }
+        }
+        Ok(())
+    }
+    fn blob_usage_excluding(&self, excluded_staging: Option<&OsStr>) -> Result<u64> {
+        let mut total = 0u64;
+        for entry in cache::entries(&self.root.join("blobs"))? {
+            let Some(meta) = cache::metadata(&entry.path())? else {
+                continue;
+            };
+            if meta.is_file() && !meta.file_type().is_symlink() {
+                total += meta.len();
+            }
+        }
+        for entry in cache::entries(&self.blob_tmp_root())? {
+            if excluded_staging.is_some_and(|name| entry.file_name() == name) {
+                continue;
+            }
+            let Some(meta) = cache::metadata(&entry.path())? else {
+                continue;
+            };
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let mut newest = std::time::UNIX_EPOCH;
+            if let Some(bytes) = cache::directory_size(&entry.path(), &mut newest)? {
+                total += bytes;
+            }
+        }
+        Ok(total)
+    }
+    fn reserve_blob_space(
+        &self,
+        expected_size: u64,
+        dest: Option<&Path>,
+        excluding: Option<&OsStr>,
+    ) -> Result<fs::File> {
+        let mut lease = self.blob_lease()?;
+        self.clean_abandoned_blob_staging_locked(&lease)?;
+        if dest.is_some_and(Path::exists) {
+            return Ok(lease);
+        }
+        let mut used = self.blob_usage_excluding(excluding)?;
+        if used + expected_size >= cache::BLOB_LIMIT * 8 / 10 {
+            drop(lease);
+            self.clean_cache_under_pressure()?;
+            lease = self.blob_lease()?;
+            self.clean_abandoned_blob_staging_locked(&lease)?;
+            if dest.is_some_and(Path::exists) {
+                return Ok(lease);
+            }
+            used = self.blob_usage_excluding(excluding)?;
+        }
+        if used + expected_size > cache::BLOB_LIMIT {
+            return Err(ServiceError::invalid(format!(
+                "blob budget (1 GiB) reached; {} more bytes required; run /cache or anticrumb cache prune; referenced files are retained",
+                used + expected_size - cache::BLOB_LIMIT
+            )));
+        }
+        Ok(lease)
+    }
+    pub fn artifact_writer(
+        &self,
+        scope: &str,
+        name: &str,
+        mime: &str,
+        expected_size: Option<u64>,
+        expected_sha256: Option<&str>,
+        origin: &str,
+    ) -> Result<ArtifactWriter> {
+        use fs2::FileExt;
+        if let Some(size) = expected_size {
+            if size > MAX_ARTIFACT_BYTES {
+                return Err(ServiceError::invalid(format!(
+                    "artifact exceeds {MAX_ARTIFACT_LABEL}"
+                )));
+            }
+        }
+        if let Some(sha) = expected_sha256 {
+            if !is_valid_sha256_hex(sha) {
+                return Err(ServiceError::invalid("invalid artifact SHA-256"));
+            }
+        }
+        let normalized_name = Path::new(name)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if !is_valid_artifact_name(&normalized_name) {
+            return Err(ServiceError::invalid("invalid artifact name"));
+        }
+        let expected_dest = expected_sha256.map(|sha| self.root.join("blobs").join(sha));
+        let store_lease = if let Some(size) = expected_size {
+            self.reserve_blob_space(size, expected_dest.as_deref(), None)?
+        } else {
+            let lease = self.blob_lease()?;
+            self.clean_abandoned_blob_staging_locked(&lease)?;
+            lease
+        };
+        let tmp_root = self.ensure_blob_tmp_root()?;
+        let staging_dir = tmp_root.join(id("tmp"));
+        fs::create_dir(&staging_dir).map_err(ServiceError::storage)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o700))
+                .map_err(ServiceError::storage)?;
+        }
+        let data_path = staging_dir.join("data");
+        let mut staging = TempStagingGuard {
+            dir: staging_dir.clone(),
+            data_path: data_path.clone(),
+            lease: None,
+            armed: true,
+        };
+        let mut lease_opts = fs::OpenOptions::new();
+        lease_opts.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lease_opts.mode(0o600);
+        }
+        let lease_file = lease_opts
+            .open(staging_dir.join(".lease"))
+            .map_err(ServiceError::storage)?;
+        lease_file.lock_exclusive().map_err(ServiceError::storage)?;
+        staging.lease = Some(lease_file);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&data_path).map_err(ServiceError::storage)?;
+        drop(store_lease);
+        Ok(ArtifactWriter {
+            store: self.clone(),
+            scope: scope.into(),
+            name: normalized_name,
+            mime: mime.into(),
+            origin: origin.into(),
+            expected_size,
+            expected_sha256: expected_sha256.map(str::to_owned),
+            hasher: Sha256::new(),
+            written: 0,
+            writer: Some(BufWriter::with_capacity(64 * 1024, file)),
+            staging,
+        })
+    }
     pub fn artifact(
         &self,
         scope: &str,
@@ -458,94 +718,129 @@ impl Store {
         bytes: &[u8],
         origin: &str,
     ) -> Result<Artifact> {
-        if bytes.len() > 32 * 1024 * 1024 {
-            return Err(ServiceError::invalid("artifact exceeds 32 MiB"));
+        let size = bytes.len() as u64;
+        if size > MAX_ARTIFACT_BYTES {
+            return Err(ServiceError::invalid(format!(
+                "artifact exceeds {MAX_ARTIFACT_LABEL}"
+            )));
         }
-        let mut lease = self.blob_lease()?;
-        let hash = digest(bytes);
-        let dest = self.root.join("blobs").join(&hash);
-        if !dest.exists() {
-            let usage = || -> Result<u64> {
-                fs::read_dir(self.root.join("blobs"))
-                    .map_err(ServiceError::storage)?
-                    .map(|entry| {
-                        let entry = entry.map_err(ServiceError::storage)?;
-                        let meta =
-                            fs::symlink_metadata(entry.path()).map_err(ServiceError::storage)?;
-                        Ok(if meta.is_file() && !meta.file_type().is_symlink() {
-                            meta.len()
-                        } else {
-                            0
-                        })
-                    })
-                    .sum()
-            };
-            let mut used = usage()?;
-            if used + bytes.len() as u64 >= cache::BLOB_LIMIT * 8 / 10 {
-                drop(lease);
-                self.clean_cache_under_pressure()?;
-                lease = self.blob_lease()?;
-                used = usage()?;
-            }
-            let additional = if dest.exists() { 0 } else { bytes.len() as u64 };
-            if used + additional > cache::BLOB_LIMIT {
-                return Err(ServiceError::invalid(format!(
-                    "blob budget (1 GiB) reached; {} more bytes required; run /cache or anticrumb cache prune; referenced files are retained",
-                    used + additional - cache::BLOB_LIMIT
-                )));
-            }
-            if !dest.exists() {
-                let tmp = self.root.join("blobs").join(id("tmp"));
-                fs::write(&tmp, bytes).map_err(ServiceError::storage)?;
-                fs::rename(&tmp, &dest).map_err(ServiceError::storage)?;
-            }
-        }
-        let artifact = Artifact {
-            id: if origin == "input" {
-                format!(
-                    "artifact_{}",
-                    digest(
-                        serde_json::json!([
-                            scope,
-                            Path::new(name)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            mime,
-                            hash
-                        ])
-                        .to_string()
-                        .as_bytes()
-                    )
-                )
-            } else {
-                id("artifact")
-            },
-            scope: scope.into(),
-            hash,
-            mime: mime.into(),
-            name: Path::new(name)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            size: bytes.len() as u64,
-            origin: origin.into(),
-            created_at: now_ms(),
-        };
-        self.put(scope, "artifact", &artifact.id, &artifact)?;
-        drop(lease);
-        Ok(artifact)
+        let mut writer = self.artifact_writer(scope, name, mime, Some(size), None, origin)?;
+        writer.write_chunk(bytes)?;
+        writer.finish()
     }
     pub fn artifact_path(&self, scope: &str, id: &str) -> Result<(Artifact, PathBuf)> {
         let art: Artifact = self.get(scope, "artifact", id)?;
-        if art.hash.len() != 64 || !art.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !is_valid_sha256_hex(&art.hash) {
             return Err(ServiceError::invalid("invalid blob hash"));
         }
         let path = self.root.join("blobs").join(&art.hash);
         Ok((art, path))
     }
+    pub fn open_artifact(&self, scope: &str, id: &str) -> Result<(Artifact, fs::File)> {
+        let _lease = self.blob_lease()?;
+        let (art, path) = self.artifact_path(scope, id)?;
+        if art.size > MAX_ARTIFACT_BYTES {
+            return Err(ServiceError::invalid(format!(
+                "artifact exceeds {MAX_ARTIFACT_LABEL}"
+            )));
+        }
+        let sym_meta = fs::symlink_metadata(&path).map_err(ServiceError::storage)?;
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+            return Err(ServiceError::new(
+                ErrorCode::StorageFailure,
+                "blob",
+                "artifact integrity check failed",
+            ));
+        }
+        let file = fs::File::open(&path).map_err(ServiceError::storage)?;
+        let meta = file.metadata().map_err(ServiceError::storage)?;
+        if !meta.is_file() || meta.len() != art.size {
+            return Err(ServiceError::new(
+                ErrorCode::StorageFailure,
+                "blob",
+                "artifact integrity check failed",
+            ));
+        }
+        Ok((art, file))
+    }
+    fn export_open_artifact(art: Artifact, mut src: fs::File, dest: &Path) -> Result<Artifact> {
+        let mut dst = BufWriter::with_capacity(
+            64 * 1024,
+            fs::File::create(dest).map_err(ServiceError::storage)?,
+        );
+        let result = (|| -> Result<Artifact> {
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut hasher = Sha256::new();
+            let mut total = 0u64;
+            loop {
+                let n = match src.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(ServiceError::storage(e)),
+                };
+                let Some(next) = total.checked_add(n as u64) else {
+                    return Err(ServiceError::new(
+                        ErrorCode::StorageFailure,
+                        "blob",
+                        "artifact integrity check failed",
+                    ));
+                };
+                if next > art.size {
+                    return Err(ServiceError::new(
+                        ErrorCode::StorageFailure,
+                        "blob",
+                        "artifact integrity check failed",
+                    ));
+                }
+                total = next;
+                hasher.update(&buf[..n]);
+                dst.write_all(&buf[..n]).map_err(ServiceError::storage)?;
+            }
+            dst.flush().map_err(ServiceError::storage)?;
+            let mut actual_hash = String::with_capacity(64);
+            for byte in hasher.finalize() {
+                let _ = write!(&mut actual_hash, "{byte:02x}");
+            }
+            if total != art.size || actual_hash != art.hash {
+                return Err(ServiceError::new(
+                    ErrorCode::StorageFailure,
+                    "blob",
+                    "artifact integrity check failed",
+                ));
+            }
+            Ok(art)
+        })();
+        drop(dst);
+        if result.is_err() {
+            let _ = fs::remove_file(dest);
+        }
+        result
+    }
+    pub fn export_artifact_to_path(&self, scope: &str, id: &str, dest: &Path) -> Result<Artifact> {
+        let (art, src) = self.open_artifact(scope, id)?;
+        Self::export_open_artifact(art, src, dest)
+    }
+    pub fn export_artifact_under(
+        &self,
+        scope: &str,
+        id: &str,
+        dir: &Path,
+        prefix: &str,
+    ) -> Result<PathBuf> {
+        let (art, src) = self.open_artifact(scope, id)?;
+        if !is_valid_artifact_name(&art.name) {
+            return Err(ServiceError::invalid("invalid artifact name"));
+        }
+        let dest = dir.join(format!("{prefix}{}", art.name));
+        Self::export_open_artifact(art, src, &dest)?;
+        Ok(dest)
+    }
     pub fn recover(&self) -> Result<usize> {
+        {
+            let lease = self.blob_lease()?;
+            self.clean_abandoned_blob_staging_locked(&lease)?;
+        }
         let mut recovered = 0;
         for mut run in self.list::<Run>("local", "run")? {
             if ["queued", "preparing", "submitted", "running"].contains(&run.state.as_str()) {
@@ -875,9 +1170,18 @@ impl Store {
         }))
     }
     pub fn artifact_bytes(&self, scope: &str, id: &str) -> Result<(Artifact, Vec<u8>)> {
-        let _lease = self.blob_lease()?;
-        let (art, path) = self.artifact_path(scope, id)?;
-        let bytes = fs::read(path).map_err(ServiceError::storage)?;
+        let (art, file) = self.open_artifact(scope, id)?;
+        let cap = usize::try_from(art.size).map_err(|_| {
+            ServiceError::new(
+                ErrorCode::StorageFailure,
+                "blob",
+                "artifact exceeds addressable size",
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(cap.min(256 * 1024));
+        file.take(art.size.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(ServiceError::storage)?;
         if bytes.len() as u64 != art.size || digest(&bytes) != art.hash {
             return Err(ServiceError::new(
                 ErrorCode::StorageFailure,
@@ -1173,6 +1477,138 @@ impl Store {
     }
 }
 
+struct TempStagingGuard {
+    dir: PathBuf,
+    data_path: PathBuf,
+    // Held exclusively while this writer is active so cache cleanup never deletes live staging.
+    lease: Option<fs::File>,
+    armed: bool,
+}
+
+impl TempStagingGuard {
+    fn disarm_and_cleanup(&mut self) {
+        if self.armed {
+            self.armed = false;
+            let _ = fs::remove_file(&self.data_path);
+            drop(self.lease.take());
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+impl Drop for TempStagingGuard {
+    fn drop(&mut self) {
+        self.disarm_and_cleanup();
+    }
+}
+
+pub struct ArtifactWriter {
+    store: Store,
+    scope: String,
+    name: String,
+    mime: String,
+    origin: String,
+    expected_size: Option<u64>,
+    expected_sha256: Option<String>,
+    hasher: Sha256,
+    written: u64,
+    // Declared before `staging` so buffered handles close before staging cleanup on drop.
+    writer: Option<BufWriter<fs::File>>,
+    staging: TempStagingGuard,
+}
+
+impl ArtifactWriter {
+    pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        let next = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                ServiceError::invalid(format!("artifact exceeds {MAX_ARTIFACT_LABEL}"))
+            })?;
+        if next > MAX_ARTIFACT_BYTES {
+            return Err(ServiceError::invalid(format!(
+                "artifact exceeds {MAX_ARTIFACT_LABEL}"
+            )));
+        }
+        if let Some(expected) = self.expected_size {
+            if next > expected {
+                return Err(ServiceError::invalid(
+                    "artifact byte count exceeds declared size",
+                ));
+            }
+        }
+        if !bytes.is_empty() {
+            let writer = self
+                .writer
+                .as_mut()
+                .ok_or_else(|| ServiceError::storage("artifact writer already closed"))?;
+            writer.write_all(bytes).map_err(ServiceError::storage)?;
+            self.hasher.update(bytes);
+            self.written = next;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Artifact> {
+        if let Some(expected) = self.expected_size {
+            if self.written != expected {
+                return Err(ServiceError::invalid("artifact size mismatch"));
+            }
+        }
+        let mut hash = String::with_capacity(64);
+        for byte in self.hasher.clone().finalize() {
+            let _ = write!(&mut hash, "{byte:02x}");
+        }
+        if let Some(expected) = &self.expected_sha256 {
+            if hash != *expected {
+                return Err(ServiceError::invalid("artifact SHA-256 mismatch"));
+            }
+        }
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or_else(|| ServiceError::storage("artifact writer already closed"))?;
+        writer.flush().map_err(ServiceError::storage)?;
+        drop(writer);
+        let dest = self.store.root.join("blobs").join(&hash);
+        let staging_name = self.staging.dir.file_name().map(OsStr::to_os_string);
+        let lease =
+            self.store
+                .reserve_blob_space(self.written, Some(&dest), staging_name.as_deref())?;
+        if !dest.exists() {
+            fs::rename(&self.staging.data_path, &dest).map_err(ServiceError::storage)?;
+        }
+        let artifact = Artifact {
+            id: if self.origin == "input" {
+                format!(
+                    "artifact_{}",
+                    digest(
+                        serde_json::json!([self.scope, self.name, self.mime, hash])
+                            .to_string()
+                            .as_bytes()
+                    )
+                )
+            } else {
+                id("artifact")
+            },
+            scope: self.scope.clone(),
+            hash,
+            mime: self.mime.clone(),
+            name: self.name.clone(),
+            size: self.written,
+            origin: self.origin.clone(),
+            created_at: now_ms(),
+        };
+        let put_result = self
+            .store
+            .put(&self.scope, "artifact", &artifact.id, &artifact);
+        self.staging.disarm_and_cleanup();
+        drop(lease);
+        put_result?;
+        Ok(artifact)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,6 +1687,249 @@ mod tests {
         let (_, path) = store.artifact_path("default", &artifact.id).unwrap();
         std::fs::write(path, b"modified").unwrap();
         assert!(store.artifact_bytes("default", &artifact.id).is_err());
+        let export = root.path().join("export.txt");
+        assert!(store
+            .export_artifact_to_path("default", &artifact.id, &export)
+            .is_err());
+        assert!(!export.exists());
+    }
+    #[test]
+    fn artifact_writer_streams_verifies_and_cleans_temp_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let payload = vec![0x5a_u8; 300 * 1024];
+        let hash = digest(&payload);
+        let mut writer = store
+            .artifact_writer(
+                "default",
+                "chunked.bin",
+                "application/octet-stream",
+                Some(payload.len() as u64),
+                Some(&hash),
+                "input",
+            )
+            .unwrap();
+        for chunk in payload.chunks(64 * 1024) {
+            writer.write_chunk(chunk).unwrap();
+        }
+        let art = writer.finish().unwrap();
+        assert_eq!(art.size, payload.len() as u64);
+        assert_eq!(art.hash, hash);
+        let export = root.path().join("exported.bin");
+        store
+            .export_artifact_to_path("default", &art.id, &export)
+            .unwrap();
+        assert_eq!(std::fs::read(&export).unwrap(), payload);
+
+        // Aborted writer removes its temporary file immediately on drop.
+        let mut aborted = store
+            .artifact_writer(
+                "default",
+                "aborted.bin",
+                "application/octet-stream",
+                Some(128),
+                None,
+                "input",
+            )
+            .unwrap();
+        aborted.write_chunk(&[1, 2, 3, 4]).unwrap();
+        drop(aborted);
+        let leftovers: Vec<_> = std::fs::read_dir(root.path().join("blobs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("tmp_"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let staging_leftovers: Vec<_> = std::fs::read_dir(root.path().join("blobs").join(".tmp"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(staging_leftovers.is_empty());
+
+        // Size and hash mismatches reject without committing a blob.
+        let truncated = store
+            .artifact_writer(
+                "default",
+                "short.bin",
+                "application/octet-stream",
+                Some(10),
+                None,
+                "input",
+            )
+            .unwrap();
+        assert!(truncated.finish().is_err());
+
+        let mut bad_hash = store
+            .artifact_writer(
+                "default",
+                "badhash.bin",
+                "application/octet-stream",
+                Some(4),
+                Some(&"00".repeat(32)),
+                "input",
+            )
+            .unwrap();
+        bad_hash.write_chunk(b"1234").unwrap();
+        assert!(bad_hash.finish().is_err());
+
+        // Oversized expectation above 100 MiB is rejected before allocating temp storage.
+        assert!(store
+            .artifact_writer(
+                "default",
+                "too-big.bin",
+                "application/octet-stream",
+                Some(MAX_ARTIFACT_BYTES + 1),
+                None,
+                "input",
+            )
+            .is_err());
+
+        // Stored metadata above MAX_ARTIFACT_BYTES or with invalid name is rejected on read/export.
+        let mut oversized_meta = art.clone();
+        oversized_meta.size = MAX_ARTIFACT_BYTES + 1;
+        store
+            .put("default", "artifact", "oversized-id", &oversized_meta)
+            .unwrap();
+        assert!(store.open_artifact("default", "oversized-id").is_err());
+        assert!(store.artifact_bytes("default", "oversized-id").is_err());
+        assert!(store
+            .export_artifact_to_path("default", "oversized-id", &root.path().join("nope.bin"))
+            .is_err());
+
+        let mut bad_name_meta = art.clone();
+        bad_name_meta.name = "../escape.bin".into();
+        store
+            .put("default", "artifact", "bad-name-id", &bad_name_meta)
+            .unwrap();
+        let export_dir = root.path().join("export-under");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        let err = store
+            .export_artifact_under("default", "bad-name-id", &export_dir, "0-")
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn blob_staging_protects_live_uploads_and_reclaims_crash_leftovers() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+
+        // Active upload holds `.lease` under `blobs/.tmp/tmp_*` and survives concurrent
+        // pressure cleanup and recover().
+        let mut live = store
+            .artifact_writer(
+                "default",
+                "live.bin",
+                "application/octet-stream",
+                Some(12),
+                None,
+                "input",
+            )
+            .unwrap();
+        live.write_chunk(b"hello ").unwrap();
+
+        let abandoned = root.path().join("blobs").join(".tmp").join(id("tmp"));
+        std::fs::create_dir_all(&abandoned).unwrap();
+        std::fs::write(abandoned.join(".lease"), b"").unwrap();
+        let abandoned_data = std::fs::File::create(abandoned.join("data")).unwrap();
+        abandoned_data.set_len(cache::BLOB_LIMIT).unwrap();
+        drop(abandoned_data);
+
+        // Even while a job is active (busy), starting another writer reclaims the unlocked
+        // crash leftover without touching the live writer.
+        store
+            .put(
+                "local",
+                "agent",
+                "active",
+                &serde_json::json!({"state":"running"}),
+            )
+            .unwrap();
+        let next = store
+            .artifact("default", "other.txt", "text/plain", b"ok", "input")
+            .unwrap();
+        assert_eq!(next.size, 2);
+        assert!(!abandoned.exists());
+
+        live.write_chunk(b"world!").unwrap();
+        let committed = live.finish().unwrap();
+        assert_eq!(
+            store.artifact_bytes("default", &committed.id).unwrap().1,
+            b"hello world!"
+        );
+
+        // recover() also reclaims unlocked staging leftovers immediately.
+        let orphan = root.path().join("blobs").join(".tmp").join(id("tmp"));
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(".lease"), b"").unwrap();
+        std::fs::write(orphan.join("data"), b"stale").unwrap();
+        store.recover().unwrap();
+        assert!(!orphan.exists());
+
+        // Direct/internal callers of `artifact_writer` and `artifact` also validate normalized names.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "nested/..",
+            "bad:name",
+            "bad\\name",
+            "bad\0name",
+        ] {
+            assert!(
+                matches!(
+                    store.artifact("default", bad, "text/plain", b"x", "input"),
+                    Err(err) if err.code == ErrorCode::InvalidRequest
+                ),
+                "expected invalid artifact name for {bad:?}"
+            );
+        }
+        let from_path = store
+            .artifact(
+                "default",
+                "/tmp/dir/clean.txt",
+                "text/plain",
+                b"ok",
+                "input",
+            )
+            .unwrap();
+        assert_eq!(from_path.name, "clean.txt");
+    }
+
+    #[test]
+    fn store_open_is_race_safe_and_rejects_symlink_staging_root() {
+        let root = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = root.path().to_path_buf();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    Store::open(&path).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let store = Store::open(root.path()).unwrap();
+        assert_eq!(store.blob_usage_excluding(None).unwrap(), 0);
+
+        #[cfg(unix)]
+        {
+            let link_root = tempfile::tempdir().unwrap();
+            let target = link_root.path().join("outside");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(link_root.path().join("blobs")).unwrap();
+            std::os::unix::fs::symlink(&target, link_root.path().join("blobs").join(".tmp"))
+                .unwrap();
+            let err = match Store::open(link_root.path()) {
+                Ok(_) => panic!("expected symlink staging root to fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code, ErrorCode::InvalidRequest);
+        }
     }
     #[test]
     fn multi_provider_multi_account_stats_accounts_and_sessions() {

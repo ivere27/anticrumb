@@ -5,6 +5,8 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::json;
 
+const MAX_SCREENSHOT_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct ViewState {
     document: String,
@@ -128,7 +130,7 @@ impl VisualMode {
             let encoded = result["data"]
                 .as_str()
                 .ok_or("screenshot returned no PNG data")?;
-            if encoded.len() > (crate::input::MAX_FILE_BYTES as usize).div_ceil(3) * 4 {
+            if encoded.len() > MAX_SCREENSHOT_BYTES.div_ceil(3) * 4 {
                 return Err("screenshot exceeds 32 MiB; capture a smaller region".into());
             }
             let png = STANDARD

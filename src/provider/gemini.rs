@@ -754,10 +754,13 @@ fn prepare_tab(
     let mut files = Vec::new();
     let upload_root = store.root().join("uploads").join(id("turn"));
     let _cleanup = TempDirGuard::new(upload_root.clone())?;
-    for artifact_id in &request.artifacts {
-        let (art, bytes) = store.artifact_bytes(&account.id, artifact_id)?;
-        let target = upload_root.join(format!("{}-{}", files.len(), art.name));
-        std::fs::write(&target, bytes).map_err(ServiceError::storage)?;
+    for (idx, artifact_id) in request.artifacts.iter().enumerate() {
+        let target = store.export_artifact_under(
+            &account.id,
+            artifact_id,
+            &upload_root,
+            &format!("{idx}-"),
+        )?;
         files.push(target);
     }
     if !files.is_empty() {

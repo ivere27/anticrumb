@@ -4,7 +4,6 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -78,18 +77,11 @@ pub use crate::remote_backend::RemoteBackend;
 pub use crate::rpc::workspace_client::Client;
 impl Client {
     pub fn clear_web_history(&self, account: &str) -> Result<Value> {
-        self.request(
-            "POST",
-            &format!("/api/accounts/{account}/clear-history"),
-            Some(&json!({})),
-        )
+        self.runtime.block_on(self.clear_web_history_async(account))
     }
     pub fn web_history_cleanup(&self, account: &str) -> Result<Value> {
-        self.request(
-            "GET",
-            &format!("/api/accounts/{account}/clear-history"),
-            None,
-        )
+        self.runtime
+            .block_on(self.web_history_cleanup_async(account))
     }
     pub fn submit(&self, request: &TurnRequest) -> Result<String> {
         let value = self.request(
@@ -463,22 +455,11 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
                 return Err(ServiceError::invalid("artifact get ACCOUNT ID DEST"));
             }
             let client = Client::connect()?;
-            let response = client.artifact(identifier(&args[2])?, identifier(&args[3])?)?;
-            let metadata = response
-                .artifact
-                .ok_or_else(|| ServiceError::invalid("missing artifact metadata"))?;
-            if metadata.hash != digest(&response.data)
-                || metadata.size != response.data.len() as u64
-            {
-                return Err(ServiceError::invalid("artifact integrity mismatch"));
-            }
-            let mut out = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&args[4])
-                .map_err(ServiceError::storage)?;
-            out.write_all(&response.data)
-                .map_err(ServiceError::storage)?;
+            client.download_artifact(
+                identifier(&args[2])?,
+                identifier(&args[3])?,
+                Path::new(&args[4]),
+            )?;
             Ok(())
         }
         _ => {
@@ -932,6 +913,9 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
         None
     };
     let prepared = crate::input::prepare(&o.words.join(" "), &o.workspace, &o.files)?;
+    for warning in &prepared.warnings {
+        eprintln!("warning: {warning}");
+    }
     if prepared.text.trim().is_empty() {
         return Err(ServiceError::invalid("provide a task or follow-up prompt"));
     }
@@ -950,7 +934,10 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     } else if o.yolo {
         "agent (--yolo, all permissions)".to_owned()
     } else {
-        format!("agent (permissions: {})", o.effective_permissions().summary())
+        format!(
+            "agent (permissions: {})",
+            o.effective_permissions().summary()
+        )
     };
     eprintln!("mode: {mode_desc} | agent: {id}");
     follow_agent(&client, id, o.json, o.print)
@@ -1020,6 +1007,9 @@ fn chat_command(args: &[String], image: bool) -> Result<()> {
     let client = Client::connect()?;
     o.resolve_account(&client)?;
     let prepared = crate::input::prepare(&o.words.join(" "), &o.workspace, &o.files)?;
+    for warning in &prepared.warnings {
+        eprintln!("warning: {warning}");
+    }
     let mut r = TurnRequest::text(prepared.text);
     r.account_id = o.account;
     r.model = o.model;
@@ -1076,6 +1066,9 @@ fn job_command(kind: &str, args: &[String]) -> Result<()> {
                 .as_str()
                 .ok_or_else(|| ServiceError::invalid("missing account"))?;
             let prepared = crate::input::prepare(&args[2..].join(" "), workspace, &[])?;
+            for warning in &prepared.warnings {
+                eprintln!("warning: {warning}");
+            }
             let artifacts = client.upload_files(account, &prepared.files, &prepared.temp_files)?;
             client.request(
                 "POST",
@@ -1792,98 +1785,169 @@ fn connect_config(args: &[String]) -> Result<()> {
     eprintln!("Use the token printed by `anticrumb server` as ANTICRUMB_TOKEN (OpenCode/Codex), ANTHROPIC_AUTH_TOKEN (Claude), or GEMINI_API_KEY (Antigravity). Configure the provider client to trust the server certificate.");
     Ok(())
 }
+fn group_conversations(value: Value, workspace: &Path, account: &str) -> Result<Vec<Value>> {
+    let all_jobs: Vec<Value> = value
+        .as_array()
+        .ok_or_else(|| ServiceError::invalid("invalid conversation list"))?
+        .iter()
+        .filter(|v| {
+            v["request"]["workspace"]
+                .as_str()
+                .is_some_and(|s| Path::new(s) == workspace)
+                && v["request"]["account_id"] == account
+        })
+        .cloned()
+        .collect();
+
+    // Group conversation chains: only show one entry per conversation.
+    // A "leaf" is a turn whose ID is not referenced as parent_id by any
+    // other turn. Its label uses the root turn's first prompt text.
+    let parent_ids: std::collections::HashSet<&str> = all_jobs
+        .iter()
+        .filter_map(|v| v["request"]["parent_id"].as_str())
+        .collect();
+    let job_map: std::collections::HashMap<&str, &Value> = all_jobs
+        .iter()
+        .filter_map(|v| Some((v["id"].as_str()?, v)))
+        .collect();
+
+    let mut jobs: Vec<Value> = all_jobs
+        .iter()
+        .filter(|v| v["id"].as_str().is_some_and(|id| !parent_ids.contains(id)))
+        .map(|leaf| {
+            // Walk up the parent chain to find the root's first prompt.
+            let mut current = leaf;
+            for _ in 0..100 {
+                match current["request"]["parent_id"]
+                    .as_str()
+                    .and_then(|pid| job_map.get(pid))
+                {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+            let root_task = current["request"]["task"].clone();
+            let mut entry = (*leaf).clone();
+            entry["request"]["task"] = root_task;
+            entry
+        })
+        .collect();
+
+    jobs.sort_by_key(|v| {
+        std::cmp::Reverse(
+            v["updated_at"]
+                .as_u64()
+                .or(v["created_at"].as_u64())
+                .unwrap_or(0),
+        )
+    });
+    Ok(jobs)
+}
+
+fn upload_mime(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "rs" | "py" | "js" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
 impl Client {
-    pub fn upload_files(
+    pub(crate) async fn request_async(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        crate::rpc::workspace_client::presentation(&self.rpc, method, path, body).await
+    }
+    pub(crate) async fn upload_files_async(
         &self,
         account: &str,
         files: &[PathBuf],
         temp_files: &[PathBuf],
     ) -> Result<Vec<String>> {
+        // Runs on success, error, and when the TUI aborts this future mid-upload.
+        struct TempFiles<'a>(&'a [PathBuf]);
+        impl Drop for TempFiles<'_> {
+            fn drop(&mut self) {
+                crate::input::cleanup_temp_files(self.0);
+            }
+        }
+        let _temp_files = TempFiles(temp_files);
         if files.len() > crate::input::MAX_FILES {
-            crate::input::cleanup_temp_files(temp_files);
             return Err(ServiceError::invalid("maximum 10 attachments"));
         }
-        let uploaded = files
-            .iter()
-            .map(|path| self.upload(account, path))
-            .collect::<Result<Vec<_>>>();
-        crate::input::cleanup_temp_files(temp_files);
-        uploaded
+        let mut uploaded = Vec::with_capacity(files.len());
+        {
+            for path in files {
+                let path_owned = path.clone();
+                let (resolved, name, mime) = tokio::task::spawn_blocking(move || {
+                    let resolved = crate::input::file(Path::new("."), &path_owned)?;
+                    let mime = upload_mime(&resolved);
+                    let name = resolved
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    Ok::<_, ServiceError>((resolved, name, mime))
+                })
+                .await
+                .map_err(ServiceError::storage)??;
+                let value = self
+                    .rpc
+                    .put_artifact_file(account, &resolved, &name, mime)
+                    .await?;
+                uploaded.push(value.id);
+            }
+        }
+        Ok(uploaded)
     }
-    pub fn conversations(&self, workspace: &Path, account: &str) -> Result<Vec<Value>> {
-        let value = self.request("GET", "/api/agents", None)?;
-        let all_jobs: Vec<Value> = value
-            .as_array()
-            .ok_or_else(|| ServiceError::invalid("invalid conversation list"))?
-            .iter()
-            .filter(|v| {
-                v["request"]["workspace"]
-                    .as_str()
-                    .is_some_and(|s| Path::new(s) == workspace)
-                    && v["request"]["account_id"] == account
-            })
-            .cloned()
-            .collect();
-
-        // Group conversation chains: only show one entry per conversation.
-        // A "leaf" is a turn whose ID is not referenced as parent_id by any
-        // other turn. Its label uses the root turn's first prompt text.
-        let parent_ids: std::collections::HashSet<&str> = all_jobs
-            .iter()
-            .filter_map(|v| v["request"]["parent_id"].as_str())
-            .collect();
-        let job_map: std::collections::HashMap<&str, &Value> = all_jobs
-            .iter()
-            .filter_map(|v| Some((v["id"].as_str()?, v)))
-            .collect();
-
-        let mut jobs: Vec<Value> = all_jobs
-            .iter()
-            .filter(|v| v["id"].as_str().is_some_and(|id| !parent_ids.contains(id)))
-            .map(|leaf| {
-                // Walk up the parent chain to find the root's first prompt.
-                let mut current = leaf;
-                for _ in 0..100 {
-                    match current["request"]["parent_id"]
-                        .as_str()
-                        .and_then(|pid| job_map.get(pid))
-                    {
-                        Some(parent) => current = parent,
-                        None => break,
-                    }
-                }
-                let root_task = current["request"]["task"].clone();
-                let mut entry = (*leaf).clone();
-                entry["request"]["task"] = root_task;
-                entry
-            })
-            .collect();
-
-        jobs.sort_by_key(|v| {
-            std::cmp::Reverse(
-                v["updated_at"]
-                    .as_u64()
-                    .or(v["created_at"].as_u64())
-                    .unwrap_or(0),
-            )
-        });
-        Ok(jobs)
+    pub(crate) async fn conversations_async(
+        &self,
+        workspace: &Path,
+        account: &str,
+    ) -> Result<Vec<Value>> {
+        let value = self.request_async("GET", "/api/agents", None).await?;
+        group_conversations(value, workspace, account)
     }
-    pub fn conversation(&self, id: &str, workspace: &Path, account: &str) -> Result<Value> {
+    pub(crate) async fn conversation_async(
+        &self,
+        id: &str,
+        workspace: &Path,
+        account: &str,
+    ) -> Result<Value> {
         if id == "last" || id.is_empty() {
             return self
-                .conversations(workspace, account)?
+                .conversations_async(workspace, account)
+                .await?
                 .into_iter()
                 .next()
                 .ok_or_else(|| {
                     ServiceError::invalid("no saved conversations in this working directory")
                 });
         }
-        self.request("GET", &format!("/api/agents/{}", identifier(id)?), None)
+        self.request_async("GET", &format!("/api/agents/{}", identifier(id)?), None)
+            .await
     }
-    pub fn delete_conversation(&self, id: &str, workspace: &Path, account: &str) -> Result<()> {
+    pub(crate) async fn delete_conversation_async(
+        &self,
+        id: &str,
+        workspace: &Path,
+        account: &str,
+    ) -> Result<()> {
         let id = identifier(id)?;
-        let job = self.request("GET", &format!("/api/agents/{id}"), None)?;
+        let job = self
+            .request_async("GET", &format!("/api/agents/{id}"), None)
+            .await?;
         if job["request"]["workspace"].as_str().map(Path::new) != Some(workspace)
             || job["request"]["account_id"] != account
         {
@@ -1891,33 +1955,90 @@ impl Client {
                 "conversation deletion requires the same workspace and account",
             ));
         }
-        self.request("DELETE", &format!("/api/agents/{id}"), None)?;
+        self.request_async("DELETE", &format!("/api/agents/{id}"), None)
+            .await?;
         Ok(())
     }
-    pub fn events(&self, id: &str, after: i64) -> Result<Vec<Event>> {
-        serde_json::from_value(self.request(
+    /// Read events straight from RPC, skipping the JSON presentation round trip
+    /// (hot path: polled continuously while a turn is active).
+    pub(crate) async fn events_async(&self, id: &str, after: i64) -> Result<Vec<Event>> {
+        let cursor = crate::rpc::pb::EventCursor {
+            run_id: id.into(),
+            after,
+        };
+        let page = if id.starts_with("agent_") {
+            self.rpc.read_agent_events(cursor).await?
+        } else {
+            self.rpc.read_events(cursor).await?
+        };
+        page.events
+            .into_iter()
+            .map(crate::rpc::codec::event_from)
+            .collect()
+    }
+    pub(crate) async fn agent_async(&self, id: &str) -> Result<crate::rpc::pb::Agent> {
+        self.rpc
+            .get_agent(crate::rpc::pb::AgentRef { id: id.into() })
+            .await
+    }
+    pub(crate) fn agent_value(agent: crate::rpc::pb::Agent) -> Result<Value> {
+        serde_json::to_value(crate::rpc::codec::agent_from(agent)?).map_err(ServiceError::storage)
+    }
+    pub(crate) async fn start_agent_async(
+        &self,
+        request: crate::agent_service::AgentRequest,
+    ) -> Result<String> {
+        let id = crate::rpc::workspace_client::start_agent(&self.rpc, request)
+            .await?
+            .id;
+        if id.is_empty() {
+            return Err(ServiceError::invalid("missing job ID"));
+        }
+        Ok(id)
+    }
+    pub(crate) async fn clear_web_history_async(&self, account: &str) -> Result<Value> {
+        self.request_async(
+            "POST",
+            &format!("/api/accounts/{account}/clear-history"),
+            Some(&json!({})),
+        )
+        .await
+    }
+    pub(crate) async fn web_history_cleanup_async(&self, account: &str) -> Result<Value> {
+        self.request_async(
             "GET",
-            &format!("/api/events/{id}?after={after}"),
+            &format!("/api/accounts/{account}/clear-history"),
             None,
-        )?)
-        .map_err(ServiceError::storage)
+        )
+        .await
+    }
+    pub fn upload_files(
+        &self,
+        account: &str,
+        files: &[PathBuf],
+        temp_files: &[PathBuf],
+    ) -> Result<Vec<String>> {
+        self.runtime
+            .block_on(self.upload_files_async(account, files, temp_files))
+    }
+    pub fn conversations(&self, workspace: &Path, account: &str) -> Result<Vec<Value>> {
+        self.runtime
+            .block_on(self.conversations_async(workspace, account))
+    }
+    pub fn conversation(&self, id: &str, workspace: &Path, account: &str) -> Result<Value> {
+        self.runtime
+            .block_on(self.conversation_async(id, workspace, account))
+    }
+    pub fn delete_conversation(&self, id: &str, workspace: &Path, account: &str) -> Result<()> {
+        self.runtime
+            .block_on(self.delete_conversation_async(id, workspace, account))
+    }
+    pub fn events(&self, id: &str, after: i64) -> Result<Vec<Event>> {
+        self.runtime.block_on(self.events_async(id, after))
     }
     pub fn upload(&self, account: &str, path: &Path) -> Result<String> {
         let path = crate::input::file(Path::new("."), path)?;
-        let extension = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let mime = match extension.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            "pdf" => "application/pdf",
-            "txt" | "md" | "rs" | "py" | "js" => "text/plain",
-            _ => "application/octet-stream",
-        };
-        self.put_file(account, &path, mime)
+        self.put_file(account, &path, upload_mime(&path))
     }
 }
 #[cfg(test)]
@@ -1987,7 +2108,10 @@ mod tests {
         // Default --agent permissions are read-only (read=true, edit=false, shell=false, browser=false, subagent=false)
         let mut default_agent = PromptOptions::parse(&["--agent".into(), "task".into()]).unwrap();
         default_agent.load_saved_permissions(dir.path());
-        assert_eq!(default_agent.effective_permissions(), ToolPermissions::read_only());
+        assert_eq!(
+            default_agent.effective_permissions(),
+            ToolPermissions::read_only()
+        );
 
         let prefs = crate::tui::preferences::Preferences::open(dir.path()).unwrap();
         prefs
@@ -2004,7 +2128,10 @@ mod tests {
         agent_opts.load_saved_permissions(dir.path());
         assert!(agent_opts.agent);
         assert!(!agent_opts.yolo);
-        assert!(agent_opts.no_shell, "--agent must respect saved /permissions");
+        assert!(
+            agent_opts.no_shell,
+            "--agent must respect saved /permissions"
+        );
         let agent_req = agent_opts.agent_request("task".into(), None);
         assert!(!agent_req.chat_only);
         assert!(agent_req.no_shell);

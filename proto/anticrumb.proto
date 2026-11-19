@@ -131,11 +131,13 @@ service SessionService {
 }
 
 service ArtifactService {
-  // Bounded to 32 MiB. Uploads are content-addressed and deduplicated within an
-  // account/name/MIME/hash tuple. Bytes are staged on the Chrome host and then
-  // attached through Gemini's native file picker, never expanded into a prompt.
-  rpc PutArtifact(PutArtifactRequest) returns (Artifact);
-  rpc GetArtifact(ArtifactRef) returns (ArtifactData);
+  // Bounded to 100 MiB (100 * 1024 * 1024 bytes). Uploads stream one metadata
+  // message followed by byte chunks; downloads stream metadata followed by byte
+  // chunks. Bytes are content-addressed and deduplicated within an
+  // account/name/MIME/hash tuple, staged on the browser host, and attached via
+  // the provider's native file input rather than expanded into prompts.
+  rpc PutArtifact(stream PutArtifactChunk) returns (Artifact);
+  rpc GetArtifact(ArtifactRef) returns (stream GetArtifactChunk);
 }
 
 // Local-only service for the coding agent on the TUI machine. This service is
@@ -594,12 +596,18 @@ message Session {
 }
 message SessionList { repeated Session sessions = 1; }
 message ArtifactRef { string account_id = 1; string id = 2; }
-message PutArtifactRequest {
+message PutArtifactMeta {
   string account_id = 1;
-  string name = 2; // Basename only; both slash conventions are rejected.
+  string name = 2; // Basename only; slash, colon, NUL, '.', and '..' are rejected.
   string mime = 3;
-  bytes data = 4;
-  string sha256 = 5; // Required; receiver checks before committing a blob.
+  string sha256 = 4; // Required lowercase SHA-256 hex; receiver checks before committing.
+  uint64 size = 5; // Required total byte length; receiver checks before committing.
+}
+message PutArtifactChunk {
+  oneof payload {
+    PutArtifactMeta meta = 1; // First message only.
+    bytes data = 2; // Zero or more byte chunks after meta.
+  }
 }
 message Artifact {
   string id = 1;
@@ -611,7 +619,12 @@ message Artifact {
   string origin = 7;
   int64 created_at = 8;
 }
-message ArtifactData { Artifact artifact = 1; bytes data = 2; }
+message GetArtifactChunk {
+  oneof payload {
+    Artifact artifact = 1; // First message only.
+    bytes data = 2; // Zero or more byte chunks after artifact metadata.
+  }
+}
 message ArtifactList { repeated Artifact artifacts = 1; }
 
 // Wire-compatible with Synurang core.v1.Error's first three fields. The extra

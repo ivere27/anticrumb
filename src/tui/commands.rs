@@ -164,6 +164,71 @@ pub(super) fn complete(editor: &Editor, workspace: &std::path::Path) -> Option<C
     if raw.contains(['"', '\'', '\n']) {
         return None;
     }
+    if let Some(git_prefix) = raw.strip_prefix("git:") {
+        let mut values = Vec::new();
+        let format_item = |item: &str| {
+            if quoted {
+                format!("@\"{item}\" ")
+            } else {
+                format!("@{item} ")
+            }
+        };
+        let git_prefix_lower = git_prefix.to_ascii_lowercase();
+        for special in ["diff", "staged"] {
+            if special.starts_with(&git_prefix_lower) {
+                values.push(format_item(&format!("git:{special}")));
+            }
+        }
+        let commit_limit = if git_prefix.is_empty() {
+            20usize.saturating_sub(values.len())
+        } else {
+            20
+        };
+        let is_hex = !git_prefix_lower.is_empty()
+            && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
+        let mut matched_recent_sha = false;
+        let mut sha_values = Vec::new();
+        let mut subject_matches: Vec<(i64, usize, String)> = Vec::new();
+        for (idx, (sha, subject)) in
+            super::mentions::recent_git_commits(workspace, commit_limit)
+                .into_iter()
+                .enumerate()
+        {
+            if git_prefix.is_empty()
+                || (is_hex && sha.to_ascii_lowercase().starts_with(&git_prefix_lower))
+            {
+                matched_recent_sha = true;
+                sha_values.push(format_item(&format!("git:{sha}")));
+            } else if !git_prefix.is_empty() && !subject.is_empty() {
+                if let Some(subj_score) = super::mentions::fuzzy_score(git_prefix, &subject) {
+                    subject_matches.push((
+                        1_200 + subj_score.clamp(-400, 500) - idx as i64,
+                        idx,
+                        format_item(&format!("git:{sha}")),
+                    ));
+                }
+            }
+        }
+        if is_hex && !matched_recent_sha {
+            if let Some((old_sha, _)) =
+                super::mentions::resolve_git_commit_entry(workspace, git_prefix)
+            {
+                let item = format_item(&format!("git:{old_sha}"));
+                if !sha_values.contains(&item) && !subject_matches.iter().any(|m| m.2 == item) {
+                    sha_values.push(item);
+                }
+            }
+        }
+        values.extend(sha_values);
+        subject_matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        values.extend(subject_matches.into_iter().map(|(_, _, val)| val));
+        values.truncate(20);
+        return Some(Completion {
+            start,
+            end: editor.cursor,
+            values,
+        });
+    }
     let (directory, name) = raw
         .rsplit_once('/')
         .map(|(d, n)| (format!("{d}/"), n))
@@ -561,6 +626,7 @@ impl State {
             ),
             ("@git:diff", "Attach unstaged git diff as a patch file"),
             ("@git:staged", "Attach staged git diff as a patch file"),
+            ("@git:<commit>", "Attach a specific git commit as a patch file"),
             ("Tab", "Complete slash commands or @path"),
             (
                 "Up / Down",
@@ -1368,6 +1434,9 @@ impl State {
             }
         };
         self.log_prompt(&self.editor.display_text());
+        for warning in &prepared.warnings {
+            self.log_warning(warning);
+        }
         self.remember_draft(&draft);
         self.scroll = 0;
         self.pending = Some((draft, std::mem::take(&mut self.files)));

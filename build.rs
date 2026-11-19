@@ -202,13 +202,18 @@ fn main() {
                 let request = ty(method.input_type.as_ref().unwrap());
                 let response = ty(method.output_type.as_ref().unwrap());
                 let path = format!("/{package}.{name}/{method_name}");
+                let client_stream = method.client_streaming.unwrap_or(false);
+                let server_stream = method.server_streaming.unwrap_or(false);
                 assert!(
-                    !method.client_streaming.unwrap_or(false),
-                    "add client-stream codegen before declaring a request stream"
+                    !(client_stream && server_stream),
+                    "add bidi-stream codegen before declaring a bidi stream"
                 );
-                if method.server_streaming.unwrap_or(false) {
+                if server_stream {
                     grpc.push_str(&format!("type {method_name}Stream = TypedStream<pb::{response}>;\nasync fn {rust_name}(&self, request: tonic::Request<pb::{request}>) -> std::result::Result<tonic::Response<Self::{method_name}Stream>,tonic::Status> {{ let api = self.for_request(request.extensions()); api.authorize(request.metadata())?; api.stream(\"{path}\", request.into_inner()).await }}\n"));
                     ffi.push_str(&format!("async fn {rust_name}(&self, context: synurang_call::Context, request: pb::{request}, responses: synurang_call::Sender<pb::{response}>) -> synurang_call::Result<()> {{ self.stream(context,\"{path}\",request,responses).await }}\n"));
+                } else if client_stream {
+                    grpc.push_str(&format!("async fn {rust_name}(&self, request: tonic::Request<tonic::Streaming<pb::{request}>>) -> std::result::Result<tonic::Response<pb::{response}>,tonic::Status> {{ let api = self.for_request(request.extensions()); api.authorize(request.metadata())?; api.client_stream(\"{path}\", request.into_inner()).await.map(tonic::Response::new) }}\n"));
+                    ffi.push_str(&format!("async fn {rust_name}(&self, context: synurang_call::Context, requests: synurang_call::Receiver<pb::{request}>) -> synurang_call::Result<pb::{response}> {{ self.client_stream(context,\"{path}\",requests).await }}\n"));
                 } else {
                     grpc.push_str(&format!("async fn {rust_name}(&self, request: tonic::Request<pb::{request}>) -> std::result::Result<tonic::Response<pb::{response}>,tonic::Status> {{ let api = self.for_request(request.extensions()); api.authorize(request.metadata())?; api.call(\"{path}\",request.into_inner()).await.map(tonic::Response::new) }}\n"));
                     ffi.push_str(&format!("async fn {rust_name}(&self, context: synurang_call::Context, request: pb::{request}) -> synurang_call::Result<pb::{response}> {{ self.call(context,\"{path}\",request).await }}\n"));

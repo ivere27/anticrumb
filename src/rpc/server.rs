@@ -78,7 +78,7 @@ pub fn format_duration(d: std::time::Duration) -> String {
 
 #[derive(Clone)]
 pub struct GrpcApi {
-    pub host: Arc<Host>,
+    host: Option<Arc<Host>>,
     pub token: Option<String>,
     local: Option<super::local::LocalInfo>,
     context: Option<ConnectionContext>,
@@ -86,8 +86,16 @@ pub struct GrpcApi {
 impl GrpcApi {
     pub fn new(host: Arc<Host>, token: Option<String>) -> Self {
         Self {
-            host,
+            host: Some(host),
             token,
+            local: None,
+            context: None,
+        }
+    }
+    fn local() -> Self {
+        Self {
+            host: None,
+            token: None,
             local: None,
             context: None,
         }
@@ -101,9 +109,12 @@ impl GrpcApi {
         api
     }
     async fn selected_host(&self) -> std::result::Result<Arc<Host>, tonic::Status> {
-        match &self.local {
-            Some(local) => local.host().await.map_err(codec::status),
-            None => Ok(self.host.clone()),
+        match (&self.local, &self.host) {
+            (Some(local), _) => local.host().await.map_err(codec::status),
+            (None, Some(host)) => Ok(host.clone()),
+            (None, None) => Err(codec::status(ServiceError::invalid(
+                "call WorkspaceService.ConnectClient before workspace operations",
+            ))),
         }
     }
     pub fn authorize(&self, metadata: &MetadataMap) -> std::result::Result<(), tonic::Status> {
@@ -210,6 +221,19 @@ impl GrpcApi {
                 .await
                 .map_err(codec::status)?
                 .encode_to_vec()
+        } else if path == "/anticrumb.v1.PlatformService/Shutdown" {
+            if let Some(local) = &self.local {
+                local
+                    .shutdown(request.encode_to_vec())
+                    .await
+                    .map_err(codec::status)?
+            } else {
+                self.selected_host()
+                    .await?
+                    .dispatch(path, request.encode_to_vec())
+                    .await
+                    .map_err(codec::status)?
+            }
         } else {
             self.selected_host()
                 .await?
@@ -227,20 +251,78 @@ impl GrpcApi {
         }
         Resp::decode(bytes.as_slice()).map_err(|_| tonic::Status::internal("invalid host response"))
     }
-    pub async fn stream(
+    async fn stream<Req: ServerStreamReq>(
         &self,
         _path: &str,
-        request: pb::EventCursor,
-    ) -> std::result::Result<tonic::Response<TypedStream<pb::Event>>, tonic::Status> {
-        let rx = self
-            .selected_host()
-            .await?
-            .watch(request)
-            .await
-            .map_err(codec::status)?;
+        request: Req,
+    ) -> std::result::Result<tonic::Response<TypedStream<Req::Item>>, tonic::Status> {
+        let host = self.selected_host().await?;
+        let rx = request.open_stream(host).await.map_err(codec::status)?;
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx).map(|v| v.map_err(codec::status)),
         )))
+    }
+    async fn client_stream<Req: ClientStreamReq>(
+        &self,
+        _path: &str,
+        stream: tonic::Streaming<Req>,
+    ) -> std::result::Result<Req::Resp, tonic::Status> {
+        let host = self.selected_host().await?;
+        Req::handle_client_stream(host, stream)
+            .await
+            .map_err(codec::status)
+    }
+}
+
+#[tonic::async_trait]
+trait ServerStreamReq: Sized {
+    type Item: Send + 'static;
+    async fn open_stream(
+        self,
+        host: Arc<Host>,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<Self::Item>>>;
+}
+
+#[tonic::async_trait]
+impl ServerStreamReq for pb::EventCursor {
+    type Item = pb::Event;
+    async fn open_stream(
+        self,
+        host: Arc<Host>,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<Self::Item>>> {
+        host.watch(self).await
+    }
+}
+
+#[tonic::async_trait]
+impl ServerStreamReq for pb::ArtifactRef {
+    type Item = pb::GetArtifactChunk;
+    async fn open_stream(
+        self,
+        host: Arc<Host>,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<Self::Item>>> {
+        host.get_artifact_stream(self).await
+    }
+}
+
+#[tonic::async_trait]
+trait ClientStreamReq: Sized + Send + 'static {
+    type Resp: Send + 'static;
+    async fn handle_client_stream(
+        host: Arc<Host>,
+        stream: tonic::Streaming<Self>,
+    ) -> Result<Self::Resp>;
+}
+
+#[tonic::async_trait]
+impl ClientStreamReq for pb::PutArtifactChunk {
+    type Resp = pb::Artifact;
+    async fn handle_client_stream(
+        host: Arc<Host>,
+        stream: tonic::Streaming<Self>,
+    ) -> Result<Self::Resp> {
+        host.put_artifact_stream(stream.map(|item| item.map_err(codec::from_status)))
+            .await
     }
 }
 include!(concat!(env!("OUT_DIR"), "/grpc_bindings.rs"));
@@ -412,7 +494,7 @@ where
                 }
             });
         let shutdown = shutdown(host.clone());
-        serve_routes(host, token, secure, shutdown).await
+        serve_routes(GrpcApi::new(host, token), secure, shutdown).await
     } else {
         let shutdown = shutdown(host.clone());
         let active = active_clients.clone();
@@ -446,7 +528,7 @@ where
                 }))
             }
         });
-        serve_routes(host, token, logged, shutdown).await
+        serve_routes(GrpcApi::new(host, token), logged, shutdown).await
     }
 }
 
@@ -456,7 +538,6 @@ async fn shutdown(host: Arc<Host>) {
 }
 
 pub(crate) async fn serve_local<I, IO>(
-    host: Arc<Host>,
     incoming: I,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
@@ -470,12 +551,11 @@ where
         + 'static,
     IO::ConnectInfo: Clone + Send + Sync + 'static,
 {
-    serve_routes(host, None, incoming, shutdown).await
+    serve_routes(GrpcApi::local(), incoming, shutdown).await
 }
 
 async fn serve_routes<I, IO>(
-    host: Arc<Host>,
-    token: Option<String>,
+    api: GrpcApi,
     incoming: I,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
@@ -489,7 +569,6 @@ where
         + 'static,
     IO::ConnectInfo: Clone + Send + Sync + 'static,
 {
-    let api = GrpcApi::new(host.clone(), token.clone());
     let mut builder = Server::builder()
         .accept_http1(true)
         .concurrency_limit_per_connection(64);
@@ -508,11 +587,15 @@ where
             .add_service(service!(turn_service_server, TurnServiceServer))
             .add_service(service!(session_service_server, SessionServiceServer))
             .add_service(service!(artifact_service_server, ArtifactServiceServer));
-    if host.role == "workspace" {
+    if api
+        .host
+        .as_ref()
+        .is_none_or(|host| host.role == "workspace")
+    {
         routes = routes.add_service(service!(workspace_service_server, WorkspaceServiceServer));
     }
-    if let Some(token) = token {
-        let provider = crate::http::router(host.service.clone(), token)?;
+    if let (Some(token), Some(host)) = (api.token.as_ref(), api.host.as_ref()) {
+        let provider = crate::http::router(host.service.clone(), token.clone())?;
         routes = routes.into_axum_router().fallback_service(provider).into();
     }
     builder
@@ -645,5 +728,17 @@ mod tests {
         assert!(ctx
             .logged_auth_success
             .swap(true, std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn unbound_selected_host_matches_local_invalid_request_status() {
+        let err = GrpcApi::local().selected_host().await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let decoded = codec::from_status(err);
+        assert_eq!(decoded.code, crate::domain::ErrorCode::InvalidRequest);
+        assert_eq!(
+            decoded.message,
+            "call WorkspaceService.ConnectClient before workspace operations"
+        );
     }
 }

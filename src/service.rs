@@ -288,7 +288,17 @@ pub struct Service {
     persistence_failures: Mutex<HashMap<String, Run>>,
     run_bus: Arc<RunEventBus>,
     cleanup_running: std::sync::atomic::AtomicBool,
+    cleanup_notify: Arc<tokio::sync::Notify>,
     cleanup_cancel: CancelToken,
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        // Background loops hold only a Weak<Service> while idle-waiting on
+        // `cleanup_notify`; cancelling wakes them so they exit instead of
+        // parking forever once the service is gone.
+        self.cleanup_cancel.cancel();
+    }
 }
 
 impl Service {
@@ -308,6 +318,7 @@ impl Service {
             persistence_failures: Mutex::new(HashMap::new()),
             run_bus: Arc::new(RunEventBus::default()),
             cleanup_running: false.into(),
+            cleanup_notify: Arc::new(tokio::sync::Notify::new()),
             cleanup_cancel: CancelToken::new(),
         }))
     }
