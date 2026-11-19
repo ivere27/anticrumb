@@ -4,8 +4,25 @@
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     if ($architecture -ne 'AMD64') { throw 'anticrumb currently provides Windows x64 packages only.' }
+    $requested = if ($env:ANTICRUMB_VERSION) { $env:ANTICRUMB_VERSION.Trim() } else { '' }
+    $isNightly = $requested -ceq 'nightly'
+    if ($isNightly) {
+        $releaseUri = 'https://api.github.com/repos/ivere27/anticrumb/releases/tags/nightly'
+        $notFoundMessage = 'No nightly anticrumb release is available yet. See https://github.com/ivere27/anticrumb/releases.'
+    } elseif ($requested) {
+        $stripped = if ($requested.StartsWith('v')) { $requested.Substring(1) } else { $requested }
+        if ($stripped -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'ANTICRUMB_VERSION must be nightly or a stable version such as 0.1.0.'
+        }
+        $requested = $stripped
+        $releaseUri = "https://api.github.com/repos/ivere27/anticrumb/releases/tags/v$requested"
+        $notFoundMessage = 'No stable anticrumb release is available yet. See https://github.com/ivere27/anticrumb/releases.'
+    } else {
+        $releaseUri = 'https://api.github.com/repos/ivere27/anticrumb/releases/latest'
+        $notFoundMessage = 'No stable anticrumb release is available yet. See https://github.com/ivere27/anticrumb/releases.'
+    }
     try {
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/ivere27/anticrumb/releases/latest' -Headers @{
+        $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
             Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2026-03-10'
         }
     } catch {
@@ -13,15 +30,25 @@
         if ($status -eq 403 -or $status -eq 429) {
             throw 'GitHub API access was denied or rate-limited. Wait and retry, or download from https://github.com/ivere27/anticrumb/releases.'
         }
-        if ($status -eq 404) { throw 'No stable anticrumb release is available yet. See https://github.com/ivere27/anticrumb/releases.' }
+        if ($status -eq 404) { throw $notFoundMessage }
         throw 'Cannot contact GitHub releases; try again later.'
     }
-    if ($release.tag_name -isnot [string] -or $release.tag_name -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
-        $release.draft -isnot [bool] -or $release.draft -or $release.prerelease -isnot [bool] -or $release.prerelease -or
-        $release.assets -isnot [array]) {
-        throw 'Invalid stable release metadata; nothing was installed.'
+    if ($isNightly) {
+        if ($release.tag_name -isnot [string] -or $release.tag_name -cne 'nightly' -or
+            $release.draft -isnot [bool] -or $release.draft -or $release.prerelease -isnot [bool] -or -not $release.prerelease -or
+            $release.assets -isnot [array]) {
+            throw 'Invalid nightly release metadata; nothing was installed.'
+        }
+        $version = 'nightly'
+    } else {
+        if ($release.tag_name -isnot [string] -or $release.tag_name -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+            ($requested -and $release.tag_name -cne "v$requested") -or
+            $release.draft -isnot [bool] -or $release.draft -or $release.prerelease -isnot [bool] -or $release.prerelease -or
+            $release.assets -isnot [array]) {
+            throw 'Invalid stable release metadata; nothing was installed.'
+        }
+        $version = $release.tag_name.Substring(1)
     }
-    $version = $release.tag_name.Substring(1)
     $target = 'x86_64-pc-windows-msvc'
     $packages = @($release.assets | Where-Object { $_.name -ceq "anticrumb-$target.zip" })
     if ($packages.Count -eq 0) {

@@ -10,8 +10,9 @@ use std::process::Command;
 use tempfile::TempDir;
 use xtask::publish::{
     archive_members, discover, discover_filtered, ensure_pages, preflight, prepare,
-    prepare_filtered, publish, run_with_runner, sha256_file, target_extension, validate_archive,
-    verify_uploads, version_from_cargo, ProcessOutput, PublishError, Runner, REPOSITORY, TARGETS,
+    prepare_filtered, publish, publish_ci, run_ci_with_runner, run_with_runner, sha256_file,
+    target_extension, validate_archive, verify_uploads, version_from_cargo, CiChannel,
+    ProcessOutput, PublishError, Runner, REPOSITORY, TARGETS,
 };
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -1235,4 +1236,410 @@ fn cli_docker_only_dry_run_ignores_local_packages() {
     let stdout = String::from_utf8(out).unwrap();
     assert!(stdout.contains("docker-linux"));
     assert!(!stdout.contains("/local/") && !stdout.contains("\\local\\"));
+}
+
+#[test]
+fn release_ci_stable_validates_tag_and_publishes_verified_draft() {
+    let f = Fixture::new();
+    let archive = f.package("x86_64-unknown-linux-gnu", "ci-linux");
+    let expected_sha = sha256_file(&archive).unwrap();
+    let expected_size = fs::metadata(&archive).unwrap().len();
+    let asset_name = archive.file_name().unwrap().to_string_lossy().into_owned();
+    let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    let events: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let runner = MockRunner {
+        handler: |args, _| {
+            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match strs.as_slice() {
+                ["gh", "api", "--hostname", "github.com", p, "--paginate", "--slurp"]
+                    if p.contains("/releases") =>
+                {
+                    if events.borrow().iter().any(|e| e == "create-draft") {
+                        events.borrow_mut().push("verify".into());
+                        Ok(ProcessOutput {
+                            status: 0,
+                            stdout: json!([[{
+                                "tag_name": "v1.2.3",
+                                "draft": true,
+                                "prerelease": false,
+                                "assets": [{
+                                    "name": asset_name,
+                                    "size": expected_size,
+                                    "state": "uploaded",
+                                    "digest": format!("sha256:{expected_sha}")
+                                }]
+                            }]])
+                            .to_string(),
+                            stderr: String::new(),
+                        })
+                    } else {
+                        Ok(ProcessOutput {
+                            status: 0,
+                            stdout: "[[]]".into(),
+                            stderr: String::new(),
+                        })
+                    }
+                }
+                ["gh", "release", "create", "v1.2.3", ..] => {
+                    assert!(strs.contains(&"--draft"));
+                    assert!(strs.contains(&sha));
+                    events.borrow_mut().push("create-draft".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "release", "edit", "v1.2.3", ..] => {
+                    assert!(strs.contains(&"--draft=false"));
+                    assert!(strs.contains(&"--latest"));
+                    events.borrow_mut().push("publish".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                _ => panic!("unexpected subprocess: {args:?}"),
+            }
+        },
+    };
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let args: Vec<String> = [
+        "--channel",
+        "stable",
+        "--tag",
+        "v1.2.3",
+        "--sha",
+        sha,
+        "--dist",
+        f.dist.to_str().unwrap(),
+        "--require-target",
+        "x86_64-unknown-linux-gnu",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let code = run_ci_with_runner(&runner, &f.root, &args, &mut out, &mut err);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(*events.borrow(), vec!["create-draft", "verify", "publish"]);
+
+    // Reject tag mismatched with Cargo.toml and missing required target before calling gh.
+    let panic_runner = MockRunner {
+        handler: |args, _| panic!("should not invoke gh on invalid inputs: {args:?}"),
+    };
+    let bad_tag_args: Vec<String> = [
+        "--channel",
+        "stable",
+        "--tag",
+        "v9.9.9",
+        "--sha",
+        sha,
+        "--dist",
+        f.dist.to_str().unwrap(),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        run_ci_with_runner(&panic_runner, &f.root, &bad_tag_args, &mut out, &mut err),
+        1
+    );
+    let missing_target_args: Vec<String> = [
+        "--channel",
+        "stable",
+        "--tag",
+        "v1.2.3",
+        "--sha",
+        sha,
+        "--dist",
+        f.dist.to_str().unwrap(),
+        "--require-target",
+        "aarch64-apple-darwin",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        run_ci_with_runner(
+            &panic_runner,
+            &f.root,
+            &missing_target_args,
+            &mut out,
+            &mut err
+        ),
+        1
+    );
+}
+
+#[test]
+fn release_ci_nightly_creates_initial_prerelease_and_rolls_existing_release() {
+    let f = Fixture::new();
+    let archive = f.package("x86_64-unknown-linux-gnu", "ci-linux");
+    let expected_sha = sha256_file(&archive).unwrap();
+    let expected_size = fs::metadata(&archive).unwrap().len();
+    let asset_name = archive.file_name().unwrap().to_string_lossy().into_owned();
+    let sha = "abcdef1234567890abcdef1234567890abcdef12";
+
+    // Case 1: initial nightly release creation
+    let create_events: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let create_runner = MockRunner {
+        handler: |args, _| {
+            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match strs.as_slice() {
+                ["gh", "api", "--hostname", "github.com", p, "--paginate", "--slurp"]
+                    if p.contains("/releases") =>
+                {
+                    if create_events.borrow().iter().any(|e| e == "create-draft") {
+                        create_events.borrow_mut().push("verify".into());
+                        Ok(ProcessOutput {
+                            status: 0,
+                            stdout: json!([[{
+                                "tag_name": "nightly",
+                                "draft": true,
+                                "prerelease": true,
+                                "assets": [{
+                                    "name": asset_name,
+                                    "size": expected_size,
+                                    "state": "uploaded",
+                                    "digest": format!("sha256:{expected_sha}")
+                                }]
+                            }]])
+                            .to_string(),
+                            stderr: String::new(),
+                        })
+                    } else {
+                        Ok(ProcessOutput {
+                            status: 0,
+                            stdout: "[[]]".into(),
+                            stderr: String::new(),
+                        })
+                    }
+                }
+                ["gh", "release", "create", "nightly", ..] => {
+                    assert!(strs.contains(&"--draft"));
+                    assert!(strs.contains(&"--prerelease"));
+                    assert!(strs.contains(&"--latest=false"));
+                    assert!(strs.contains(&"anticrumb nightly (abcdef1)"));
+                    create_events.borrow_mut().push("create-draft".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "release", "edit", "nightly", ..] => {
+                    assert!(strs.contains(&"--draft=false"));
+                    assert!(strs.contains(&"--prerelease"));
+                    assert!(strs.contains(&"--latest=false"));
+                    create_events.borrow_mut().push("publish".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                _ => panic!("unexpected subprocess: {args:?}"),
+            }
+        },
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let args: Vec<String> = [
+        "--channel",
+        "nightly",
+        "--sha",
+        sha,
+        "--dist",
+        f.dist.to_str().unwrap(),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        run_ci_with_runner(&create_runner, &f.root, &args, &mut out, &mut err),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(
+        *create_events.borrow(),
+        vec!["create-draft", "verify", "publish"]
+    );
+
+    // Case 2: existing nightly release gets clobber-uploaded, stale assets deleted, verified, git ref moved, and edited
+    let update_events: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let update_runner = MockRunner {
+        handler: |args, _| {
+            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match strs.as_slice() {
+                ["gh", "api", "--hostname", "github.com", p, "--paginate", "--slurp"]
+                    if p.contains("/releases") =>
+                {
+                    if update_events.borrow().iter().any(|e| e == "upload") {
+                        update_events.borrow_mut().push("verify".into());
+                        Ok(ProcessOutput {
+                            status: 0,
+                            stdout: json!([[{
+                                "tag_name": "nightly",
+                                "draft": false,
+                                "prerelease": true,
+                                "assets": [{
+                                    "name": asset_name,
+                                    "size": expected_size,
+                                    "state": "uploaded",
+                                    "digest": format!("sha256:{expected_sha}")
+                                }]
+                            }]])
+                            .to_string(),
+                            stderr: String::new(),
+                        })
+                    } else {
+                        Ok(ProcessOutput {
+                            status: 0,
+                            stdout: json!([[{
+                                "tag_name": "nightly",
+                                "draft": false,
+                                "prerelease": true,
+                                "assets": [
+                                    {"name": asset_name},
+                                    {"name": "anticrumb-stale-target.tar.gz"}
+                                ]
+                            }]])
+                            .to_string(),
+                            stderr: String::new(),
+                        })
+                    }
+                }
+                ["gh", "release", "upload", "nightly", ..] => {
+                    assert!(strs.contains(&"--clobber"));
+                    update_events.borrow_mut().push("upload".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "release", "delete-asset", "nightly", "anticrumb-stale-target.tar.gz", ..] =>
+                {
+                    assert!(strs.contains(&"--yes"));
+                    update_events.borrow_mut().push("delete-stale".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "api", "--hostname", "github.com", p] if p.contains("matching-refs") => {
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: json!([{"ref": "refs/tags/nightly"}]).to_string(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "api", "--hostname", "github.com", "--method", "PATCH", p, ..]
+                    if p.ends_with("/git/refs/tags/nightly") =>
+                {
+                    assert!(strs.contains(&&*format!("sha={sha}")));
+                    update_events.borrow_mut().push("patch-ref".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "release", "edit", "nightly", ..] => {
+                    assert!(strs.contains(&"--target"));
+                    assert!(strs.contains(&sha));
+                    assert!(strs.contains(&"--prerelease"));
+                    assert!(strs.contains(&"--latest=false"));
+                    assert!(strs.contains(&"anticrumb nightly (abcdef1)"));
+                    update_events.borrow_mut().push("edit".into());
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                _ => panic!("unexpected subprocess: {args:?}"),
+            }
+        },
+    };
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_ci_with_runner(&update_runner, &f.root, &args, &mut out, &mut err),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(
+        *update_events.borrow(),
+        vec!["upload", "delete-stale", "verify", "patch-ref", "edit"]
+    );
+
+    // Case 3: publish_ci rejects invalid short/non-hex SHA before invoking subprocesses, and reports nightly-specific verification state errors
+    let (mut plan, uploads) = prepare(&f.root, &f.dist).unwrap();
+    plan.tag = "nightly".to_string();
+    let panic_runner = MockRunner {
+        handler: |args, _| panic!("unexpected subprocess on invalid SHA: {args:?}"),
+    };
+    let mut dummy_out = Vec::new();
+    let short_err = publish_ci(
+        &panic_runner,
+        &f.root,
+        CiChannel::Nightly,
+        &plan,
+        &uploads,
+        "abc",
+        &mut dummy_out,
+    )
+    .unwrap_err();
+    assert!(short_err.to_string().contains("7..=40"), "{short_err}");
+
+    let non_prerelease_runner = MockRunner {
+        handler: |args, _| {
+            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match strs.as_slice() {
+                ["gh", "api", "--hostname", "github.com", p, "--paginate", "--slurp"]
+                    if p.contains("/releases") =>
+                {
+                    Ok(ProcessOutput {
+                        status: 0,
+                        stdout: json!([[{
+                            "tag_name": "nightly",
+                            "draft": false,
+                            "prerelease": false,
+                            "assets": []
+                        }]])
+                        .to_string(),
+                        stderr: String::new(),
+                    })
+                }
+                ["gh", "release", "upload", "nightly", ..] => Ok(ProcessOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                _ => panic!("unexpected subprocess: {args:?}"),
+            }
+        },
+    };
+    let state_err = publish_ci(
+        &non_prerelease_runner,
+        &f.root,
+        CiChannel::Nightly,
+        &plan,
+        &uploads,
+        sha,
+        &mut dummy_out,
+    )
+    .unwrap_err();
+    assert!(
+        state_err.to_string().contains("nightly prerelease"),
+        "{state_err}"
+    );
 }

@@ -811,7 +811,7 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
 }
 pub fn agent_request_from(r: pb::AgentRequest) -> d::AgentRequest {
     let chat_only = (r.max_steps & CHAT_ONLY_STEP_FLAG) != 0;
-    let permissions = ((r.max_steps & PERMS_PRESENT_FLAG) != 0).then(|| d::ToolPermissions {
+    let permissions = ((r.max_steps & PERMS_PRESENT_FLAG) != 0).then_some(d::ToolPermissions {
         read: (r.max_steps & PERM_READ_FLAG) != 0,
         edit: (r.max_steps & PERM_EDIT_FLAG) != 0,
         shell: (r.max_steps & PERM_SHELL_FLAG) != 0,

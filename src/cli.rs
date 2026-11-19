@@ -315,7 +315,7 @@ Interactive: /help /mode /provider /model /usage /copy /theme /browser /browse /
 Enter sends; Esc interrupts; Tab completes; Alt+Enter inserts a newline.
 
 Service and integration commands:
-  update [--check]                         install or check the latest release
+  update [--check] [--nightly] [--force]  install or check stable or nightly releases
   daemon [OPTIONS]                         persistent local IPC daemon (see daemon --help)
   server [IP:PORT] [OPTIONS]               network browser RPC and HTTPS /v1 server (see server --help)
   browser [OPTIONS] [COMMAND]               stateful browser commands / interactive shell

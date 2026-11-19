@@ -410,7 +410,12 @@ pub(super) fn resolve_git_commit_entry(workspace: &Path, rev: &str) -> Option<(S
     }
     let verified = std::process::Command::new("git")
         .current_dir(workspace)
-        .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
         .output()
         .ok()?;
     if !verified.status.success() {
@@ -471,8 +476,8 @@ pub(super) fn search_mentions(
         if is_cancelled() {
             return None;
         }
-        let is_hex = !git_prefix_lower.is_empty()
-            && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex =
+            !git_prefix_lower.is_empty() && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
         let mut matched_recent_sha = false;
         for (idx, (sha, subject)) in commits.into_iter().enumerate() {
             let score = if git_prefix_lower.is_empty()
@@ -879,9 +884,7 @@ mod tests {
             .build()
             .unwrap();
         let update = rt
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
-            })
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), rx.recv()).await })
             .expect("timed out waiting for async mention matches")
             .expect("expected async mention matches");
         match update {
@@ -946,9 +949,7 @@ mod tests {
         // Prefix filtering on commit hash preserves matches.
         let prefix = format!("git:{}", &sha1[..3]);
         let (filtered, _) = search_mentions(&root, &prefix, None, 1).unwrap();
-        assert!(filtered
-            .iter()
-            .any(|m| m.display == format!("git:{sha1}")));
+        assert!(filtered.iter().any(|m| m.display == format!("git:{sha1}")));
 
         // Hex digits like a/e/f must not falsely float git:diff or git:staged above commits;
         // 'd' matches git:diff by prefix only (not git:staged).
@@ -1090,7 +1091,8 @@ mod tests {
         }
 
         // Unambiguous >=4-hex prefix of a commit >20 commits ago still resolves via git rev-parse.
-        let (old_matches, _) = search_mentions(&root, &format!("git:{old_short}"), None, 1).unwrap();
+        let (old_matches, _) =
+            search_mentions(&root, &format!("git:{old_short}"), None, 1).unwrap();
         assert_eq!(old_matches.len(), 1);
         assert_eq!(old_matches[0].display, format!("git:{old_short}"));
         assert_eq!(old_matches[0].detail, "very old ancestor");

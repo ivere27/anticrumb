@@ -61,7 +61,8 @@ fn build_coding_agent(
         browser: true,
         subagent: spec.allow_spawn_agent && !spec.read_only,
     });
-    let effective_allow_shell = !spec.chat_only && perms.shell && spec.allow_shell && !spec.read_only;
+    let effective_allow_shell =
+        !spec.chat_only && perms.shell && spec.allow_shell && !spec.read_only;
     let config = AgentConfig {
         environment: spec.environment.clone(),
         workspace_root: spec.workspace.clone(),
@@ -559,7 +560,7 @@ impl AgentManager {
             build_browser_control(self.store.root(), &request.account_id, &request.workspace)?;
         let allow_subagent = !request.temporary
             && !request.chat_only
-            && request.permissions.map_or(true, |p| p.subagent);
+            && request.permissions.is_none_or(|p| p.subagent);
         let spec = AgentRuntimeSpec {
             environment: request.environment.clone(),
             workspace: request.workspace.clone(),
@@ -567,7 +568,7 @@ impl AgentManager {
             model: request.model.clone(),
             thinking: request.thinking.clone(),
             temporary: request.temporary,
-            allow_shell: !request.no_shell && request.permissions.map_or(true, |p| p.shell),
+            allow_shell: !request.no_shell && request.permissions.is_none_or(|p| p.shell),
             read_only: false,
             allow_spawn_agent: allow_subagent,
             chat_only: request.chat_only,

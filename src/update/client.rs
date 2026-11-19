@@ -1,6 +1,12 @@
-use super::{failure, LATEST_RELEASE_URL};
+use super::{failure, LATEST_RELEASE_URL, NIGHTLY_RELEASE_URL};
 use crate::domain::{ErrorCode, Result, ServiceError};
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReleaseMetadataKind {
+    Stable,
+    Nightly,
+}
 
 pub(super) struct UpdateClient {
     runtime: tokio::runtime::Runtime,
@@ -91,10 +97,10 @@ fn resolve_redirect(base: &crate::url_lite::Url, location: &str) -> Result<crate
     }
 }
 
-pub(super) fn http_failure(
+pub(super) fn http_failure_for_kind(
     status: http::StatusCode,
     headers: &http::HeaderMap,
-    release_metadata: bool,
+    release_metadata: Option<ReleaseMetadataKind>,
 ) -> ServiceError {
     let number = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
     if status == http::StatusCode::TOO_MANY_REQUESTS
@@ -111,8 +117,12 @@ pub(super) fn http_failure(
         );
     }
     let message = match status {
-        http::StatusCode::NOT_FOUND if release_metadata => {
+        http::StatusCode::NOT_FOUND if release_metadata == Some(ReleaseMetadataKind::Stable) => {
             "No public stable anticrumb release is available (GitHub HTTP 404). The repository may still be private or its first release is not published yet."
+                .into()
+        }
+        http::StatusCode::NOT_FOUND if release_metadata == Some(ReleaseMetadataKind::Nightly) => {
+            "No public nightly anticrumb release is available (GitHub HTTP 404). Push to master or run the release workflow to publish nightly first."
                 .into()
         }
         http::StatusCode::FORBIDDEN => {
@@ -135,7 +145,13 @@ async fn fetch_async(
 ) -> Result<Vec<u8>> {
     use http_body_util::{BodyExt, Empty};
 
-    let release_metadata = initial_url == LATEST_RELEASE_URL;
+    let release_metadata = if initial_url == LATEST_RELEASE_URL {
+        Some(ReleaseMetadataKind::Stable)
+    } else if initial_url == NIGHTLY_RELEASE_URL {
+        Some(ReleaseMetadataKind::Nightly)
+    } else {
+        None
+    };
     let mut url = crate::url_lite::Url::parse(initial_url)
         .map_err(|_| failure("update_download", "invalid release URL"))?;
 
@@ -191,7 +207,7 @@ async fn fetch_async(
                 concat!("anticrumb/", env!("CARGO_PKG_VERSION")),
             )
             .header(http::header::CONNECTION, "close");
-        if url.as_str() == LATEST_RELEASE_URL {
+        if url.as_str() == LATEST_RELEASE_URL || url.as_str() == NIGHTLY_RELEASE_URL {
             builder = builder
                 .header(http::header::ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2026-03-10");
@@ -229,7 +245,7 @@ async fn fetch_async(
         }
 
         if !response.status().is_success() {
-            return Err(http_failure(
+            return Err(http_failure_for_kind(
                 response.status(),
                 response.headers(),
                 release_metadata,

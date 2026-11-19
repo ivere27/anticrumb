@@ -100,7 +100,8 @@ impl Service {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
-                if service.stopping.load(Ordering::SeqCst) || service.cleanup_cancel.is_cancelled() {
+                if service.stopping.load(Ordering::SeqCst) || service.cleanup_cancel.is_cancelled()
+                {
                     break;
                 }
                 let notify = service.cleanup_notify.clone();

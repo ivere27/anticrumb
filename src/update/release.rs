@@ -7,12 +7,16 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 pub(super) struct Release {
     pub(super) tag_name: String,
+    #[serde(default)]
+    pub(super) target_commitish: Option<String>,
+    #[serde(default)]
+    pub(super) name: Option<String>,
     draft: bool,
     prerelease: bool,
     assets: Vec<Asset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(super) struct Asset {
     name: String,
     pub(super) browser_download_url: String,
@@ -26,29 +30,32 @@ pub(super) fn parse_release(bytes: &[u8]) -> Result<Release> {
         .map_err(|_| failure("update_release", "invalid GitHub release metadata"))
 }
 
+pub(super) fn normalize_hex_sha(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !(7..=40).contains(&trimmed.len()) || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed[..7].to_ascii_lowercase())
+}
+
 impl Release {
-    pub(super) fn validate(&self, target: &str) -> Result<(Version, &Asset)> {
-        let version = self
-            .tag_name
-            .strip_prefix('v')
-            .and_then(|tag| Version::parse(tag).ok())
-            .ok_or_else(|| {
-                failure(
-                    "update_release",
-                    "latest release tag must use vMAJOR.MINOR.PATCH",
-                )
-            })?;
-        if self.draft
-            || self.prerelease
-            || !version.pre.is_empty()
-            || !version.build.is_empty()
-            || self.tag_name != format!("v{version}")
-        {
-            return Err(failure(
-                "update_release",
-                "latest release must be published and stable without prerelease or build metadata",
-            ));
+    fn extract_nightly_commit(&self) -> Option<String> {
+        if let Some(sha) = self.target_commitish.as_deref().and_then(normalize_hex_sha) {
+            return Some(sha);
         }
+        if let Some(name) = self.name.as_deref() {
+            for segment in name.split('(').skip(1) {
+                if let Some((inside, _)) = segment.split_once(')') {
+                    if let Some(sha) = normalize_hex_sha(inside) {
+                        return Some(sha);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn validate_asset(&self, target: &str) -> Result<&Asset> {
         let suffix = if target.contains("windows") {
             "zip"
         } else {
@@ -85,7 +92,50 @@ impl Release {
             ));
         }
         asset.sha256()?;
+        Ok(asset)
+    }
+
+    pub(super) fn validate(&self, target: &str) -> Result<(Version, &Asset)> {
+        let version = self
+            .tag_name
+            .strip_prefix('v')
+            .and_then(|tag| Version::parse(tag).ok())
+            .ok_or_else(|| {
+                failure(
+                    "update_release",
+                    "latest release tag must use vMAJOR.MINOR.PATCH",
+                )
+            })?;
+        if self.draft
+            || self.prerelease
+            || !version.pre.is_empty()
+            || !version.build.is_empty()
+            || self.tag_name != format!("v{version}")
+        {
+            return Err(failure(
+                "update_release",
+                "latest release must be published and stable without prerelease or build metadata",
+            ));
+        }
+        let asset = self.validate_asset(target)?;
         Ok((version, asset))
+    }
+
+    pub(super) fn validate_nightly(&self, target: &str) -> Result<(Option<String>, &Asset)> {
+        if self.tag_name != "nightly" {
+            return Err(failure(
+                "update_release",
+                "nightly release tag must be nightly",
+            ));
+        }
+        if self.draft || !self.prerelease {
+            return Err(failure(
+                "update_release",
+                "nightly release must be a published prerelease",
+            ));
+        }
+        let asset = self.validate_asset(target)?;
+        Ok((self.extract_nightly_commit(), asset))
     }
 }
 

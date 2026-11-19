@@ -34,11 +34,22 @@ fetch() {
         --proto-redir '=https' --max-filesize "${3:-536870912}" --retry 3 "$1" -o "$2"
 }
 requested=${ANTICRUMB_VERSION:-}
-requested=${requested#v}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --nightly) requested=nightly ;;
+        *) fail "Unknown option: $1" ;;
+    esac
+    shift
+done
 api='https://api.github.com/repos/ivere27/anticrumb/releases/latest'
-if [ -n "$requested" ]; then
+not_found_msg='No stable release is available yet. See https://github.com/ivere27/anticrumb/releases.'
+if [ "$requested" = "nightly" ]; then
+    api='https://api.github.com/repos/ivere27/anticrumb/releases/tags/nightly'
+    not_found_msg='No nightly release is available yet. See https://github.com/ivere27/anticrumb/releases.'
+elif [ -n "$requested" ]; then
+    requested=${requested#v}
     printf '%s\n' "$requested" | awk '/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {ok=1} END {exit !ok}' ||
-        fail 'ANTICRUMB_VERSION must be a stable version such as 0.1.0.'
+        fail 'ANTICRUMB_VERSION must be nightly or a stable version such as 0.1.0.'
     api="https://api.github.com/repos/ivere27/anticrumb/releases/tags/v$requested"
 fi
 status=$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
@@ -48,7 +59,7 @@ status=$(curl --silent --show-error --location --proto '=https' --proto-redir '=
 case "$status" in
     200) ;;
     403|429) fail 'GitHub API access was denied or rate-limited. Wait and retry, or download from https://github.com/ivere27/anticrumb/releases.' ;;
-    404) fail 'No stable release is available yet. See https://github.com/ivere27/anticrumb/releases.' ;;
+    404) fail "$not_found_msg" ;;
     *) fail "Cannot read GitHub release metadata (HTTP $status). Try again later." ;;
 esac
 archive="anticrumb-$target.tar.gz"
@@ -150,10 +161,18 @@ END {
     if(failed) exit 1
     pos=1; value("release",0); space(); if(pos<=length(json)) invalid("trailing JSON data")
     tag=field[release,"tag_name"]
-    if(fieldtype[release,"tag_name"]!="string" || tag !~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) invalid("expected stable vX.Y.Z tag")
-    if(requested!="" && tag!="v" requested) invalid("requested tag does not match release")
-    if(fieldtype[release,"draft"]!="boolean" || field[release,"draft"]!="false" ||
-       fieldtype[release,"prerelease"]!="boolean" || field[release,"prerelease"]!="false") invalid("release is not published and stable")
+    if(requested=="nightly") {
+        if(fieldtype[release,"tag_name"]!="string" || tag!="nightly") invalid("expected nightly tag")
+        if(fieldtype[release,"draft"]!="boolean" || field[release,"draft"]!="false" ||
+           fieldtype[release,"prerelease"]!="boolean" || field[release,"prerelease"]!="true") invalid("release is not a published nightly prerelease")
+        ver="nightly"
+    } else {
+        if(fieldtype[release,"tag_name"]!="string" || tag !~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) invalid("expected stable vX.Y.Z tag")
+        if(requested!="" && tag!="v" requested) invalid("requested tag does not match release")
+        if(fieldtype[release,"draft"]!="boolean" || field[release,"draft"]!="false" ||
+           fieldtype[release,"prerelease"]!="boolean" || field[release,"prerelease"]!="false") invalid("release is not published and stable")
+        ver=substr(tag,2)
+    }
     if(!haveassets || matches!=1) invalid("expected one package for this platform")
     url="https://github.com/ivere27/anticrumb/releases/download/" tag "/" name
     digest=field[selected,"digest"]; size=field[selected,"size"]
@@ -161,7 +180,7 @@ END {
        fieldtype[selected,"state"]!="string" || field[selected,"state"]!="uploaded") invalid("unexpected package URL or upload state")
     if(fieldtype[selected,"digest"]!="string" || length(digest)!=71 || substr(digest,1,7)!="sha256:" || substr(digest,8) ~ /[^0-9a-fA-F]/) invalid("missing or invalid SHA-256 asset digest")
     if(fieldtype[selected,"size"]!="number" || size !~ /^[1-9][0-9]*$/ || size+0>536870912) invalid("invalid package size")
-    print substr(tag,2); print url; print tolower(substr(digest,8)); print size
+    print ver; print url; print tolower(substr(digest,8)); print size
 }' "$scratch/release.json" > "$scratch/package-info" || fail 'Release validation failed; nothing was installed.'
 { IFS= read -r version; IFS= read -r download_url; IFS= read -r expected; IFS= read -r expected_size; } < "$scratch/package-info"
 printf 'Downloading anticrumb %s for %s…\n' "$version" "$target"

@@ -184,15 +184,14 @@ pub(super) fn complete(editor: &Editor, workspace: &std::path::Path) -> Option<C
         } else {
             20
         };
-        let is_hex = !git_prefix_lower.is_empty()
-            && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex =
+            !git_prefix_lower.is_empty() && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
         let mut matched_recent_sha = false;
         let mut sha_values = Vec::new();
         let mut subject_matches: Vec<(i64, usize, String)> = Vec::new();
-        for (idx, (sha, subject)) in
-            super::mentions::recent_git_commits(workspace, commit_limit)
-                .into_iter()
-                .enumerate()
+        for (idx, (sha, subject)) in super::mentions::recent_git_commits(workspace, commit_limit)
+            .into_iter()
+            .enumerate()
         {
             if git_prefix.is_empty()
                 || (is_hex && sha.to_ascii_lowercase().starts_with(&git_prefix_lower))
@@ -626,7 +625,10 @@ impl State {
             ),
             ("@git:diff", "Attach unstaged git diff as a patch file"),
             ("@git:staged", "Attach staged git diff as a patch file"),
-            ("@git:<commit>", "Attach a specific git commit as a patch file"),
+            (
+                "@git:<commit>",
+                "Attach a specific git commit as a patch file",
+            ),
             ("Tab", "Complete slash commands or @path"),
             (
                 "Up / Down",

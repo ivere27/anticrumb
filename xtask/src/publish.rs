@@ -591,23 +591,43 @@ pub fn verify_uploads(
     tag: &str,
     uploads: &[PathBuf],
 ) -> Result<(), PublishError> {
+    verify_release_assets(runner, root, tag, uploads, Some(true), false)
+}
+
+fn verify_release_assets(
+    runner: &dyn Runner,
+    root: &Path,
+    tag: &str,
+    uploads: &[PathBuf],
+    expected_draft: Option<bool>,
+    expected_prerelease: bool,
+) -> Result<(), PublishError> {
     let found: Vec<Value> = releases(runner, root)?
         .into_iter()
         .filter(|r| r.get("tag_name").and_then(Value::as_str) == Some(tag))
         .collect();
     if found.len() != 1
-        || !found[0]
-            .get("draft")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        || expected_draft
+            .is_some_and(|want| found[0].get("draft").and_then(Value::as_bool) != Some(want))
         || found[0]
             .get("prerelease")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
+            .unwrap_or(!expected_prerelease)
+            != expected_prerelease
     {
-        return Err(PublishError::new(
-            "expected one unpublished stable draft after upload; refusing to publish",
-        ));
+        let message = match (expected_draft, expected_prerelease) {
+            (Some(true), false) => {
+                "expected one unpublished stable draft after upload; refusing to publish"
+            }
+            (Some(true), true) => {
+                "expected one unpublished nightly prerelease draft after upload; refusing to publish"
+            }
+            (_, true) => "expected one nightly prerelease after upload; refusing to update nightly release",
+            (_, false) => {
+                "expected one release matching expected publication state after upload; refusing to publish"
+            }
+        };
+        return Err(PublishError::new(message));
     }
     let mut expected: BTreeMap<String, (u64, String)> = BTreeMap::new();
     for path in uploads {
@@ -848,4 +868,506 @@ pub fn run_cli(root: &Path, args: &[String]) -> i32 {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     run_with_runner(&RealRunner, root, args, &mut stdout, &mut stderr)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiChannel {
+    Nightly,
+    Stable,
+}
+
+fn is_valid_commit_sha(raw: &str) -> bool {
+    (7..=40).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn stage_uploads(
+    uploads: &[PathBuf],
+    assets: &BTreeMap<String, AssetPlan>,
+) -> Result<(tempfile::TempDir, Vec<PathBuf>), PublishError> {
+    let temp = tempfile::Builder::new()
+        .prefix("anticrumb-release-")
+        .tempdir()
+        .map_err(|e| {
+            PublishError::new(format!("cannot create temporary staging directory: {e}"))
+        })?;
+    let mut staged = Vec::with_capacity(uploads.len());
+    for source in uploads {
+        let name = source
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let destination = temp.path().join(name);
+        let expected = sha256_file(source)?;
+        fs::copy(source, &destination)
+            .map_err(|e| PublishError::new(format!("cannot stage {}: {e}", source.display())))?;
+        if sha256_file(&destination)? != expected {
+            return Err(PublishError::new(format!(
+                "{name} changed while preparing upload; try again"
+            )));
+        }
+        staged.push(destination);
+    }
+    for asset in assets.values() {
+        let snapshot = temp.path().join(&asset.name);
+        let snap_size = fs::metadata(&snapshot)
+            .map_err(|e| PublishError::new(format!("cannot stat {}: {e}", snapshot.display())))?
+            .len();
+        if sha256_file(&snapshot)? != asset.sha256 || snap_size != asset.size {
+            return Err(PublishError::new(format!(
+                "{} changed after validation; try again",
+                asset.name
+            )));
+        }
+    }
+    Ok((temp, staged))
+}
+
+fn nightly_release_commands(
+    staged: &[PathBuf],
+    sha: &str,
+    version: &str,
+    exists: bool,
+) -> (Vec<String>, Vec<String>) {
+    let short_sha = sha.get(..7).unwrap_or(sha);
+    let repository = format!("github.com/{REPOSITORY}");
+    let title = format!("anticrumb nightly ({short_sha})");
+    let notes =
+        format!("Rolling nightly pre-release built from master ({sha}).\n\nVersion: {version} ({short_sha})");
+    if exists {
+        let mut upload = vec![
+            "gh".to_string(),
+            "release".to_string(),
+            "upload".to_string(),
+            "nightly".to_string(),
+        ];
+        for path in staged {
+            upload.push(path.to_string_lossy().into_owned());
+        }
+        upload.extend([
+            "--repo".to_string(),
+            repository.clone(),
+            "--clobber".to_string(),
+        ]);
+        let edit = vec![
+            "gh".to_string(),
+            "release".to_string(),
+            "edit".to_string(),
+            "nightly".to_string(),
+            "--repo".to_string(),
+            repository,
+            "--draft=false".to_string(),
+            "--prerelease".to_string(),
+            "--latest=false".to_string(),
+            "--target".to_string(),
+            sha.to_string(),
+            "--title".to_string(),
+            title,
+            "--notes".to_string(),
+            notes,
+        ];
+        (upload, edit)
+    } else {
+        let mut create = vec![
+            "gh".to_string(),
+            "release".to_string(),
+            "create".to_string(),
+            "nightly".to_string(),
+        ];
+        for path in staged {
+            create.push(path.to_string_lossy().into_owned());
+        }
+        create.extend([
+            "--repo".to_string(),
+            repository.clone(),
+            "--target".to_string(),
+            sha.to_string(),
+            "--draft".to_string(),
+            "--prerelease".to_string(),
+            "--latest=false".to_string(),
+            "--title".to_string(),
+            title,
+            "--notes".to_string(),
+            notes,
+        ]);
+        let edit = vec![
+            "gh".to_string(),
+            "release".to_string(),
+            "edit".to_string(),
+            "nightly".to_string(),
+            "--repo".to_string(),
+            repository,
+            "--draft=false".to_string(),
+            "--prerelease".to_string(),
+            "--latest=false".to_string(),
+        ];
+        (create, edit)
+    }
+}
+
+fn update_nightly_git_ref(runner: &dyn Runner, root: &Path, sha: &str) -> Result<(), PublishError> {
+    let refs = api(
+        runner,
+        &format!("repos/{REPOSITORY}/git/matching-refs/tags/nightly"),
+        root,
+        false,
+    )?;
+    let has_exact = refs.as_array().is_some_and(|list| {
+        list.iter()
+            .any(|r| r.get("ref").and_then(Value::as_str) == Some("refs/tags/nightly"))
+    });
+    if has_exact {
+        let args: Vec<String> = [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "PATCH",
+            &format!("repos/{REPOSITORY}/git/refs/tags/nightly"),
+            "-f",
+            &format!("sha={sha}"),
+            "-F",
+            "force=true",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        run_command(runner, &args, root)?;
+    } else {
+        let args: Vec<String> = [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "POST",
+            &format!("repos/{REPOSITORY}/git/refs"),
+            "-f",
+            "ref=refs/tags/nightly",
+            "-f",
+            &format!("sha={sha}"),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        run_command(runner, &args, root)?;
+    }
+    Ok(())
+}
+
+pub fn publish_ci(
+    runner: &dyn Runner,
+    root: &Path,
+    channel: CiChannel,
+    plan: &Plan,
+    uploads: &[PathBuf],
+    sha: &str,
+    out: &mut dyn Write,
+) -> Result<(), PublishError> {
+    if !is_valid_commit_sha(sha) {
+        return Err(PublishError::new(
+            "commit SHA must be a 7..=40 character hexadecimal string",
+        ));
+    }
+    let sha_lower = sha.to_ascii_lowercase();
+    let (_temp, staged) = stage_uploads(uploads, &plan.assets)?;
+    match channel {
+        CiChannel::Stable => {
+            let plan_tuple = parse_semver_tuple(&plan.version).ok_or_else(|| {
+                PublishError::new("Cargo.toml [package].version must be a stable X.Y.Z version")
+            })?;
+            for release in releases(runner, root)? {
+                let tag_name = release
+                    .get("tag_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if tag_name == plan.tag {
+                    return Err(PublishError::new(format!(
+                        "release {} already exists (including drafts); it will not be overwritten",
+                        plan.tag
+                    )));
+                }
+                let previous = tag_name.strip_prefix('v').unwrap_or(tag_name);
+                let is_draft = release
+                    .get("draft")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let is_prerelease = release
+                    .get("prerelease")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !is_draft && !is_prerelease {
+                    if let Some(prev_tuple) = parse_semver_tuple(previous) {
+                        if prev_tuple >= plan_tuple {
+                            return Err(PublishError::new(format!(
+                                "version must be newer than published stable release {tag_name}"
+                            )));
+                        }
+                    }
+                }
+            }
+            let (create, finalize) = release_commands(plan, &staged, &sha_lower);
+            let flow = (|| -> Result<(), PublishError> {
+                run_command(runner, &create, root)?;
+                verify_uploads(runner, root, &plan.tag, &staged)?;
+                run_command(runner, &finalize, root)?;
+                Ok(())
+            })();
+            if let Err(error) = flow {
+                return Err(PublishError::new(format!(
+                    "{error}\nInspect https://github.com/{REPOSITORY}/releases before retrying. \
+                    A failed upload may have left a draft; existing releases are never overwritten."
+                )));
+            }
+            let _ = writeln!(
+                out,
+                "Published https://github.com/{REPOSITORY}/releases/tag/{}",
+                plan.tag
+            );
+            Ok(())
+        }
+        CiChannel::Nightly => {
+            let all_releases = releases(runner, root)?;
+            let existing: Vec<&Value> = all_releases
+                .iter()
+                .filter(|r| r.get("tag_name").and_then(Value::as_str) == Some("nightly"))
+                .collect();
+            if existing.len() > 1 {
+                return Err(PublishError::new(
+                    "multiple nightly releases found; remove duplicates before updating",
+                ));
+            }
+            let existing_release = existing.into_iter().next();
+            let (first_step, finalize) = nightly_release_commands(
+                &staged,
+                &sha_lower,
+                &plan.version,
+                existing_release.is_some(),
+            );
+            if let Some(rel) = existing_release {
+                let expected_names: BTreeSet<String> =
+                    plan.assets.values().map(|a| a.name.clone()).collect();
+                let stale_names: Vec<String> = rel
+                    .get("assets")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.get("name").and_then(Value::as_str).map(str::to_string))
+                    .filter(|name| !expected_names.contains(name))
+                    .collect();
+                run_command(runner, &first_step, root)?;
+                for stale in stale_names {
+                    let del = vec![
+                        "gh".to_string(),
+                        "release".to_string(),
+                        "delete-asset".to_string(),
+                        "nightly".to_string(),
+                        stale,
+                        "--repo".to_string(),
+                        format!("github.com/{REPOSITORY}"),
+                        "--yes".to_string(),
+                    ];
+                    run_command(runner, &del, root)?;
+                }
+                verify_release_assets(runner, root, "nightly", &staged, None, true)?;
+                update_nightly_git_ref(runner, root, &sha_lower)?;
+                run_command(runner, &finalize, root)?;
+            } else {
+                let flow = (|| -> Result<(), PublishError> {
+                    run_command(runner, &first_step, root)?;
+                    verify_release_assets(runner, root, "nightly", &staged, Some(true), true)?;
+                    run_command(runner, &finalize, root)?;
+                    Ok(())
+                })();
+                if let Err(error) = flow {
+                    return Err(PublishError::new(format!(
+                        "{error}\nInspect https://github.com/{REPOSITORY}/releases before retrying."
+                    )));
+                }
+            }
+            let _ = writeln!(
+                out,
+                "Updated https://github.com/{REPOSITORY}/releases/tag/nightly ({})",
+                &sha_lower[..7]
+            );
+            Ok(())
+        }
+    }
+}
+
+pub fn run_ci_with_runner(
+    runner: &dyn Runner,
+    root: &Path,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let mut channel: Option<CiChannel> = None;
+    let mut dist = root.join("dist");
+    let mut tag: Option<String> = None;
+    let mut sha: Option<String> = None;
+    let mut required_targets: Vec<String> = Vec::new();
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--channel" => match crate::next_flag_value(args, &mut i, "--channel") {
+                Ok("nightly") => channel = Some(CiChannel::Nightly),
+                Ok("stable") => channel = Some(CiChannel::Stable),
+                Ok(other) => {
+                    let _ = writeln!(
+                        err,
+                        "CI release failed: invalid --channel {other} (expected nightly or stable)"
+                    );
+                    return 2;
+                }
+                Err(msg) => {
+                    let _ = writeln!(err, "CI release failed: {msg}");
+                    return 2;
+                }
+            },
+            "--dist" => match crate::next_flag_value(args, &mut i, "--dist") {
+                Ok(val) => dist = PathBuf::from(val),
+                Err(msg) => {
+                    let _ = writeln!(err, "CI release failed: {msg}");
+                    return 2;
+                }
+            },
+            "--tag" => match crate::next_flag_value(args, &mut i, "--tag") {
+                Ok(val) => tag = Some(val.to_string()),
+                Err(msg) => {
+                    let _ = writeln!(err, "CI release failed: {msg}");
+                    return 2;
+                }
+            },
+            "--sha" => match crate::next_flag_value(args, &mut i, "--sha") {
+                Ok(val) => sha = Some(val.to_string()),
+                Err(msg) => {
+                    let _ = writeln!(err, "CI release failed: {msg}");
+                    return 2;
+                }
+            },
+            "--require-target" => match crate::next_flag_value(args, &mut i, "--require-target") {
+                Ok(val) => required_targets.push(val.to_string()),
+                Err(msg) => {
+                    let _ = writeln!(err, "CI release failed: {msg}");
+                    return 2;
+                }
+            },
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "-h" | "--help" => {
+                let _ = writeln!(
+                    out,
+                    "Usage: release-ci --channel <nightly|stable> --sha SHA [--tag vX.Y.Z] [--dist DIR] [--require-target TARGET]... [--dry-run]"
+                );
+                return 0;
+            }
+            other => {
+                let _ = writeln!(err, "CI release failed: unknown argument {other}");
+                return 2;
+            }
+        }
+    }
+    let Some(channel) = channel else {
+        let _ = writeln!(
+            err,
+            "CI release failed: --channel <nightly|stable> is required"
+        );
+        return 2;
+    };
+    let Some(sha) = sha else {
+        let _ = writeln!(err, "CI release failed: --sha SHA is required");
+        return 2;
+    };
+    if !is_valid_commit_sha(&sha) {
+        let _ = writeln!(
+            err,
+            "CI release failed: --sha must be a 7..=40 character hexadecimal commit SHA"
+        );
+        return 2;
+    }
+
+    let dist_resolved = if dist.is_absolute() {
+        dist
+    } else {
+        root.join(dist)
+    };
+    let result = (|| -> Result<(), PublishError> {
+        let (mut plan, uploads) = prepare(root, &dist_resolved)?;
+        match channel {
+            CiChannel::Stable => {
+                let Some(ref requested_tag) = tag else {
+                    return Err(PublishError::new(
+                        "--tag vX.Y.Z is required for --channel stable",
+                    ));
+                };
+                let Some(stripped) = requested_tag.strip_prefix('v') else {
+                    return Err(PublishError::new(format!(
+                        "stable tag {requested_tag} must start with v and use vX.Y.Z"
+                    )));
+                };
+                if !is_stable_semver(stripped) {
+                    return Err(PublishError::new(format!(
+                        "stable tag {requested_tag} must use vMAJOR.MINOR.PATCH"
+                    )));
+                }
+                if stripped != plan.version {
+                    return Err(PublishError::new(format!(
+                        "tag {requested_tag} does not match Cargo.toml version {}",
+                        plan.version
+                    )));
+                }
+                plan.tag = requested_tag.clone();
+            }
+            CiChannel::Nightly => {
+                if let Some(ref requested_tag) = tag {
+                    if requested_tag != "nightly" {
+                        return Err(PublishError::new(
+                            "--tag must be nightly when --channel nightly is used",
+                        ));
+                    }
+                }
+                plan.tag = "nightly".to_string();
+            }
+        }
+        for req in &required_targets {
+            if !plan.assets.contains_key(req) {
+                return Err(PublishError::new(format!(
+                    "missing required build target package: {req}"
+                )));
+            }
+        }
+        let _ = writeln!(
+            out,
+            "Prepared {} ({}): {} platform package(s)",
+            plan.tag,
+            &sha.to_ascii_lowercase()[..7],
+            plan.assets.len()
+        );
+        for path in &uploads {
+            let _ = writeln!(out, "  {}", path.display());
+        }
+        if dry_run {
+            let _ = writeln!(
+                out,
+                "Dry run: no GitHub requests, tags, releases or uploads performed."
+            );
+            return Ok(());
+        }
+        publish_ci(runner, root, channel, &plan, &uploads, &sha, out)
+    })();
+    if let Err(error) = result {
+        let _ = writeln!(err, "CI release failed: {error}");
+        return 1;
+    }
+    0
+}
+
+pub fn run_ci_cli(root: &Path, args: &[String]) -> i32 {
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    run_ci_with_runner(&RealRunner, root, args, &mut stdout, &mut stderr)
 }

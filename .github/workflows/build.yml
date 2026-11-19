@@ -1,22 +1,78 @@
-name: Build and test
-on: [push, pull_request, workflow_dispatch]
+name: Build, test, and release
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_nightly:
+        description: 'Update the rolling nightly pre-release after build (master branch only)'
+        type: boolean
+        default: false
+
 permissions:
   contents: read
+
 jobs:
+  preflight:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag '$tag' must match vMAJOR.MINOR.PATCH (e.g. v1.0.0)" >&2
+            exit 1
+          fi
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$tag" != "v${cargo_version}" ]]; then
+            echo "Release tag '$tag' does not match Cargo.toml version 'v${cargo_version}'" >&2
+            exit 1
+          fi
+
   native:
+    needs: [preflight]
+    if: ${{ !cancelled() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
+    concurrency:
+      group: ${{ github.workflow }}-native-${{ github.ref }}-${{ matrix.os }}-${{ matrix.target }}
+      cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            cross: false
+            package: true
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            package: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cross: false
+            package: false
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+            cross: false
+            package: true
           - os: macos-15
             target: aarch64-apple-darwin
+            cross: false
+            package: true
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            cross: false
+            package: true
     runs-on: ${{ matrix.os }}
+    env:
+      ANTICRUMB_GIT_HEAD: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -24,19 +80,94 @@ jobs:
           toolchain: '1.97.0'
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.target }}
       - uses: arduino/setup-protoc@v3
         with:
           version: '29.3'
-      - run: cargo test --locked -p xtask --test publish_contract
-      - run: cargo run --locked -q -p xtask -- check
-      - run: cargo run --locked -q -p xtask -- test
-      - run: cargo run --locked -q -p xtask -- transports --profile dev
-      - if: runner.os != 'Windows'
+      - name: Install Linux ARM64 cross-compiler
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - if: ${{ !matrix.cross }}
+        run: cargo test --locked -p xtask --test installer_contract --test publish_contract
+      - if: ${{ !matrix.cross }}
+        run: cargo run --locked -q -p xtask -- check
+      - if: ${{ !matrix.cross }}
+        run: cargo run --locked -q -p xtask -- test
+      - if: ${{ !matrix.cross }}
+        run: cargo run --locked -q -p xtask -- transports --profile dev
+      - if: ${{ !matrix.cross && runner.os != 'Windows' }}
         run: cargo run --locked -q -p xtask -- tui --profile dev
-      - run: cargo run --locked -q -p xtask -- package --target ${{ matrix.target }}
+      - name: Package release archive
+        if: matrix.package
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo run --locked -q -p xtask -- package --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
+        if: matrix.package
         with:
           name: anticrumb-${{ matrix.target }}
+          if-no-files-found: error
           path: |
             dist/*.zip
             dist/*.tar.gz
+
+  release:
+    needs: [native]
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ startsWith(github.ref, 'refs/tags/') && github.ref || 'nightly' }}
+      cancel-in-progress: false
+    if: >-
+      success() && (
+        (github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) ||
+        (github.event_name == 'workflow_dispatch' && inputs.release_nightly == true && github.ref == 'refs/heads/master')
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-xtask
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: anticrumb-*
+          path: release-dist
+          merge-multiple: false
+      - name: Publish rolling nightly pre-release
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cargo run --locked -q -p xtask -- release-ci \
+            --channel nightly \
+            --dist release-dist \
+            --sha "${GITHUB_SHA}" \
+            --require-target x86_64-unknown-linux-gnu \
+            --require-target aarch64-unknown-linux-gnu \
+            --require-target x86_64-pc-windows-msvc \
+            --require-target aarch64-apple-darwin \
+            --require-target x86_64-apple-darwin
+      - name: Publish versioned stable release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cargo run --locked -q -p xtask -- release-ci \
+            --channel stable \
+            --tag "${GITHUB_REF_NAME}" \
+            --dist release-dist \
+            --sha "${GITHUB_SHA}" \
+            --require-target x86_64-unknown-linux-gnu \
+            --require-target aarch64-unknown-linux-gnu \
+            --require-target x86_64-pc-windows-msvc \
+            --require-target aarch64-apple-darwin \
+            --require-target x86_64-apple-darwin

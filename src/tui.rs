@@ -2560,7 +2560,7 @@ mod tests {
             row: layout3.completion.start + 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert!( state.completion_mouse(click, &mut tx));
+        assert!(state.completion_mouse(click, &mut tx));
         assert_eq!(state.editor.text, "@second.rs ");
         assert!(state.mention.is_none());
 
@@ -2613,11 +2613,17 @@ mod tests {
         state.editor.set("/permissions".into());
         state.submit(&mut tx);
         assert_eq!(state.menu.as_ref().unwrap().choices.len(), 5);
-        assert!(state.menu.as_ref().unwrap().choices[0].label.starts_with("[x] read"));
-        assert!(state.menu.as_ref().unwrap().choices[1].label.starts_with("[ ] edit"));
+        assert!(state.menu.as_ref().unwrap().choices[0]
+            .label
+            .starts_with("[x] read"));
+        assert!(state.menu.as_ref().unwrap().choices[1]
+            .label
+            .starts_with("[ ] edit"));
         state.move_menu(false); // move to `edit` (index 1)
         assert!(state.toggle_permission_menu_item()); // toggle `edit` ON
-        assert!(state.menu.as_ref().unwrap().choices[1].label.starts_with("[x] edit"));
+        assert!(state.menu.as_ref().unwrap().choices[1]
+            .label
+            .starts_with("[x] edit"));
         state.select(&mut tx); // Enter saves permissions (read + edit, shell still disabled)
         assert!(state.options.no_shell);
         assert_eq!(
@@ -2664,7 +2670,10 @@ mod tests {
             panic!("expected Start command");
         };
         assert!(!agent_req.chat_only);
-        assert!(agent_req.no_shell, "run_shell must be disabled under --agent when /permissions disabled shell");
+        assert!(
+            agent_req.no_shell,
+            "run_shell must be disabled under --agent when /permissions disabled shell"
+        );
         assert_eq!(
             agent_req.permissions,
             Some(crate::domain::ToolPermissions {
@@ -2699,7 +2708,10 @@ mod tests {
         };
         assert!(!req2.chat_only);
         assert!(!req2.no_shell);
-        assert_eq!(req2.permissions, Some(crate::domain::ToolPermissions::all()));
+        assert_eq!(
+            req2.permissions,
+            Some(crate::domain::ToolPermissions::all())
+        );
         state.active = None;
         state.pending = None;
         state.phase = "ready".into();
@@ -2804,7 +2816,10 @@ mod tests {
         let Command::Start(req2, files2, _) = rx.try_recv().unwrap() else {
             panic!("expected Command::Start");
         };
-        assert_eq!(req2.task, "Check [Attached file: real.txt] with @fdsjifdsoidsf");
+        assert_eq!(
+            req2.task,
+            "Check [Attached file: real.txt] with @fdsjifdsoidsf"
+        );
         assert_eq!(files2.len(), 1);
         assert_eq!(files2[0].file_name().unwrap(), "real.txt");
 

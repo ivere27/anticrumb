@@ -63,7 +63,10 @@ impl Preferences {
             .put("ui", "settings", "debug_level", &level.min(2))
     }
     pub fn permissions(&self) -> Option<ToolPermissions> {
-        if let Ok(perms) = self.store.get::<ToolPermissions>("ui", "settings", "permissions") {
+        if let Ok(perms) = self
+            .store
+            .get::<ToolPermissions>("ui", "settings", "permissions")
+        {
             return Some(perms);
         }
         self.no_shell().map(|no_shell| ToolPermissions {
@@ -75,11 +78,15 @@ impl Preferences {
         })
     }
     pub fn set_permissions(&self, perms: ToolPermissions) -> Result<()> {
-        self.store.put("ui", "settings", "no_shell", &!perms.shell)?;
+        self.store
+            .put("ui", "settings", "no_shell", &!perms.shell)?;
         self.store.put("ui", "settings", "permissions", &perms)
     }
     pub fn no_shell(&self) -> Option<bool> {
-        if let Ok(perms) = self.store.get::<ToolPermissions>("ui", "settings", "permissions") {
+        if let Ok(perms) = self
+            .store
+            .get::<ToolPermissions>("ui", "settings", "permissions")
+        {
             return Some(!perms.shell);
         }
         self.store.get::<bool>("ui", "settings", "no_shell").ok()

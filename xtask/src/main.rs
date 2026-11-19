@@ -15,7 +15,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
         eprintln!(
-            "Usage: cargo run --locked -q -p xtask -- <build|package|check|test|transports|tui|macos-cross|proto|publish> [options]"
+            "Usage: cargo run --locked -q -p xtask -- <build|package|check|test|transports|tui|macos-cross|proto|publish|release-ci> [options]"
         );
         std::process::exit(2);
     };
@@ -31,6 +31,7 @@ fn main() {
         "macos-cross" => xtask::build::run_macos_cross(&root, rest),
         "proto" => xtask::generate::run_cli(&root),
         "publish" => xtask::publish::run_cli(&root, rest),
+        "release-ci" => xtask::publish::run_ci_cli(&root, rest),
         other => {
             eprintln!("Unknown xtask command: {other}");
             2

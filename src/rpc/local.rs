@@ -1298,13 +1298,8 @@ mod tests {
         let store = crate::store::Store::open(dir).unwrap();
         let backend = Arc::new(crate::service::WebBackend::new(store.clone()));
         let service = crate::service::Service::new(store, backend).unwrap();
-        let host = Host::with_service(
-            service,
-            None,
-            "workspace",
-            Some(Host::lease(dir).unwrap()),
-        )
-        .unwrap();
+        let host = Host::with_service(service, None, "workspace", Some(Host::lease(dir).unwrap()))
+            .unwrap();
         let client = RpcClient::embedded(host.clone(), tokio::runtime::Handle::current()).unwrap();
         (host, client)
     }
@@ -1400,10 +1395,9 @@ mod tests {
             _local_lease: None,
         };
 
-        let mut fut = Box::pin(workspaces.shutdown_grpc_binding(
-            binding,
-            prost::Message::encode_to_vec(&pb::Empty {}),
-        ));
+        let mut fut = Box::pin(
+            workspaces.shutdown_grpc_binding(binding, prost::Message::encode_to_vec(&pb::Empty {})),
+        );
         let poll = fut
             .as_mut()
             .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));

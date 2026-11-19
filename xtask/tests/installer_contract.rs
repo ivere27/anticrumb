@@ -24,12 +24,12 @@ fn sha256_bytes(data: &[u8]) -> String {
         .collect()
 }
 
-fn release_for(name: &str, data: &[u8]) -> Value {
-    let url = format!("https://github.com/ivere27/anticrumb/releases/download/v{VERSION}/{name}");
+fn release_for_tag(tag: &str, prerelease: bool, name: &str, data: &[u8]) -> Value {
+    let url = format!("https://github.com/ivere27/anticrumb/releases/download/{tag}/{name}");
     json!({
-        "tag_name": format!("v{VERSION}"),
+        "tag_name": tag,
         "draft": false,
-        "prerelease": false,
+        "prerelease": prerelease,
         "assets": [{
             "name": name,
             "browser_download_url": url,
@@ -38,6 +38,10 @@ fn release_for(name: &str, data: &[u8]) -> Value {
             "state": "uploaded"
         }]
     })
+}
+
+fn release_for(name: &str, data: &[u8]) -> Value {
+    release_for_tag(&format!("v{VERSION}"), false, name, data)
 }
 
 #[cfg(unix)]
@@ -230,8 +234,13 @@ esac
         }
 
         fn install(&self) -> Output {
+            self.install_with_args(&[])
+        }
+
+        fn install_with_args(&self, args: &[&str]) -> Output {
             let mut cmd = Command::new("sh");
             cmd.arg(workspace_root().join("install.sh"));
+            cmd.args(args);
             cmd.env("HOME", &self.home)
                 .env("SHELL", "/bin/sh")
                 .env(
@@ -540,11 +549,76 @@ esac
         assert!(String::from_utf8_lossy(&result.stderr).contains("size mismatch"));
         assert!(!f.home.join(".local/bin/anticrumb").exists());
     }
+
+    #[test]
+    fn nightly_env_and_flag_install_verified_prerelease() {
+        let mut f = ShellFixture::new();
+        f.package("Linux", "x86_64", false, None, false);
+        let name = "anticrumb-x86_64-unknown-linux-gnu.tar.gz";
+        let archive_bytes = fs::read(f.downloads.join(name)).unwrap();
+        let nightly = release_for_tag("nightly", true, name, &archive_bytes);
+        fs::write(
+            f.downloads.join("release.json"),
+            serde_json::to_string(&nightly).unwrap(),
+        )
+        .unwrap();
+
+        f.version_override = Some("nightly".into());
+        let result = f.install();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            fs::read(f.home.join(".local/bin/anticrumb")).unwrap(),
+            BINARY
+        );
+        let first_req = fs::read_to_string(&f.requests)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            first_req,
+            "https://api.github.com/repos/ivere27/anticrumb/releases/tags/nightly"
+        );
+
+        f.version_override = None;
+        fs::write(&f.requests, "").unwrap();
+        let via_flag = f.install_with_args(&["--nightly"]);
+        assert!(
+            via_flag.status.success(),
+            "{}",
+            String::from_utf8_lossy(&via_flag.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&f.requests)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+            "https://api.github.com/repos/ivere27/anticrumb/releases/tags/nightly"
+        );
+
+        // Non-prerelease must be rejected on nightly channel
+        let mut not_prerelease = nightly.clone();
+        not_prerelease["prerelease"] = json!(false);
+        fs::write(
+            f.downloads.join("release.json"),
+            serde_json::to_string(&not_prerelease).unwrap(),
+        )
+        .unwrap();
+        assert!(!f.install_with_args(&["--nightly"]).status.success());
+    }
 }
 
 #[cfg(windows)]
 mod powershell_installer {
     use super::*;
+    use std::io::Write;
+    use std::path::Path;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
@@ -561,11 +635,12 @@ mod powershell_installer {
 
     fn run_ps(
         root: &TempDir,
+        target: &str,
         bad_hash: bool,
         symlink: bool,
+        version: Option<&str>,
         mutate: Option<&dyn Fn(&mut Value)>,
     ) -> Output {
-        let target = "x86_64-pc-windows-gnu";
         let archive = root.path().join("package.zip");
         {
             let file = File::create(&archive).unwrap();
@@ -584,10 +659,17 @@ mod powershell_installer {
             writer.write_all(b"evil").unwrap();
             writer.finish().unwrap();
         }
-        let mut release = release_for(
-            &format!("anticrumb-{target}.zip"),
-            &fs::read(&archive).unwrap(),
-        );
+        let archive_bytes = fs::read(&archive).unwrap();
+        let mut release = if version == Some("nightly") {
+            release_for_tag(
+                "nightly",
+                true,
+                &format!("anticrumb-{target}.zip"),
+                &archive_bytes,
+            )
+        } else {
+            release_for(&format!("anticrumb-{target}.zip"), &archive_bytes)
+        };
         if bad_hash {
             release["assets"][0]["digest"] = json!(format!("sha256:{}", "0".repeat(64)));
         }
@@ -600,6 +682,16 @@ mod powershell_installer {
         fs::write(&requests, "").unwrap();
         let wrapper = root.path().join("run.ps1");
         let install_ps1 = workspace_root().join("install.ps1");
+        let expected_uri = match version {
+            Some("nightly") => {
+                "https://api.github.com/repos/ivere27/anticrumb/releases/tags/nightly".to_string()
+            }
+            Some(v) => format!(
+                "https://api.github.com/repos/ivere27/anticrumb/releases/tags/v{}",
+                v.strip_prefix('v').unwrap_or(v)
+            ),
+            None => "https://api.github.com/repos/ivere27/anticrumb/releases/latest".to_string(),
+        };
         fs::write(
             &wrapper,
             format!(
@@ -608,7 +700,7 @@ mod powershell_installer {
                     param($Uri, $Headers)\n\
                     Add-Content -LiteralPath {} -Value $Uri\n\
                     switch ($Uri) {{\n\
-                        'https://api.github.com/repos/ivere27/anticrumb/releases/latest' {{ Get-Content -Raw -LiteralPath {} | ConvertFrom-Json }}\n\
+                        '{}' {{ Get-Content -Raw -LiteralPath {} | ConvertFrom-Json }}\n\
                         default {{ throw \"Unexpected metadata URL: $Uri\" }}\n\
                     }}\n\
                 }}\n\
@@ -617,6 +709,7 @@ mod powershell_installer {
                 try {{ & {} }}\n\
                 finally {{ [Environment]::SetEnvironmentVariable('Path', $previousPath, 'User') }}\n",
                 ps_quote(&requests),
+                expected_uri,
                 ps_quote(&metadata),
                 ps_quote(&requests),
                 ps_quote(&archive),
@@ -624,14 +717,18 @@ mod powershell_installer {
             ),
         )
         .unwrap();
-        Command::new("pwsh")
-            .args(["-NoProfile", "-NonInteractive", "-File"])
+        let mut cmd = Command::new("pwsh");
+        cmd.args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&wrapper)
             .env("USERPROFILE", root.path().join("home"))
             .env("PROCESSOR_ARCHITECTURE", "AMD64")
+            .env_remove("PROCESSOR_ARCHITEW6432")
             .env_remove("ANTICRUMB_INSTALL_DIR")
-            .output()
-            .unwrap()
+            .env_remove("ANTICRUMB_VERSION");
+        if let Some(v) = version {
+            cmd.env("ANTICRUMB_VERSION", v);
+        }
+        cmd.output().unwrap()
     }
 
     #[test]
@@ -639,17 +736,104 @@ mod powershell_installer {
         if !has_pwsh() {
             return;
         }
-        let root = TempDir::new().unwrap();
-        let out = run_ps(&root, false, false, None);
+        for target in ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"] {
+            let root = TempDir::new().unwrap();
+            let out = run_ps(&root, target, false, false, None, None);
+            assert!(
+                out.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                fs::read(root.path().join("home/.local/bin/anticrumb.exe")).unwrap(),
+                BINARY
+            );
+            assert!(!root.path().join("outside").exists());
+        }
+
+        let version_root = TempDir::new().unwrap();
+        let version_out = run_ps(
+            &version_root,
+            "x86_64-pc-windows-msvc",
+            false,
+            false,
+            Some(&format!("v{VERSION}")),
+            None,
+        );
         assert!(
-            out.status.success(),
+            version_out.status.success(),
             "{}",
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&version_out.stderr)
         );
         assert_eq!(
-            fs::read(root.path().join("home/.local/bin/anticrumb.exe")).unwrap(),
+            fs::read(version_root.path().join("home/.local/bin/anticrumb.exe")).unwrap(),
             BINARY
         );
-        assert!(!root.path().join("outside").exists());
+
+        let nightly_root = TempDir::new().unwrap();
+        let nightly_out = run_ps(
+            &nightly_root,
+            "x86_64-pc-windows-msvc",
+            false,
+            false,
+            Some("nightly"),
+            None,
+        );
+        assert!(
+            nightly_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&nightly_out.stderr)
+        );
+        assert_eq!(
+            fs::read(nightly_root.path().join("home/.local/bin/anticrumb.exe")).unwrap(),
+            BINARY
+        );
+
+        let bad_hash_root = TempDir::new().unwrap();
+        assert!(!run_ps(
+            &bad_hash_root,
+            "x86_64-pc-windows-msvc",
+            true,
+            false,
+            None,
+            None
+        )
+        .status
+        .success());
+        assert!(!bad_hash_root
+            .path()
+            .join("home/.local/bin/anticrumb.exe")
+            .exists());
+
+        let symlink_root = TempDir::new().unwrap();
+        assert!(!run_ps(
+            &symlink_root,
+            "x86_64-pc-windows-msvc",
+            false,
+            true,
+            None,
+            None
+        )
+        .status
+        .success());
+        assert!(!symlink_root
+            .path()
+            .join("home/.local/bin/anticrumb.exe")
+            .exists());
+
+        let non_prerelease_root = TempDir::new().unwrap();
+        let reject_stable_on_nightly = |r: &mut Value| {
+            r["prerelease"] = json!(false);
+        };
+        assert!(!run_ps(
+            &non_prerelease_root,
+            "x86_64-pc-windows-msvc",
+            false,
+            false,
+            Some("nightly"),
+            Some(&reject_stable_on_nightly),
+        )
+        .status
+        .success());
     }
 }

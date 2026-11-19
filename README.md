@@ -22,7 +22,7 @@ Windows PowerShell:
 irm https://ivere27.github.io/anticrumb/install.ps1 | iex
 ```
 
-Run `anticrumb update` for later versions. Downloads are verified against GitHub's asset digest. See [runtime requirements](docs/building.md#runtime-requirements).
+Run `anticrumb update` for later stable releases, or `anticrumb update --nightly` for the rolling `master` pre-release. You can also install nightly directly with `ANTICRUMB_VERSION=nightly` (or `--nightly` for `install.sh`). Downloads are verified against GitHub's asset digest. See [runtime requirements](docs/building.md#runtime-requirements).
 
 ## Quick Start
 
