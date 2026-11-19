@@ -58,6 +58,7 @@ impl Fixture {
         let thread = thread::spawn(move || {
             while !signal.load(Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                     let mut buf = [0; 4096];
                     let _ = stream.read(&mut buf);

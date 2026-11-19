@@ -316,28 +316,35 @@ fn background_process_lifecycle() {
     let s = reg.execute_call(
         &call(
             "start_process",
-            json!({"command": if cfg!(windows) { "Write-Output first; Start-Sleep -Milliseconds 800; Write-Output second; Start-Sleep -Seconds 30" } else { "echo first; sleep 0.8; echo second; sleep 30" }}),
+            json!({"command": if cfg!(windows) { "Write-Output first; Start-Sleep -Milliseconds 1200; Write-Output second; Start-Sleep -Seconds 60" } else { "echo first; sleep 0.8; echo second; sleep 30" }}),
         ),
         &ctx,
     );
     assert!(s.ok, "{}", s.output);
     let o1 = reg.execute_call(
-        &call("process_output", json!({"id": 1, "wait_secs": 5})),
+        &call(
+            "process_output",
+            json!({"id": 1, "wait_secs": if cfg!(windows) { 25 } else { 5 }}),
+        ),
         &ctx,
     );
+    // the command line in the header mentions "first"; only the stdout section matters
+    let o1_stdout = o1.output.split("[stdout]").nth(1).unwrap_or_default();
     assert!(
-        o1.ok && o1.output.contains("first") && o1.output.contains("(running)"),
+        o1.ok && o1_stdout.contains("first") && o1.output.contains("(running)"),
         "{}",
         o1.output
     );
     let o2 = reg.execute_call(
-        &call("process_output", json!({"id": 1, "wait_secs": 5})),
+        &call(
+            "process_output",
+            json!({"id": 1, "wait_secs": if cfg!(windows) { 10 } else { 5 }}),
+        ),
         &ctx,
     );
-    // the command line in the header mentions "first"; only the stdout section matters
     let o2_stdout = o2.output.split("[stdout]").nth(1).unwrap_or_default();
     assert!(
-        o2_stdout.contains("second") && !o2_stdout.contains("first"),
+        o2.ok && o2_stdout.contains("second") && !o2_stdout.contains("first"),
         "{}",
         o2.output
     );

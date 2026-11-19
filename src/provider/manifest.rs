@@ -632,9 +632,13 @@ impl ManifestWebProvider {
             } else {
                 "image/webp"
             };
+            let name = Path::new(&path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             artifacts.push(
                 store
-                    .artifact(account, &path, mime, &bytes, "generated")?
+                    .artifact(account, &name, mime, &bytes, "generated")?
                     .id,
             );
         }

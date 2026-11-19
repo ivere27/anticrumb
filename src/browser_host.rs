@@ -1699,9 +1699,25 @@ impl MockHttpServer {
         let thread = std::thread::spawn(move || {
             while !stop_srv.load(Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let mut req = [0u8; 2048];
-                    let n = stream.read(&mut req).unwrap_or(0);
-                    let req_str = String::from_utf8_lossy(&req[..n]).into_owned();
+                    // macOS/BSD sockets inherit O_NONBLOCK from the listener; restore
+                    // blocking I/O before reading HTTP headers or WebSocket frames.
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let mut req = [0u8; 4096];
+                    let mut len = 0;
+                    while len < req.len() {
+                        match stream.read(&mut req[len..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                len += n;
+                                if req[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let req_str = String::from_utf8_lossy(&req[..len]).into_owned();
                     handler(stream, &req_str, port);
                 } else {
                     sleep(Duration::from_millis(5));

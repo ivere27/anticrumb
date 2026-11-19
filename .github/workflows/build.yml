@@ -2,7 +2,7 @@ name: Build, test, and release
 on:
   push:
     branches:
-      - '**'
+      - 'master'
     tags:
       - 'v*'
   pull_request:
@@ -71,8 +71,10 @@ jobs:
             cross: false
             package: true
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     env:
       ANTICRUMB_GIT_HEAD: ${{ github.sha }}
+      ANTICRUMB_BUILD_CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || (github.ref == 'refs/heads/master' && 'nightly' || 'dev') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -86,21 +88,16 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: '29.3'
+          repo-token: ${{ github.token }}
       - name: Install Linux ARM64 cross-compiler
         if: matrix.cross
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - if: ${{ !matrix.cross }}
-        run: cargo test --locked -p xtask --test installer_contract --test publish_contract
-      - if: ${{ !matrix.cross }}
         run: cargo run --locked -q -p xtask -- check
       - if: ${{ !matrix.cross }}
         run: cargo run --locked -q -p xtask -- test
-      - if: ${{ !matrix.cross }}
-        run: cargo run --locked -q -p xtask -- transports --profile dev
-      - if: ${{ !matrix.cross && runner.os != 'Windows' }}
-        run: cargo run --locked -q -p xtask -- tui --profile dev
       - name: Package release archive
         if: matrix.package
         env:

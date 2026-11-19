@@ -64,6 +64,8 @@ impl Store {
             fs::set_permissions(&tmp_root, fs::Permissions::from_mode(0o700))
                 .map_err(ServiceError::storage)?;
         }
+        #[cfg(not(unix))]
+        let _ = tmp_root;
         use fs2::FileExt;
         let _init_lock = {
             let file = fs::OpenOptions::new()
@@ -517,7 +519,6 @@ impl Store {
         Self::ensure_blob_tmp_root_at(&self.root)
     }
     fn clean_abandoned_blob_staging_locked(&self, _lease: &fs::File) -> Result<()> {
-        use fs2::FileExt;
         let tmp_root = self.blob_tmp_root();
         for entry in cache::entries(&tmp_root)? {
             let path = entry.path();
@@ -531,32 +532,16 @@ impl Store {
             if !cache::owned_name(&name, "tmp_") {
                 continue;
             }
-            let lock_path = path.join(".lease");
-            let held_lock = match fs::symlink_metadata(&lock_path) {
-                Ok(lock_meta) if lock_meta.is_file() && !lock_meta.file_type().is_symlink() => {
-                    let file = match fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&lock_path)
-                    {
-                        Ok(file) => file,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(error) => return Err(ServiceError::storage(error)),
-                    };
-                    if file.try_lock_exclusive().is_err() {
-                        continue;
-                    }
-                    Some(file)
-                }
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(ServiceError::storage(error)),
+            let held_lock = match cache::try_open_temp_lease(&path.join(".lease"))? {
+                cache::TempLease::Acquired(file) => Some(file),
+                cache::TempLease::Missing => None,
+                cache::TempLease::LockedOrInvalid | cache::TempLease::Gone => continue,
             };
             // Remove payload before unlocking/dropping the lease handle (required on Windows)
             // while still holding `_lease` (`blobs.lock`).
-            let _ = fs::remove_file(path.join("data"));
+            let _ = cache::retry_transient(|| fs::remove_file(path.join("data")));
             drop(held_lock);
-            match fs::remove_dir_all(&path) {
+            match cache::retry_transient(|| fs::remove_dir_all(&path)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ServiceError::storage(error)),
@@ -643,11 +628,9 @@ impl Store {
                 return Err(ServiceError::invalid("invalid artifact SHA-256"));
             }
         }
-        let normalized_name = Path::new(name)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+        // Strip optional POSIX directory prefix consistently across platforms so Windows
+        // rejects backslashes and drive prefixes instead of stripping `bad\name` to `name`.
+        let normalized_name = name.rsplit('/').next().unwrap_or("").to_owned();
         if !is_valid_artifact_name(&normalized_name) {
             return Err(ServiceError::invalid("invalid artifact name"));
         }
@@ -1872,7 +1855,9 @@ mod tests {
             ".",
             "..",
             "nested/..",
+            "nested/dir/",
             "bad:name",
+            "C:\\dir\\clean.txt",
             "bad\\name",
             "bad\0name",
         ] {

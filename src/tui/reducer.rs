@@ -311,12 +311,9 @@ impl State {
     }
 
     pub(super) fn log_startup_banner(&mut self) {
-        let version = env!("CARGO_PKG_VERSION");
-        let commit = crate::cli::commit_head();
-        let version_label = match &commit {
-            Some(head) => format!("anticrumb {version} ({head})"),
-            None => format!("anticrumb {version}"),
-        };
+        let version = crate::build_info::display_version();
+        let commit = crate::build_info::commit_head();
+        let version_label = crate::build_info::format_tui_title(&version, commit.as_deref());
         let account_label = format!("{} · {}", self.provider_name(), self.options.account);
         let model_label = format!("{} ({})", self.model_label(), self.thinking_label());
         let workspace_label = Self::format_workspace_home(&self.options.workspace);

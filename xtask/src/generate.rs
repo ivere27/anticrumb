@@ -42,6 +42,20 @@ fn asset_spec() -> Result<(&'static str, &'static str, &'static str, &'static st
     }
 }
 
+fn canonical_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 pub fn run(root: &Path) -> Result<(), String> {
     let (target, suffix, digest, docker_platform) = asset_spec()?;
     let filename = format!("protoc-gen-synurang-ffi-{VERSION}-{target}.{suffix}");
@@ -155,7 +169,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     let manifest = json!({
         "generator_release": format!("v{VERSION}"),
         "runtime_commit": COMMIT,
-        "schema_sha256": sha256_bytes(&schema),
+        "schema_sha256": sha256_bytes(&canonical_lf(&schema)),
     });
     let mut rendered =
         serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
@@ -173,4 +187,20 @@ pub fn run_cli(root: &Path) -> i32 {
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_lf_normalizes_crlf_for_schema_hashing() {
+        let lf = b"syntax = \"proto3\";\nmessage Foo {}\n";
+        let crlf = b"syntax = \"proto3\";\r\nmessage Foo {}\r\n";
+        assert_eq!(
+            sha256_bytes(&canonical_lf(lf)),
+            sha256_bytes(&canonical_lf(crlf))
+        );
+        assert_eq!(canonical_lf(crlf), lf);
+    }
 }

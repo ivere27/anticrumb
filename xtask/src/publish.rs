@@ -931,8 +931,9 @@ fn nightly_release_commands(
     let short_sha = sha.get(..7).unwrap_or(sha);
     let repository = format!("github.com/{REPOSITORY}");
     let title = format!("anticrumb nightly ({short_sha})");
-    let notes =
-        format!("Rolling nightly pre-release built from master ({sha}).\n\nVersion: {version} ({short_sha})");
+    let notes = format!(
+        "Rolling nightly pre-release built from master ({sha}).\n\nVersion: {version}-nightly ({short_sha})"
+    );
     if exists {
         let mut upload = vec![
             "gh".to_string(),

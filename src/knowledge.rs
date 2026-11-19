@@ -23,11 +23,64 @@ pub struct Excerpt {
     pub text: String,
     pub citation: String,
 }
+const MAX_SOURCE_FILES: usize = 20_000;
+
+fn is_excluded_name(name: &str) -> bool {
+    matches!(name, ".git" | "node_modules" | "target" | ".anticrumb")
+        || name.starts_with(".env")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+}
+
+fn walk_files_fallback(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries_iter = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if dir == root => return Err(ServiceError::storage(err)),
+            Err(_) => continue,
+        };
+        let mut entries: Vec<_> = entries_iter.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut subdirs = Vec::new();
+        for entry in entries {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if is_excluded_name(name) {
+                continue;
+            }
+            if ft.is_dir() {
+                subdirs.push(entry.path());
+            } else if ft.is_file() {
+                paths.push(entry.path());
+                if paths.len() > MAX_SOURCE_FILES {
+                    return Err(ServiceError::invalid(
+                        "source exceeds 20000 files; select a smaller directory",
+                    ));
+                }
+            }
+        }
+        for sub in subdirs.into_iter().rev() {
+            stack.push(sub);
+        }
+    }
+    Ok(paths)
+}
+
 pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
     if root.is_file() {
         return Ok(vec![root.to_owned()]);
     }
-    let output = std::process::Command::new("rg")
+    match std::process::Command::new("rg")
         .args([
             "--files",
             "--hidden",
@@ -49,24 +102,29 @@ pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
         ])
         .current_dir(root)
         .output()
-        .map_err(ServiceError::storage)?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(ServiceError::invalid("rg could not enumerate source"));
+    {
+        Ok(output) => {
+            if !output.status.success() && output.status.code() != Some(1) {
+                return Err(ServiceError::invalid("rg could not enumerate source"));
+            }
+            let paths = output
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|b| !b.is_empty())
+                .filter_map(|b| std::str::from_utf8(b).ok())
+                .take(MAX_SOURCE_FILES + 1)
+                .map(|p| root.join(p))
+                .collect::<Vec<_>>();
+            if paths.len() > MAX_SOURCE_FILES {
+                return Err(ServiceError::invalid(
+                    "source exceeds 20000 files; select a smaller directory",
+                ));
+            }
+            Ok(paths)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => walk_files_fallback(root),
+        Err(err) => Err(ServiceError::storage(err)),
     }
-    let paths = output
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|b| !b.is_empty())
-        .filter_map(|b| std::str::from_utf8(b).ok())
-        .take(20001)
-        .map(|p| root.join(p))
-        .collect::<Vec<_>>();
-    if paths.len() > 20000 {
-        return Err(ServiceError::invalid(
-            "source exceeds 20000 files; select a smaller directory",
-        ));
-    }
-    Ok(paths)
 }
 pub fn add(store: &Store, name: &str, path: &Path, url: Option<String>) -> Result<Source> {
     if name.is_empty()
@@ -181,5 +239,45 @@ mod tests {
         sync(&store, "repo").unwrap();
         assert!(query(&store, "lexical_cache", None, 5).unwrap().is_empty());
         assert_eq!(query(&store, "replaced", Some("repo"), 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fallback_enumeration_excludes_sensitive_and_ignored_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join(".anticrumb")).unwrap();
+
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        fs::write(root.join(".hidden"), "visible hidden file\n").unwrap();
+        fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        fs::write(root.join(".env.local"), "SECRET=2\n").unwrap();
+        fs::write(root.join("cert.pem"), "PEM\n").unwrap();
+        fs::write(root.join("secret.key"), "KEY\n").unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "module\n").unwrap();
+        fs::write(root.join("target/debug/bin"), "bin\n").unwrap();
+        fs::write(root.join(".anticrumb/state"), "state\n").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(temp.path().join("outside.txt"), root.join("link.txt")).unwrap();
+
+        let listed = walk_files_fallback(&root).unwrap();
+        let rel: Vec<_> = listed
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(rel, vec![".hidden", "src/lib.rs"]);
+
+        let missing = walk_files_fallback(&temp.path().join("does-not-exist")).unwrap_err();
+        assert_eq!(missing.code, ErrorCode::StorageFailure);
     }
 }

@@ -82,36 +82,113 @@ fn old(metadata: &fs::Metadata, cutoff: i64) -> bool {
         .is_some_and(|age| age.as_millis() < cutoff.max(0) as u128)
 }
 
-pub(super) fn entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+fn is_transient_windows_io_error(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // Concurrent directory cleanup on Windows briefly leaves deleted entries in
+        // DELETE_PENDING (`ERROR_ACCESS_DENIED` = 5) or contended (`ERROR_SHARING_VIOLATION` = 32,
+        // `ERROR_DIR_NOT_EMPTY` = 145) before the OS finishes closing handles.
+        error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 145))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+pub(super) fn retry_transient<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(windows)]
+    const MAX_ATTEMPTS: usize = 50;
+    #[cfg(not(windows))]
+    const MAX_ATTEMPTS: usize = 1;
+
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Err(error) if is_transient_windows_io_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                attempt += 1;
+                if attempt <= 3 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_millis(if attempt <= 8 { 1 } else { 5 }));
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+pub(super) enum TempLease {
+    Acquired(fs::File),
+    LockedOrInvalid,
+    Gone,
+    Missing,
+}
+
+pub(super) fn try_open_temp_lease(lock_path: &Path) -> Result<TempLease> {
+    match metadata(lock_path)? {
+        Some(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+            let file = match retry_transient(|| {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+            }) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(TempLease::Gone);
+                }
+                Err(error) => return Err(ServiceError::storage(error)),
+            };
+            if file.try_lock_exclusive().is_err() {
+                return Ok(TempLease::LockedOrInvalid);
+            }
+            Ok(TempLease::Acquired(file))
+        }
+        Some(_) => Ok(TempLease::LockedOrInvalid),
+        None => Ok(TempLease::Missing),
+    }
+}
+
+fn entries_raw(path: &Path) -> std::io::Result<Option<Vec<fs::DirEntry>>> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
             let dir = match fs::read_dir(path) {
                 Ok(dir) => dir,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Vec::new());
+                    return Ok(Some(Vec::new()));
                 }
-                Err(error) => return Err(ServiceError::storage(error)),
+                Err(error) => return Err(error),
             };
             let mut items = Vec::new();
             for entry in dir {
                 match entry {
                     Ok(entry) => items.push(entry),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(ServiceError::storage(error)),
+                    Err(error) => return Err(error),
                 }
             }
-            Ok(items)
+            Ok(Some(items))
         }
-        Ok(_) => Err(ServiceError::invalid(
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(Vec::new())),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+    match retry_transient(|| entries_raw(path)).map_err(ServiceError::storage)? {
+        Some(items) => Ok(items),
+        None => Err(ServiceError::invalid(
             "cache directory must not be a symlink or a file",
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(ServiceError::storage(error)),
     }
 }
 
 pub(super) fn metadata(path: &Path) -> Result<Option<fs::Metadata>> {
-    match fs::symlink_metadata(path) {
+    match retry_transient(|| fs::symlink_metadata(path)) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ServiceError::storage(error)),
@@ -300,20 +377,13 @@ impl Store {
                     continue;
                 }
                 let lock = entry.path().join(".lease");
-                let lease = match fs::symlink_metadata(&lock) {
-                    Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
-                        let file = match fs::OpenOptions::new().read(true).write(true).open(lock) {
-                            Ok(file) => file,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(error) => return Err(ServiceError::storage(error)),
-                        };
-                        if file.try_lock_exclusive().is_err() {
-                            continue;
-                        }
-                        Some(file)
+                let lease = match try_open_temp_lease(&lock)? {
+                    TempLease::Acquired(file) => {
+                        (options.prune && !options.dry_run).then_some(file)
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !busy => None,
-                    _ => continue,
+                    TempLease::LockedOrInvalid | TempLease::Gone => continue,
+                    TempLease::Missing if !busy => None,
+                    TempLease::Missing => continue,
                 };
                 stats.temporary_entries += 1;
                 removals.push(Removal {
@@ -346,32 +416,22 @@ impl Store {
                 continue;
             }
             let lock = entry.path().join(".lease");
-            let lease = match fs::symlink_metadata(&lock) {
-                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
-                    let file = match fs::OpenOptions::new().read(true).write(true).open(lock) {
-                        Ok(file) => file,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            if metadata(&entry.path())?.is_none() {
-                                stats.temporary_bytes = stats.temporary_bytes.saturating_sub(bytes);
-                            }
-                            continue;
-                        }
-                        Err(error) => return Err(ServiceError::storage(error)),
-                    };
-                    if file.try_lock_exclusive().is_err() {
-                        continue;
+            let lease = match try_open_temp_lease(&lock)? {
+                TempLease::Acquired(file) => (options.prune && !options.dry_run).then_some(file),
+                TempLease::LockedOrInvalid => continue,
+                TempLease::Gone => {
+                    if metadata(&entry.path())?.is_none() {
+                        stats.temporary_bytes = stats.temporary_bytes.saturating_sub(bytes);
                     }
-                    Some(file)
+                    continue;
                 }
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                TempLease::Missing => {
                     if metadata(&entry.path())?.is_none() {
                         stats.temporary_bytes = stats.temporary_bytes.saturating_sub(bytes);
                         continue;
                     }
                     None
                 }
-                Err(e) => return Err(ServiceError::storage(e)),
             };
             stats.temporary_entries += 1;
             removals.push(Removal {
@@ -396,9 +456,9 @@ impl Store {
             for file in removals {
                 drop(file.lease);
                 let removed = if file.directory {
-                    fs::remove_dir_all(&file.path)
+                    retry_transient(|| fs::remove_dir_all(&file.path))
                 } else {
-                    fs::remove_file(&file.path)
+                    retry_transient(|| fs::remove_file(&file.path))
                 };
                 if let Err(error) = removed {
                     if error.kind() == std::io::ErrorKind::NotFound {
@@ -780,6 +840,19 @@ mod tests {
 
     #[test]
     fn cache_entries_handles_missing_dir_and_concurrent_staging_drops() {
+        struct JoinOnDrop {
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for JoinOnDrop {
+            fn drop(&mut self) {
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         assert!(entries(&dir.path().join("does-not-exist"))
@@ -789,30 +862,33 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_dropper = stop.clone();
         let dropper_store = store.clone();
-        let dropper = std::thread::spawn(move || {
-            for _ in 0..40 {
-                if stop_dropper.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
+        let mut dropper = JoinOnDrop {
+            stop: stop.clone(),
+            handle: Some(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    if stop_dropper.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut writer = dropper_store
+                        .artifact_writer(
+                            "default",
+                            "ephemeral.bin",
+                            "application/octet-stream",
+                            Some(32),
+                            None,
+                            "input",
+                        )
+                        .unwrap();
+                    writer.write_chunk(&[7; 16]).unwrap();
+                    drop(writer);
                 }
-                let mut writer = dropper_store
-                    .artifact_writer(
-                        "default",
-                        "ephemeral.bin",
-                        "application/octet-stream",
-                        Some(32),
-                        None,
-                        "input",
-                    )
-                    .unwrap();
-                writer.write_chunk(&[7; 16]).unwrap();
-                drop(writer);
-            }
-        });
+            })),
+        };
         for _ in 0..40 {
             let stats = store.cache_report(Options::default()).unwrap();
             assert!(!stats.pruned);
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        dropper.join().unwrap();
+        dropper.handle.take().unwrap().join().unwrap();
     }
 }

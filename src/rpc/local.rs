@@ -28,12 +28,30 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_GRACE: Duration = Duration::from_millis(300);
 
-fn protocol() -> String {
+fn canonical_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn protocol_for_schema(schema: &[u8]) -> String {
     format!(
         "{}:{}",
         env!("CARGO_PKG_VERSION"),
-        digest(include_bytes!("../../proto/anticrumb.proto"))
+        digest(&canonical_lf(schema))
     )
+}
+
+fn protocol() -> String {
+    protocol_for_schema(include_bytes!("../../proto/anticrumb.proto"))
 }
 
 pub(crate) fn workspace_root(connection: &Connection) -> PathBuf {
@@ -1039,7 +1057,7 @@ pub(crate) async fn run(managed: bool, browser: Option<Arc<Host>>) -> Result<()>
         eprintln!(
             "{} {}",
             super::server::log_timestamp(),
-            crate::cli::help_banner()
+            crate::build_info::help_banner()
         );
     }
     let _cleanup = Cleanup(paths.clone());
@@ -1501,5 +1519,12 @@ mod tests {
         assert_eq!(host_err.code, crate::domain::ErrorCode::InvalidRequest);
         assert_eq!(shutdown_err.code, crate::domain::ErrorCode::InvalidRequest);
         assert_eq!(host_err.message, shutdown_err.message);
+    }
+
+    #[test]
+    fn protocol_hash_ignores_crlf_line_endings() {
+        let lf = b"syntax = \"proto3\";\npackage anticrumb.v1;\n";
+        let crlf = b"syntax = \"proto3\";\r\npackage anticrumb.v1;\r\n";
+        assert_eq!(protocol_for_schema(lf), protocol_for_schema(crlf));
     }
 }

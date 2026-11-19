@@ -306,7 +306,15 @@ pub fn execute_with_jobs(
         Action::Test => {
             run_checked(
                 &cargo,
-                &["test", "--locked", "--workspace", "--all-targets"],
+                &["test", "--locked", "-p", "anticrumb", "--all-targets"],
+                root,
+                extra_env,
+            )?;
+            // Avoid rebuilding target/debug/xtask(.exe) via --workspace feature
+            // unification or --bins while this process is executing from it on Windows.
+            run_checked(
+                &cargo,
+                &["test", "--locked", "-p", "xtask", "--lib", "--tests"],
                 root,
                 extra_env,
             )?;

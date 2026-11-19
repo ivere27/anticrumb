@@ -4,13 +4,14 @@ mod client;
 mod install;
 mod release;
 
+use crate::build_info::{self, BuildChannel};
 use crate::domain::{ErrorCode, Result, ServiceError};
 use fs2::FileExt;
 use semver::Version;
 use std::fs;
 
 pub(crate) use install::cleanup_old_executables;
-pub const TARGET: &str = env!("ANTICRUMB_BUILD_TARGET");
+pub const TARGET: &str = build_info::build_target();
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/ivere27/anticrumb/releases/latest";
 const NIGHTLY_RELEASE_URL: &str =
     "https://api.github.com/repos/ivere27/anticrumb/releases/tags/nightly";
@@ -85,27 +86,38 @@ enum UpdatePlan<'a> {
 fn plan_update<'a>(
     options: UpdateOptions,
     current: &Version,
+    current_channel: BuildChannel,
     current_commit: Option<&str>,
     release: &'a release::Release,
     target: &str,
 ) -> Result<UpdatePlan<'a>> {
+    let current_display = build_info::format_display_version(&current.to_string(), current_channel);
     match options.channel {
         UpdateChannel::Stable => {
             let (version, asset) = release.validate(target)?;
             let newer = version.cmp_precedence(current).is_gt();
             if !newer && !options.force {
-                return Ok(UpdatePlan::UpToDate(format!(
-                    "anticrumb {current} is up to date (published: {version})."
-                )));
+                let message = match current_channel {
+                    BuildChannel::Stable => format!(
+                        "anticrumb {current_display} is up to date (published: {version})."
+                    ),
+                    BuildChannel::Nightly => format!(
+                        "anticrumb {current_display} is on the nightly channel (latest stable: {version}). Run anticrumb update --nightly for nightly updates, or anticrumb update --force to switch to stable."
+                    ),
+                    BuildChannel::Dev => format!(
+                        "anticrumb {current_display} is a local/dev build (latest stable: {version}). Run anticrumb update --force to install stable."
+                    ),
+                };
+                return Ok(UpdatePlan::UpToDate(message));
             }
             if options.check {
                 let message = if newer {
                     format!(
-                        "Update available: anticrumb {current} → {version} ({target}). Run anticrumb update to install."
+                        "Update available: anticrumb {current_display} → {version} ({target}). Run anticrumb update to install."
                     )
                 } else {
                     format!(
-                        "Reinstall available (--force): anticrumb {current} → {version} ({target}). Run anticrumb update --force to install."
+                        "Reinstall available (--force): anticrumb {current_display} → {version} ({target}). Run anticrumb update --force to install."
                     )
                 };
                 return Ok(UpdatePlan::CheckAvailable(message));
@@ -113,7 +125,7 @@ fn plan_update<'a>(
             Ok(UpdatePlan::Install {
                 asset,
                 downloading_label: version.to_string(),
-                updated_from: current.to_string(),
+                updated_from: current_display,
                 updated_to: version.to_string(),
             })
         }
@@ -122,10 +134,10 @@ fn plan_update<'a>(
             let normalized_local = current_commit.and_then(release::normalize_hex_sha);
             let current_label = match current_commit {
                 Some(commit) => format!(
-                    "{current} ({})",
+                    "{current_display} ({})",
                     normalized_local.as_deref().unwrap_or(commit)
                 ),
-                None => current.to_string(),
+                None => current_display,
             };
             let target_label = match &nightly_commit {
                 Some(commit) => format!("nightly ({commit})"),
@@ -135,13 +147,14 @@ fn plan_update<'a>(
                 (normalized_local.as_deref(), nightly_commit.as_deref()),
                 (Some(local), Some(remote)) if local.eq_ignore_ascii_case(remote)
             );
-            if same_commit && !options.force {
+            let up_to_date = current_channel == BuildChannel::Nightly && same_commit;
+            if up_to_date && !options.force {
                 return Ok(UpdatePlan::UpToDate(format!(
                     "anticrumb {current_label} is up to date with {target_label}."
                 )));
             }
             if options.check {
-                let message = if !same_commit {
+                let message = if !up_to_date {
                     format!(
                         "Update available: anticrumb {current_label} → {target_label} ({target}). Run anticrumb update --nightly to install."
                     )
@@ -185,7 +198,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 "anticrumb update [--check] [--nightly] [--force]\n\
                  Install the latest verified release for this executable's build target.\n\
                  --check    check for updates without installing\n\
-                 --nightly  use the rolling nightly pre-release channel\n\
+                 --nightly  opt into the rolling nightly pre-release channel (default: stable)\n\
                  --force    install even if the published build matches the current version or commit\n\
                  Existing services keep running; restart them when their work is finished."
             );
@@ -199,12 +212,14 @@ pub fn run(args: &[String]) -> Result<()> {
         options.channel.metadata_url(),
         MAX_RELEASE_METADATA,
     )?)?;
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+    let current = Version::parse(build_info::package_version())
         .map_err(|_| failure("update", "current build has an invalid version"))?;
-    let current_commit = crate::cli::commit_head();
+    let current_channel = BuildChannel::current();
+    let current_commit = build_info::commit_head();
     let (asset, downloading_label, updated_from, updated_to) = match plan_update(
         options,
         &current,
+        current_channel,
         current_commit.as_deref(),
         &release,
         TARGET,
@@ -821,26 +836,66 @@ mod tests {
             ..nightly_opts
         };
 
-        // Matching commit (7-char, 40-char, or uppercase hex) -> up to date
+        // Matching commit on nightly channel (7-char, 40-char, or uppercase hex) -> up to date
         for matching in [
             "abcdef1",
             "ABCDEF1",
             "ABCDEF1234567890ABCDEF1234567890ABCDEF12",
             "abcdef1234567890abcdef1234567890abcdef12",
         ] {
-            match plan_update(nightly_opts, &current, Some(matching), &nightly, LINUX).unwrap() {
+            match plan_update(
+                nightly_opts,
+                &current,
+                BuildChannel::Nightly,
+                Some(matching),
+                &nightly,
+                LINUX,
+            )
+            .unwrap()
+            {
                 UpdatePlan::UpToDate(msg) => {
-                    assert!(msg.contains("0.8.3 (abcdef1)"), "{msg}");
+                    assert!(msg.contains("0.8.3-nightly (abcdef1)"), "{msg}");
                     assert!(msg.contains("up to date with nightly (abcdef1)"), "{msg}");
                 }
                 other => panic!("expected UpToDate for {matching}, got {other:?}"),
             }
         }
 
+        // Local dev build on same commit -> switches to official GitHub-built nightly
+        match plan_update(
+            nightly_opts,
+            &current,
+            BuildChannel::Dev,
+            Some("abcdef1"),
+            &nightly,
+            LINUX,
+        )
+        .unwrap()
+        {
+            UpdatePlan::Install {
+                updated_from,
+                updated_to,
+                ..
+            } => {
+                assert_eq!(updated_from, "0.8.3-dev (abcdef1)");
+                assert_eq!(updated_to, "nightly (abcdef1)");
+            }
+            other => panic!("expected Install for dev -> nightly switch, got {other:?}"),
+        }
+
         // Different commit -> update available / install
-        match plan_update(nightly_check, &current, Some("3d9d844"), &nightly, LINUX).unwrap() {
+        match plan_update(
+            nightly_check,
+            &current,
+            BuildChannel::Nightly,
+            Some("3d9d844"),
+            &nightly,
+            LINUX,
+        )
+        .unwrap()
+        {
             UpdatePlan::CheckAvailable(msg) => {
-                assert!(msg.contains("0.8.3 (3d9d844) → nightly (abcdef1)"));
+                assert!(msg.contains("0.8.3-nightly (3d9d844) → nightly (abcdef1)"));
                 assert!(msg.contains("anticrumb update --nightly"));
             }
             other => panic!("expected CheckAvailable, got {other:?}"),
@@ -848,9 +903,23 @@ mod tests {
 
         // Dirty local build or missing commit -> updates to clean nightly
         for commit in [Some("abcdef1-dirty"), None] {
-            match plan_update(nightly_opts, &current, commit, &nightly, LINUX).unwrap() {
-                UpdatePlan::Install { updated_to, .. } => {
-                    assert_eq!(updated_to, "nightly (abcdef1)")
+            match plan_update(
+                nightly_opts,
+                &current,
+                BuildChannel::Dev,
+                commit,
+                &nightly,
+                LINUX,
+            )
+            .unwrap()
+            {
+                UpdatePlan::Install {
+                    updated_from,
+                    updated_to,
+                    ..
+                } => {
+                    assert!(updated_from.starts_with("0.8.3-dev"));
+                    assert_eq!(updated_to, "nightly (abcdef1)");
                 }
                 other => panic!("expected Install, got {other:?}"),
             }
@@ -862,19 +931,52 @@ mod tests {
             ..nightly_opts
         };
         assert!(matches!(
-            plan_update(forced_nightly, &current, Some("abcdef1"), &nightly, LINUX).unwrap(),
+            plan_update(
+                forced_nightly,
+                &current,
+                BuildChannel::Nightly,
+                Some("abcdef1"),
+                &nightly,
+                LINUX,
+            )
+            .unwrap(),
             UpdatePlan::Install { .. }
         ));
 
-        // Forced stable on same version -> reinstalls (e.g. reverting from nightly to stable)
+        // Stable update on nightly/dev does not downgrade on matching base version without --force
         let stable = release("0.8.3", LINUX);
         let stable_opts = UpdateOptions {
             check: false,
             channel: UpdateChannel::Stable,
             force: false,
         };
+        match plan_update(
+            stable_opts,
+            &current,
+            BuildChannel::Nightly,
+            Some("9999999"),
+            &stable,
+            LINUX,
+        )
+        .unwrap()
+        {
+            UpdatePlan::UpToDate(msg) => {
+                assert!(msg.contains("0.8.3-nightly"), "{msg}");
+                assert!(msg.contains("--nightly"), "{msg}");
+                assert!(msg.contains("--force"), "{msg}");
+            }
+            other => panic!("expected UpToDate hint for nightly -> stable, got {other:?}"),
+        }
         assert!(matches!(
-            plan_update(stable_opts, &current, Some("9999999"), &stable, LINUX).unwrap(),
+            plan_update(
+                stable_opts,
+                &current,
+                BuildChannel::Stable,
+                Some("9999999"),
+                &stable,
+                LINUX,
+            )
+            .unwrap(),
             UpdatePlan::UpToDate(_)
         ));
         let forced_stable = UpdateOptions {
@@ -882,7 +984,15 @@ mod tests {
             ..stable_opts
         };
         assert!(matches!(
-            plan_update(forced_stable, &current, Some("9999999"), &stable, LINUX).unwrap(),
+            plan_update(
+                forced_stable,
+                &current,
+                BuildChannel::Nightly,
+                Some("9999999"),
+                &stable,
+                LINUX,
+            )
+            .unwrap(),
             UpdatePlan::Install { .. }
         ));
     }

@@ -10,7 +10,10 @@ use crate::{
     store::Store,
 };
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 pub const DEFAULT_MODEL_ID: &str = "gemini-web-default";
 
@@ -865,9 +868,13 @@ fn capture_media(store: &Store, tab: &mut GeminiTab, account: &str) -> Result<Ve
         } else {
             "image/webp"
         };
+        let name = Path::new(&path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         artifacts.push(
             store
-                .artifact(account, &path, mime, &bytes, "generated")?
+                .artifact(account, &name, mime, &bytes, "generated")?
                 .id,
         );
     }

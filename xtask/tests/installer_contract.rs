@@ -1,11 +1,12 @@
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
 
 const VERSION: &str = "0.1.0";
 const BINARY: &[u8] = b"downloaded binary fixture; this must never be executed\n";
@@ -44,9 +45,58 @@ fn release_for(name: &str, data: &[u8]) -> Value {
     release_for_tag(&format!("v{VERSION}"), false, name, data)
 }
 
+fn write_windows_fixture_zip(archive: &Path, target: &str, symlink: bool) {
+    let file = File::create(archive).unwrap();
+    let mut writer = ZipWriter::new(file);
+    let entry_name = format!("anticrumb-{target}/anticrumb.exe");
+    if symlink {
+        // ZipWriter::start_file strips upper file-type bits and forces S_IFREG;
+        // add_symlink writes S_IFLNK (0o120000) into external attributes.
+        writer
+            .add_symlink(entry_name, "../../outside", SimpleFileOptions::default())
+            .unwrap();
+    } else {
+        writer
+            .start_file(
+                entry_name,
+                SimpleFileOptions::default().unix_permissions(0o100755),
+            )
+            .unwrap();
+        writer.write_all(BINARY).unwrap();
+    }
+    writer
+        .start_file("../../outside", SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(b"evil").unwrap();
+    writer.finish().unwrap();
+}
+
+#[test]
+fn windows_zip_fixture_encodes_regular_and_symlink_entries() {
+    let root = TempDir::new().unwrap();
+    let target = "x86_64-pc-windows-msvc";
+    let expected_name = format!("anticrumb-{target}/anticrumb.exe");
+
+    let regular = root.path().join("regular.zip");
+    write_windows_fixture_zip(&regular, target, false);
+    let mut regular_archive = zip::ZipArchive::new(File::open(&regular).unwrap()).unwrap();
+    let regular_entry = regular_archive.by_name(&expected_name).unwrap();
+    assert!(!regular_entry.is_symlink());
+    assert_eq!(regular_entry.unix_mode(), Some(0o100755));
+
+    let symlink = root.path().join("symlink.zip");
+    write_windows_fixture_zip(&symlink, target, true);
+    let mut symlink_archive = zip::ZipArchive::new(File::open(&symlink).unwrap()).unwrap();
+    let symlink_entry = symlink_archive.by_name(&expected_name).unwrap();
+    assert!(symlink_entry.is_symlink());
+    assert_eq!(symlink_entry.unix_mode(), Some(0o120777));
+}
+
 #[cfg(unix)]
 mod posix_shell_installer {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::os::unix::fs::PermissionsExt;
 
     struct ShellFixture {
@@ -617,10 +667,6 @@ esac
 #[cfg(windows)]
 mod powershell_installer {
     use super::*;
-    use std::io::Write;
-    use std::path::Path;
-    use zip::write::SimpleFileOptions;
-    use zip::ZipWriter;
 
     fn has_pwsh() -> bool {
         Command::new("pwsh")
@@ -642,23 +688,7 @@ mod powershell_installer {
         mutate: Option<&dyn Fn(&mut Value)>,
     ) -> Output {
         let archive = root.path().join("package.zip");
-        {
-            let file = File::create(&archive).unwrap();
-            let mut writer = ZipWriter::new(file);
-            let mode = if symlink { 0o120777 } else { 0o100755 };
-            writer
-                .start_file(
-                    format!("anticrumb-{target}/anticrumb.exe"),
-                    SimpleFileOptions::default().unix_permissions(mode),
-                )
-                .unwrap();
-            writer.write_all(BINARY).unwrap();
-            writer
-                .start_file("../../outside", SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(b"evil").unwrap();
-            writer.finish().unwrap();
-        }
+        write_windows_fixture_zip(&archive, target, symlink);
         let archive_bytes = fs::read(&archive).unwrap();
         let mut release = if version == Some("nightly") {
             release_for_tag(
