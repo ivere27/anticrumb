@@ -77,10 +77,27 @@ enum UpdatePlan<'a> {
     CheckAvailable(String),
     Install {
         asset: &'a release::Asset,
+        asset_target: String,
         downloading_label: String,
         updated_from: String,
         updated_to: String,
     },
+}
+
+fn format_target_label(target: &str, asset_target: &str) -> String {
+    if asset_target == target {
+        asset_target.to_owned()
+    } else {
+        format!("{asset_target}, fallback from {target}")
+    }
+}
+
+fn format_download_target(target: &str, asset_target: &str) -> String {
+    if asset_target == target {
+        asset_target.to_owned()
+    } else {
+        format!("{asset_target} (fallback from {target})")
+    }
 }
 
 fn plan_update<'a>(
@@ -94,7 +111,8 @@ fn plan_update<'a>(
     let current_display = build_info::format_display_version(&current.to_string(), current_channel);
     match options.channel {
         UpdateChannel::Stable => {
-            let (version, asset) = release.validate(target)?;
+            let (version, asset_target, asset) = release.validate_with_target(target)?;
+            let platform_label = format_target_label(target, &asset_target);
             let newer = version.cmp_precedence(current).is_gt();
             if !newer && !options.force {
                 let message = match current_channel {
@@ -113,24 +131,27 @@ fn plan_update<'a>(
             if options.check {
                 let message = if newer {
                     format!(
-                        "Update available: anticrumb {current_display} → {version} ({target}). Run anticrumb update to install."
+                        "Update available: anticrumb {current_display} → {version} ({platform_label}). Run anticrumb update to install."
                     )
                 } else {
                     format!(
-                        "Reinstall available (--force): anticrumb {current_display} → {version} ({target}). Run anticrumb update --force to install."
+                        "Reinstall available (--force): anticrumb {current_display} → {version} ({platform_label}). Run anticrumb update --force to install."
                     )
                 };
                 return Ok(UpdatePlan::CheckAvailable(message));
             }
             Ok(UpdatePlan::Install {
                 asset,
+                asset_target,
                 downloading_label: version.to_string(),
                 updated_from: current_display,
                 updated_to: version.to_string(),
             })
         }
         UpdateChannel::Nightly => {
-            let (nightly_commit, asset) = release.validate_nightly(target)?;
+            let (nightly_commit, asset_target, asset) =
+                release.validate_nightly_with_target(target)?;
+            let platform_label = format_target_label(target, &asset_target);
             let normalized_local = current_commit.and_then(release::normalize_hex_sha);
             let current_label = match current_commit {
                 Some(commit) => format!(
@@ -156,17 +177,18 @@ fn plan_update<'a>(
             if options.check {
                 let message = if !up_to_date {
                     format!(
-                        "Update available: anticrumb {current_label} → {target_label} ({target}). Run anticrumb update --nightly to install."
+                        "Update available: anticrumb {current_label} → {target_label} ({platform_label}). Run anticrumb update --nightly to install."
                     )
                 } else {
                     format!(
-                        "Reinstall available (--force): anticrumb {current_label} → {target_label} ({target}). Run anticrumb update --nightly --force to install."
+                        "Reinstall available (--force): anticrumb {current_label} → {target_label} ({platform_label}). Run anticrumb update --nightly --force to install."
                     )
                 };
                 return Ok(UpdatePlan::CheckAvailable(message));
             }
             Ok(UpdatePlan::Install {
                 asset,
+                asset_target,
                 downloading_label: target_label.clone(),
                 updated_from: current_label,
                 updated_to: target_label,
@@ -216,7 +238,7 @@ pub fn run(args: &[String]) -> Result<()> {
         .map_err(|_| failure("update", "current build has an invalid version"))?;
     let current_channel = BuildChannel::current();
     let current_commit = build_info::commit_head();
-    let (asset, downloading_label, updated_from, updated_to) = match plan_update(
+    let (asset, asset_target, downloading_label, updated_from, updated_to) = match plan_update(
         options,
         &current,
         current_channel,
@@ -230,10 +252,17 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         UpdatePlan::Install {
             asset,
+            asset_target,
             downloading_label,
             updated_from,
             updated_to,
-        } => (asset, downloading_label, updated_from, updated_to),
+        } => (
+            asset,
+            asset_target,
+            downloading_label,
+            updated_from,
+            updated_to,
+        ),
     };
     let executable =
         std::env::current_exe().map_err(|error| io_failure("update_install", error))?;
@@ -259,16 +288,22 @@ pub fn run(args: &[String]) -> Result<()> {
         )
     })?;
     let stage = install::Stage::create(parent)?;
-    eprintln!("Downloading anticrumb {downloading_label} for {TARGET}…");
+    let download_target = format_download_target(TARGET, &asset_target);
+    eprintln!("Downloading anticrumb {downloading_label} for {download_target}…");
     let bytes = client::fetch(&client, &asset.browser_download_url, asset.size)?;
     archive::verify_archive(&bytes, asset)?;
-    archive::extract_archive(&bytes, TARGET, &stage.0)?;
+    archive::extract_archive(&bytes, &asset_target, &stage.0)?;
     let retained = install::install_with(
-        &stage.0.join(executable_name(TARGET)),
+        &stage.0.join(executable_name(&asset_target)),
         &executable,
         install::replace_file,
     )?;
-    println!("Updated anticrumb {updated_from} → {updated_to}.");
+    let fallback_note = if asset_target == TARGET {
+        String::new()
+    } else {
+        format!(" ({})", format_target_label(TARGET, &asset_target))
+    };
+    println!("Updated anticrumb {updated_from} → {updated_to}{fallback_note}.");
     println!("Existing workspace and daemon services keep their current version. Finish active work, then restart them to use the update.");
     for backup in retained {
         println!(
@@ -291,6 +326,7 @@ mod tests {
 
     const LINUX: &str = "x86_64-unknown-linux-gnu";
     const WINDOWS: &str = "x86_64-pc-windows-msvc";
+    const WINDOWS_GNU: &str = "x86_64-pc-windows-gnu";
 
     fn release_value(version: &str, target: &str) -> serde_json::Value {
         let suffix = if target.contains("windows") {
@@ -1007,5 +1043,210 @@ mod tests {
         );
         assert!(err.message.contains("No public nightly anticrumb release"));
         assert!(err.message.contains("HTTP 404"));
+    }
+
+    #[test]
+    fn windows_x64_targets_fall_back_across_gnu_and_msvc_when_exact_asset_is_absent() {
+        let msvc_only = release("0.8.4", WINDOWS);
+        let (version, asset_target, asset) = msvc_only.validate_with_target(WINDOWS_GNU).unwrap();
+        assert_eq!(version.to_string(), "0.8.4");
+        assert_eq!(asset_target, WINDOWS);
+        assert_eq!(
+            asset.browser_download_url,
+            format!(
+                "https://github.com/{REPOSITORY}/releases/download/v0.8.4/anticrumb-{WINDOWS}.zip"
+            )
+        );
+
+        let stable_opts = UpdateOptions {
+            check: false,
+            channel: UpdateChannel::Stable,
+            force: false,
+        };
+        let current = Version::parse("0.8.3").unwrap();
+        match plan_update(
+            stable_opts,
+            &current,
+            BuildChannel::Stable,
+            None,
+            &msvc_only,
+            WINDOWS_GNU,
+        )
+        .unwrap()
+        {
+            UpdatePlan::Install { asset_target, .. } => assert_eq!(asset_target, WINDOWS),
+            other => panic!("expected Install, got {other:?}"),
+        }
+
+        let stable_check = UpdateOptions {
+            check: true,
+            ..stable_opts
+        };
+        match plan_update(
+            stable_check,
+            &current,
+            BuildChannel::Stable,
+            None,
+            &msvc_only,
+            WINDOWS_GNU,
+        )
+        .unwrap()
+        {
+            UpdatePlan::CheckAvailable(msg) => {
+                assert!(
+                    msg.contains("0.8.3 → 0.8.4 (x86_64-pc-windows-msvc, fallback from x86_64-pc-windows-gnu)"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected CheckAvailable, got {other:?}"),
+        }
+
+        // Exact target match omits fallback annotation.
+        match plan_update(
+            stable_check,
+            &current,
+            BuildChannel::Stable,
+            None,
+            &msvc_only,
+            WINDOWS,
+        )
+        .unwrap()
+        {
+            UpdatePlan::CheckAvailable(msg) => {
+                assert!(
+                    msg.contains("0.8.3 → 0.8.4 (x86_64-pc-windows-msvc)"),
+                    "{msg}"
+                );
+                assert!(!msg.contains("fallback from"), "{msg}");
+            }
+            other => panic!("expected exact-match CheckAvailable, got {other:?}"),
+        }
+
+        assert_eq!(
+            format_target_label(WINDOWS, WINDOWS),
+            "x86_64-pc-windows-msvc"
+        );
+        assert_eq!(
+            format_target_label(WINDOWS_GNU, WINDOWS),
+            "x86_64-pc-windows-msvc, fallback from x86_64-pc-windows-gnu"
+        );
+        assert_eq!(
+            format_download_target(WINDOWS, WINDOWS),
+            "x86_64-pc-windows-msvc"
+        );
+        assert_eq!(
+            format_download_target(WINDOWS_GNU, WINDOWS),
+            "x86_64-pc-windows-msvc (fallback from x86_64-pc-windows-gnu)"
+        );
+
+        let nightly_msvc_only = parse_release(
+            &serde_json::to_vec(&nightly_release_value(
+                "abcdef1234567890abcdef1234567890abcdef12",
+                WINDOWS,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let (commit, nightly_target, _) = nightly_msvc_only
+            .validate_nightly_with_target(WINDOWS_GNU)
+            .unwrap();
+        assert_eq!(commit.as_deref(), Some("abcdef1"));
+        assert_eq!(nightly_target, WINDOWS);
+        match plan_update(
+            UpdateOptions {
+                check: true,
+                channel: UpdateChannel::Nightly,
+                force: false,
+            },
+            &current,
+            BuildChannel::Stable,
+            None,
+            &nightly_msvc_only,
+            WINDOWS_GNU,
+        )
+        .unwrap()
+        {
+            UpdatePlan::CheckAvailable(msg) => {
+                assert!(
+                    msg.contains("→ nightly (abcdef1) (x86_64-pc-windows-msvc, fallback from x86_64-pc-windows-gnu)"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected nightly CheckAvailable, got {other:?}"),
+        }
+        match plan_update(
+            UpdateOptions {
+                check: false,
+                channel: UpdateChannel::Nightly,
+                force: false,
+            },
+            &current,
+            BuildChannel::Stable,
+            None,
+            &nightly_msvc_only,
+            WINDOWS_GNU,
+        )
+        .unwrap()
+        {
+            UpdatePlan::Install { asset_target, .. } => assert_eq!(asset_target, WINDOWS),
+            other => panic!("expected nightly Install, got {other:?}"),
+        }
+
+        let gnu_only = release("0.8.4", WINDOWS_GNU);
+        let (_, reverse_target, _) = gnu_only.validate_with_target(WINDOWS).unwrap();
+        assert_eq!(reverse_target, WINDOWS_GNU);
+
+        // Selecting the fallback target keeps extract_archive aligned with the zip root directory.
+        let mut builder = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        builder
+            .start_file(
+                format!("anticrumb-{asset_target}/anticrumb.exe"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        builder.write_all(b"new windows binary").unwrap();
+        let zip_bytes = builder.finish().unwrap().into_inner();
+        let extracted = tempfile::tempdir().unwrap();
+        extract_archive(&zip_bytes, &asset_target, extracted.path()).unwrap();
+        assert_eq!(
+            fs::read(extracted.path().join(executable_name(&asset_target))).unwrap(),
+            b"new windows binary"
+        );
+        let wrong_dir = tempfile::tempdir().unwrap();
+        assert!(extract_archive(&zip_bytes, WINDOWS_GNU, wrong_dir.path()).is_err());
+    }
+
+    #[test]
+    fn windows_x64_fallback_prefers_exact_target_and_rejects_corrupt_primary_or_unrelated_targets()
+    {
+        let mut dual = release_value("0.8.4", WINDOWS);
+        let gnu_asset = release_value("0.8.4", WINDOWS_GNU)["assets"][0].clone();
+        dual["assets"].as_array_mut().unwrap().push(gnu_asset);
+        dual["assets"][1]["digest"] = serde_json::json!(format!("sha256:{}", digest(b"gnu")));
+        let dual_release = parse_release(&serde_json::to_vec(&dual).unwrap()).unwrap();
+
+        let (_, picked_gnu, asset_gnu) = dual_release.validate_with_target(WINDOWS_GNU).unwrap();
+        assert_eq!(picked_gnu, WINDOWS_GNU);
+        assert_eq!(asset_gnu.sha256().unwrap(), digest(b"gnu"));
+
+        let (_, picked_msvc, asset_msvc) = dual_release.validate_with_target(WINDOWS).unwrap();
+        assert_eq!(picked_msvc, WINDOWS);
+        assert_eq!(asset_msvc.sha256().unwrap(), digest(b"abc"));
+
+        // Corrupt/tampered exact asset must fail rather than falling back to the alternate Windows build.
+        let mut corrupt_primary = dual.clone();
+        corrupt_primary["assets"][1]["state"] = serde_json::json!("starter");
+        let parsed_corrupt = parse_release(&serde_json::to_vec(&corrupt_primary).unwrap()).unwrap();
+        assert!(parsed_corrupt.validate_with_target(WINDOWS_GNU).is_err());
+
+        // Non-matching or non-Windows targets must never cross-fallback.
+        let linux_only = release("0.8.4", LINUX);
+        let missing_err = linux_only.validate_with_target(WINDOWS_GNU).unwrap_err();
+        assert!(missing_err
+            .message
+            .contains("no published release asset for build target x86_64-pc-windows-gnu"));
+        assert!(linux_only
+            .validate_with_target("aarch64-unknown-linux-gnu")
+            .is_err());
     }
 }

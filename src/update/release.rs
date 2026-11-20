@@ -38,6 +38,23 @@ pub(super) fn normalize_hex_sha(raw: &str) -> Option<String> {
     Some(trimmed[..7].to_ascii_lowercase())
 }
 
+fn windows_x64_fallback(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-pc-windows-gnu" => Some("x86_64-pc-windows-msvc"),
+        "x86_64-pc-windows-msvc" => Some("x86_64-pc-windows-gnu"),
+        _ => None,
+    }
+}
+
+fn asset_filename(target: &str) -> String {
+    let suffix = if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("anticrumb-{target}.{suffix}")
+}
+
 impl Release {
     fn extract_nightly_commit(&self) -> Option<String> {
         if let Some(sha) = self.target_commitish.as_deref().and_then(normalize_hex_sha) {
@@ -55,13 +72,8 @@ impl Release {
         None
     }
 
-    fn validate_asset(&self, target: &str) -> Result<&Asset> {
-        let suffix = if target.contains("windows") {
-            "zip"
-        } else {
-            "tar.gz"
-        };
-        let name = format!("anticrumb-{target}.{suffix}");
+    fn validate_exact_asset(&self, target: &str) -> Result<&Asset> {
+        let name = asset_filename(target);
         let mut matching = self.assets.iter().filter(|asset| asset.name == name);
         let asset = matching.next().ok_or_else(|| {
             failure(
@@ -95,7 +107,28 @@ impl Release {
         Ok(asset)
     }
 
-    pub(super) fn validate(&self, target: &str) -> Result<(Version, &Asset)> {
+    fn validate_asset(&self, target: &str) -> Result<(String, &Asset)> {
+        let primary_name = asset_filename(target);
+        if self.assets.iter().any(|asset| asset.name == primary_name) {
+            return self
+                .validate_exact_asset(target)
+                .map(|asset| (target.to_owned(), asset));
+        }
+        if let Some(fallback) = windows_x64_fallback(target) {
+            let fallback_name = asset_filename(fallback);
+            if self.assets.iter().any(|asset| asset.name == fallback_name) {
+                return self
+                    .validate_exact_asset(fallback)
+                    .map(|asset| (fallback.to_owned(), asset));
+            }
+        }
+        Err(failure(
+            "update_release",
+            format!("no published release asset for build target {target}"),
+        ))
+    }
+
+    pub(super) fn validate_with_target(&self, target: &str) -> Result<(Version, String, &Asset)> {
         let version = self
             .tag_name
             .strip_prefix('v')
@@ -117,11 +150,20 @@ impl Release {
                 "latest release must be published and stable without prerelease or build metadata",
             ));
         }
-        let asset = self.validate_asset(target)?;
+        let (asset_target, asset) = self.validate_asset(target)?;
+        Ok((version, asset_target, asset))
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate(&self, target: &str) -> Result<(Version, &Asset)> {
+        let (version, _, asset) = self.validate_with_target(target)?;
         Ok((version, asset))
     }
 
-    pub(super) fn validate_nightly(&self, target: &str) -> Result<(Option<String>, &Asset)> {
+    pub(super) fn validate_nightly_with_target(
+        &self,
+        target: &str,
+    ) -> Result<(Option<String>, String, &Asset)> {
         if self.tag_name != "nightly" {
             return Err(failure(
                 "update_release",
@@ -134,8 +176,14 @@ impl Release {
                 "nightly release must be a published prerelease",
             ));
         }
-        let asset = self.validate_asset(target)?;
-        Ok((self.extract_nightly_commit(), asset))
+        let (asset_target, asset) = self.validate_asset(target)?;
+        Ok((self.extract_nightly_commit(), asset_target, asset))
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_nightly(&self, target: &str) -> Result<(Option<String>, &Asset)> {
+        let (commit, _, asset) = self.validate_nightly_with_target(target)?;
+        Ok((commit, asset))
     }
 }
 

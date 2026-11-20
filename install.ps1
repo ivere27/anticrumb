@@ -73,8 +73,18 @@
         $archive = Join-Path $scratch 'package.zip'
         Write-Host "Downloading anticrumb $version for $target..."
         Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $archive
-        if ((Get-Item -LiteralPath $archive).Length -ne $asset.size -or
-            (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $expectedDigest) {
+        if ((Get-Item -LiteralPath $archive).Length -ne $asset.size) {
+            throw 'Package size or SHA-256 mismatch; nothing was installed.'
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $stream = [IO.File]::OpenRead($archive)
+            try {
+                $hashBytes = $sha256.ComputeHash($stream)
+                $actualDigest = [BitConverter]::ToString($hashBytes).Replace('-', '')
+            } finally { $stream.Dispose() }
+        } finally { $sha256.Dispose() }
+        if ($actualDigest -ine $expectedDigest) {
             throw 'Package size or SHA-256 mismatch; nothing was installed.'
         }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -104,7 +114,7 @@
         $zip = $null
         foreach ($file in $stagedFiles) {
             if (Test-Path -LiteralPath $file.Destination) {
-                [IO.File]::Replace($file.Source, $file.Destination, $null)
+                [IO.File]::Replace($file.Source, $file.Destination, [NullString]::Value)
             } else { [IO.File]::Move($file.Source, $file.Destination) }
         }
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
