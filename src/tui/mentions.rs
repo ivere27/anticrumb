@@ -117,33 +117,71 @@ impl MentionPopup {
             .map(|p| {
                 p.matches
                     .iter()
-                    .filter(|m| {
+                    .filter_map(|m| {
                         if let (Some(raw_git), Some(low_git)) =
                             (git_prefix, git_prefix_lower.as_deref())
                         {
-                            return match m.kind {
-                                MentionKind::Git => match m.display.as_str() {
-                                    "git:diff" => "diff".starts_with(low_git),
-                                    "git:staged" => "staged".starts_with(low_git),
-                                    _ => {
-                                        let sha =
-                                            m.display.strip_prefix("git:").unwrap_or(&m.display);
-                                        sha.to_ascii_lowercase().starts_with(low_git)
-                                            || (!m.detail.is_empty()
-                                                && fuzzy_score(raw_git, &m.detail).is_some())
+                            if m.kind != MentionKind::Git {
+                                return None;
+                            }
+                            let has_plus = low_git.ends_with('+');
+                            let query_core = low_git.strip_suffix('+').unwrap_or(low_git);
+                            let raw_query_core = raw_git.strip_suffix('+').unwrap_or(raw_git);
+                            match m.display.as_str() {
+                                "git:diff" | "git:diff+" | "git:staged" | "git:staged+" => {
+                                    let suffix = m.display.strip_prefix("git:").unwrap();
+                                    let matches = if has_plus && query_core.is_empty() {
+                                        suffix.ends_with('+')
+                                    } else {
+                                        suffix.starts_with(low_git)
+                                    };
+                                    if matches {
+                                        Some(m.clone())
+                                    } else {
+                                        None
                                     }
-                                },
-                                _ => false,
-                            };
+                                }
+                                _ => {
+                                    let sha = m.display.strip_prefix("git:").unwrap_or(&m.display);
+                                    let sha_core = sha.strip_suffix('+').unwrap_or(sha);
+                                    let matches = if query_core.is_empty() {
+                                        true
+                                    } else {
+                                        sha_core.to_ascii_lowercase().starts_with(query_core)
+                                            || (!m.detail.is_empty()
+                                                && fuzzy_score(raw_query_core, &m.detail).is_some())
+                                    };
+                                    if matches {
+                                        let mut updated = m.clone();
+                                        updated.display = if has_plus {
+                                            format!("git:{sha_core}+")
+                                        } else {
+                                            format!("git:{sha_core}")
+                                        };
+                                        Some(updated)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        } else {
+                            if m.kind == MentionKind::Git
+                                && !matches!(
+                                    m.display.as_str(),
+                                    "git:diff" | "git:diff+" | "git:staged" | "git:staged+"
+                                )
+                            {
+                                return None;
+                            }
+                            if parsed.query.is_empty()
+                                || fuzzy_score(&parsed.query, &m.display).is_some()
+                            {
+                                Some(m.clone())
+                            } else {
+                                None
+                            }
                         }
-                        if m.kind == MentionKind::Git
-                            && !matches!(m.display.as_str(), "git:diff" | "git:staged")
-                        {
-                            return false;
-                        }
-                        parsed.query.is_empty() || fuzzy_score(&parsed.query, &m.display).is_some()
                     })
-                    .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -454,15 +492,33 @@ pub(super) fn search_mentions(
     let mut results: Vec<MentionMatch> = Vec::new();
 
     if let Some(git_prefix) = query.strip_prefix("git:") {
+        let (prefix_core, has_plus) = if let Some(p) = git_prefix.strip_suffix('+') {
+            (p, true)
+        } else {
+            (git_prefix, false)
+        };
         let git_prefix_lower = git_prefix.to_ascii_lowercase();
+        let prefix_core_lower = prefix_core.to_ascii_lowercase();
         for (idx, (name, suffix, desc)) in [
             ("git:diff", "diff", "Unstaged git diff"),
+            (
+                "git:diff+",
+                "diff+",
+                "Unstaged git diff with tree-sitter AST context",
+            ),
             ("git:staged", "staged", "Staged git diff"),
+            (
+                "git:staged+",
+                "staged+",
+                "Staged git diff with tree-sitter AST context",
+            ),
         ]
         .into_iter()
         .enumerate()
         {
-            if suffix.starts_with(&git_prefix_lower) {
+            if suffix.starts_with(&git_prefix_lower)
+                || (has_plus && prefix_core.is_empty() && suffix.ends_with('+'))
+            {
                 results.push(MentionMatch {
                     display: name.to_owned(),
                     kind: MentionKind::Git,
@@ -476,24 +532,29 @@ pub(super) fn search_mentions(
         if is_cancelled() {
             return None;
         }
-        let is_hex =
-            !git_prefix_lower.is_empty() && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex = !prefix_core_lower.is_empty()
+            && prefix_core_lower.chars().all(|c| c.is_ascii_hexdigit());
         let mut matched_recent_sha = false;
         for (idx, (sha, subject)) in commits.into_iter().enumerate() {
-            let score = if git_prefix_lower.is_empty()
-                || (is_hex && sha.to_ascii_lowercase().starts_with(&git_prefix_lower))
+            let score = if prefix_core_lower.is_empty()
+                || (is_hex && sha.to_ascii_lowercase().starts_with(&prefix_core_lower))
             {
                 matched_recent_sha = true;
                 Some(100_000 - idx as i64)
-            } else if !git_prefix.is_empty() && !subject.is_empty() {
-                fuzzy_score(git_prefix, &subject)
+            } else if !prefix_core.is_empty() && !subject.is_empty() {
+                fuzzy_score(prefix_core, &subject)
                     .map(|subj_score| 1_200 + subj_score.clamp(-400, 500) - idx as i64)
             } else {
                 None
             };
             if let Some(score) = score {
+                let display = if has_plus {
+                    format!("git:{sha}+")
+                } else {
+                    format!("git:{sha}")
+                };
                 results.push(MentionMatch {
-                    display: format!("git:{sha}"),
+                    display,
                     kind: MentionKind::Git,
                     detail: subject,
                     score,
@@ -502,8 +563,12 @@ pub(super) fn search_mentions(
         }
 
         if is_hex && !matched_recent_sha {
-            if let Some((old_sha, old_subject)) = resolve_git_commit_entry(workspace, git_prefix) {
-                let display = format!("git:{old_sha}");
+            if let Some((old_sha, old_subject)) = resolve_git_commit_entry(workspace, prefix_core) {
+                let display = if has_plus {
+                    format!("git:{old_sha}+")
+                } else {
+                    format!("git:{old_sha}")
+                };
                 if !results.iter().any(|m| m.display == display) {
                     results.push(MentionMatch {
                         display,
@@ -529,7 +594,15 @@ pub(super) fn search_mentions(
     if !query.starts_with("~/") {
         for (name, desc) in [
             ("git:diff", "Unstaged git diff"),
+            (
+                "git:diff+",
+                "Unstaged git diff with tree-sitter AST context",
+            ),
             ("git:staged", "Staged git diff"),
+            (
+                "git:staged+",
+                "Staged git diff with tree-sitter AST context",
+            ),
         ] {
             if let Some(score) = fuzzy_score(query, name) {
                 results.push(MentionMatch {
@@ -937,19 +1010,28 @@ mod tests {
             displays,
             vec![
                 "git:diff",
+                "git:diff+",
                 "git:staged",
+                "git:staged+",
                 &format!("git:{sha2}"),
                 &format!("git:{sha1}"),
             ]
         );
-        assert_eq!(matches[2].kind, MentionKind::Git);
-        assert_eq!(matches[2].detail, "second commit subject");
-        assert_eq!(matches[3].detail, "first commit subject");
+        assert_eq!(matches[4].kind, MentionKind::Git);
+        assert_eq!(matches[4].detail, "second commit subject");
+        assert_eq!(matches[5].detail, "first commit subject");
 
         // Prefix filtering on commit hash preserves matches.
         let prefix = format!("git:{}", &sha1[..3]);
         let (filtered, _) = search_mentions(&root, &prefix, None, 1).unwrap();
         assert!(filtered.iter().any(|m| m.display == format!("git:{sha1}")));
+
+        // Filtering with trailing + preserves commit matches with + in display.
+        let plus_prefix = format!("git:{}+", &sha1[..3]);
+        let (plus_filtered, _) = search_mentions(&root, &plus_prefix, None, 1).unwrap();
+        assert!(plus_filtered
+            .iter()
+            .any(|m| m.display == format!("git:{sha1}+")));
 
         // Hex digits like a/e/f must not falsely float git:diff or git:staged above commits;
         // 'd' matches git:diff by prefix only (not git:staged).
@@ -957,15 +1039,17 @@ mod tests {
             let (hex_matches, _) =
                 search_mentions(&root, &format!("git:{hex_ch}"), None, 1).unwrap();
             assert!(
-                !hex_matches
-                    .iter()
-                    .any(|m| matches!(m.display.as_str(), "git:diff" | "git:staged")),
+                !hex_matches.iter().any(|m| matches!(
+                    m.display.as_str(),
+                    "git:diff" | "git:diff+" | "git:staged" | "git:staged+"
+                )),
                 "git:{hex_ch} should not include git:diff or git:staged, got {:?}",
                 hex_matches.iter().map(|m| &m.display).collect::<Vec<_>>()
             );
         }
         let (d_matches, _) = search_mentions(&root, "git:d", None, 1).unwrap();
         assert!(d_matches.iter().any(|m| m.display == "git:diff"));
+        assert!(d_matches.iter().any(|m| m.display == "git:diff+"));
         assert!(!d_matches.iter().any(|m| m.display == "git:staged"));
 
         // Subject search finds commits by commit message, while SHA prefix matches rank higher.
@@ -985,7 +1069,7 @@ mod tests {
             None,
         );
         let mut popup_base = popup_base;
-        popup_base.apply_results(1, "git:", matches, 4);
+        popup_base.apply_results(1, "git:", matches, 6);
         let popup_e = MentionPopup::new(
             &MentionQuery {
                 start: 0,
@@ -996,14 +1080,47 @@ mod tests {
             2,
             Some(&popup_base),
         );
-        assert!(!popup_e
-            .matches
-            .iter()
-            .any(|m| matches!(m.display.as_str(), "git:diff" | "git:staged")));
+        assert!(!popup_e.matches.iter().any(|m| matches!(
+            m.display.as_str(),
+            "git:diff" | "git:diff+" | "git:staged" | "git:staged+"
+        )));
         assert!(popup_e
             .matches
             .iter()
             .any(|m| m.display == format!("git:{sha2}")));
+
+        // @git:+ includes git:diff+ and git:staged+ at the top, along with recent commits with +
+        let (plus_matches, _) = search_mentions(&root, "git:+", None, 1).unwrap();
+        assert!(plus_matches.iter().any(|m| m.display == "git:diff+"));
+        assert!(plus_matches.iter().any(|m| m.display == "git:staged+"));
+        assert!(!plus_matches.iter().any(|m| m.display == "git:diff"));
+        assert!(!plus_matches.iter().any(|m| m.display == "git:staged"));
+        assert!(plus_matches
+            .iter()
+            .any(|m| m.display == format!("git:{sha1}+")));
+        assert!(plus_matches
+            .iter()
+            .any(|m| m.display == format!("git:{sha2}+")));
+
+        // Optimistic popup cache filtering synchronizes + suffix on commit display when user appends +
+        let popup_plus = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 10,
+                query: "git:first+".into(),
+                quoted: false,
+            },
+            3,
+            Some(&popup_base),
+        );
+        assert!(popup_plus
+            .matches
+            .iter()
+            .any(|m| m.display == format!("git:{sha1}+")));
+        assert!(!popup_plus
+            .matches
+            .iter()
+            .any(|m| m.display == format!("git:{sha1}")));
 
         // Unmatched slash names don't error or leak filesystem matches.
         let (slash_matches, _) = search_mentions(&root, "git:feat/login", None, 1).unwrap();
