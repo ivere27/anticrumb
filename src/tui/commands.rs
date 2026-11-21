@@ -173,46 +173,55 @@ pub(super) fn complete(editor: &Editor, workspace: &std::path::Path) -> Option<C
                 format!("@{item} ")
             }
         };
+        let (prefix_core, has_plus) = if let Some(p) = git_prefix.strip_suffix('+') {
+            (p, true)
+        } else {
+            (git_prefix, false)
+        };
         let git_prefix_lower = git_prefix.to_ascii_lowercase();
-        for special in ["diff", "staged"] {
-            if special.starts_with(&git_prefix_lower) {
+        let prefix_core_lower = prefix_core.to_ascii_lowercase();
+        for special in ["diff", "diff+", "staged", "staged+"] {
+            if special.starts_with(&git_prefix_lower)
+                || (has_plus && prefix_core.is_empty() && special.ends_with('+'))
+            {
                 values.push(format_item(&format!("git:{special}")));
             }
         }
-        let commit_limit = if git_prefix.is_empty() {
+        let commit_limit = if prefix_core.is_empty() {
             20usize.saturating_sub(values.len())
         } else {
             20
         };
-        let is_hex =
-            !git_prefix_lower.is_empty() && git_prefix_lower.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex = !prefix_core_lower.is_empty()
+            && prefix_core_lower.chars().all(|c| c.is_ascii_hexdigit());
         let mut matched_recent_sha = false;
         let mut sha_values = Vec::new();
         let mut subject_matches: Vec<(i64, usize, String)> = Vec::new();
+        let item_suffix = if has_plus { "+" } else { "" };
         for (idx, (sha, subject)) in super::mentions::recent_git_commits(workspace, commit_limit)
             .into_iter()
             .enumerate()
         {
-            if git_prefix.is_empty()
-                || (is_hex && sha.to_ascii_lowercase().starts_with(&git_prefix_lower))
+            if prefix_core.is_empty()
+                || (is_hex && sha.to_ascii_lowercase().starts_with(&prefix_core_lower))
             {
                 matched_recent_sha = true;
-                sha_values.push(format_item(&format!("git:{sha}")));
-            } else if !git_prefix.is_empty() && !subject.is_empty() {
-                if let Some(subj_score) = super::mentions::fuzzy_score(git_prefix, &subject) {
+                sha_values.push(format_item(&format!("git:{sha}{item_suffix}")));
+            } else if !prefix_core.is_empty() && !subject.is_empty() {
+                if let Some(subj_score) = super::mentions::fuzzy_score(prefix_core, &subject) {
                     subject_matches.push((
                         1_200 + subj_score.clamp(-400, 500) - idx as i64,
                         idx,
-                        format_item(&format!("git:{sha}")),
+                        format_item(&format!("git:{sha}{item_suffix}")),
                     ));
                 }
             }
         }
         if is_hex && !matched_recent_sha {
             if let Some((old_sha, _)) =
-                super::mentions::resolve_git_commit_entry(workspace, git_prefix)
+                super::mentions::resolve_git_commit_entry(workspace, prefix_core)
             {
-                let item = format_item(&format!("git:{old_sha}"));
+                let item = format_item(&format!("git:{old_sha}{item_suffix}"));
                 if !sha_values.contains(&item) && !subject_matches.iter().any(|m| m.2 == item) {
                     sha_values.push(item);
                 }
@@ -260,7 +269,7 @@ pub(super) fn complete(editor: &Editor, workspace: &std::path::Path) -> Option<C
         })
         .collect();
     if directory.is_empty() {
-        for special in ["git:diff", "git:staged"] {
+        for special in ["git:diff", "git:diff+", "git:staged", "git:staged+"] {
             if special.starts_with(name) {
                 values.push(if quoted {
                     format!("@\"{special}\" ")
@@ -624,10 +633,22 @@ impl State {
                 "Attach file through Gemini's picker (@\"path with spaces\")",
             ),
             ("@git:diff", "Attach unstaged git diff as a patch file"),
+            (
+                "@git:diff+",
+                "Attach unstaged git diff with tree-sitter AST context",
+            ),
             ("@git:staged", "Attach staged git diff as a patch file"),
+            (
+                "@git:staged+",
+                "Attach staged git diff with tree-sitter AST context",
+            ),
             (
                 "@git:<commit>",
                 "Attach a specific git commit as a patch file",
+            ),
+            (
+                "@git:<commit>+",
+                "Attach a specific git commit with tree-sitter AST context",
             ),
             ("Tab", "Complete slash commands or @path"),
             (

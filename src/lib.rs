@@ -25,6 +25,7 @@ pub mod service;
 pub mod store;
 pub mod tab_pool;
 pub mod tool_codec;
+pub mod tree_sitter_diff;
 pub mod tui;
 pub mod update;
 pub(crate) mod url_lite;

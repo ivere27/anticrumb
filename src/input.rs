@@ -280,6 +280,8 @@ pub fn git_commit_file(workspace: &Path, rev: &str) -> Result<PathBuf> {
     git_commit_patch_for_sha(workspace, &full_sha)
 }
 
+pub use crate::tree_sitter_diff::{git_commit_expanded_file, git_diff_expanded_file};
+
 pub fn cleanup_temp_files(temp_files: &[PathBuf]) {
     let temp_root = std::env::temp_dir();
     for path in temp_files {
@@ -295,8 +297,11 @@ pub fn cleanup_temp_files(temp_files: &[PathBuf]) {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum GitPatchTarget {
     Diff,
+    DiffPlus,
     Staged,
+    StagedPlus,
     Commit(String),
+    CommitPlus(String),
 }
 
 fn resolve_git_mention(
@@ -304,19 +309,45 @@ fn resolve_git_mention(
     spec: &str,
     git_cache: &mut HashMap<GitPatchTarget, PathBuf>,
     temp_files: &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
 ) -> Result<PathBuf> {
     let target = match spec {
         "diff" => GitPatchTarget::Diff,
+        "diff+" => GitPatchTarget::DiffPlus,
         "staged" => GitPatchTarget::Staged,
-        rev => GitPatchTarget::Commit(resolve_git_commit(workspace, rev)?),
+        "staged+" => GitPatchTarget::StagedPlus,
+        other => {
+            let mut resolved = None;
+            if let Some(rev) = other.strip_suffix('+') {
+                if !rev.is_empty() {
+                    if let Ok(sha) = resolve_git_commit(workspace, rev) {
+                        resolved = Some(GitPatchTarget::CommitPlus(sha));
+                    }
+                }
+            }
+            if let Some(target) = resolved {
+                target
+            } else {
+                GitPatchTarget::Commit(resolve_git_commit(workspace, other)?)
+            }
+        }
     };
     if let Some(existing) = git_cache.get(&target) {
         return Ok(existing.clone());
     }
     let patch = match &target {
         GitPatchTarget::Diff => git_diff_file(workspace, false)?,
+        GitPatchTarget::DiffPlus => {
+            crate::tree_sitter_diff::git_diff_expanded_file(workspace, false, warnings)?
+        }
         GitPatchTarget::Staged => git_diff_file(workspace, true)?,
+        GitPatchTarget::StagedPlus => {
+            crate::tree_sitter_diff::git_diff_expanded_file(workspace, true, warnings)?
+        }
         GitPatchTarget::Commit(full_sha) => git_commit_patch_for_sha(workspace, full_sha)?,
+        GitPatchTarget::CommitPlus(full_sha) => {
+            crate::tree_sitter_diff::git_commit_expanded_file(workspace, full_sha, warnings)?
+        }
     };
     git_cache.insert(target, patch.clone());
     if !temp_files.contains(&patch) {
@@ -424,7 +455,7 @@ fn prepare_internal(
             }
             let raw_mention = &line[pos..pos + end_rel];
             let resolved = if let Some(spec) = path.strip_prefix("git:") {
-                resolve_git_mention(workspace, spec, &mut git_cache, temp_files)
+                resolve_git_mention(workspace, spec, &mut git_cache, temp_files, &mut warnings)
             } else {
                 file(workspace, Path::new(path))
             };
@@ -790,6 +821,242 @@ mod tests {
         assert!(clean_staged.warnings[0].contains("no staged git changes"));
     }
 
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn git_diff_plus_and_staged_plus_expand_tree_sitter_ast_context_and_warn_on_unsupported_language(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+
+        let rust_code = "\
+fn helper() -> i32 {
+    1
+}
+
+fn compute(a: i32, b: i32) -> i32 {
+    let x = a;
+    let y = b;
+    x + y
+}
+
+fn other() -> i32 {
+    3
+}
+";
+        let css_code = "\
+.container {
+    margin: 0;
+    padding: 10px;
+}
+";
+        std::fs::write(dir.path().join("math.rs"), rust_code).unwrap();
+        std::fs::write(dir.path().join("styles.css"), css_code).unwrap();
+        run(&["add", "math.rs", "styles.css"]);
+        run(&["commit", "-m", "init"]);
+
+        // Modify unstaged
+        let rust_mod = rust_code.replace("x + y", "x * 2 + y");
+        let css_mod = css_code.replace("padding: 10px;", "padding: 20px;");
+        std::fs::write(dir.path().join("math.rs"), rust_mod).unwrap();
+        std::fs::write(dir.path().join("styles.css"), css_mod).unwrap();
+
+        let unstaged = prepare("Review @git:diff+ please", dir.path(), &[]).unwrap();
+        assert_eq!(unstaged.files.len(), 1);
+        assert_eq!(unstaged.temp_files.len(), 1);
+        assert_eq!(unstaged.files[0], unstaged.temp_files[0]);
+        assert_eq!(unstaged.files[0].file_name().unwrap(), "git-diff+.patch");
+        assert_eq!(
+            unstaged.text,
+            "Review [Attached file: git-diff+.patch] please"
+        );
+
+        let patch_content = std::fs::read_to_string(&unstaged.files[0]).unwrap();
+        // Supported Rust file expanded to include enclosing function `fn compute`
+        assert!(patch_content.contains("fn compute(a: i32, b: i32) -> i32 {"));
+        assert!(patch_content.contains("+    x * 2 + y"));
+        // Unsupported CSS file included via git diff -W fallback
+        assert!(patch_content.contains(".container {"));
+        assert!(patch_content.contains("+    padding: 20px;"));
+        // Warning logged for the unsupported language file
+        assert!(unstaged
+            .warnings
+            .iter()
+            .any(|w| w
+                .contains("unsupported language for 'styles.css'; falling back to git diff -W")));
+
+        cleanup_temp_files(&unstaged.temp_files);
+        assert!(!unstaged.files[0].exists());
+
+        // Stage the changes and test @git:staged+
+        run(&["add", "math.rs", "styles.css"]);
+        let staged = prepare("Commit @git:staged+ please", dir.path(), &[]).unwrap();
+        assert_eq!(staged.files.len(), 1);
+        assert_eq!(staged.temp_files.len(), 1);
+        assert_eq!(staged.files[0].file_name().unwrap(), "git-staged+.patch");
+        assert_eq!(
+            staged.text,
+            "Commit [Attached file: git-staged+.patch] please"
+        );
+        let staged_patch = std::fs::read_to_string(&staged.files[0]).unwrap();
+        assert!(staged_patch.contains("fn compute(a: i32, b: i32) -> i32 {"));
+        assert!(staged_patch.contains("+    x * 2 + y"));
+        assert!(staged_patch.contains("+    padding: 20px;"));
+        assert!(staged
+            .warnings
+            .iter()
+            .any(|w| w
+                .contains("unsupported language for 'styles.css'; falling back to git diff -W")));
+        cleanup_temp_files(&staged.temp_files);
+        assert!(!staged.files[0].exists());
+
+        // Deduplication in same turn
+        let duplicate = prepare("@git:staged+ and @git:staged+", dir.path(), &[]).unwrap();
+        assert_eq!(duplicate.files.len(), 1);
+        assert_eq!(
+            duplicate.text,
+            "[Attached file: git-staged+.patch] and [Attached file: git-staged+.patch]"
+        );
+        cleanup_temp_files(&duplicate.temp_files);
+        assert!(!duplicate.files[0].exists());
+
+        // Non-git repository test
+        let non_git = tempfile::tempdir().unwrap();
+        let non_git_prompt = prepare("@git:diff+", non_git.path(), &[]).unwrap();
+        assert!(non_git_prompt.files.is_empty());
+        assert_eq!(non_git_prompt.text, "@git:diff+");
+        assert!(non_git_prompt.warnings[0].contains("not a git repository"));
+        assert!(non_git_prompt.warnings[0].contains("keeping @git:diff+ as prompt text"));
+
+        // Clean repository test
+        run(&["commit", "-m", "update"]);
+        let clean = prepare("@git:diff+", dir.path(), &[]).unwrap();
+        assert!(clean.files.is_empty());
+        assert_eq!(clean.text, "@git:diff+");
+        assert!(clean.warnings[0].contains("no unstaged git changes"));
+        assert!(clean.warnings[0].contains("keeping @git:diff+ as prompt text"));
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn git_commit_plus_expands_tree_sitter_ast_context_and_warns_on_unsupported_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+
+        let rust_code = "\
+fn helper() -> i32 {
+    1
+}
+
+fn compute(a: i32, b: i32) -> i32 {
+    let x = a;
+    let y = b;
+    x + y
+}
+
+fn other() -> i32 {
+    3
+}
+";
+        let css_code = "\
+.container {
+    margin: 0;
+    padding: 10px;
+}
+";
+        std::fs::write(dir.path().join("math.rs"), rust_code).unwrap();
+        std::fs::write(dir.path().join("styles.css"), css_code).unwrap();
+        run(&["add", "math.rs", "styles.css"]);
+        run(&["commit", "-m", "init"]);
+
+        // Commit modifications
+        let rust_mod = rust_code.replace("x + y", "x * 2 + y");
+        let css_mod = css_code.replace("padding: 10px;", "padding: 20px;");
+        std::fs::write(dir.path().join("math.rs"), rust_mod).unwrap();
+        std::fs::write(dir.path().join("styles.css"), css_mod).unwrap();
+        run(&["add", "math.rs", "styles.css"]);
+        run(&["commit", "-m", "commit with tree-sitter changes"]);
+
+        let head_sha_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let full_sha = String::from_utf8_lossy(&head_sha_out.stdout)
+            .trim()
+            .to_string();
+        let short_sha = &full_sha[..12];
+        let expected_patch_filename = format!("git-{short_sha}+.patch");
+
+        // 1. Test @git:HEAD+
+        let prepared = prepare("Review @git:HEAD+ please", dir.path(), &[]).unwrap();
+        assert_eq!(prepared.files.len(), 1);
+        assert_eq!(prepared.temp_files.len(), 1);
+        assert_eq!(
+            prepared.files[0].file_name().unwrap().to_str().unwrap(),
+            expected_patch_filename
+        );
+        assert_eq!(
+            prepared.text,
+            format!("Review [Attached file: {expected_patch_filename}] please")
+        );
+
+        let patch_content = std::fs::read_to_string(&prepared.files[0]).unwrap();
+        // Preserves commit message
+        assert!(patch_content.contains("commit with tree-sitter changes"));
+        // Supported Rust file expanded to include enclosing function `fn compute`
+        assert!(patch_content.contains("fn compute(a: i32, b: i32) -> i32 {"));
+        assert!(patch_content.contains("+    x * 2 + y"));
+        // Unsupported CSS file included via fallback
+        assert!(patch_content.contains(".container {"));
+        assert!(patch_content.contains("+    padding: 20px;"));
+        // Warning logged for unsupported language file
+        assert!(prepared
+            .warnings
+            .iter()
+            .any(|w| w.contains("unsupported language for 'styles.css'")));
+
+        cleanup_temp_files(&prepared.temp_files);
+        assert!(!prepared.files[0].exists());
+
+        // 2. Test short SHA+ and deduplication with HEAD+
+        let short_mention = format!("@git:{}+ and @git:HEAD+", &full_sha[..7]);
+        let dedup = prepare(&short_mention, dir.path(), &[]).unwrap();
+        assert_eq!(dedup.files.len(), 1);
+        assert_eq!(
+            dedup.text,
+            format!("[Attached file: {expected_patch_filename}] and [Attached file: {expected_patch_filename}]")
+        );
+        cleanup_temp_files(&dedup.temp_files);
+        assert!(!dedup.files[0].exists());
+
+        // 3. Test invalid commit with + preserves literal text and warns
+        let bad = prepare("@git:nonexistent+ hello", dir.path(), &[]).unwrap();
+        assert!(bad.files.is_empty());
+        assert_eq!(bad.text, "@git:nonexistent+ hello");
+        assert!(bad.warnings[0].contains("unknown git commit: nonexistent"));
+        assert!(bad.warnings[0].contains("keeping @git:nonexistent+ as prompt text"));
+    }
+
     #[test]
     fn git_commit_mentions_attach_dedup_and_support_refs_and_merges() {
         let dir = tempfile::tempdir().unwrap();
@@ -979,5 +1246,62 @@ mod tests {
         cleanup_temp_files(&recorded_temps);
         assert!(!recorded_temps[0].exists());
         assert!(!recorded_temps[0].parent().unwrap().exists());
+    }
+
+    #[test]
+    fn git_commit_plus_and_branch_ending_with_plus() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("code.rs"), "fn hello() {}\n").unwrap();
+        run_out(&["add", "code.rs"]);
+        run_out(&["commit", "-m", "init"]);
+        run_out(&["branch", "c++"]);
+
+        // 1. @git:c++ resolves to branch c++ (since branch `c+` does not exist)
+        let prep = prepare("@git:c++", dir.path(), &[]).unwrap();
+        assert_eq!(prep.files.len(), 1);
+        assert!(
+            !prep.files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("+.patch"),
+            "literal branch c++ should produce a regular patch"
+        );
+        cleanup_temp_files(&prep.temp_files);
+
+        // 2. When both `foo` and `foo+` exist, documented precedence resolves `@git:foo+`
+        //    as AST-expanded `foo` (CommitPlus) rather than literal `foo+`.
+        run_out(&["branch", "foo"]);
+        let foo_sha = run_out(&["rev-parse", "foo"]);
+        std::fs::write(dir.path().join("code.rs"), "fn hello() { let x = 1; }\n").unwrap();
+        run_out(&["add", "code.rs"]);
+        run_out(&["commit", "-m", "second"]);
+        run_out(&["branch", "foo+"]);
+        let prep_conflict = prepare("@git:foo+", dir.path(), &[]).unwrap();
+        assert_eq!(prep_conflict.files.len(), 1);
+        let conflict_name = prep_conflict.files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(conflict_name, format!("git-{}+.patch", &foo_sha[..12]));
+        cleanup_temp_files(&prep_conflict.temp_files);
+
+        // 3. @git:+ is handled gracefully as an invalid commit rather than panic/empty error
+        let prep_plus = prepare("@git:+", dir.path(), &[]).unwrap();
+        assert!(prep_plus.files.is_empty());
+        assert!(prep_plus.warnings[0].contains("unknown git commit"));
     }
 }

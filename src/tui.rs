@@ -927,12 +927,12 @@ mod tests {
         e.set("@git:".into());
         assert_eq!(
             complete(&e, dir.path()).unwrap().values,
-            vec!["@git:diff ", "@git:staged "]
+            vec!["@git:diff ", "@git:diff+ ", "@git:staged ", "@git:staged+ "]
         );
         e.set("@\"git:st".into());
         assert_eq!(
             complete(&e, dir.path()).unwrap().values,
-            vec!["@\"git:staged\" "]
+            vec!["@\"git:staged\" ", "@\"git:staged+\" "]
         );
     }
 
@@ -966,7 +966,9 @@ mod tests {
             complete(&e, dir.path()).unwrap().values,
             vec![
                 "@git:diff ".to_owned(),
+                "@git:diff+ ".to_owned(),
                 "@git:staged ".to_owned(),
+                "@git:staged+ ".to_owned(),
                 format!("@git:{sha2} "),
                 format!("@git:{sha1} "),
             ]
