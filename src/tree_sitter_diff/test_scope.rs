@@ -427,7 +427,7 @@ fn collect_rust_attr_block(
 
 /// Walks nested C/C++ declarators (or macro call / header line fallback for Catch2 string-arg macros)
 /// to extract the innermost function or test macro identifier name.
-fn extract_c_cpp_function_name<'a>(
+pub(super) fn extract_c_cpp_function_name<'a>(
     node: &tree_sitter::Node<'a>,
     lines: &[&'a str],
 ) -> Option<&'a str> {
@@ -496,7 +496,7 @@ fn extract_c_cpp_function_name<'a>(
 }
 
 /// Extracts trimmed text for an AST node from 0-indexed `lines`, skipping comment lines/nodes.
-fn collect_node_lines_text(node: &tree_sitter::Node, lines: &[&str]) -> String {
+pub(super) fn collect_node_lines_text(node: &tree_sitter::Node, lines: &[&str]) -> String {
     let sp = node.start_position();
     let ep = node.end_position();
     if sp.row >= lines.len() {
@@ -543,7 +543,7 @@ fn collect_node_lines_text(node: &tree_sitter::Node, lines: &[&str]) -> String {
 
 /// Checks AST outer `attribute_item` siblings preceding `node` and inner `inner_attribute_item`
 /// children inside `node`'s body (for `mod_item` / `function_item`).
-fn has_ast_rust_attr(
+pub(super) fn has_ast_rust_attr(
     node: &tree_sitter::Node,
     lines: &[&str],
     mut predicate: impl FnMut(&str) -> bool,
@@ -596,7 +596,7 @@ fn has_ast_rust_attr(
 
 /// Checks AST annotations (`modifiers` -> `marker_annotation`/`annotation` in Java)
 /// and attributes (`attribute_list` in C#) attached to `node`.
-fn has_ast_java_csharp_test_attr(node: &tree_sitter::Node, lines: &[&str]) -> bool {
+pub(super) fn has_ast_java_csharp_test_attr(node: &tree_sitter::Node, lines: &[&str]) -> bool {
     let mut cursor = node.walk();
     for ch in node.named_children(&mut cursor) {
         match ch.kind() {
