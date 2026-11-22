@@ -639,7 +639,7 @@ fn test_utf8_multibyte_signature_truncation_no_panic() {
 #[test]
 fn test_oversized_function_context_clamping_retains_signature() {
     let mut code = String::from("fn giant_function() {\n");
-    for i in 1..=180 {
+    for i in 1..=240 {
         code.push_str(&format!("    let var_{i} = {i};\n"));
     }
     code.push_str("}\n");
@@ -650,13 +650,13 @@ fn test_oversized_function_context_clamping_retains_signature() {
         .unwrap();
     let tree = parser.parse(&code, None).unwrap();
 
-    // Change at line 90 (middle of the 182-line function)
+    // Change at line 120 (middle of the 242-line function > MAX_EXPANSION_LINES = 220)
     let (start, end, sig) =
-        find_enclosing_definition(SupportedLanguage::Rust, &tree.root_node(), 90, 90, &code);
+        find_enclosing_definition(SupportedLanguage::Rust, &tree.root_node(), 120, 120, &code);
     assert_eq!(sig.as_deref().unwrap(), "fn giant_function() {");
-    // Must clamp to 5 lines around line 90 rather than expanding to the full 182 lines or dropping to 0
-    assert_eq!(start, 85);
-    assert_eq!(end, 95);
+    // Must clamp to CLAMPED_CONTEXT_LINES (10) lines around line 120 rather than expanding to 242 lines
+    assert_eq!(start, 110);
+    assert_eq!(end, 130);
 }
 
 #[test]
@@ -1756,13 +1756,13 @@ fn test_clamped_state_header_and_low_churn_clamping() {
         0,
     );
     assert!(is_clamped);
-    assert_eq!(s, 20); // 25 - 5
-    assert_eq!(e, 30); // 25 + 5
+    assert_eq!(s, 15); // 25 - 10
+    assert_eq!(e, 35); // 25 + 10
     assert!(sig.as_deref().unwrap().starts_with("fn test_big_case() {"));
 
-    // 2. Low churn large production function (95 lines, 1 line changed)
+    // 2. Low churn large production function (165 lines >= LOW_CHURN_MIN_SPAN = 150, 1 line changed)
     let mut prod_code = String::from("fn prepare_internal() {\n");
-    for i in 1..=93 {
+    for i in 1..=163 {
         prod_code.push_str(&format!("    let step_{i} = {i};\n"));
     }
     prod_code.push_str("}\n");
@@ -1770,15 +1770,15 @@ fn test_clamped_state_header_and_low_churn_clamping() {
     let (s_prod, e_prod, sig_prod, is_clamped_prod) = find_enclosing_definition_full(
         SupportedLanguage::Rust,
         &tree_prod.root_node(),
-        50,
-        50,
+        80,
+        80,
         &prod_code,
         Some(Path::new("src/input.rs")),
         0,
     );
     assert!(is_clamped_prod);
-    assert_eq!(s_prod, 45); // 50 - 5
-    assert_eq!(e_prod, 55); // 50 + 5
+    assert_eq!(s_prod, 70); // 80 - 10
+    assert_eq!(e_prod, 90); // 80 + 10
     assert_eq!(sig_prod.as_deref().unwrap(), "fn prepare_internal() {");
 }
 
@@ -3065,12 +3065,12 @@ fn test_feedback_clamped_hunk_merge_and_full_coverage() {
     let repo = temp.path();
     init_git_repo(repo);
 
-    // Case 1: Non-comment declaration on line 1 (unclamped: 1..=1) + clamped edit at val_2 (line 5 -> 2..=10).
-    // They merge into a single hunk (2 <= 1 + 1) covering 1..=10, while full_end = 78 > 10 preserves [clamped].
+    // Case 1: Non-comment declaration on line 1 (unclamped: 1..=1) + clamped edit at val_2 (line 5 -> 2..=15).
+    // They merge into a single hunk (2 <= 1 + 1) covering 1..=15, while full_end = 163 > 15 preserves [clamped].
     let mut initial = String::new();
     initial.push_str("const X: i32 = 1;\n");
     initial.push_str("fn large_function_to_clamp() {\n");
-    for i in 0..75 {
+    for i in 0..160 {
         initial.push_str(&format!("    let val_{i} = {i};\n"));
     }
     initial.push_str("}\n");
@@ -3824,10 +3824,10 @@ fn test_round2_merged_hunk_preserves_clamped_signature_and_range_telemetry() {
 
     let mut initial = String::from("const MAGIC_OFFSET: i32 = 1;\n");
     initial.push_str("fn heavy_worker(input: i32) -> i32 {\n");
-    for i in 1..=70 {
+    for i in 1..=160 {
         initial.push_str(&format!("    let step_{i} = input + {i};\n"));
     }
-    initial.push_str("    step_70\n}\n");
+    initial.push_str("    step_160\n}\n");
 
     let file_path = repo.join("worker.rs");
     std::fs::write(&file_path, &initial).unwrap();
@@ -4390,9 +4390,9 @@ pub fn relocate_me(alpha: i32, beta: i32) -> i32 {
     )
     .unwrap();
 
-    // 2. Also add a large new test file (>= 200 lines)
+    // 2. Also add a large new test file (>= 500 lines)
     let mut big_test = String::new();
-    for i in 0..25 {
+    for i in 0..55 {
         big_test.push_str(&format!(
             "#[test]\nfn test_case_{i}() {{\n    let a = {i};\n    let b = a + 1;\n    let c = b + 2;\n    let d = c + 3;\n    let e = d + 4;\n    assert_eq!(e, {i} + 10);\n}}\n\n"
         ));
@@ -4886,4 +4886,1955 @@ export const dispatchPipelineRequest = (requestPayload: IncomingRequest, respons
         "git apply --check failed on trimmed -U3 patch: {}\n{trimmed}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn make_new_file_diff(path: &str, source: &str) -> String {
+    let line_count = source.lines().count();
+    let mut diff = format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{line_count} @@\n"
+    );
+    for line in source.split_inclusive('\n') {
+        diff.push('+');
+        diff.push_str(line);
+    }
+    if !diff.ends_with('\n') {
+        diff.push('\n');
+    }
+    diff
+}
+
+#[test]
+fn test_inline_tests_folded_before_production_code_multi_language() {
+    // 1. Rust: `#[cfg(test)] mod common_tests` folded (including `#[cfg(test)]`),
+    //    `fn test_connection()` (prod name heuristic) NOT falsely omitted,
+    //    and 1-line `#[cfg(test)] mod external_tests;` NOT folded.
+    let mut rust_src = String::from(
+        "\
+#[cfg(test)]
+mod external_tests;
+
+pub fn test_connection(host: &str) -> bool {
+    let trimmed = host.trim();
+    !trimmed.is_empty()
+}
+
+pub fn core_router(req: &str) -> usize {
+    req.len() + 42
+}
+
+#[cfg(test)]
+mod common_tests {
+    use super::*;
+
+",
+    );
+    for i in 0..8 {
+        rust_src.push_str(&format!(
+            "    #[test]\n    fn test_case_{i}() {{\n        let v = core_router(\"payload_{i}\");\n        assert!(v > {i});\n        assert!(test_connection(\"localhost\"));\n    }}\n\n"
+        ));
+    }
+    rust_src.push_str("}\n");
+
+    let rust_diff = make_new_file_diff("src/router.rs", &rust_src);
+    let prod_only_budget = rust_diff.len() - 400;
+    let items = vec![RenderedChunk {
+        path: Some(PathBuf::from("src/router.rs")),
+        is_test: false,
+        is_new: true,
+        is_deleted: false,
+        pre_omitted: false,
+        is_omitted: false,
+        raw_chunk: rust_diff.clone(),
+        rendered: rust_diff,
+        orig_line_map: None,
+        inline_test_blocks: Vec::new(),
+    }];
+    let mut warnings = Vec::new();
+    let out = apply_patch_budget("", items, prod_only_budget, &mut warnings);
+    assert!(out.len() <= prod_only_budget);
+    assert!(
+        out.contains("+[omitted inline tests: L13-L"),
+        "Expected #[cfg(test)] mod common_tests to be folded starting at #[cfg(test)] line 13:\n{out}"
+    );
+    assert!(
+        out.contains("mod common_tests; 8 tests"),
+        "Expected inline test TOC with mod name and test count:\n{out}"
+    );
+    assert!(
+        out.contains("pub fn test_connection(host: &str) -> bool"),
+        "Production function named `test_connection` must NOT be falsely omitted:\n{out}"
+    );
+    assert!(
+        out.contains("pub fn core_router(req: &str) -> usize"),
+        "Core production logic must remain completely intact:\n{out}"
+    );
+    assert!(
+        out.contains("+mod external_tests;"),
+        "1-line external `mod external_tests;` declaration must NOT be folded:\n{out}"
+    );
+    assert!(
+        !out.contains("assert!(v > 0);"),
+        "Folded inline test body must not remain in output:\n{out}"
+    );
+    assert!(
+        out.contains("1 inline-tests-omitted"),
+        "Banner must report 1 inline-tests-omitted:\n{out}"
+    );
+
+    // 2. Modified Rust file (real git repo): both prod fn and #[cfg(test)] mod tests modified.
+    //    Tier 2 folds inline test hunk while preserving prod hunk, AND Tier 3 `-U3` still works!
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    let mut init_mod = String::from("pub fn dispatch_work(x: i32) -> i32 {\n");
+    for i in 1..=25 {
+        init_mod.push_str(&format!("    let step_{i} = x + {i};\n"));
+    }
+    init_mod.push_str("    step_25\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n");
+    for i in 0..6 {
+        init_mod.push_str(&format!(
+            "    #[test]\n    fn test_dispatch_{i}() {{\n        let r = dispatch_work({i});\n        assert_eq!(r, {i} + 25);\n    }}\n\n"
+        ));
+    }
+    init_mod.push_str("}\n");
+
+    std::fs::write(repo.join("engine.rs"), &init_mod).unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "engine.rs"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+
+    let updated_mod = init_mod
+        .replace("let step_12 = x + 12;", "let step_12 = x * 2 + 12;")
+        .replace("assert_eq!(r, 3 + 25);", "assert_eq!(r, 3 * 2 + 25);\n        assert!(r > 0);\n        assert!(r < 1000);\n        assert_ne!(r, 0);\n        assert_eq!(dispatch_work(3), r);\n        assert_eq!(r - 25, 6);");
+    std::fs::write(repo.join("engine.rs"), &updated_mod).unwrap();
+
+    let mut w_mod = Vec::new();
+    let expanded_full = generate_expanded_diff(repo, false, &mut w_mod).unwrap();
+    let diff_pos = expanded_full.find("diff --git ").unwrap();
+    let expanded_chunk = expanded_full[diff_pos..].to_string();
+
+    // Parse inline test blocks for the modified file and run apply_patch_budget under tight budget
+    // that forces BOTH Tier 2 (inline test fold) AND Tier 3 (`-U3` degradation) on the same file.
+    let mut parser = Parser::new();
+    parser
+        .set_language(&SupportedLanguage::Rust.language_fn())
+        .unwrap();
+    let tree = parser.parse(&updated_mod, None).unwrap();
+    let inline_blocks = ast_compact::find_inline_test_blocks(
+        SupportedLanguage::Rust,
+        &tree.root_node(),
+        &updated_mod,
+    );
+    assert!(
+        !inline_blocks.is_empty(),
+        "Expected inline #[cfg(test)] mod tests block in modified engine.rs"
+    );
+
+    let tight_budget = 900;
+    let items_mod = vec![RenderedChunk {
+        path: Some(PathBuf::from("engine.rs")),
+        is_test: false,
+        is_new: false,
+        is_deleted: false,
+        pre_omitted: false,
+        is_omitted: false,
+        raw_chunk: expanded_chunk.clone(),
+        rendered: expanded_chunk,
+        orig_line_map: None,
+        inline_test_blocks: inline_blocks,
+    }];
+    let mut w_budget = Vec::new();
+    let compacted_mod = apply_patch_budget("", items_mod, tight_budget, &mut w_budget);
+    assert!(
+        compacted_mod.len() <= tight_budget,
+        "Compacted modified file exceeded {tight_budget} B ({}):\n{compacted_mod}",
+        compacted_mod.len()
+    );
+    assert!(
+        compacted_mod.contains("[degraded to -U3]"),
+        "Tier 3 -U3 must succeed even after Tier 2 inserted [omitted inline tests:]:\n{compacted_mod}"
+    );
+    assert!(
+        compacted_mod.contains("[omitted inline tests:"),
+        "Modified inline test hunk must be folded:\n{compacted_mod}"
+    );
+    assert!(
+        compacted_mod.contains("+    let step_12 = x * 2 + 12;"),
+        "Production edit must remain intact:\n{compacted_mod}"
+    );
+    assert!(
+        compacted_mod.contains("1 inline-tests-omitted, 1 degraded to -U3"),
+        "Banner must match body markers 1:1:\n{compacted_mod}"
+    );
+
+    // 3. Multi-language inline test folding across Python, TypeScript, Java, C#, C++, Ruby, Go
+    let multi_cases: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "src/parser.py",
+            "\
+def parse_payload(raw: str) -> dict:
+    return {'len': len(raw)}
+
+class TestParser(unittest.TestCase):
+    def test_empty(self):
+        v = parse_payload('')
+        self.assertEqual(v['len'], 0)
+        self.assertIsInstance(v, dict)
+        self.assertTrue(True)
+
+    def test_non_empty(self):
+        v = parse_payload('hello')
+        self.assertEqual(v['len'], 5)
+",
+            "def parse_payload",
+            "self.assertEqual(v['len'], 0)",
+        ),
+        (
+            "src/query.ts",
+            "\
+export function parseQuery(q: string): string[] {
+  return q.split('&').filter(Boolean);
+}
+
+if (import.meta.vitest) {
+  const { it, expect } = import.meta.vitest;
+  it('splits query parameters cleanly', () => {
+    const res = parseQuery('a=1&b=2');
+    expect(res).toEqual(['a=1', 'b=2']);
+    expect(res.length).toBe(2);
+    expect(res[0]).toBe('a=1');
+  });
+}
+
+describe('parseQuery suite', () => {
+  it('handles empty input', () => {
+    const res = parseQuery('');
+    expect(res).toEqual([]);
+    expect(res.length).toBe(0);
+  });
+});
+",
+            "export function parseQuery",
+            "expect(res).toEqual(['a=1', 'b=2'])",
+        ),
+        (
+            "src/Calculator.java",
+            "\
+public class Calculator {
+    public int compute(int a, int b) {
+        return a * 2 + b;
+    }
+
+    @Test
+    public void testComputePositive() {
+        Calculator c = new Calculator();
+        int r1 = c.compute(2, 3);
+        int r2 = c.compute(4, 5);
+        assertEquals(7, r1);
+        assertEquals(13, r2);
+    }
+
+    @Test
+    public void testComputeZero() {
+        Calculator c = new Calculator();
+        int r = c.compute(0, 0);
+        assertEquals(0, r);
+    }
+}
+",
+            "public int compute(int a, int b)",
+            "assertEquals(13, r2)",
+        ),
+        (
+            "src/Billing.cs",
+            "\
+public class Billing {
+    public int ComputeTotal(int price, int tax) {
+        return price + tax;
+    }
+
+    [Fact]
+    public void ShouldAddTax() {
+        var b = new Billing();
+        var total = b.ComputeTotal(100, 10);
+        Assert.Equal(110, total);
+        Assert.True(total > 0);
+        Assert.NotEqual(0, total);
+    }
+}
+",
+            "public int ComputeTotal",
+            "Assert.Equal(110, total)",
+        ),
+        (
+            "src/eval.cpp",
+            "\
+int evaluate_core(int x) {
+    return x * x + 1;
+}
+
+TEST(EvalSuite, HandlesPositive) {
+    int a = evaluate_core(3);
+    int b = evaluate_core(4);
+    EXPECT_EQ(a, 10);
+    EXPECT_EQ(b, 17);
+    EXPECT_GT(b, a);
+    EXPECT_NE(a, 0);
+}
+",
+            "int evaluate_core(int x)",
+            "EXPECT_EQ(b, 17)",
+        ),
+        (
+            "lib/payment.rb",
+            "\
+class PaymentService
+  def charge(amount)
+    amount * 100
+  end
+end
+
+describe 'PaymentService' do
+  it 'converts dollars to cents' do
+    svc = PaymentService.new
+    res = svc.charge(12)
+    expect(res).to eq(1200)
+    expect(res).to be > 0
+  end
+end
+",
+            "class PaymentService",
+            "expect(res).to eq(1200)",
+        ),
+        (
+            "pkg/netutil.go",
+            "\
+package netutil
+
+import \"testing\"
+
+func TestConnection(addr string) error {
+	if addr == \"\" {
+		return nil
+	}
+	return nil
+}
+
+func TestParser(t *testing.T) {
+	a := 1
+	b := 2
+	c := a + b
+	if c != 3 {
+		t.Fatalf(\"bad sum: %d\", c)
+	}
+	if a >= b {
+		t.Fatal(\"unexpected order\")
+	}
+}
+",
+            "func TestConnection(addr string) error",
+            "t.Fatalf(",
+        ),
+    ];
+
+    for (path, src, must_keep, must_fold) in multi_cases {
+        let diff = make_new_file_diff(path, src);
+        let folded =
+            ast_compact::fold_inline_tests_in_new_chunk(&diff, &diff, None, Path::new(path))
+                .unwrap_or_else(|| panic!("Expected inline tests to fold for {path}"));
+        assert!(
+            folded.0.contains("+[omitted inline tests:"),
+            "Expected inline test marker for {path}:\n{}",
+            folded.0
+        );
+        assert!(
+            folded.0.contains(must_keep),
+            "Production code `{must_keep}` must be preserved for {path}:\n{}",
+            folded.0
+        );
+        assert!(
+            !folded.0.contains(must_fold),
+            "Inline test body `{must_fold}` must be folded for {path}:\n{}",
+            folded.0
+        );
+    }
+}
+
+#[test]
+fn test_tier4_progressive_ast_skeletonization_multi_language() {
+    // 1. Rust: preserves types, traits, impl headers, doc comments, short helper,
+    //    folds longest bodies first, never double-folds nested functions!
+    let mut rs = String::from(
+        "\
+/// Public configuration struct.
+pub struct PipelineConfig {
+    pub max_retries: usize,
+    pub timeout_ms: u64,
+}
+
+pub enum StageStatus {
+    Ready,
+    Done,
+}
+
+pub trait Executor {
+    fn execute(&self, cfg: &PipelineConfig) -> StageStatus;
+}
+
+/// Short helper that stays intact when larger functions suffice.
+pub fn tiny_helper(x: i32) -> i32 {
+    x + 1
+}
+
+/// Heavy function containing a nested inner function (must not double-fold!).
+pub fn mega_processor(input: i32) -> i32 {
+    fn nested_inner(v: i32) -> i32 {
+        let a = v + 1;
+        let b = a + 2;
+        let c = b + 3;
+        let d = c + 4;
+        let e = d + 5;
+        let f = e + 6;
+        f
+    }
+",
+    );
+    for i in 0..35 {
+        rs.push_str(&format!("    let acc_{i} = nested_inner(input + {i});\n"));
+    }
+    rs.push_str("    acc_34\n}\n\nimpl PipelineConfig {\n    /// Second long method.\n    pub fn run_all(&self) -> usize {\n");
+    for i in 0..30 {
+        rs.push_str(&format!("        let step_{i} = self.max_retries + {i};\n"));
+    }
+    rs.push_str("        step_29\n    }\n}\n");
+
+    let rs_diff = make_new_file_diff("src/pipeline.rs", &rs);
+    let target = rs_diff.len() / 2;
+    let (skel, line_map, folded, total) = ast_compact::skeletonize_new_chunk_progressive(
+        &rs_diff,
+        &rs_diff,
+        None,
+        Path::new("src/pipeline.rs"),
+        target,
+    )
+    .expect("expected Rust file to skeletonize");
+    assert!(folded >= 1 && folded <= total);
+    assert_eq!(skel.split_inclusive('\n').count(), line_map.len());
+    assert!(skel.contains("+++ b/src/pipeline.rs\n[skeletonized:"));
+    assert!(skel.contains("pub struct PipelineConfig"));
+    assert!(skel.contains("pub enum StageStatus"));
+    assert!(skel.contains("pub trait Executor"));
+    assert!(skel.contains("/// Public configuration struct."));
+    assert!(skel.contains("pub fn tiny_helper(x: i32) -> i32 {\n+    x + 1\n+}"));
+    assert!(skel.contains("pub fn mega_processor(input: i32) -> i32 { /* ... "));
+    assert!(
+        !skel.contains("fn nested_inner"),
+        "Nested function inside already-folded outer body must not leak or double-fold:\n{skel}"
+    );
+    assert!(skel.contains("impl PipelineConfig {"));
+    assert!(skel.contains("pub fn run_all(&self) -> usize"));
+
+    // 2. Multi-language skeletonization across Python, TypeScript, Go, Java, C#, C++, Ruby, Bash
+    let cases: Vec<(&str, String, Vec<&str>, &str)> = vec![
+        (
+            "src/service.py",
+            {
+                let mut s = String::from(
+                    "class OrderService:\n    def process_order(self, order_id: int) -> int:\n        \"\"\"Process a single order.\"\"\"\n",
+                );
+                for i in 0..18 {
+                    s.push_str(&format!("        step_{i} = order_id + {i}\n"));
+                }
+                s.push_str("        return step_17\n");
+                s
+            },
+            vec![
+                "class OrderService:",
+                "def process_order(self, order_id: int) -> int:",
+                "\"\"\"Process a single order.\"\"\"",
+            ],
+            "...  # ... ",
+        ),
+        (
+            "src/handler.ts",
+            {
+                let mut s = String::from(
+                    "export interface RequestCtx {\n  id: string;\n}\n\nexport const handleRequest = (ctx: RequestCtx): number => {\n",
+                );
+                for i in 0..18 {
+                    s.push_str(&format!("  const v{i} = ctx.id.length + {i};\n"));
+                }
+                s.push_str("  return v17;\n};\n");
+                s
+            },
+            vec![
+                "export interface RequestCtx",
+                "export const handleRequest = (ctx: RequestCtx): number => { /* ... ",
+            ],
+            "*/ };",
+        ),
+        (
+            "pkg/server.go",
+            {
+                let mut s = String::from(
+                    "package server\n\ntype Server struct {\n\tPort int\n}\n\nfunc (s *Server) Handle(id int) int {\n",
+                );
+                for i in 0..18 {
+                    s.push_str(&format!("\tstep{i} := s.Port + id + {i}\n"));
+                }
+                s.push_str("\treturn step17\n}\n");
+                s
+            },
+            vec![
+                "type Server struct",
+                "func (s *Server) Handle(id int) int { /* ... ",
+            ],
+            "lines (L",
+        ),
+        (
+            "src/Worker.java",
+            {
+                let mut s =
+                    String::from("public class Worker {\n    public int runBatch(int n) {\n");
+                for i in 0..18 {
+                    s.push_str(&format!("        int v{i} = n + {i};\n"));
+                }
+                s.push_str("        return v17;\n    }\n}\n");
+                s
+            },
+            vec![
+                "public class Worker",
+                "public int runBatch(int n) { /* ... ",
+            ],
+            "lines (L",
+        ),
+        (
+            "src/Engine.cs",
+            {
+                let mut s =
+                    String::from("public class Engine\n{\n    public int Execute(int n)\n    {\n");
+                for i in 0..18 {
+                    s.push_str(&format!("        var v{i} = n + {i};\n"));
+                }
+                s.push_str("        return v17;\n    }\n}\n");
+                s
+            },
+            vec![
+                "public class Engine",
+                "public int Execute(int n)",
+                "{ /* ... ",
+            ],
+            "lines (L",
+        ),
+        (
+            "src/frame.cpp",
+            {
+                let mut s = String::from(
+                    "struct Frame {\n    int size;\n};\n\ntemplate <typename T>\nT transform_frame(T x) {\n",
+                );
+                for i in 0..18 {
+                    s.push_str(&format!("    T v{i} = x + {i};\n"));
+                }
+                s.push_str("    return v17;\n}\n");
+                s
+            },
+            vec![
+                "struct Frame",
+                "template <typename T>",
+                "T transform_frame(T x) { /* ... ",
+            ],
+            "lines (L",
+        ),
+        (
+            "lib/worker.rb",
+            {
+                let mut s = String::from("class Worker\n  def process(val)\n");
+                for i in 0..18 {
+                    s.push_str(&format!("    v{i} = val + {i}\n"));
+                }
+                s.push_str("    v17\n  end\nend\n");
+                s
+            },
+            vec!["class Worker", "def process(val)", "+  end"],
+            "# ... ",
+        ),
+        (
+            "scripts/deploy.sh",
+            {
+                let mut s = String::from("#!/usr/bin/env bash\ndeploy_release() {\n");
+                for i in 0..18 {
+                    s.push_str(&format!("  echo \"step {i}\"\n"));
+                }
+                s.push_str("}\n");
+                s
+            },
+            vec!["deploy_release() {", "+}"],
+            "# ... ",
+        ),
+    ];
+
+    for (path, src, must_contain, placeholder_cue) in cases {
+        let diff = make_new_file_diff(path, &src);
+        let (skel, map, folded, _) = ast_compact::skeletonize_new_chunk_progressive(
+            &diff,
+            &diff,
+            None,
+            Path::new(path),
+            200,
+        )
+        .unwrap_or_else(|| panic!("Expected skeletonization to succeed for {path}"));
+        assert!(folded >= 1);
+        assert_eq!(skel.split_inclusive('\n').count(), map.len());
+        assert!(
+            skel.contains("[skeletonized:"),
+            "Missing [skeletonized:] marker for {path}:\n{skel}"
+        );
+        assert!(
+            skel.contains(placeholder_cue),
+            "Missing placeholder cue `{placeholder_cue}` for {path}:\n{skel}"
+        );
+        for expected in must_contain {
+            assert!(
+                skel.contains(expected),
+                "Expected `{expected}` preserved in skeleton for {path}:\n{skel}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_tier5_line_anchor_accuracy_bare_symbols_omitted_toc_and_banner_1_to_1() {
+    // 1. Build a file with an inline test block near the top (lines 1..=65) followed by
+    //    20 short struct/fn definitions (lines 67..=166). After Tier 2 folds lines 1..=65,
+    //    forcing Tier 5 Head+Tail truncation MUST still report exact original line numbers
+    //    for `[resuming at L...]` and list bare symbol names without `+N more`.
+    let mut src = String::from("#[cfg(test)]\nmod early_tests {\n");
+    for i in 0..12 {
+        src.push_str(&format!(
+            "    #[test]\n    fn test_early_{i}() {{\n        let x = {i};\n        assert_eq!(x, {i});\n    }}\n"
+        ));
+    }
+    src.push_str("}\n\n");
+    let first_prod_line = src.lines().count() + 1;
+    let mut def_start_lines = Vec::new();
+    for i in 0..20 {
+        def_start_lines.push(src.lines().count() + 1);
+        src.push_str(&format!(
+            "pub struct Record_{i} {{\n    pub field_a: i32,\n    pub field_b: String,\n    pub field_c: bool,\n}}\n"
+        ));
+    }
+    let diff = make_new_file_diff("src/records.rs", &src);
+
+    // Step A: Fold inline tests (Tier 2) — shifts rendered line count dramatically while keeping orig_line_map
+    let (after_t2, map_t2) = ast_compact::fold_inline_tests_in_new_chunk(
+        &diff,
+        &diff,
+        None,
+        Path::new("src/records.rs"),
+    )
+    .expect("expected inline test fold");
+    assert!(after_t2.contains("+[omitted inline tests: L1-L"));
+
+    // Step B: Force Tier 5 truncation on `after_t2` with `map_t2`
+    let items = vec![RenderedChunk {
+        path: Some(PathBuf::from("src/records.rs")),
+        is_test: false,
+        is_new: true,
+        is_deleted: false,
+        pre_omitted: false,
+        is_omitted: false,
+        raw_chunk: diff.clone(),
+        rendered: after_t2.clone(),
+        orig_line_map: Some(map_t2),
+        inline_test_blocks: Vec::new(),
+    }];
+    let mut warnings = Vec::new();
+    let out = apply_patch_budget("", items, 1500, &mut warnings);
+    assert!(out.len() <= 1500, "Output {} exceeded 1500 B", out.len());
+    assert!(
+        out.contains("[truncated due to patch budget: src/records.rs"),
+        "Expected truncation marker:\n{out}"
+    );
+    // Extract `[resuming at L<N>]` and verify L<N> matches the ACTUAL line in original `src`!
+    let anchor_pos = out
+        .find("[resuming at L")
+        .expect("Expected explicit [resuming at L...] anchor");
+    let after_anchor = &out[anchor_pos + "[resuming at L".len()..];
+    let bracket_end = after_anchor.find(']').expect("closing bracket");
+    let resumed_line: usize = after_anchor[..bracket_end]
+        .parse()
+        .expect("numeric resuming line");
+    let next_line_after_anchor = after_anchor[bracket_end + 1..]
+        .strip_prefix('\n')
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix('+')
+        .unwrap();
+    let orig_lines: Vec<&str> = src.lines().collect();
+    assert!(
+        resumed_line >= first_prod_line,
+        "Resuming line L{resumed_line} must reflect ORIGINAL line numbers (>= L{first_prod_line}), not post-collapse line count!\n{out}"
+    );
+    assert_eq!(
+        orig_lines[resumed_line - 1],
+        next_line_after_anchor,
+        "Line at [resuming at L{resumed_line}] must match original source line verbatim!\n{out}"
+    );
+    // Bare symbol names listed without `+N more` and without `struct ` keyword prefix
+    assert!(
+        out.contains("defs: Record_"),
+        "Expected bare symbol names in omitted defs list:\n{out}"
+    );
+    assert!(
+        !out.contains(" more;"),
+        "Omitted symbol list for 20 small structs should list all bare names without `+N more`:\n{out}"
+    );
+
+    // 2. Budget-omitted files (both NEW and MODIFIED) include AST symbol TOCs within budget,
+    //    and banner counts match body markers 1:1.
+    let mut new_mod_src = String::new();
+    for i in 0..8 {
+        new_mod_src.push_str(&format!(
+            "pub fn omitted_symbol_{i}(v: i32) -> i32 {{\n    let tmp = v * 2 + {i};\n    tmp + {i}\n}}\n"
+        ));
+    }
+    let new_omitted_diff = make_new_file_diff("src/omitted_new.rs", &new_mod_src);
+    let mut mod_omitted_diff = String::from(
+        "diff --git a/src/omitted_mod.rs b/src/omitted_mod.rs\nindex 1111111..2222222 100644\n--- a/src/omitted_mod.rs\n+++ b/src/omitted_mod.rs\n@@ -10,15 +10,15 @@ impl Cache > pub fn evict_expired(&mut self) {\n",
+    );
+    for i in 0..12 {
+        mod_omitted_diff.push_str(&format!(
+            "-    let old_val_{i} = self.entries[{i}];\n+    let new_val_{i} = self.entries[{i}] + 1;\n"
+        ));
+    }
+    mod_omitted_diff.push_str(
+        "@@ -80,12 +80,12 @@ pub fn flush_wal(path: &Path) -> Result<()> {\n-    let old_b = 3;\n+    let new_b = 4;\n",
+    );
+    let pre_omitted_lock = String::from(
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n[omitted: Cargo.lock (+100/-50 lines)]\n\n",
+    );
+
+    // Force both files to become budget-omitted by setting tight budget where per-chunk share < 512 B
+    let items_omit = vec![
+        RenderedChunk {
+            path: Some(PathBuf::from("Cargo.lock")),
+            is_test: false,
+            is_new: false,
+            is_deleted: false,
+            pre_omitted: true,
+            is_omitted: true,
+            raw_chunk: pre_omitted_lock.clone(),
+            rendered: pre_omitted_lock,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+        RenderedChunk {
+            path: Some(PathBuf::from("src/omitted_new.rs")),
+            is_test: false,
+            is_new: true,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: new_omitted_diff.clone(),
+            rendered: new_omitted_diff,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+        RenderedChunk {
+            path: Some(PathBuf::from("src/omitted_mod.rs")),
+            is_test: false,
+            is_new: false,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: mod_omitted_diff.clone(),
+            rendered: mod_omitted_diff,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+    ];
+    let mut w_omit = Vec::new();
+    let omit_out = apply_patch_budget("", items_omit, 860, &mut w_omit);
+    assert!(
+        omit_out.len() <= 860,
+        "Omitted output {} exceeded 860 B:\n{omit_out}",
+        omit_out.len()
+    );
+    assert_eq!(
+        omit_out.matches("[omitted due to patch budget:").count(),
+        2,
+        "Expected 2 budget-omitted markers:\n{omit_out}"
+    );
+    assert!(
+        omit_out.contains("L1-L4: pub fn omitted_symbol_0"),
+        "Budget-omitted new file must include AST symbol TOC with line ranges:\n{omit_out}"
+    );
+    assert!(
+        omit_out.contains("L10-L24: impl Cache > pub fn evict_expired"),
+        "Budget-omitted modified file must include modified hunk AST TOC:\n{omit_out}"
+    );
+    assert!(
+        omit_out.contains("1 pre-omitted, 2 budget-omitted"),
+        "Banner must separate pre-omitted and budget-omitted 1:1:\n{omit_out}"
+    );
+
+    // 3. End-to-end git repo test: machine-generated Go header (`// Code generated by ... DO NOT EDIT.`)
+    //    is automatically pre-omitted.
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+    std::fs::write(repo.join("keep.go"), "package main\nfunc main() {}\n").unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+    std::fs::write(
+        repo.join("queries.sql.go"),
+        "// Code generated by sqlc. DO NOT EDIT.\npackage db\nfunc QueryUser() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("keep.go"),
+        "package main\nfunc main() { println(1) }\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    let mut w_gen = Vec::new();
+    let gen_patch = generate_expanded_diff(repo, true, &mut w_gen).unwrap();
+    assert!(
+        gen_patch.contains("[omitted: queries.sql.go"),
+        "Generated header file must be pre-omitted:\n{gen_patch}"
+    );
+    assert!(
+        !gen_patch.contains("+func QueryUser()"),
+        "Generated file body must not appear in patch:\n{gen_patch}"
+    );
+    assert!(gen_patch.contains("println(1)"));
+}
+
+#[test]
+fn test_review_feedback_regressions_waterfill_dogfood_deletion_moved_and_multilang() {
+    // 1. Tier 4 water-fill must only divide remaining NEW prod files (protecting modified files
+    //    from Tier 5 truncation AND keeping small new files <= cap untouched).
+    let mut mod_chunk = String::from(
+        "diff --git a/src/existing_mod.rs b/src/existing_mod.rs\nindex 1111111..2222222 100644\n--- a/src/existing_mod.rs\n+++ b/src/existing_mod.rs\n@@ -1,4 +1,4 @@ fn keep_me() {\n",
+    );
+    for i in 0..80 {
+        mod_chunk.push_str(&format!(
+            "-    let old_val_{i} = compute_old({i});\n+    let new_val_{i} = compute_new({i});\n"
+        ));
+    }
+    let mut big_new_src = String::new();
+    for f in 0..25 {
+        big_new_src.push_str(&format!("pub fn big_worker_{f}(x: i32) -> i32 {{\n"));
+        for k in 0..14 {
+            big_new_src.push_str(&format!("    let tmp_{k} = x + {k} + {f};\n"));
+        }
+        big_new_src.push_str("    tmp_13\n}\n");
+    }
+    let big_new_diff = make_new_file_diff("src/big_new.rs", &big_new_src);
+
+    let small_new_src = "\
+pub fn small_helper(x: i32) -> i32 {
+    let a = x + 1;
+    let b = a * 2;
+    let c = b + 3;
+    let d = c * 4;
+    let e = d + 5;
+    e
+}
+";
+    let small_new_diff = make_new_file_diff("src/small_new.rs", small_new_src);
+
+    // Budget comfortably fits `mod_chunk` + `small_new_diff` + skeletonized `big_new_diff`,
+    // whereas buggy water-fill including `mod_chunk` in Tier 4 would under-skeletonize `big_new`
+    // and truncate `existing_mod.rs` in Tier 5 (and also force-skeletonize `small_new.rs`).
+    let budget = mod_chunk.len() + small_new_diff.len() + 3600;
+    let items_t4 = vec![
+        RenderedChunk {
+            path: Some(PathBuf::from("src/existing_mod.rs")),
+            is_test: false,
+            is_new: false,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: mod_chunk.clone(),
+            rendered: mod_chunk.clone(),
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+        RenderedChunk {
+            path: Some(PathBuf::from("src/big_new.rs")),
+            is_test: false,
+            is_new: true,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: big_new_diff.clone(),
+            rendered: big_new_diff,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+        RenderedChunk {
+            path: Some(PathBuf::from("src/small_new.rs")),
+            is_test: false,
+            is_new: true,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: small_new_diff.clone(),
+            rendered: small_new_diff,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+    ];
+    let mut w_t4 = Vec::new();
+    let out_t4 = apply_patch_budget("", items_t4, budget, &mut w_t4);
+    assert!(out_t4.len() <= budget, "Exceeded budget: {}", out_t4.len());
+    assert!(
+        !out_t4.contains("[truncated due to patch budget: src/existing_mod.rs"),
+        "Modified production file must NOT be truncated when Tier 4 can skeletonize big_new.rs:\n{out_t4}"
+    );
+    assert!(
+        out_t4.contains("+++ b/src/big_new.rs\n[skeletonized:"),
+        "Big new file must be skeletonized:\n{out_t4}"
+    );
+    assert!(
+        !out_t4.contains("+++ b/src/small_new.rs\n[skeletonized:"),
+        "Small new file <= water-fill cap must remain untouched:\n{out_t4}"
+    );
+    assert!(out_t4.contains("+    let e = d + 5;"));
+
+    // 2. Dogfooding banner 1:1 counting: code literals mentioning marker text inside diff lines
+    //    must NEVER be counted as `truncated` or `budget-omitted` in the top banner.
+    let dogfood_src = "\
+pub fn check_markers(s: &str) -> bool {
+    let a = s.contains(\"[truncated due to patch budget:\");
+    let b = s.contains(\"[omitted due to patch budget:\");
+    a || b
+}
+";
+    let dogfood_diff = make_new_file_diff("src/dogfood.rs", dogfood_src);
+    let big_new_diff2 = make_new_file_diff("src/big_new2.rs", &big_new_src);
+    let dog_budget = dogfood_diff.len() + 3600;
+    let items_dog = vec![
+        RenderedChunk {
+            path: Some(PathBuf::from("src/dogfood.rs")),
+            is_test: false,
+            is_new: true,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: dogfood_diff.clone(),
+            rendered: dogfood_diff,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+        RenderedChunk {
+            path: Some(PathBuf::from("src/big_new2.rs")),
+            is_test: false,
+            is_new: true,
+            is_deleted: false,
+            pre_omitted: false,
+            is_omitted: false,
+            raw_chunk: big_new_diff2.clone(),
+            rendered: big_new_diff2,
+            orig_line_map: None,
+            inline_test_blocks: Vec::new(),
+        },
+    ];
+    let mut w_dog = Vec::new();
+    let out_dog = apply_patch_budget("", items_dog, dog_budget, &mut w_dog);
+    let banner_line = out_dog.lines().next().unwrap();
+    assert!(
+        banner_line.starts_with("[patch-budget:") && banner_line.contains("1 skeletonized"),
+        "Expected 1 skeletonized banner, got: {banner_line}"
+    );
+    assert!(
+        !banner_line.contains("truncated") && !banner_line.contains("budget-omitted"),
+        "Code string literals must NOT trigger false banner counts: {banner_line}"
+    );
+
+    // 3. Pure deletion (`new_count == 0`) right after an inline test block (`new_start == b.end_line`)
+    //    must NOT be folded as inline tests, whereas a pure deletion strictly inside (`< b.end_line`) IS folded.
+    let inline_blk = vec![ast_compact::InlineTestBlock {
+        start_line: 80,
+        end_line: 100,
+        scope_label: Some("mod tests".to_string()),
+        test_names: vec!["test_alpha".to_string()],
+    }];
+    let prod_del_after_test = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -101,10 +100,0 @@
+-pub fn deleted_prod_fn() {
+-    let a = 1;
+-    let b = 2;
+-    let c = 3;
+-    let d = 4;
+-    let e = 5;
+-    let f = 6;
+-    let g = 7;
+-    let h = 8;
+-}
+";
+    assert!(
+        ast_compact::fold_inline_tests_in_modified_chunk(prod_del_after_test, &inline_blk)
+            .is_none(),
+        "Pure deletion right after inline test closing line (new_start == b.end_line) must NOT be folded!"
+    );
+
+    let del_inside_test = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -85,10 +85,0 @@ mod tests > fn test_alpha() { (+2 more)
+-    #[test]
+-    fn test_old() {
+-        let a = 1;
+-        let b = 2;
+-        let c = 3;
+-        let d = 4;
+-        let e = 5;
+-        let f = 6;
+-        assert_eq!(a + b + c + d + e + f, 21);
+-    }
+";
+    let folded_del = ast_compact::fold_inline_tests_in_modified_chunk(del_inside_test, &inline_blk)
+        .expect("Pure deletion strictly inside inline test block should fold");
+    assert!(
+        folded_del.contains("(mod tests; 3 tests; +0/-10 lines): fn test_alpha() { (+2 more)]"),
+        "Modified inline test marker must deduplicate scope prefix and reflect (+2 more) as 3 tests:\n{folded_del}"
+    );
+
+    // 4. Moved-verbatim (`orig_line_map = None`) inside a new file's inline test block must NOT
+    //    split the block into duplicate `[omitted inline tests: ...]` markers.
+    let moved_inline_src = "\
+pub fn prod_keep() -> i32 {
+    42
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_first() {
+        let a = 1;
+        assert_eq!(a, 1);
+    }
+
+    #[test]
+    fn test_moved() {
+        let m1 = 1;
+        let m2 = 2;
+        let m3 = 3;
+        let m4 = 4;
+        assert_eq!(m1 + m2 + m3 + m4, 10);
+    }
+
+    #[test]
+    fn test_last() {
+        let z = 9;
+        assert_eq!(z, 9);
+    }
+}
+";
+    let raw_moved_diff = make_new_file_diff("src/moved_inline.rs", moved_inline_src);
+    // Simulate `summarize_moved_new_file_chunk` replacing lines 15..=23 with a `None`-mapped moved line
+    let mut sim_rendered = String::new();
+    let mut sim_map: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut raw_src_ln = 0usize;
+    let mut in_hunk = false;
+    let mut emitted_moved = false;
+    for l in raw_moved_diff.split_inclusive('\n') {
+        if !in_hunk {
+            sim_rendered.push_str(l);
+            sim_map.push(None);
+            if l.starts_with("@@ ") {
+                in_hunk = true;
+            }
+            continue;
+        }
+        raw_src_ln += 1;
+        if (15..=23).contains(&raw_src_ln) {
+            if !emitted_moved {
+                sim_rendered
+                    .push_str("+[moved verbatim from old.rs: fn test_moved() { (+9 lines)]\n");
+                sim_map.push(None);
+                emitted_moved = true;
+            }
+        } else {
+            sim_rendered.push_str(l);
+            sim_map.push(Some((raw_src_ln, raw_src_ln)));
+        }
+    }
+    let (folded_moved, _) = ast_compact::fold_inline_tests_in_new_chunk(
+        &raw_moved_diff,
+        &sim_rendered,
+        Some(&sim_map),
+        Path::new("src/moved_inline.rs"),
+    )
+    .expect("Expected inline test block containing moved line to fold cleanly");
+    assert_eq!(
+        folded_moved.matches("+[omitted inline tests:").count(),
+        1,
+        "Inline test block containing moved-verbatim line must produce exactly 1 marker:\n{folded_moved}"
+    );
+    assert!(
+        !folded_moved.contains("+[moved verbatim"),
+        "Moved-verbatim line inside folded inline test block must be absorbed:\n{folded_moved}"
+    );
+    assert!(folded_moved.contains("pub fn prod_keep() -> i32"));
+
+    // 5. C++ `#ifdef`/`#define`/`#endif` between TEST(...) blocks must NOT be treated as `#` comments
+    let cpp_preproc = "\
+TEST(Suite, First) {
+    int a = 1;
+    EXPECT_EQ(a, 1);
+}
+#ifdef ENABLE_EXTRA
+#define EXTRA_VAL 42
+#endif
+TEST(Suite, Second) {
+    int b = 2;
+    EXPECT_EQ(b, 2);
+}
+";
+    let mut cpp_parser = Parser::new();
+    cpp_parser
+        .set_language(&SupportedLanguage::Cpp.language_fn())
+        .unwrap();
+    let cpp_tree = cpp_parser.parse(cpp_preproc, None).unwrap();
+    let cpp_blocks = ast_compact::find_inline_test_blocks(
+        SupportedLanguage::Cpp,
+        &cpp_tree.root_node(),
+        cpp_preproc,
+    );
+    assert_eq!(
+        cpp_blocks.len(),
+        2,
+        "C++ #ifdef/#define between TEST blocks must prevent merging so preprocessor lines are never hidden: {cpp_blocks:?}"
+    );
+
+    // 6. Ruby production method interior DSL (`feature`/`context`) must NOT be folded as inline tests
+    let rb_dsl = "\
+class AppConfig
+  def configure
+    feature :dark_mode do
+      enable_theme(:dark)
+    end
+    context :billing do
+      set_currency(:usd)
+    end
+  end
+end
+
+describe 'AppConfig' do
+  it 'configures defaults' do
+    cfg = AppConfig.new
+    expect(cfg).not_to be_nil
+  end
+end
+";
+    let mut rb_parser = Parser::new();
+    rb_parser
+        .set_language(&SupportedLanguage::Ruby.language_fn())
+        .unwrap();
+    let rb_tree = rb_parser.parse(rb_dsl, None).unwrap();
+    let rb_blocks =
+        ast_compact::find_inline_test_blocks(SupportedLanguage::Ruby, &rb_tree.root_node(), rb_dsl);
+    assert_eq!(
+        rb_blocks.len(),
+        1,
+        "Only top-level RSpec describe should match, not DSL calls inside `def configure`: {rb_blocks:?}"
+    );
+    assert_eq!(rb_blocks[0].scope_label.as_deref(), Some("describe"));
+
+    // 7. `pub(crate)` visibility skipping in `find_sig_head_cut`
+    let pub_crate = "pub(crate) fn run_job(x: i32) -> i32 {";
+    let cut = ast_compact::find_sig_head_cut(pub_crate, &['(', '{', '<']);
+    assert_eq!(&pub_crate[..cut], "pub(crate) fn run_job");
+
+    let pub_in = "pub(in crate::rpc::host) struct Session<T> {";
+    let cut_in = ast_compact::find_sig_head_cut(pub_in, &['(', '{', '<']);
+    assert_eq!(&pub_in[..cut_in], "pub(in crate::rpc::host) struct Session");
+
+    // 8. Modified auto-generated file (edited at line 55, NOT line 1) with multiline `/* ... */`
+    //    header lacking `*` prefix must still be pre-omitted.
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    let mut gen_rs = String::from("/*\n   Code generated by flatc. DO NOT EDIT.\n*/\n\n");
+    for i in 1..=60 {
+        gen_rs.push_str(&format!("pub const FIELD_{i}: i32 = {i};\n"));
+    }
+    std::fs::write(repo.join("schema_types.rs"), &gen_rs).unwrap();
+    std::fs::write(repo.join("real.rs"), "pub fn real_fn() -> i32 { 1 }\n").unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+
+    // Modify ONLY line 55 of generated file (line 1 header is NOT in `-U0` diff!)
+    let mod_gen_rs = gen_rs.replace(
+        "pub const FIELD_50: i32 = 50;",
+        "pub const FIELD_50: i32 = 500;",
+    );
+    std::fs::write(repo.join("schema_types.rs"), &mod_gen_rs).unwrap();
+    std::fs::write(repo.join("real.rs"), "pub fn real_fn() -> i32 { 2 }\n").unwrap();
+
+    let mut w_gen = Vec::new();
+    let patch = generate_expanded_diff(repo, false, &mut w_gen).unwrap();
+    assert!(
+        patch.contains("[omitted: schema_types.rs"),
+        "Modified auto-generated file with multiline /* ... */ header must be omitted even when line 1 was untouched:\n{patch}"
+    );
+    assert!(
+        !patch.contains("FIELD_50: i32 = 500"),
+        "Modified auto-generated file body must not appear in patch:\n{patch}"
+    );
+    assert!(patch.contains("+pub fn real_fn() -> i32 { 2 }"));
+
+    // 9. Consecutive moved test tail + moved production function immediately after inline test block
+    //    must absorb ONLY the moved test tail and preserve the moved production function!
+    let adj_moved_src = "\
+#[test]
+fn test_first() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+    assert_eq!(a + b + c + d, 10);
+}
+#[test]
+fn test_second_moved() {
+    let x1 = 1;
+    let x2 = 2;
+    let x3 = 3;
+    let x4 = 4;
+    let x5 = 5;
+    let x6 = 6;
+    assert_eq!(x1 + x2 + x3 + x4 + x5 + x6, 21);
+}
+pub fn prod_moved_immediately_after() -> i32 {
+    let p1 = 10;
+    let p2 = 20;
+    let p3 = 30;
+    let p4 = 40;
+    let p5 = 50;
+    let p6 = 60;
+    p1 + p2 + p3 + p4 + p5 + p6
+}
+";
+    // Line layout: L1..=8 test_first, L9 #[test], L10..=18 test_second_moved (9 lines),
+    // L19..=27 prod_moved_immediately_after (9 lines).
+    let raw_adj = make_new_file_diff("src/adj_moved.rs", adj_moved_src);
+    let mut adj_rendered = String::new();
+    let mut adj_map: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut ln = 0usize;
+    let mut in_h = false;
+    let mut emitted_t2 = false;
+    let mut emitted_prod = false;
+    for l in raw_adj.split_inclusive('\n') {
+        if !in_h {
+            adj_rendered.push_str(l);
+            adj_map.push(None);
+            if l.starts_with("@@ ") {
+                in_h = true;
+            }
+            continue;
+        }
+        ln += 1;
+        if (10..=18).contains(&ln) {
+            if !emitted_t2 {
+                adj_rendered.push_str(
+                    "+[moved verbatim from old.rs: fn test_second_moved() { (+9 lines)]\n",
+                );
+                adj_map.push(None);
+                emitted_t2 = true;
+            }
+        } else if (19..=27).contains(&ln) {
+            if !emitted_prod {
+                adj_rendered.push_str(
+                    "+[moved verbatim from old.rs: pub fn prod_moved_immediately_after() -> i32 { (+9 lines)]\n",
+                );
+                adj_map.push(None);
+                emitted_prod = true;
+            }
+        } else {
+            adj_rendered.push_str(l);
+            adj_map.push(Some((ln, ln)));
+        }
+    }
+    let (folded_adj, _) = ast_compact::fold_inline_tests_in_new_chunk(
+        &raw_adj,
+        &adj_rendered,
+        Some(&adj_map),
+        Path::new("src/adj_moved.rs"),
+    )
+    .expect("Expected inline tests to fold");
+    assert_eq!(folded_adj.matches("+[omitted inline tests:").count(), 1);
+    assert!(
+        !folded_adj.contains("test_second_moved() {"),
+        "Moved test tail inside inline test block must be absorbed:\n{folded_adj}"
+    );
+    assert!(
+        folded_adj.contains("+[moved verbatim from old.rs: pub fn prod_moved_immediately_after() -> i32 { (+9 lines)]"),
+        "Moved production function immediately following inline test block must NOT be swallowed:\n{folded_adj}"
+    );
+
+    // 10. Two-line split generated file header (e.g. OpenAPI / gRPC) must be detected across lines 1..=5
+    let openapi_two_line = "\
+diff --git a/src/api_client.ts b/src/api_client.ts
+new file mode 100644
+--- /dev/null
++++ b/src/api_client.ts
+@@ -0,0 +1,4 @@
++// Auto-generated by OpenAPI Generator
++// Do not edit this file manually.
++export interface ApiClient {}
+";
+    assert!(
+        has_generated_file_header(openapi_two_line),
+        "Two-line split generated header must be detected"
+    );
+    let normal_two_line = "\
+diff --git a/src/notes.ts b/src/notes.ts
+new file mode 100644
+--- /dev/null
++++ b/src/notes.ts
+@@ -0,0 +1,4 @@
++// Hand-written API helper
++// Do not edit without updating docs.
++export interface Helper {}
+";
+    assert!(
+        !has_generated_file_header(normal_two_line),
+        "Comment with only 'do not edit' without generated phrase must NOT false-positive"
+    );
+}
+
+#[test]
+fn test_review_fixes_ruby_dsl_leading_moved_test_mod_scope_and_deleted_generated() {
+    // 1. Ruby production class/module DSL (`feature :billing do`, `obj.context do`,
+    //    `Flipper.feature do`, top-level DSL `feature :flag do` without tests) must NOT be folded,
+    //    while explicit `RSpec.describe` (even inside `module`) and `class *Test` ARE folded.
+    let ruby_prod_dsl = "\
+class BillingController < ApplicationController
+  feature :billing do
+    enable :invoices
+    enable :subscriptions
+    enable :webhooks
+    enable :proration
+    enable :receipts
+  end
+
+  obj.context do
+    step_one
+    step_two
+    step_three
+    step_four
+    step_five
+  end
+end
+
+Flipper.feature(:checkout) do |actor|
+  a = actor.id
+  b = a + 1
+  c = b + 2
+  d = c + 3
+  d > 0
+end
+
+feature :top_level_flag do
+  enable :alpha
+  enable :beta
+  enable :gamma
+  enable :delta
+  enable :epsilon
+end
+";
+    let ruby_dsl_diff = make_new_file_diff("app/controllers/billing_controller.rb", ruby_prod_dsl);
+    assert!(
+        ast_compact::fold_inline_tests_in_new_chunk(
+            &ruby_dsl_diff,
+            &ruby_dsl_diff,
+            None,
+            Path::new("app/controllers/billing_controller.rb"),
+        )
+        .is_none(),
+        "Ruby production class/module/receiver DSL blocks must NEVER be folded as inline tests!"
+    );
+
+    let ruby_rspec_in_module = "\
+module Payments
+  class Service
+    def run(x)
+      x + 1
+    end
+  end
+
+  RSpec.describe Service do
+    it 'adds one' do
+      svc = Service.new
+      res = svc.run(41)
+      expect(res).to eq(42)
+      expect(res).to be > 0
+    end
+  end
+end
+";
+    let ruby_rspec_diff = make_new_file_diff("lib/payments.rb", ruby_rspec_in_module);
+    let (folded_rb, _) = ast_compact::fold_inline_tests_in_new_chunk(
+        &ruby_rspec_diff,
+        &ruby_rspec_diff,
+        None,
+        Path::new("lib/payments.rb"),
+    )
+    .expect("Explicit RSpec.describe inside module must still be folded");
+    assert!(folded_rb.contains("def run(x)"));
+    assert!(folded_rb.contains("+[omitted inline tests:"));
+    assert!(!folded_rb.contains("expect(res).to eq(42)"));
+
+    // 2. Merged inline test block whose *start* is `+[moved verbatim ...]` followed by a normal
+    //    inline test (e.g. Go `TestA` moved + `TestB` normal) must fold into ONE marker without
+    //    leaving `TestA` duplicated above `[omitted inline tests: ...]`.
+    let go_moved_head_src = "\
+package mathx
+
+import \"testing\"
+
+func Add(a, b int) int {
+	return a + b
+}
+
+func TestAlpha(t *testing.T) {
+	a := 1
+	b := 2
+	c := 3
+	d := 4
+	if Add(a, b)+c+d != 10 {
+		t.Fatalf(\"bad alpha\")
+	}
+}
+
+func TestBeta(t *testing.T) {
+	x := 10
+	y := 20
+	z := 30
+	w := 40
+	if Add(x, y)+z+w != 100 {
+		t.Fatalf(\"bad beta\")
+	}
+}
+";
+    // Line layout: L1..=L8 prod, L9..=L17 TestAlpha (9 lines), L18 blank, L19..=L27 TestBeta (9 lines)
+    let raw_go = make_new_file_diff("pkg/mathx.go", go_moved_head_src);
+    let mut go_rendered = String::new();
+    let mut go_map: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut ln = 0usize;
+    let mut in_h = false;
+    let mut emitted_alpha = false;
+    for l in raw_go.split_inclusive('\n') {
+        if !in_h {
+            go_rendered.push_str(l);
+            go_map.push(None);
+            if l.starts_with("@@ ") {
+                in_h = true;
+            }
+            continue;
+        }
+        ln += 1;
+        if (9..=17).contains(&ln) {
+            if !emitted_alpha {
+                go_rendered.push_str(
+                    "+[moved verbatim from old.go: func TestAlpha(t *testing.T) { (+9 lines)]\n",
+                );
+                go_map.push(None);
+                emitted_alpha = true;
+            }
+        } else {
+            go_rendered.push_str(l);
+            go_map.push(Some((ln, ln)));
+        }
+    }
+    let (folded_go, _) = ast_compact::fold_inline_tests_in_new_chunk(
+        &raw_go,
+        &go_rendered,
+        Some(&go_map),
+        Path::new("pkg/mathx.go"),
+    )
+    .expect("Merged Go inline test block with moved start should fold");
+    assert_eq!(folded_go.matches("+[omitted inline tests:").count(), 1);
+    assert!(
+        !folded_go.contains("moved verbatim from old.go: func TestAlpha"),
+        "Leading moved test inside merged inline test block must be absorbed without duplication:\n{folded_go}"
+    );
+    assert!(folded_go.contains("TestAlpha, TestBeta"));
+    assert!(folded_go.contains("func Add(a, b int) int"));
+
+    // 3. Modified file inline test hunk outside test functions (e.g. `use` edits inside `mod tests`
+    //    where hunk signature is `mod tests` or `mod tests {`) must NOT duplicate scope or claim `1 test`.
+    let mod_tests_chunk = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -50,8 +50,9 @@ mod tests {
+     use super::*;
+-    use crate::old_helper_module_with_long_name::OldHelper;
++    use crate::new_helper_module_with_long_name::NewHelper;
++    use crate::another_helper_module_with_long_name::ExtraHelper;
+     const FIXTURE_A: &str = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";
+     const FIXTURE_B: &str = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\";
+     const FIXTURE_C: &str = \"cccccccccccccccccccccccccccccccc\";
+     const FIXTURE_D: &str = \"dddddddddddddddddddddddddddddddd\";
+     const FIXTURE_E: &str = \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\";
+";
+    let inline_blocks = vec![ast_compact::InlineTestBlock {
+        start_line: 48,
+        end_line: 120,
+        scope_label: Some("mod tests".to_string()),
+        test_names: vec!["test_one".to_string()],
+    }];
+    let folded_mod =
+        ast_compact::fold_inline_tests_in_modified_chunk(mod_tests_chunk, &inline_blocks)
+            .expect("Expected mod tests use-only hunk to fold");
+    assert!(
+        folded_mod.contains("[omitted inline tests: L50-L58 (mod tests; 9 lines; +2/-1 lines)]"),
+        "Expected non-duplicated scope marker without false `1 test`, got:\n{folded_mod}"
+    );
+    assert!(
+        !folded_mod.contains("1 test"),
+        "Scope-only mod tests hunk must not claim `1 test`:\n{folded_mod}"
+    );
+    assert!(
+        !folded_mod.contains(": mod tests"),
+        "Scope-only mod tests hunk must not duplicate `: mod tests`:\n{folded_mod}"
+    );
+
+    // 4. End-to-end git repo test: deleted auto-generated `queries.sql.go` is pre-omitted (and not
+    //    dumped or indexed), while C/Rust files with `#define` / `#![doc]` mentioning `@generated`
+    //    are NOT falsely pre-omitted.
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    let mut sqlc_go = String::from("// Code generated by sqlc. DO NOT EDIT.\npackage db\n\n");
+    for i in 0..20 {
+        sqlc_go.push_str(&format!(
+            "func QueryRow{i}() int {{\n\tx := {i}\n\treturn x + 1\n}}\n"
+        ));
+    }
+    std::fs::write(repo.join("queries.sql.go"), &sqlc_go).unwrap();
+    std::fs::write(
+        repo.join("keep.rs"),
+        "#![doc = \"Checks @generated headers\"]\npub fn keep() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+
+    std::fs::remove_file(repo.join("queries.sql.go")).unwrap();
+    std::fs::write(
+        repo.join("keep.rs"),
+        "#![doc = \"Checks @generated headers\"]\npub fn keep() -> i32 { 2 }\n",
+    )
+    .unwrap();
+
+    let mut w = Vec::new();
+    let patch = generate_expanded_diff(repo, false, &mut w).unwrap();
+    assert!(
+        patch.contains("[omitted: queries.sql.go"),
+        "Deleted generated queries.sql.go must be pre-omitted:\n{patch}"
+    );
+    assert!(
+        !patch.contains("QueryRow0"),
+        "Deleted generated file body must not appear in diff:\n{patch}"
+    );
+    assert!(
+        patch.contains("+pub fn keep() -> i32 { 2 }"),
+        "Rust file with #![doc = \"Checks @generated headers\"] must NOT be omitted:\n{patch}"
+    );
+}
+
+#[test]
+fn test_round_two_multilang_span_map_ruby_spec_blank_indent_and_unsupported_gen() {
+    use super::diff_expand::{apply_patch_budget, RenderedChunk};
+
+    // 1. Tier 4 (Skeletonize) -> Tier 5 (Head+Tail) span map & AST snap across Rust, Python, and Bash:
+    //    When a skeletonized function (e.g. L1..L22) sits at the end of the omitted region,
+    //    `omitted L{s}-L{e}` must use its closing span `e` (not `s`) so it aligns with
+    //    `[resuming at L{e+1}]`, and `head_end` AST snapping recognizes skeletonized functions as complete.
+    let mut rs_src = String::new();
+    for f in 0..25 {
+        rs_src.push_str(&format!("pub fn stage_{f:02}(x: i32) -> i32 {{\n"));
+        for k in 0..18 {
+            rs_src.push_str(&format!("    let step_{k} = x + {f} + {k};\n"));
+        }
+        rs_src.push_str("    step_17\n}\n");
+    }
+    let rs_diff = make_new_file_diff("src/pipeline.rs", &rs_src);
+    let (rs_skel, rs_map, _, _) = ast_compact::skeletonize_new_chunk_progressive(
+        &rs_diff,
+        &rs_diff,
+        None,
+        Path::new("src/pipeline.rs"),
+        2000,
+    )
+    .expect("Expected Rust file to skeletonize");
+    // Every folded function line in `rs_map` must store a multi-line `(start, end)` span with `end > start`.
+    assert!(
+        rs_map.iter().flatten().any(|&(s, e)| e >= s + 15),
+        "Skeletonized orig_line_map must preserve full (start, end) spans"
+    );
+
+    let items_rs = vec![RenderedChunk {
+        path: Some(PathBuf::from("src/pipeline.rs")),
+        is_test: false,
+        is_new: true,
+        is_deleted: false,
+        pre_omitted: false,
+        is_omitted: false,
+        raw_chunk: rs_diff,
+        rendered: rs_skel,
+        orig_line_map: Some(rs_map),
+        inline_test_blocks: Vec::new(),
+    }];
+    let mut w_rs = Vec::new();
+    let out_rs = apply_patch_budget("", items_rs, 1400, &mut w_rs);
+    assert!(
+        out_rs.len() <= 1400,
+        "Output {} exceeded 1400",
+        out_rs.len()
+    );
+    let om_pos = out_rs
+        .find("omitted L")
+        .expect("Expected `omitted L{s}-L{e}` in Tier 5 output");
+    let om_rest = &out_rs[om_pos + "omitted L".len()..];
+    let dash = om_rest.find("-L").unwrap();
+    let om_start: usize = om_rest[..dash].parse().unwrap();
+    let after_l = &om_rest[dash + 2..];
+    let sp = after_l.find(' ').unwrap();
+    let om_end: usize = after_l[..sp].parse().unwrap();
+
+    let res_pos = out_rs
+        .find("[resuming at L")
+        .expect("Expected `[resuming at L...]` anchor");
+    let res_rest = &out_rs[res_pos + "[resuming at L".len()..];
+    let res_end = res_rest.find(']').unwrap();
+    let resumed_ln: usize = res_rest[..res_end].parse().unwrap();
+    assert_eq!(
+        om_end + 1,
+        resumed_ln,
+        "Omitted end L{om_end} must match closing line right before [resuming at L{resumed_ln}] (not skeleton start L{om_start}!):\n{out_rs}"
+    );
+    assert!(om_end > om_start + 10);
+
+    // 2. Ruby `class *Spec` / `*Test` without test superclass or test members must NOT be folded,
+    //    while `Minitest::Test`, `Minitest::Spec`, `def test_*`, Rails `test "..." do`, and
+    //    `*Spec` with `it '...' do` ARE folded.
+    let ruby_prod_specs = "\
+class ApiSpec
+  def initialize(version)
+    @version = version
+  end
+
+  def validate(payload)
+    a = payload[:id]
+    b = payload[:name]
+    c = payload[:kind]
+    d = @version
+    a && b && c && d
+  end
+end
+
+class JobSpec < BaseSchema
+  def serialize
+    x = 1
+    y = 2
+    z = 3
+    w = 4
+    x + y + z + w
+  end
+end
+
+class HealthCheckTest
+  def ping
+    a = 1
+    b = 2
+    c = 3
+    d = 4
+    a + b + c + d
+  end
+end
+";
+    let ruby_prod_diff = make_new_file_diff("lib/specs/api_spec_model.rb", ruby_prod_specs);
+    assert!(
+        ast_compact::fold_inline_tests_in_new_chunk(
+            &ruby_prod_diff,
+            &ruby_prod_diff,
+            None,
+            Path::new("lib/specs/api_spec_model.rb"),
+        )
+        .is_none(),
+        "Production Ruby classes named ApiSpec/JobSpec/HealthCheckTest without test inheritance or test methods must NOT be folded!"
+    );
+
+    let ruby_real_test_classes = "\
+class Billing
+  def fee(x)
+    x * 2
+  end
+end
+
+class BillingTest
+  def test_fee_calculation
+    b = Billing.new
+    v1 = b.fee(1)
+    v2 = b.fee(2)
+    v3 = b.fee(3)
+    raise unless v1 + v2 + v3 == 12
+  end
+end
+
+class BillingSpec < Minitest::Spec
+  it 'doubles amounts' do
+    b = Billing.new
+    res = b.fee(21)
+    assert_equal 42, res
+    assert res > 0
+  end
+end
+";
+    let ruby_real_diff = make_new_file_diff("lib/billing.rb", ruby_real_test_classes);
+    let (folded_rb_real, _) = ast_compact::fold_inline_tests_in_new_chunk(
+        &ruby_real_diff,
+        &ruby_real_diff,
+        None,
+        Path::new("lib/billing.rb"),
+    )
+    .expect("Real Ruby test classes (def test_* and < Minitest::Spec) must fold");
+    assert!(folded_rb_real.contains("class Billing\n"));
+    assert!(
+        !folded_rb_real.contains("raise unless v1 + v2 + v3 == 12"),
+        "BillingTest body must be folded:\n{folded_rb_real}"
+    );
+    assert!(
+        !folded_rb_real.contains("assert_equal 42"),
+        "BillingSpec body must be folded:\n{folded_rb_real}"
+    );
+    assert!(folded_rb_real.contains("(class BillingTest; 1 test): test_fee_calculation"));
+    assert!(folded_rb_real.contains("class BillingSpec"));
+
+    // 3. Python (PEP 257 blank line after docstring, including nested method), Bash (blank line
+    //    after `{`), and Ruby (blank line after `def`) skeletonization must preserve real body indent!
+    let py_blank_after_doc = "\
+class Service:
+    def compute(self, x):
+        \"\"\"Compute weighted total.
+
+        Uses multiple stages.
+        \"\"\"
+
+        a = x + 1
+        b = a + 2
+        c = b + 3
+        d = c + 4
+        e = d + 5
+        f = e + 6
+        return f
+";
+    let py_diff = make_new_file_diff("src/service.py", py_blank_after_doc);
+    let (py_skel, py_map, _, _) = ast_compact::skeletonize_new_chunk_progressive(
+        &py_diff,
+        &py_diff,
+        None,
+        Path::new("src/service.py"),
+        100,
+    )
+    .expect("Expected Python method with blank line after docstring to skeletonize");
+    assert!(
+        py_skel.contains("+        ...  # ... "),
+        "Python skeleton placeholder must preserve 8-space method indent even when first folded line is blank:\n{py_skel}"
+    );
+    assert!(
+        py_map.iter().flatten().any(|&(s, e)| e >= s + 6),
+        "Python skeletonized body line must carry full (start, end) span"
+    );
+
+    let bash_blank_after_brace = "\
+deploy_release() {
+
+    local env=\"$1\"
+    local tag=\"$2\"
+    echo \"deploy $env $tag\"
+    step_one \"$env\"
+    step_two \"$tag\"
+    step_three \"$env\"
+    step_four \"$tag\"
+    step_five \"$env\"
+}
+";
+    let bash_diff = make_new_file_diff("scripts/deploy.sh", bash_blank_after_brace);
+    let (bash_skel, bash_map, _, _) = ast_compact::skeletonize_new_chunk_progressive(
+        &bash_diff,
+        &bash_diff,
+        None,
+        Path::new("scripts/deploy.sh"),
+        100,
+    )
+    .expect("Expected Bash function with blank line after `{` to skeletonize");
+    assert!(
+        bash_skel.contains("+    # ... "),
+        "Bash skeleton placeholder must preserve 4-space body indent even when line after `{{` is blank:\n{bash_skel}"
+    );
+    assert!(
+        bash_map.iter().flatten().any(|&(s, e)| e >= s + 6),
+        "Bash skeletonized inner line must carry full (start, end) span"
+    );
+
+    // 4. End-to-end git repo test: modified unsupported-language generated files (`.kt`, `.sql`,
+    //    `.xml` with `<?xml ...?>`) edited far below line 1 MUST be pre-omitted without falling
+    //    back to `git diff -W`, while hand-written files mentioning `@generated` in doc comments
+    //    must NOT be pre-omitted.
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    let mut gen_kt = String::from("// Code generated by ksp. DO NOT EDIT.\npackage app.gen\n\n");
+    for i in 1..=50 {
+        gen_kt.push_str(&format!("const val K_{i} = {i}\n"));
+    }
+    let mut gen_sql = String::from("-- @generated\n");
+    for i in 1..=50 {
+        gen_sql.push_str(&format!("SELECT {i};\n"));
+    }
+    let mut gen_xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!-- Auto-generated by xjc. Do not edit. -->\n<root>\n",
+    );
+    for i in 1..=50 {
+        gen_xml.push_str(&format!("  <item id=\"{i}\"/>\n"));
+    }
+    gen_xml.push_str("</root>\n");
+
+    let hand_rs =
+        "//! Handles @generated files and lockfiles safely.\npub fn handle() -> i32 { 1 }\n";
+    let hand_kt = "// Utility for checking @generated comments in Kotlin\nfun check() = 1\n";
+
+    std::fs::write(repo.join("Models.kt"), &gen_kt).unwrap();
+    std::fs::write(repo.join("schema.sql"), &gen_sql).unwrap();
+    std::fs::write(repo.join("manifest.xml"), &gen_xml).unwrap();
+    std::fs::write(repo.join("handler.rs"), hand_rs).unwrap();
+    std::fs::write(repo.join("Helper.kt"), hand_kt).unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+
+    // Edit ONLY around line 45 in generated unsupported-language files (line 1 untouched!)
+    std::fs::write(
+        repo.join("Models.kt"),
+        gen_kt.replace("const val K_45 = 45", "const val K_45 = 450"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("schema.sql"),
+        gen_sql.replace("SELECT 45;", "SELECT 450;"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("manifest.xml"),
+        gen_xml.replace("<item id=\"45\"/>", "<item id=\"450\"/>"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("handler.rs"),
+        hand_rs.replace("-> i32 { 1 }", "-> i32 { 2 }"),
+    )
+    .unwrap();
+    std::fs::write(repo.join("Helper.kt"), hand_kt.replace("= 1", "= 2")).unwrap();
+
+    // Test both Unstaged (worktree read) and Staged (git cat-file blob read)!
+    for staged in [false, true] {
+        if staged {
+            Command::new("git")
+                .current_dir(repo)
+                .args(["add", "."])
+                .status()
+                .unwrap();
+        }
+        let mut warnings = Vec::new();
+        let patch = generate_expanded_diff(repo, staged, &mut warnings).unwrap();
+        assert!(
+            patch.contains("[omitted: Models.kt"),
+            "Modified generated .kt (staged={staged}) must be pre-omitted:\n{patch}"
+        );
+        assert!(
+            patch.contains("[omitted: schema.sql"),
+            "Modified generated .sql (staged={staged}) must be pre-omitted:\n{patch}"
+        );
+        assert!(
+            patch.contains("[omitted: manifest.xml"),
+            "Modified generated .xml (staged={staged}) must be pre-omitted:\n{patch}"
+        );
+        assert!(!patch.contains("K_45 = 450"));
+        assert!(!patch.contains("SELECT 450;"));
+        assert!(!patch.contains("id=\"450\""));
+        assert!(
+            !warnings.iter().any(|w| w.contains("Models.kt") || w.contains("schema.sql") || w.contains("manifest.xml")),
+            "Pre-omitted generated unsupported files must not emit unsupported-language fallback warnings: {warnings:?}"
+        );
+        assert!(
+            patch.contains("+pub fn handle() -> i32 { 2 }"),
+            "Hand-written Rust file with `//! Handles @generated files` must NOT be omitted:\n{patch}"
+        );
+        assert!(
+            patch.contains("+fun check() = 2"),
+            "Hand-written Kotlin file mentioning `@generated` in prose must NOT be omitted:\n{patch}"
+        );
+    }
 }

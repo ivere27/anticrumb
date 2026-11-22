@@ -5,6 +5,8 @@ use std::{
     process::Command,
 };
 
+#[cfg(feature = "tree-sitter")]
+mod ast_compact;
 mod diff_expand;
 #[cfg(feature = "tree-sitter")]
 mod signature;
@@ -19,10 +21,15 @@ pub use diff_expand::{
     is_lockfile_or_generated,
 };
 
+/// 1-based inclusive source line span `(start_line, end_line)` for a rendered diff line.
+type SourceLineSpan = (usize, usize);
+/// Per-line mapping from rendered diff lines to optional 1-based source line spans.
+type SourceLineMap = Vec<Option<SourceLineSpan>>;
+
 /// Maximum number of lines an AST definition is allowed to expand to for general code.
 /// Prevents large classes, structs, or JSON objects from dumping massive amounts of context.
 #[cfg(feature = "tree-sitter")]
-const MAX_EXPANSION_LINES: usize = 150;
+const MAX_EXPANSION_LINES: usize = 220;
 
 /// Maximum number of lines allowed for test functions/blocks before clamping.
 #[cfg(feature = "tree-sitter")]
@@ -34,7 +41,7 @@ const ATTR_ONLY_MAX_EXPANSION_LINES: usize = 15;
 
 /// Minimum span for a function to be considered large for low-churn clamping.
 #[cfg(feature = "tree-sitter")]
-const LOW_CHURN_MIN_SPAN: usize = 60;
+const LOW_CHURN_MIN_SPAN: usize = 150;
 
 /// Maximum changed lines in a large function to trigger low-churn clamping.
 #[cfg(feature = "tree-sitter")]
@@ -42,10 +49,31 @@ const LOW_CHURN_MAX_CHANGE_LINES: usize = 3;
 
 /// Number of context lines to provide around a change when an AST definition exceeds MAX_EXPANSION_LINES.
 #[cfg(feature = "tree-sitter")]
-const CLAMPED_CONTEXT_LINES: usize = 5;
+const CLAMPED_CONTEXT_LINES: usize = 10;
 
 /// Soft byte budget for combined expanded diff output before progressive chunk compaction triggers.
-const DEFAULT_PATCH_BUDGET_BYTES: usize = 256 * 1024;
+/// Tuned for 1M-context reasoning models (~140K-150K tokens) so large commits keep full production logic.
+const DEFAULT_PATCH_BUDGET_BYTES: usize = 512 * 1024;
+const MIN_PATCH_BUDGET_BYTES: usize = 16 * 1024;
+const MAX_PATCH_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Parses an optional KiB override value (e.g. from `ANTICRUMB_PATCH_BUDGET_KIB`) into bytes,
+/// clamped to `[16 KiB, 16 MiB]`.
+fn parse_patch_budget_kib(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&kib| kib > 0)
+        .map(|kib| {
+            kib.saturating_mul(1024)
+                .clamp(MIN_PATCH_BUDGET_BYTES, MAX_PATCH_BUDGET_BYTES)
+        })
+        .unwrap_or(DEFAULT_PATCH_BUDGET_BYTES)
+}
+
+/// Resolves the active soft patch budget from `ANTICRUMB_PATCH_BUDGET_KIB` or `DEFAULT_PATCH_BUDGET_BYTES`.
+fn resolve_patch_budget_bytes() -> usize {
+    let val = std::env::var("ANTICRUMB_PATCH_BUDGET_KIB").ok();
+    parse_patch_budget_kib(val.as_deref())
+}
 
 /// Maximum file size (in bytes) allowed for Tree-sitter in-memory parsing (1 MiB).
 /// Files exceeding this limit fall back to `git diff -W` to prevent memory and CPU spikes.

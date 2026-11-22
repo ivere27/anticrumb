@@ -1635,7 +1635,7 @@ fn strip_ast_comments_in_range(
 
 /// Unwraps wrapper nodes (`export_statement`, `template_declaration`, JS/TS variable/property/
 /// assignment-bound functions) to locate the AST `body` node for `target`.
-fn find_ast_body_node<'a>(
+pub(super) fn find_ast_body_node<'a>(
     lang: SupportedLanguage,
     target: &tree_sitter::Node<'a>,
 ) -> Option<tree_sitter::Node<'a>> {

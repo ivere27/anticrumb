@@ -1,13 +1,13 @@
 #[cfg(feature = "tree-sitter")]
 use super::{
-    check_primary_definition, find_enclosing_definition_detail, signature,
+    ast_compact, check_primary_definition, find_enclosing_definition_detail, signature,
     test_scope::{is_ast_node_attr_or_comment, is_attribute_or_comment_only},
     SupportedLanguage, ATTR_ONLY_MAX_EXPANSION_LINES, CLAMPED_CONTEXT_LINES,
     MAX_TREESITTER_FILE_BYTES, TREESITTER_PARSE_TIMEOUT_MICROS,
 };
 use super::{
-    get_repo_root, git_cmd, is_test_file_path, unquote_c_style, GitDiffSource,
-    DEFAULT_PATCH_BUDGET_BYTES,
+    get_repo_root, git_cmd, is_test_file_path, resolve_patch_budget_bytes, unquote_c_style,
+    GitDiffSource,
 };
 use crate::domain::{Result, ServiceError};
 #[cfg(feature = "tree-sitter")]
@@ -23,7 +23,7 @@ use tree_sitter::Parser;
 #[cfg(feature = "tree-sitter")]
 const LOOKAHEAD_MAX_LINES: usize = 12;
 #[cfg(feature = "tree-sitter")]
-const LARGE_NEW_TEST_SUMMARY_MIN_LINES: usize = 200;
+const LARGE_NEW_TEST_SUMMARY_MIN_LINES: usize = 500;
 #[cfg(feature = "tree-sitter")]
 const MIN_MOVED_BLOCK_NON_EMPTY_LINES: usize = 8;
 #[cfg(feature = "tree-sitter")]
@@ -41,7 +41,7 @@ struct ParsedHunk {
     moved_summary: Option<String>,
 }
 
-fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize, String)> {
+pub(super) fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize, String)> {
     if !line.starts_with("@@ -") {
         return None;
     }
@@ -71,6 +71,7 @@ struct MergedHunk {
     exp_end: usize,
     full_start: usize,
     full_end: usize,
+    is_inline_test: bool,
     sigs: Vec<(String, bool, usize, usize)>,
     hunks: Vec<ParsedHunk>,
 }
@@ -280,7 +281,7 @@ pub(super) fn dedent_lines(lines: &[&str]) -> String {
 }
 
 #[cfg(feature = "tree-sitter")]
-fn parse_with_timeout(
+pub(super) fn parse_with_timeout(
     lang: SupportedLanguage,
     source: &str,
 ) -> std::result::Result<tree_sitter::Tree, &'static str> {
@@ -320,7 +321,7 @@ fn parse_with_timeout(
 }
 
 #[cfg(feature = "tree-sitter")]
-fn is_container_definition_node(node: &tree_sitter::Node) -> bool {
+pub(super) fn is_container_definition_node(node: &tree_sitter::Node) -> bool {
     let mut target = *node;
     if matches!(target.kind(), "export_statement" | "decorated_definition") {
         if let Some(d) = target
@@ -427,7 +428,11 @@ fn has_potential_move_destinations(chunks: &[String]) -> bool {
         else {
             continue;
         };
-        if is_deleted || is_special || is_lockfile_or_generated(&target_path) {
+        if is_deleted
+            || is_special
+            || is_lockfile_or_generated(&target_path)
+            || has_generated_file_header(chunk)
+        {
             continue;
         }
         if SupportedLanguage::from_path(&target_path).is_none() {
@@ -464,7 +469,11 @@ fn collect_moved_deleted_blocks_for_chunk(chunk: &str) -> Vec<([u8; 32], MovedSo
     else {
         return Vec::new();
     };
-    if is_new || is_special || is_lockfile_or_generated(&target_path) {
+    if is_new
+        || is_special
+        || is_lockfile_or_generated(&target_path)
+        || has_generated_file_header(chunk)
+    {
         return Vec::new();
     }
     let src_path = old_path.unwrap_or(target_path);
@@ -553,7 +562,7 @@ fn collect_moved_deleted_blocks(chunks: &[String]) -> HashMap<[u8; 32], MovedSou
 }
 
 #[cfg(feature = "tree-sitter")]
-fn extract_chunk_header_and_added_source(chunk: &str) -> (String, String, usize) {
+pub(super) fn extract_chunk_header_and_added_source(chunk: &str) -> (String, String, usize) {
     let mut header = String::new();
     let mut added_source = String::new();
     let mut added_count = 0usize;
@@ -669,11 +678,14 @@ fn summarize_large_new_test_chunk(chunk: &str, path: &Path) -> Option<String> {
 }
 
 #[cfg(feature = "tree-sitter")]
+type MovedChunkSummary = (String, super::SourceLineMap);
+
+#[cfg(feature = "tree-sitter")]
 fn summarize_moved_new_file_chunk(
     chunk: &str,
     path: &Path,
     moved_map: &HashMap<[u8; 32], MovedSource>,
-) -> Option<String> {
+) -> Option<MovedChunkSummary> {
     if moved_map.is_empty() {
         return None;
     }
@@ -708,6 +720,7 @@ fn summarize_moved_new_file_chunk(
     let mut body_line_count = 0usize;
     let mut line_idx = 1usize;
     let mut move_cursor = 0usize;
+    let mut body_line_map: Vec<Option<(usize, usize)>> = Vec::with_capacity(lines.len());
     // Sort by start line ascending, preferring wider enclosing ranges first on ties.
     moved_ranges.sort_by_key(|r| (r.0, std::cmp::Reverse(r.1)));
 
@@ -723,6 +736,7 @@ fn summarize_moved_new_file_chunk(
                 "+[moved verbatim from {}: {sig_label} (+{span} lines)]\n",
                 src.path.display()
             ));
+            body_line_map.push(None);
             body_line_count += 1;
             line_idx = (e + 1).max(line_idx + 1);
             move_cursor += 1;
@@ -733,11 +747,18 @@ fn summarize_moved_new_file_chunk(
             if !raw.ends_with('\n') {
                 body.push('\n');
             }
+            body_line_map.push(Some((line_idx, line_idx)));
             body_line_count += 1;
             line_idx += 1;
         }
     }
-    Some(format!("{header}@@ -0,0 +1,{body_line_count} @@\n{body}"))
+    let header_lines_count = header.split_inclusive('\n').count();
+    let mut orig_line_map = vec![None; header_lines_count + 1];
+    orig_line_map.extend(body_line_map);
+    Some((
+        format!("{header}@@ -0,0 +1,{body_line_count} @@\n{body}"),
+        orig_line_map,
+    ))
 }
 
 #[cfg(feature = "tree-sitter")]
@@ -797,7 +818,15 @@ fn select_merged_signature(m: &MergedHunk, is_clamped: bool) -> Option<String> {
     }
 }
 
-/// Expands a single file's raw diff chunk with Tree-Sitter AST context.
+#[cfg(feature = "tree-sitter")]
+enum TreeSitterExpandResult {
+    Expanded(String, Vec<ast_compact::InlineTestBlock>),
+    Generated,
+}
+
+/// Expands a single file's raw diff chunk with Tree-Sitter AST context, also returning any
+/// detected explicit inline test blocks inside production files for Tier 2 budget compaction
+/// (or signaling `Generated` when the full file's top comment header marks it auto-generated).
 #[cfg(feature = "tree-sitter")]
 fn expand_chunk_with_treesitter(
     repo_root: &Path,
@@ -806,7 +835,7 @@ fn expand_chunk_with_treesitter(
     source: GitDiffSource<'_>,
     lang: SupportedLanguage,
     moved_deleted_map: &HashMap<[u8; 32], MovedSource>,
-) -> Result<Option<String>> {
+) -> Result<Option<TreeSitterExpandResult>> {
     // Read new content with size limit checks to prevent memory spikes on huge files
     let new_content = match source {
         GitDiffSource::Staged | GitDiffSource::Commit(_) => {
@@ -884,14 +913,26 @@ fn expand_chunk_with_treesitter(
         }
     };
 
+    if has_generated_source_header(&new_content, Some(path)) {
+        return Ok(Some(TreeSitterExpandResult::Generated));
+    }
+
     let new_lines: Vec<&str> = new_content.split_inclusive('\n').collect();
     if new_lines.is_empty() {
-        return Ok(Some(chunk.to_string()));
+        return Ok(Some(TreeSitterExpandResult::Expanded(
+            chunk.to_string(),
+            Vec::new(),
+        )));
     }
     let plain_lines: Vec<&str> = new_content.lines().collect();
 
     let tree = parse_with_timeout(lang, &new_content).map_err(ServiceError::invalid)?;
     let root = tree.root_node();
+    let inline_test_blocks = if is_test_file_path(path) {
+        Vec::new()
+    } else {
+        ast_compact::find_inline_test_blocks(lang, &root, &new_content)
+    };
 
     // Parse header and hunks from git diff chunk, preserving original line endings for hunks
     let mut file_header = Vec::new();
@@ -926,7 +967,10 @@ fn expand_chunk_with_treesitter(
     }
 
     if hunks.is_empty() {
-        return Ok(Some(chunk.to_string()));
+        return Ok(Some(TreeSitterExpandResult::Expanded(
+            chunk.to_string(),
+            inline_test_blocks,
+        )));
     }
 
     struct ExpandedEntry {
@@ -1258,9 +1302,13 @@ fn expand_chunk_with_treesitter(
 
     entries.sort_by_key(|e| (e.exp_start, e.hunk.new_start));
 
-    // Merge overlapping or adjacent expanded hunks
+    // Merge overlapping or adjacent expanded hunks (avoiding merging non-overlapping production
+    // hunks with adjacent inline-test hunks so Tier 2 can cleanly fold inline test hunks).
     let mut merged: Vec<MergedHunk> = Vec::new();
     for entry in entries {
+        let entry_is_inline_test = inline_test_blocks
+            .iter()
+            .any(|b| entry.exp_start >= b.start_line && entry.exp_end <= b.end_line);
         let mut entry_sigs = Vec::new();
         if let Some(s) = entry.signature {
             entry_sigs.push((s, entry.is_entry_clamped, entry.def_span, entry.extra_defs));
@@ -1274,10 +1322,14 @@ fn expand_chunk_with_treesitter(
         }
 
         if let Some(last) = merged.last_mut() {
-            if entry.exp_start <= last.exp_end + 1 {
+            let can_merge = entry.exp_start <= last.exp_end
+                || (entry.exp_start == last.exp_end + 1
+                    && entry_is_inline_test == last.is_inline_test);
+            if can_merge {
                 last.exp_end = last.exp_end.max(entry.exp_end);
                 last.full_start = last.full_start.min(entry.full_start);
                 last.full_end = last.full_end.max(entry.full_end);
+                last.is_inline_test &= entry_is_inline_test;
                 last.sigs.extend(entry_sigs);
                 last.hunks.push(entry.hunk);
                 continue;
@@ -1288,6 +1340,7 @@ fn expand_chunk_with_treesitter(
             exp_end: entry.exp_end,
             full_start: entry.full_start,
             full_end: entry.full_end,
+            is_inline_test: entry_is_inline_test,
             sigs: entry_sigs,
             hunks: vec![entry.hunk],
         });
@@ -1425,7 +1478,10 @@ fn expand_chunk_with_treesitter(
         }
     }
 
-    Ok(Some(result))
+    Ok(Some(TreeSitterExpandResult::Expanded(
+        result,
+        inline_test_blocks,
+    )))
 }
 
 #[cfg(not(feature = "tree-sitter"))]
@@ -1595,6 +1651,18 @@ fn git_diff_w_for_file(
 
 /// Determines if a path belongs to a package lockfile, minified bundle, or generated asset.
 pub fn is_lockfile_or_generated(path: &Path) -> bool {
+    if let Some(parent) = path.parent() {
+        for comp in parent.components() {
+            if let std::path::Component::Normal(seg) = comp {
+                if let Some(s) = seg.to_str() {
+                    if s.eq_ignore_ascii_case("generated") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name,
         None => return false,
@@ -1660,6 +1728,515 @@ pub fn is_lockfile_or_generated(path: &Path) -> bool {
     false
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashCommentPolicy {
+    Allowed,
+    Disallowed,
+    Heuristic,
+}
+
+fn hash_comment_policy_for_path(path: Option<&Path>) -> HashCommentPolicy {
+    let Some(path) = path else {
+        return HashCommentPolicy::Heuristic;
+    };
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "rs" | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "hh"
+                | "hpp"
+                | "hxx"
+                | "m"
+                | "mm"
+                | "cs"
+                | "java"
+                | "kt"
+                | "kts"
+                | "scala"
+                | "go"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "ts"
+                | "tsx"
+                | "mts"
+                | "cts"
+                | "swift"
+                | "dart"
+                | "zig"
+                | "proto"
+                | "sql"
+                | "lua"
+                | "html"
+                | "htm"
+                | "xml"
+                | "xaml"
+                | "plist"
+                | "csproj"
+                | "vbproj"
+                | "gradle"
+                | "groovy"
+                | "hs"
+                | "elm"
+                | "vue"
+                | "svelte"
+                | "css"
+                | "scss"
+                | "less"
+                | "json"
+                | "jsonc"
+                | "md"
+                | "markdown"
+                | "mdx"
+        ) {
+            return HashCommentPolicy::Disallowed;
+        }
+        if matches!(
+            lower.as_str(),
+            "py" | "pyi"
+                | "rb"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "ksh"
+                | "fish"
+                | "pl"
+                | "pm"
+                | "r"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "ini"
+                | "cfg"
+                | "conf"
+                | "cmake"
+                | "mk"
+                | "mak"
+                | "tf"
+                | "tfvars"
+                | "hcl"
+                | "nix"
+                | "ex"
+                | "exs"
+                | "jl"
+                | "bzl"
+                | "bazel"
+                | "star"
+                | "graphql"
+                | "gql"
+                | "ps1"
+                | "cr"
+                | "nim"
+                | "properties"
+                | "env"
+        ) {
+            return HashCommentPolicy::Allowed;
+        }
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "makefile"
+                | "gnumakefile"
+                | "dockerfile"
+                | "rakefile"
+                | "gemfile"
+                | "justfile"
+                | "cmakelists.txt"
+        ) {
+            return HashCommentPolicy::Allowed;
+        }
+    }
+    HashCommentPolicy::Heuristic
+}
+
+/// Returns true for Rust attributes (`#[...]`, `#![...]`) and C/C++/C# preprocessor directives
+/// (`#include`, `#define`, `#pragma`, `#if`, etc.) so they are never treated as `#` comments.
+fn is_preprocessor_or_attr_hash_line(trimmed: &str) -> bool {
+    if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+        return true;
+    }
+    if let Some(after_hash) = trimmed.strip_prefix('#') {
+        let rest = after_hash.trim_start();
+        let kw_len = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        let kw = &rest[..kw_len];
+        let after_kw = &rest[kw_len..];
+        let has_boundary = after_kw.is_empty()
+            || after_kw.starts_with(|c: char| c.is_whitespace() || matches!(c, '(' | '<' | '"'));
+        if has_boundary
+            && matches!(
+                kw,
+                "include"
+                    | "import"
+                    | "define"
+                    | "undef"
+                    | "pragma"
+                    | "if"
+                    | "ifdef"
+                    | "ifndef"
+                    | "else"
+                    | "elif"
+                    | "endif"
+                    | "error"
+                    | "warning"
+                    | "line"
+                    | "region"
+                    | "endregion"
+                    | "nullable"
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strips leading/trailing comment delimiters (`//`, `///`, `//!`, `/*`, `*`, `#`, `--`, `<!--`,
+/// `*/`, `-->`) to obtain the trimmed inner comment text.
+fn strip_comment_delimiters(trimmed: &str, in_c_block: bool, in_html: bool) -> &str {
+    let mut s = trimmed;
+    if let Some(rest) = s.strip_prefix("<!--") {
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix("/*") {
+        s = rest.trim_start_matches(['*', '!']);
+    } else if let Some(rest) = s.strip_prefix("//") {
+        s = rest.trim_start_matches(['/', '!']);
+    } else if let Some(rest) = s.strip_prefix("--") {
+        s = rest.trim_start_matches('-');
+    } else if let Some(rest) = s.strip_prefix('#') {
+        s = rest.trim_start_matches('#');
+    } else if in_c_block {
+        s = s.trim_start_matches('*');
+    }
+    if in_html || trimmed.starts_with("<!--") {
+        if let Some(before) = s.strip_suffix("-->") {
+            s = before;
+        }
+    }
+    if in_c_block || trimmed.starts_with("/*") {
+        if let Some(before) = s.strip_suffix("*/") {
+            s = before.trim_end_matches('*');
+        }
+    }
+    s.trim()
+}
+
+/// Checks whether `s` contains `@generated` as a standalone token (not glued to ASCII identifier
+/// characters or `-` such as `foo@generated`, `@generated_helper`, or `@not-generated`).
+fn contains_at_generated_token(lower: &str) -> bool {
+    if lower.contains("@not-generated") {
+        return false;
+    }
+    let needle = "@generated";
+    let mut offset = 0usize;
+    while let Some(rel) = lower[offset..].find(needle) {
+        let pos = offset + rel;
+        let before_ok = lower[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+        let after = &lower[pos + needle.len()..];
+        let after_ok = after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+        if before_ok && after_ok {
+            return true;
+        }
+        offset = pos + needle.len();
+    }
+    false
+}
+
+/// Returns true when a comment line uses `@generated` as an actual generated-file marker
+/// (e.g. `// @generated`, `/* @generated by foo */`, `// @generated SignedSource<<...>>`,
+/// `// This file is @generated`) rather than hand-written prose mentioning it (e.g.
+/// `//! Handles @generated files`).
+fn is_explicit_at_generated_marker(body_lower: &str, is_doc_comment: bool) -> bool {
+    if body_lower.contains("@not-generated") {
+        return false;
+    }
+    if let Some(after) = body_lower.strip_prefix("@generated") {
+        let right_boundary = after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+        if right_boundary {
+            if !is_doc_comment {
+                return true;
+            }
+            let rest = after.trim_start();
+            if rest.is_empty()
+                || rest.starts_with([':', '-', '.', ',', ';', '(', '[', '<'])
+                || rest.starts_with("signedsource")
+                || rest.starts_with("by ")
+                || rest.starts_with("from ")
+                || rest.starts_with("on ")
+                || rest.starts_with("using ")
+                || rest.starts_with("with ")
+                || rest.starts_with("do not ")
+            {
+                return true;
+            }
+        }
+    }
+    contains_at_generated_token(body_lower)
+        && (body_lower.contains("signedsource")
+            || body_lower.contains("this file is @generated")
+            || body_lower.contains("this file was @generated")
+            || body_lower.contains("file is @generated")
+            || body_lower.contains("automatically @generated")
+            || body_lower.contains("auto @generated")
+            || body_lower.contains("code @generated"))
+}
+
+/// Shared detector for machine-generated markers in the leading comment header (first 5 lines),
+/// tracking multi-line `/* ... */` and `<!-- ... -->` block comments so continuation lines without
+/// leading `*` are still recognized while non-comment code lines stop inspection immediately.
+fn has_generated_header_in_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    hash_policy: HashCommentPolicy,
+) -> bool {
+    let mut in_c_block_comment = false;
+    let mut in_html_comment = false;
+    let mut seen_gen_phrase = false;
+    let mut seen_do_not_edit = false;
+    let mut seen_at_generated_token = false;
+    let mut inspected_lines = 0usize;
+
+    for content in lines {
+        inspected_lines += 1;
+        if inspected_lines > 5 {
+            break;
+        }
+        let cleaned = if inspected_lines == 1 {
+            content.trim_start_matches('\u{feff}')
+        } else {
+            content
+        };
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Skip leading Unix shebang (`#!/...`, not Rust `#![...]`), XML declaration (`<?xml ...?>`),
+        // or PHP opening tag (`<?php`) on line 1 so generated comments on lines 2..=5 are detected.
+        if inspected_lines == 1
+            && ((trimmed.starts_with("#!") && !trimmed.starts_with("#!["))
+                || (trimmed.starts_with("<?xml") && trimmed.ends_with("?>"))
+                || trimmed.eq_ignore_ascii_case("<?php"))
+        {
+            continue;
+        }
+
+        let is_hash_comment = trimmed.starts_with('#')
+            && match hash_policy {
+                HashCommentPolicy::Allowed => true,
+                HashCommentPolicy::Disallowed => false,
+                HashCommentPolicy::Heuristic => !is_preprocessor_or_attr_hash_line(trimmed),
+            };
+        let was_in_c_block = in_c_block_comment;
+        let was_in_html = in_html_comment;
+        let is_comment = if was_in_c_block || was_in_html {
+            true
+        } else {
+            trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || is_hash_comment
+                || trimmed.starts_with("--")
+                || trimmed.starts_with("<!--")
+        };
+        if !is_comment {
+            break;
+        }
+
+        if !in_c_block_comment && trimmed.starts_with("/*") && !trimmed.contains("*/") {
+            in_c_block_comment = true;
+        } else if in_c_block_comment && trimmed.contains("*/") {
+            in_c_block_comment = false;
+        }
+        if !in_html_comment && trimmed.starts_with("<!--") && !trimmed.contains("-->") {
+            in_html_comment = true;
+        } else if in_html_comment && trimmed.contains("-->") {
+            in_html_comment = false;
+        }
+
+        let is_doc_comment = trimmed.starts_with("//!") || trimmed.starts_with("///");
+        let body_lower =
+            strip_comment_delimiters(trimmed, was_in_c_block, was_in_html).to_ascii_lowercase();
+        let has_at_generated = is_explicit_at_generated_marker(&body_lower, is_doc_comment);
+        seen_at_generated_token |= contains_at_generated_token(&body_lower);
+        let has_do_not_edit =
+            body_lower.contains("do not edit") || body_lower.contains("do not modify");
+        let has_gen_phrase = body_lower.contains("code generated by")
+            || body_lower.contains("auto-generated")
+            || body_lower.contains("automatically generated")
+            || body_lower.contains("this file is generated")
+            || body_lower.contains("this file was generated")
+            || body_lower.contains("generated by protoc")
+            || body_lower.contains("generated by synurang")
+            || body_lower.contains("generated by flatc")
+            || body_lower.contains("generated by openapi")
+            || body_lower.contains("generated by sqlc")
+            || body_lower.contains("generated by mockgen");
+        seen_gen_phrase |= has_gen_phrase;
+        seen_do_not_edit |= has_do_not_edit;
+        if has_at_generated
+            || ((seen_gen_phrase || seen_at_generated_token) && seen_do_not_edit)
+            || body_lower.contains("generated by protoc")
+            || body_lower.contains("generated by synurang")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether a full source file's leading comment header (lines 1..=5) marks it generated.
+pub(super) fn has_generated_source_header(source: &str, path: Option<&Path>) -> bool {
+    has_generated_header_in_lines(source.lines(), hash_comment_policy_for_path(path))
+}
+
+/// Lightweight check of the leading ~2 KiB (lines 1..=5) of a modified file in `source` so
+/// unsupported languages (e.g. `.kt`, `.swift`, `.dart`, `.sql`, `.xml`) and oversized files are
+/// still pre-omitted when edited far below line 1 without reading the entire file.
+fn has_generated_source_header_for_file(
+    repo_root: &Path,
+    path: &Path,
+    source: GitDiffSource<'_>,
+) -> bool {
+    const HEADER_READ_LIMIT: u64 = 2048;
+    use std::io::Read;
+
+    let bytes = match source {
+        GitDiffSource::Unstaged => {
+            let full_path = repo_root.join(path);
+            let Ok(meta) = std::fs::symlink_metadata(&full_path) else {
+                return false;
+            };
+            if meta.file_type().is_symlink() || meta.is_dir() {
+                return false;
+            }
+            let Ok(file) = std::fs::File::open(&full_path) else {
+                return false;
+            };
+            let mut buf = Vec::with_capacity(HEADER_READ_LIMIT as usize);
+            if file.take(HEADER_READ_LIMIT).read_to_end(&mut buf).is_err() {
+                return false;
+            }
+            buf
+        }
+        GitDiffSource::Staged | GitDiffSource::Commit(_) => {
+            let obj_prefix = match source {
+                GitDiffSource::Staged => ":0:".to_string(),
+                GitDiffSource::Commit(sha) => format!("{sha}:"),
+                GitDiffSource::Unstaged => unreachable!(),
+            };
+            let mut cat_arg = std::ffi::OsString::from(&obj_prefix);
+            cat_arg.push(path.as_os_str());
+            let mut cat_cmd = git_cmd(repo_root);
+            cat_cmd.arg("cat-file").arg("blob").arg(&cat_arg);
+            let Ok(mut child) = cat_cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            else {
+                return false;
+            };
+            let mut stdout = child.stdout.take().expect("stdout piped");
+            let mut buf = Vec::with_capacity(HEADER_READ_LIMIT as usize);
+            let read_res = (&mut stdout).take(HEADER_READ_LIMIT).read_to_end(&mut buf);
+            drop(stdout);
+            if read_res.is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            if buf.len() as u64 >= HEADER_READ_LIMIT {
+                let _ = child.kill();
+                let _ = child.wait();
+            } else if !child.wait().is_ok_and(|s| s.success()) {
+                return false;
+            }
+            buf
+        }
+    };
+
+    if bytes.is_empty() || bytes.contains(&0) {
+        return false;
+    }
+    let header_text = String::from_utf8_lossy(&bytes);
+    has_generated_source_header(&header_text, Some(path))
+}
+
+/// Checks whether the leading comment header (lines 1..=5) of a diff chunk marks the file as
+/// machine-generated (e.g. `// Code generated by ... DO NOT EDIT`, `// @generated`, `# Auto-generated`).
+/// Inspects leading comment lines starting at file line 1 (and `-` lines for fully deleted files)
+/// while respecting language comment syntax to avoid false positives on code strings, Rust attributes,
+/// or C/C++ preprocessor directives.
+pub(super) fn has_generated_file_header(chunk: &str) -> bool {
+    let chunk_info = extract_target_path_from_diff_chunk(chunk);
+    let (path_opt, is_deleted) = match &chunk_info {
+        Some((target, old, is_del, _, _)) => (
+            Some(if *is_del {
+                old.as_deref().unwrap_or(target.as_path())
+            } else {
+                target.as_path()
+            }),
+            *is_del,
+        ),
+        None => (None, false),
+    };
+    let mut in_top_hunk = false;
+    let mut inspect_deleted = false;
+    let mut top_lines: Vec<&str> = Vec::with_capacity(5);
+
+    for raw_line in chunk.split_inclusive('\n') {
+        let trimmed_nl = raw_line.trim_end_matches(['\r', '\n']);
+        if let Some((old_start, _oc, new_start, new_count, _sig)) = parse_hunk_header(trimmed_nl) {
+            if new_start == 1 {
+                in_top_hunk = true;
+                inspect_deleted = false;
+                continue;
+            } else if is_deleted && old_start == 1 && new_start == 0 && new_count == 0 {
+                in_top_hunk = true;
+                inspect_deleted = true;
+                continue;
+            } else {
+                break;
+            }
+        }
+        if !in_top_hunk {
+            continue;
+        }
+        let content = if inspect_deleted {
+            match trimmed_nl.strip_prefix('-') {
+                Some(rest) => rest,
+                None => continue,
+            }
+        } else if let Some(rest) = trimmed_nl.strip_prefix('+') {
+            rest
+        } else if let Some(rest) = trimmed_nl.strip_prefix(' ') {
+            rest
+        } else {
+            continue;
+        };
+        top_lines.push(content);
+        if top_lines.len() >= 5 {
+            break;
+        }
+    }
+    has_generated_header_in_lines(top_lines, hash_comment_policy_for_path(path_opt))
+}
+
 pub(super) fn count_diff_churn(chunk: &str) -> (usize, usize) {
     let mut added = 0;
     let mut deleted = 0;
@@ -1710,7 +2287,7 @@ pub(super) fn summarize_omitted_chunk(chunk: &str, path: &Path) -> String {
 }
 
 const COMPACT_CONTEXT_LINES: usize = 3;
-const BUDGET_BANNER_RESERVE_BYTES: usize = 128;
+const BUDGET_BANNER_RESERVE_BYTES: usize = 256;
 
 fn format_budget_size(bytes: usize) -> String {
     if bytes >= 1024 && bytes.is_multiple_of(1024) {
@@ -1720,7 +2297,7 @@ fn format_budget_size(bytes: usize) -> String {
     }
 }
 
-fn strip_clamped_suffix(sig: &str) -> String {
+pub(super) fn strip_clamped_suffix(sig: &str) -> String {
     if let Some(idx) = sig.find(" [clamped] (lines ") {
         sig[..idx].trim_end().to_string()
     } else if sig.starts_with("[clamped] (lines ") {
@@ -1730,9 +2307,124 @@ fn strip_clamped_suffix(sig: &str) -> String {
     }
 }
 
+/// Computes a 1-based `(start_line, end_line)` span map for each line of a unified diff chunk
+/// (new-file line numbers for new/modified chunks, old-file line numbers for fully deleted chunks,
+/// and `None` when a pure top-of-file deletion hunk has `new_start == 0` so `L0` anchors are never
+/// emitted).
+pub(super) fn compute_diff_line_numbers(lines: &[&str]) -> Vec<Option<(usize, usize)>> {
+    let mut map = vec![None; lines.len()];
+    let mut is_deleted_chunk = false;
+    for raw in lines {
+        let trimmed = raw.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with("@@ ") {
+            break;
+        }
+        if trimmed.strip_suffix('\t').unwrap_or(trimmed) == "+++ /dev/null"
+            || trimmed.starts_with("deleted file mode ")
+        {
+            is_deleted_chunk = true;
+        }
+    }
+
+    let mut in_hunk = false;
+    let mut cur_old = 0usize;
+    let mut cur_new = 0usize;
+
+    for (i, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_end_matches(['\r', '\n']);
+        if let Some((old_start, _, new_start, _, _)) = parse_hunk_header(trimmed) {
+            in_hunk = true;
+            cur_old = old_start;
+            cur_new = new_start;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if is_deleted_chunk {
+            if raw.starts_with('-') {
+                map[i] = (cur_old > 0).then_some((cur_old, cur_old));
+                cur_old += 1;
+            } else if raw.starts_with('\\') {
+                map[i] = None;
+            } else {
+                in_hunk = false;
+            }
+        } else if raw.starts_with(' ') || raw.starts_with('+') {
+            map[i] = (cur_new > 0).then_some((cur_new, cur_new));
+            cur_new += 1;
+        } else if raw.starts_with('-') {
+            map[i] = (cur_new > 0).then_some((cur_new, cur_new));
+        } else if raw.starts_with('\\') {
+            map[i] = None;
+        } else {
+            in_hunk = false;
+        }
+    }
+    map
+}
+
+/// Inserts a file-level metadata marker (e.g. `[degraded to -U3]`, `[degraded to -U0]`)
+/// immediately after the diff file header (before the first hunk or inline-test marker),
+/// replacing any prior `[degraded to ...]` header marker so markers never duplicate.
+fn set_degraded_header_marker(chunk: &str, marker_line: &str) -> String {
+    let mut out = String::with_capacity(chunk.len() + marker_line.len() + 2);
+    let mut inserted = false;
+    for raw_line in chunk.split_inclusive('\n') {
+        if raw_line.starts_with("[degraded to ") {
+            continue;
+        }
+        if !inserted
+            && (raw_line.starts_with("@@ ")
+                || raw_line.starts_with("[omitted inline tests:")
+                || raw_line.starts_with("[skeletonized:"))
+        {
+            out.push_str(marker_line);
+            if !marker_line.ends_with('\n') {
+                out.push('\n');
+            }
+            inserted = true;
+        }
+        out.push_str(raw_line);
+    }
+    if !inserted {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(marker_line);
+        if !marker_line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Checks whether a chunk's file header section (before the first `@@ `) contains a marker line
+/// starting with `prefix`.
+fn has_file_header_marker(chunk: &str, prefix: &str) -> bool {
+    for line in chunk.split_inclusive('\n') {
+        if line.starts_with("@@ ") {
+            break;
+        }
+        if line.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether a chunk contains any emitted `[omitted inline tests: L...]` marker (either
+/// standalone in a modified file or `+`-prefixed in a new file).
+fn has_inline_test_omission_marker(chunk: &str) -> bool {
+    chunk.lines().any(|l| {
+        l.starts_with("[omitted inline tests: L") || l.starts_with("+[omitted inline tests: L")
+    })
+}
+
 /// Trims unchanged context lines in a unified diff chunk down to at most `context_lines`
 /// around each change, splitting wide hunks cleanly while preserving AST `@@ ... @@`
-/// signatures and exact `git apply`-compatible line numbers.
+/// signatures and exact `git apply`-compatible line numbers. Standalone `[omitted inline tests: ...]`
+/// markers between hunks are preserved verbatim.
 pub(super) fn trim_unified_diff_context(diff: &str, context_lines: usize) -> Option<String> {
     enum LineKind {
         Context,
@@ -1855,6 +2547,16 @@ pub(super) fn trim_unified_diff_context(diff: &str, context_lines: usize) -> Opt
             continue;
         }
 
+        if raw_line.starts_with("[omitted inline tests:") {
+            if let Some(prev_hdr) = cur_header.take() {
+                flush_hunk(prev_hdr, &records, &mut out);
+                records.clear();
+            }
+            in_hunk = false;
+            out.push_str(raw_line);
+            continue;
+        }
+
         if !in_hunk {
             out.push_str(raw_line);
             continue;
@@ -1906,24 +2608,70 @@ pub(super) fn trim_unified_diff_context(diff: &str, context_lines: usize) -> Opt
     }
 }
 
-fn summarize_budget_omitted_chunk(chunk: &str, path: &Path) -> String {
+fn summarize_budget_omitted_chunk_with_toc(
+    raw_chunk: &str,
+    rendered: &str,
+    path: &Path,
+    is_new: bool,
+    is_deleted: bool,
+    max_bytes: usize,
+) -> String {
     let mut header = String::new();
-    for line in chunk.split_inclusive('\n') {
+    for line in raw_chunk.split_inclusive('\n') {
         if line.starts_with("@@") || line.starts_with("GIT binary patch") {
             break;
         }
         header.push_str(line);
     }
-    let (added, deleted) = count_diff_churn(chunk);
+    let (added, deleted) = count_diff_churn(raw_chunk);
     let display_path = path.to_string_lossy();
-    format!("{header}[omitted due to patch budget: {display_path} (+{added}/-{deleted} lines)]\n\n")
+    let plain = format!(
+        "{header}[omitted due to patch budget: {display_path} (+{added}/-{deleted} lines)]\n\n"
+    );
+
+    #[cfg(feature = "tree-sitter")]
+    {
+        let toc_head = format!(
+            "{header}[omitted due to patch budget: {display_path} (+{added}/-{deleted} lines, "
+        );
+        // Cap TOC bytes so omitted summaries never blow the overall patch budget.
+        let max_toc_bytes = max_bytes.saturating_sub(toc_head.len() + 32).min(2048);
+        if let Some((toc_lines, total_defs)) = ast_compact::build_budget_omitted_toc(
+            raw_chunk,
+            rendered,
+            path,
+            is_new,
+            is_deleted,
+            max_toc_bytes,
+        ) {
+            let mut summary = format!("{toc_head}{total_defs} definitions):\n");
+            for l in &toc_lines {
+                summary.push_str(l);
+                summary.push('\n');
+            }
+            if total_defs > toc_lines.len() {
+                summary.push_str(&format!(
+                    "  ... (+{} more definitions)\n",
+                    total_defs - toc_lines.len()
+                ));
+            }
+            summary.push_str("]\n\n");
+            if summary.len() <= max_bytes {
+                return summary;
+            }
+        }
+    }
+    #[cfg(not(feature = "tree-sitter"))]
+    let _ = (rendered, is_new, is_deleted, max_bytes);
+
+    plain
 }
 
 #[cfg(feature = "tree-sitter")]
 struct AstDefSpan {
     start_line: usize,
     end_line: usize,
-    short_label: String,
+    bare_name: String,
     scope_label: String,
     is_container: bool,
 }
@@ -1990,13 +2738,7 @@ fn short_def_label(
     }
 
     let raw = signature::extract_signature(lang, matched, lines, source)?;
-    let cut = raw
-        .find(['(', '{'])
-        .filter(|&pos| {
-            // Skip `pub(...)` visibility prefix when trimming at `(`
-            !(raw.as_bytes().get(pos) == Some(&b'(') && raw[..pos].trim_end().ends_with("pub"))
-        })
-        .unwrap_or(raw.len());
+    let cut = ast_compact::find_sig_head_cut(&raw, &['(', '{']);
     let head = raw[..cut].trim().trim_end_matches('=').trim();
     if head.is_empty() {
         Some(signature::truncate_preview(&raw, 40))
@@ -2006,34 +2748,10 @@ fn short_def_label(
 }
 
 #[cfg(feature = "tree-sitter")]
-fn collect_ast_def_spans_for_new_chunk(
-    lines: &[&str],
-    path: &Path,
-) -> Option<(Vec<Option<usize>>, Vec<AstDefSpan>)> {
+fn collect_ast_def_spans_for_new_chunk(raw_chunk: &str, path: &Path) -> Option<Vec<AstDefSpan>> {
     let lang = SupportedLanguage::from_path(path)?;
-    let mut src_line_by_diff_idx: Vec<Option<usize>> = vec![None; lines.len()];
-    let mut added_source = String::new();
-    let mut in_hunk = false;
-    let mut src_line = 0usize;
-
-    for (idx, raw) in lines.iter().enumerate() {
-        if !in_hunk {
-            if raw.starts_with("@@") {
-                in_hunk = true;
-            }
-            continue;
-        }
-        if raw.starts_with("@@") {
-            continue;
-        }
-        if let Some(rest) = raw.strip_prefix('+') {
-            src_line += 1;
-            src_line_by_diff_idx[idx] = Some(src_line);
-            added_source.push_str(rest);
-        }
-    }
-
-    if src_line == 0 || added_source.len() > MAX_TREESITTER_FILE_BYTES {
+    let (_hdr, added_source, added_count) = extract_chunk_header_and_added_source(raw_chunk);
+    if added_count == 0 || added_source.len() > MAX_TREESITTER_FILE_BYTES {
         return None;
     }
 
@@ -2059,6 +2777,8 @@ fn collect_ast_def_spans_for_new_chunk(
                 .is_some_and(|prev| prev.start_line == s_line && prev.end_line == e_line);
             if !is_dup {
                 if let Some(short_label) = short_def_label(lang, &matched, lines, source) {
+                    let bare_name = ast_compact::bare_def_name(lang, &matched, lines, source)
+                        .unwrap_or_else(|| short_label.clone());
                     let parent =
                         signature::extract_parent_scope_prefix(lang, &matched, lines, source);
                     let scope_label = match parent {
@@ -2066,13 +2786,13 @@ fn collect_ast_def_spans_for_new_chunk(
                             &format!("{} > {short_label}", signature::truncate_preview(&p, 30)),
                             60,
                         ),
-                        None => short_label.clone(),
+                        None => short_label,
                     };
                     let is_container = is_container_definition_node(&matched);
                     out.push(AstDefSpan {
                         start_line: s_line,
                         end_line: e_line,
-                        short_label,
+                        bare_name,
                         scope_label,
                         is_container,
                     });
@@ -2092,17 +2812,19 @@ fn collect_ast_def_spans_for_new_chunk(
     if defs.is_empty() {
         return None;
     }
-    Some((src_line_by_diff_idx, defs))
+    Some(defs)
 }
 
 fn build_hunk_scope_truncation_marker(
     lines: &[&str],
+    src_line_map: &[Option<super::SourceLineSpan>],
     head_end: usize,
     tail_start: usize,
     display_path: &str,
-    added: usize,
-    deleted: usize,
+    churn: (usize, usize),
+    max_syms_bytes: usize,
 ) -> String {
+    let (added, deleted) = churn;
     let omitted_lines = tail_start.saturating_sub(head_end);
     let mut omitted_sigs: Vec<String> = Vec::new();
     for line in &lines[head_end..tail_start] {
@@ -2136,26 +2858,36 @@ fn build_hunk_scope_truncation_marker(
         })
     };
 
-    let mut details = vec![format!("omitted {omitted_lines} middle lines")];
+    let omitted_first = (head_end..tail_start).find_map(|i| src_line_map[i].map(|(s, _)| s));
+    let omitted_last = (head_end..tail_start)
+        .rev()
+        .find_map(|i| src_line_map[i].map(|(_, e)| e));
+    let resumed_src = (tail_start..lines.len()).find_map(|i| src_line_map[i].map(|(s, _)| s));
+
+    let mut details = match (omitted_first, omitted_last) {
+        (Some(s), Some(e)) => vec![format!("omitted L{s}-L{e} ({omitted_lines} diff lines)")],
+        _ => vec![format!("omitted {omitted_lines} middle diff lines")],
+    };
     if !omitted_sigs.is_empty() {
-        let shown: Vec<String> = omitted_sigs
-            .iter()
-            .take(4)
-            .map(|s| {
-                if s.chars().count() > 36 {
-                    let p: String = s.chars().take(33).collect();
-                    format!("{p}...")
-                } else {
-                    s.clone()
-                }
-            })
-            .collect();
-        let more = if omitted_sigs.len() > shown.len() {
-            format!(", +{} more", omitted_sigs.len() - shown.len())
-        } else {
-            String::new()
-        };
-        details.push(format!("hunks: {}{more}", shown.join(", ")));
+        let mut packed = String::new();
+        for (idx, s) in omitted_sigs.iter().enumerate() {
+            let short = if s.chars().count() > 40 {
+                let p: String = s.chars().take(37).collect();
+                format!("{p}...")
+            } else {
+                s.clone()
+            };
+            let sep = if idx == 0 { "" } else { ", " };
+            let remaining_after = omitted_sigs.len().saturating_sub(idx + 1);
+            let reserve = if remaining_after > 0 { 16 } else { 0 };
+            if idx > 0 && packed.len() + sep.len() + short.len() + reserve > max_syms_bytes {
+                packed.push_str(&format!(", +{} more", omitted_sigs.len() - idx));
+                break;
+            }
+            packed.push_str(sep);
+            packed.push_str(&short);
+        }
+        details.push(format!("hunks: {packed}"));
     }
     if let Some(scope) = resuming_scope {
         let short_scope = if scope.chars().count() > 48 {
@@ -2167,20 +2899,23 @@ fn build_hunk_scope_truncation_marker(
         details.push(format!("resuming in {short_scope}"));
     }
     details.push(format!("total +{added}/-{deleted}"));
+    let anchor = resumed_src
+        .map(|r| format!("[resuming at L{r}]\n"))
+        .unwrap_or_default();
     format!(
-        "... [truncated due to patch budget: {display_path} ({})]\n",
+        "... [truncated due to patch budget: {display_path} ({})]\n{anchor}",
         details.join("; ")
     )
 }
 
 /// Truncates a single oversized diff chunk within `budget` bytes, preserving both head
-/// (file header + opening diff lines) and tail (closing diff lines). For new code files
-/// with Tree-Sitter enabled, snaps nearby cuts to AST definition boundaries and annotates
-/// the marker with omitted line numbers, a mini-TOC of omitted definitions, and the
-/// resuming scope.
+/// (file header + opening diff lines) and tail (closing diff lines). Uses `orig_line_map`
+/// (or diff hunk line counting) so `[resuming at L...]` anchors remain exact even after
+/// prior line-collapsing tiers, and lists omitted bare symbol names bounded by budget.
 fn truncate_chunk_head_tail(
     rendered: &str,
     raw_chunk: &str,
+    orig_line_map: Option<&[Option<(usize, usize)>]>,
     path: &Path,
     is_new: bool,
     budget: usize,
@@ -2189,19 +2924,35 @@ fn truncate_chunk_head_tail(
     if lines.len() < 4 {
         return None;
     }
+    let src_line_map: Vec<Option<(usize, usize)>> = match orig_line_map {
+        Some(m) if m.len() == lines.len() => m.to_vec(),
+        _ => compute_diff_line_numbers(&lines),
+    };
+
     let (added, deleted) = count_diff_churn(raw_chunk);
     let display_path = path.to_string_lossy();
-    let base_trailer_for = |omitted: usize| {
+    let base_trailer_for = |omitted: usize,
+                            omitted_range: (Option<usize>, Option<usize>),
+                            resumed: Option<usize>| {
+        let range_label = match omitted_range {
+            (Some(s), Some(e)) => format!("omitted L{s}-L{e} ({omitted} diff lines)"),
+            _ => format!("omitted {omitted} middle diff lines"),
+        };
+        let anchor = resumed
+            .map(|r| format!("[resuming at L{r}]\n"))
+            .unwrap_or_default();
         format!(
-            "... [truncated due to patch budget: {display_path} (omitted {omitted} middle lines; total +{added}/-{deleted})]\n"
+            "... [truncated due to patch budget: {display_path} ({range_label}; total +{added}/-{deleted})]\n{anchor}"
         )
     };
-    let max_base_trailer = base_trailer_for(lines.len());
-    let rich_mode = budget >= 2048;
+    let max_base_trailer =
+        base_trailer_for(lines.len(), (Some(1), Some(lines.len())), Some(lines.len()));
+    let rich_mode = budget >= 1024;
+    let max_syms_bytes = (budget / 3).clamp(160, 2048);
     let initial_reserve = if rich_mode {
-        (max_base_trailer.len() + 200).min(budget / 3)
+        (max_base_trailer.len() + max_syms_bytes.min(512)).min(budget / 3)
     } else {
-        max_base_trailer.len() + 4
+        max_base_trailer.len() + 8
     };
     if budget <= initial_reserve + 128 {
         return None;
@@ -2237,7 +2988,8 @@ fn truncate_chunk_head_tail(
         return None;
     }
 
-    // Find end of file header (lines before first body line) so snapping never cuts the header.
+    // Find end of file header (lines up to and including first `@@`) so snapping never cuts the header
+    // or any `[degraded to ...]` / `[skeletonized: ...]` header marker.
     let header_end = lines
         .iter()
         .position(|l| l.starts_with("@@"))
@@ -2246,20 +2998,22 @@ fn truncate_chunk_head_tail(
         .min(head_end);
 
     #[cfg(feature = "tree-sitter")]
-    let ast_info = if is_new && budget >= 1024 {
-        collect_ast_def_spans_for_new_chunk(&lines, path)
+    let ast_defs = if is_new && budget >= 1024 {
+        collect_ast_def_spans_for_new_chunk(raw_chunk, path)
     } else {
         None
     };
 
     #[cfg(feature = "tree-sitter")]
-    if let Some((ref src_line_map, ref defs)) = ast_info {
+    if let Some(ref defs) = ast_defs {
         // Snap `head_end` backward onto the end of a completed AST definition if within 30% of head_bytes.
+        // Uses each rendered line's closing span `.1` so skeletonized functions (e.g. L10-L39 collapsed
+        // into one line) are recognized as completed definitions at L39.
         if let Some(last_head_src) = lines[..head_end]
             .iter()
             .enumerate()
             .rev()
-            .find_map(|(i, _)| src_line_map[i])
+            .find_map(|(i, _)| src_line_map[i].map(|(_, end)| end))
         {
             let min_head_bytes = (head_bytes * 7) / 10;
             let best_def_end = defs
@@ -2268,11 +3022,10 @@ fn truncate_chunk_head_tail(
                 .map(|d| d.end_line)
                 .max();
             if let Some(target_end_src) = best_def_end {
-                if let Some(snap_diff_idx) = src_line_map
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, sl)| (*sl == Some(target_end_src)).then_some(i + 1))
-                {
+                if let Some(snap_diff_idx) = src_line_map.iter().enumerate().find_map(|(i, sl)| {
+                    sl.is_some_and(|(_, end)| end == target_end_src)
+                        .then_some(i + 1)
+                }) {
                     if snap_diff_idx >= header_end && snap_diff_idx < head_end {
                         let new_head_bytes: usize =
                             lines[..snap_diff_idx].iter().map(|l| l.len()).sum();
@@ -2289,7 +3042,7 @@ fn truncate_chunk_head_tail(
         if let Some(first_tail_src) = lines[tail_start..]
             .iter()
             .enumerate()
-            .find_map(|(rel, _)| src_line_map[tail_start + rel])
+            .find_map(|(rel, _)| src_line_map[tail_start + rel].map(|(start, _)| start))
         {
             let min_tail_bytes = (tail_bytes * 7) / 10;
             let best_def_start = defs
@@ -2298,11 +3051,10 @@ fn truncate_chunk_head_tail(
                 .map(|d| d.start_line)
                 .min();
             if let Some(target_start_src) = best_def_start {
-                if let Some(snap_diff_idx) = src_line_map
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, sl)| (*sl == Some(target_start_src)).then_some(i))
-                {
+                if let Some(snap_diff_idx) = src_line_map.iter().enumerate().find_map(|(i, sl)| {
+                    sl.is_some_and(|(start, _)| start == target_start_src)
+                        .then_some(i)
+                }) {
                     if snap_diff_idx > tail_start && snap_diff_idx < lines.len() {
                         let new_tail_bytes: usize =
                             lines[snap_diff_idx..].iter().map(|l| l.len()).sum();
@@ -2317,21 +3069,21 @@ fn truncate_chunk_head_tail(
     }
 
     let build_marker = |he: usize, ts: usize| -> String {
-        #[cfg(feature = "tree-sitter")]
-        if let Some((ref src_line_map, ref defs)) = ast_info {
-            let omitted_first_src = (he..ts).find_map(|i| src_line_map[i]);
-            let omitted_last_src = (he..ts).rev().find_map(|i| src_line_map[i]);
-            let resumed_src = (ts..lines.len()).find_map(|i| src_line_map[i]);
+        let omitted_first_src = (he..ts).find_map(|i| src_line_map[i].map(|(s, _)| s));
+        let omitted_last_src = (he..ts).rev().find_map(|i| src_line_map[i].map(|(_, e)| e));
+        let resumed_src = (ts..lines.len()).find_map(|i| src_line_map[i].map(|(s, _)| s));
 
+        #[cfg(feature = "tree-sitter")]
+        if let Some(ref defs) = ast_defs {
             if let (Some(om_start), Some(om_end)) = (omitted_first_src, omitted_last_src) {
                 let omitted_lines = ts - he;
                 let mut omitted_defs: Vec<&str> = Vec::new();
                 for d in defs {
                     if d.start_line >= om_start
                         && d.start_line <= om_end
-                        && !omitted_defs.contains(&d.short_label.as_str())
+                        && !omitted_defs.contains(&d.bare_name.as_str())
                     {
-                        omitted_defs.push(d.short_label.as_str());
+                        omitted_defs.push(d.bare_name.as_str());
                     }
                 }
 
@@ -2343,61 +3095,79 @@ fn truncate_chunk_head_tail(
                 });
 
                 let mut parts = vec![format!(
-                    "omitted L{om_start}-L{om_end} ({omitted_lines} lines)"
+                    "omitted L{om_start}-L{om_end} ({omitted_lines} diff lines)"
                 )];
                 if !omitted_defs.is_empty() {
-                    let max_shown = 6;
-                    let shown = &omitted_defs[..omitted_defs.len().min(max_shown)];
-                    let more = if omitted_defs.len() > max_shown {
-                        format!(", +{} more", omitted_defs.len() - max_shown)
-                    } else {
-                        String::new()
-                    };
-                    parts.push(format!("defs: {}{more}", shown.join(", ")));
+                    let mut packed = String::new();
+                    for (idx, name) in omitted_defs.iter().enumerate() {
+                        let sep = if idx == 0 { "" } else { ", " };
+                        let remaining_after = omitted_defs.len().saturating_sub(idx + 1);
+                        let reserve = if remaining_after > 0 { 16 } else { 0 };
+                        if idx > 0
+                            && packed.len() + sep.len() + name.len() + reserve > max_syms_bytes
+                        {
+                            packed.push_str(&format!(", +{} more", omitted_defs.len() - idx));
+                            break;
+                        }
+                        packed.push_str(sep);
+                        packed.push_str(name);
+                    }
+                    parts.push(format!("defs: {packed}"));
                 }
                 if let Some(scope) = resuming_in {
                     parts.push(format!("resuming in {scope}"));
                 }
                 parts.push(format!("total +{added}/-{deleted}"));
+                let anchor = resumed_src
+                    .map(|r| format!("[resuming at L{r}]\n"))
+                    .unwrap_or_default();
                 return format!(
-                    "... [truncated due to patch budget: {display_path} ({})]\n",
+                    "... [truncated due to patch budget: {display_path} ({})]\n{anchor}",
                     parts.join("; ")
                 );
             }
         }
 
         if !is_new && budget >= 1024 {
-            build_hunk_scope_truncation_marker(&lines, he, ts, &display_path, added, deleted)
+            build_hunk_scope_truncation_marker(
+                &lines,
+                &src_line_map,
+                he,
+                ts,
+                &display_path,
+                (added, deleted),
+                max_syms_bytes,
+            )
         } else {
-            base_trailer_for(ts - he)
+            base_trailer_for(ts - he, (omitted_first_src, omitted_last_src), resumed_src)
         }
     };
 
     let mut marker = build_marker(head_end, tail_start);
-    let extra_newlines = usize::from(!lines[head_end - 1].ends_with('\n'))
-        + usize::from(!lines[lines.len() - 1].ends_with('\n'));
+    let extra_newlines_for = |he: usize| {
+        usize::from(!lines[he - 1].ends_with('\n'))
+            + usize::from(!lines[lines.len() - 1].ends_with('\n'))
+    };
 
     // Strictly enforce `budget` even if the enriched marker is wider than `initial_reserve`.
-    while head_bytes + marker.len() + tail_bytes + extra_newlines > budget {
-        if head_end > header_end && head_bytes >= tail_bytes {
+    while head_bytes + marker.len() + tail_bytes + extra_newlines_for(head_end) > budget {
+        if head_end > header_end && (head_bytes >= tail_bytes || tail_start + 1 >= lines.len()) {
             head_end -= 1;
             head_bytes = head_bytes.saturating_sub(lines[head_end].len());
         } else if tail_start + 1 < lines.len() {
             tail_bytes = tail_bytes.saturating_sub(lines[tail_start].len());
             tail_start += 1;
         } else {
-            marker = base_trailer_for(tail_start - head_end);
+            let om_first = (head_end..tail_start).find_map(|i| src_line_map[i].map(|(s, _)| s));
+            let om_last = (head_end..tail_start)
+                .rev()
+                .find_map(|i| src_line_map[i].map(|(_, e)| e));
+            let resumed = (tail_start..lines.len()).find_map(|i| src_line_map[i].map(|(s, _)| s));
+            marker = base_trailer_for(tail_start - head_end, (om_first, om_last), resumed);
             break;
         }
         marker = build_marker(head_end, tail_start);
-        if head_bytes + marker.len() + tail_bytes + extra_newlines <= budget {
-            break;
-        }
-        let fallback = base_trailer_for(tail_start - head_end);
-        if head_bytes + fallback.len() + tail_bytes + extra_newlines <= budget
-            && marker.len() > fallback.len() + 240
-        {
-            marker = fallback;
+        if head_bytes + marker.len() + tail_bytes + extra_newlines_for(head_end) <= budget {
             break;
         }
     }
@@ -2452,9 +3222,14 @@ pub(super) struct RenderedChunk {
     pub(super) path: Option<PathBuf>,
     pub(super) is_test: bool,
     pub(super) is_new: bool,
+    pub(super) is_deleted: bool,
+    pub(super) pre_omitted: bool,
     pub(super) is_omitted: bool,
     pub(super) raw_chunk: String,
     pub(super) rendered: String,
+    pub(super) orig_line_map: Option<Vec<Option<(usize, usize)>>>,
+    #[cfg(feature = "tree-sitter")]
+    pub(super) inline_test_blocks: Vec<ast_compact::InlineTestBlock>,
 }
 
 fn split_raw_diff_chunks(raw_diff: &str) -> (String, Vec<String>) {
@@ -2499,17 +3274,6 @@ pub(super) fn apply_patch_budget(
         return out;
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum ChunkState {
-        Intact,
-        DegradedU3,
-        DegradedU0,
-        Truncated,
-        Omitted,
-    }
-
-    let mut states = vec![ChunkState::Intact; items.len()];
-
     // Reserve space for the top `[patch-budget: ...]` metadata banner on real budgets (>= 16 KiB)
     // so the banner always fits without violating `max_bytes`.
     let effective_max = if max_bytes >= 16 * 1024 {
@@ -2518,15 +3282,16 @@ pub(super) fn apply_patch_budget(
         max_bytes
     };
 
-    // Tier 1a: shrink expanded test chunks down to compact `-U3` (preserving AST signatures) first
+    // Tier 2a: shrink separate modified test chunks down to compact `-U3` (preserving AST signatures)
     {
         let mut test_u3: Vec<(usize, String)> = items
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.is_test && !c.is_omitted && !c.is_new)
+            .filter(|(_, c)| c.is_test && !c.is_omitted && !c.is_new && !c.is_deleted)
             .filter_map(|(i, c)| {
-                trim_unified_diff_context(&c.rendered, COMPACT_CONTEXT_LINES)
-                    .map(|compact| (i, compact))
+                let compact = trim_unified_diff_context(&c.rendered, COMPACT_CONTEXT_LINES)?;
+                let marked = set_degraded_header_marker(&compact, "[degraded to -U3]");
+                (marked.len() < c.rendered.len()).then_some((i, marked))
             })
             .collect();
         test_u3.sort_by(|(a, ca), (b, cb)| {
@@ -2534,70 +3299,87 @@ pub(super) fn apply_patch_budget(
             let save_b = items[*b].rendered.len().saturating_sub(cb.len());
             save_b.cmp(&save_a)
         });
-        for (idx, compact) in test_u3 {
+        for (idx, marked) in test_u3 {
             if total_bytes(&items) <= effective_max {
                 break;
             }
-            items[idx].rendered = compact;
-            states[idx] = ChunkState::DegradedU3;
+            items[idx].rendered = marked;
+            items[idx].orig_line_map = None;
         }
     }
 
-    // Tier 1b: if still over budget, shrink expanded test chunks to raw `-U0`
+    // Tier 2b: fold explicit inline test blocks inside production files into AST TOCs before
+    // degrading or cutting any production logic (largest savings first).
+    #[cfg(feature = "tree-sitter")]
     if total_bytes(&items) > effective_max {
-        let mut test_expand_indices: Vec<usize> = items
+        type InlineTestCandidate = (usize, String, Option<super::SourceLineMap>);
+        let mut inline_candidates: Vec<InlineTestCandidate> = items
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.is_test && !c.is_omitted && c.raw_chunk.len() < c.rendered.len())
-            .map(|(i, _)| i)
-            .collect();
-        test_expand_indices.sort_by(|&a, &b| {
-            let save_a = items[a]
-                .rendered
-                .len()
-                .saturating_sub(items[a].raw_chunk.len());
-            let save_b = items[b]
-                .rendered
-                .len()
-                .saturating_sub(items[b].raw_chunk.len());
-            save_b.cmp(&save_a)
-        });
-        for idx in test_expand_indices {
-            if total_bytes(&items) <= effective_max {
-                break;
-            }
-            items[idx].rendered = items[idx].raw_chunk.clone();
-            states[idx] = ChunkState::DegradedU0;
-        }
-    }
-
-    // Tier 2: shrink expanded modified production chunks from full AST/`-W` down to compact `-U3`
-    // while preserving their AST enclosing signatures in `@@ ... @@` headers (never `-U0` yet).
-    if total_bytes(&items) > effective_max {
-        let mut prod_u3: Vec<(usize, String)> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.is_test && !c.is_omitted && !c.is_new)
+            .filter(|(_, c)| !c.is_test && !c.is_omitted && !c.is_deleted)
             .filter_map(|(i, c)| {
-                trim_unified_diff_context(&c.rendered, COMPACT_CONTEXT_LINES)
-                    .map(|compact| (i, compact))
+                if c.is_new {
+                    let p = c.path.as_deref()?;
+                    let (folded, map) = ast_compact::fold_inline_tests_in_new_chunk(
+                        &c.raw_chunk,
+                        &c.rendered,
+                        c.orig_line_map.as_deref(),
+                        p,
+                    )?;
+                    Some((i, folded, Some(map)))
+                } else {
+                    let folded = ast_compact::fold_inline_tests_in_modified_chunk(
+                        &c.rendered,
+                        &c.inline_test_blocks,
+                    )?;
+                    Some((i, folded, None))
+                }
             })
             .collect();
-        prod_u3.sort_by(|(a, ca), (b, cb)| {
+        inline_candidates.sort_by(|(a, fa, _), (b, fb, _)| {
+            let save_a = items[*a].rendered.len().saturating_sub(fa.len());
+            let save_b = items[*b].rendered.len().saturating_sub(fb.len());
+            save_b.cmp(&save_a)
+        });
+        for (idx, folded, map) in inline_candidates {
+            if total_bytes(&items) <= effective_max {
+                break;
+            }
+            items[idx].rendered = folded;
+            if map.is_some() {
+                items[idx].orig_line_map = map;
+            }
+        }
+    }
+
+    // Tier 2c: shrink separate test chunks to `-U0`, then omit remaining separate test files with AST TOC
+    if total_bytes(&items) > effective_max {
+        let mut test_u0: Vec<(usize, String)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_test && !c.is_omitted && !c.is_new && !c.is_deleted)
+            .filter_map(|(i, c)| {
+                let candidate = trim_unified_diff_context(&c.rendered, 0)
+                    .filter(|u0| u0.len() <= c.raw_chunk.len() + 120)
+                    .unwrap_or_else(|| c.raw_chunk.clone());
+                let marked = set_degraded_header_marker(&candidate, "[degraded to -U0]");
+                (marked.len() < c.rendered.len()).then_some((i, marked))
+            })
+            .collect();
+        test_u0.sort_by(|(a, ca), (b, cb)| {
             let save_a = items[*a].rendered.len().saturating_sub(ca.len());
             let save_b = items[*b].rendered.len().saturating_sub(cb.len());
             save_b.cmp(&save_a)
         });
-        for (idx, compact) in prod_u3 {
+        for (idx, marked) in test_u0 {
             if total_bytes(&items) <= effective_max {
                 break;
             }
-            items[idx].rendered = compact;
-            states[idx] = ChunkState::DegradedU3;
+            items[idx].rendered = marked;
+            items[idx].orig_line_map = None;
         }
     }
 
-    // Tier 3: omit remaining large test chunks (largest first)
     if total_bytes(&items) > effective_max {
         let mut test_indices: Vec<usize> = items
             .iter()
@@ -2607,32 +3389,130 @@ pub(super) fn apply_patch_budget(
             .collect();
         test_indices.sort_by(|&a, &b| items[b].rendered.len().cmp(&items[a].rendered.len()));
 
+        let test_count = test_indices.len().max(1);
+        let toc_cap = ((effective_max / 8) / test_count)
+            .clamp(128, 1536)
+            .min(effective_max / 2);
+
         for idx in test_indices {
             if total_bytes(&items) <= effective_max {
                 break;
             }
             if let Some(ref p) = items[idx].path {
-                let summary = summarize_budget_omitted_chunk(&items[idx].raw_chunk, p);
+                let toc_budget = (items[idx].rendered.len() / 2).min(toc_cap);
+                let summary = summarize_budget_omitted_chunk_with_toc(
+                    &items[idx].raw_chunk,
+                    &items[idx].rendered,
+                    p,
+                    items[idx].is_new,
+                    items[idx].is_deleted,
+                    toc_budget,
+                );
                 if summary.len() < items[idx].rendered.len() {
                     items[idx].rendered = summary;
                     items[idx].is_omitted = true;
-                    states[idx] = ChunkState::Omitted;
+                    items[idx].orig_line_map = None;
                 }
             }
         }
     }
 
-    // Tier 4: water-filling head/tail truncation for oversized chunks (small chunks below the
-    // water-level cap remain completely untouched).
+    // Tier 3: shrink expanded modified production chunks from full AST/`-W` down to compact `-U3`
+    // while preserving AST `@@ ... @@` signatures, `-`/`+` edits, and `[omitted inline tests: ...]` markers.
     if total_bytes(&items) > effective_max {
-        let tier4_max = if max_bytes < 16 * 1024 && max_bytes > 1024 + BUDGET_BANNER_RESERVE_BYTES {
+        let mut prod_u3: Vec<(usize, String)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_test && !c.is_omitted && !c.is_new && !c.is_deleted)
+            .filter_map(|(i, c)| {
+                let compact = trim_unified_diff_context(&c.rendered, COMPACT_CONTEXT_LINES)?;
+                let marked = set_degraded_header_marker(&compact, "[degraded to -U3]");
+                (marked.len() < c.rendered.len()).then_some((i, marked))
+            })
+            .collect();
+        prod_u3.sort_by(|(a, ca), (b, cb)| {
+            let save_a = items[*a].rendered.len().saturating_sub(ca.len());
+            let save_b = items[*b].rendered.len().saturating_sub(cb.len());
+            save_b.cmp(&save_a)
+        });
+        for (idx, marked) in prod_u3 {
+            if total_bytes(&items) <= effective_max {
+                break;
+            }
+            items[idx].rendered = marked;
+            items[idx].orig_line_map = None;
+        }
+    }
+
+    // Tier 4: progressive water-fill-aware AST skeletonization for oversized NEW production files
+    // (preserves imports, types, impl/class headers, doc comments, and all function signatures;
+    // folds longest function bodies first with exact original line ranges).
+    #[cfg(feature = "tree-sitter")]
+    if total_bytes(&items) > effective_max {
+        let mut new_prod_indices: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                !c.is_test && !c.is_omitted && c.is_new && !c.is_deleted && c.path.is_some()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        new_prod_indices.sort_by(|&a, &b| items[b].rendered.len().cmp(&items[a].rendered.len()));
+
+        for pos in 0..new_prod_indices.len() {
+            let cur_total = total_bytes(&items);
+            if cur_total <= effective_max {
+                break;
+            }
+            let idx = new_prod_indices[pos];
+            // Water-fill ONLY across remaining eligible NEW production files; modified files
+            // and already-processed chunks remain fixed so new files absorb compression before
+            // Tier 5 ever truncates modified production diffs.
+            let remaining_new_sizes: Vec<usize> = new_prod_indices[pos..]
+                .iter()
+                .map(|&i| items[i].rendered.len())
+                .collect();
+            let remaining_new_sum: usize = remaining_new_sizes.iter().sum();
+            let fixed = cur_total.saturating_sub(remaining_new_sum);
+            let avail = effective_max.saturating_sub(fixed);
+            let cap = compute_waterfill_cap(&remaining_new_sizes, avail);
+
+            // Preserve small new files already at or below the water-fill level.
+            if items[idx].rendered.len() <= cap {
+                continue;
+            }
+
+            let other_bytes = cur_total.saturating_sub(items[idx].rendered.len());
+            let needed_only_from_this = effective_max.saturating_sub(other_bytes);
+            let target_budget = cap.max(needed_only_from_this);
+            if target_budget >= items[idx].rendered.len() {
+                continue;
+            }
+
+            if let Some(ref p) = items[idx].path {
+                if let Some((skel, new_map, _, _)) = ast_compact::skeletonize_new_chunk_progressive(
+                    &items[idx].raw_chunk,
+                    &items[idx].rendered,
+                    items[idx].orig_line_map.as_deref(),
+                    p,
+                    target_budget,
+                ) {
+                    items[idx].rendered = skel;
+                    items[idx].orig_line_map = Some(new_map);
+                }
+            }
+        }
+    }
+
+    // Tier 5: last-resort extreme `-U0` (if critically tight), water-filling Head+Tail truncation
+    // with explicit `[resuming at L...]` anchors + bare symbol lists, or budget-omitted AST TOC.
+    if total_bytes(&items) > effective_max {
+        let tier5_max = if max_bytes < 16 * 1024 && max_bytes > 1024 + BUDGET_BANNER_RESERVE_BYTES {
             max_bytes.saturating_sub(BUDGET_BANNER_RESERVE_BYTES)
         } else {
             effective_max
         };
 
-        // Check if waterfill cap is critically small (< 1 KiB); only in that extreme crunch
-        // degrade modified production chunks from `-U3` to `-U0` before omitting/truncating.
         let initial_rem_sizes: Vec<usize> = items
             .iter()
             .filter(|c| !c.is_omitted)
@@ -2640,39 +3520,44 @@ pub(super) fn apply_patch_budget(
             .collect();
         let initial_rem_total: usize = initial_rem_sizes.iter().sum();
         let initial_fixed = total_bytes(&items).saturating_sub(initial_rem_total);
-        let initial_avail = tier4_max.saturating_sub(initial_fixed);
+        let initial_avail = tier5_max.saturating_sub(initial_fixed);
         let initial_cap = compute_waterfill_cap(&initial_rem_sizes, initial_avail);
 
         if initial_cap < 1024 {
-            let mut prod_u0_indices: Vec<usize> = items
+            let mut prod_u0: Vec<(usize, String)> = items
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| {
-                    !c.is_test && !c.is_omitted && c.raw_chunk.len() < c.rendered.len()
+                .filter(|(_, c)| !c.is_test && !c.is_omitted && !c.is_new && !c.is_deleted)
+                .filter_map(|(i, c)| {
+                    // Never fall back to `c.raw_chunk` if Tier 2b already folded inline test hunks,
+                    // otherwise folded inline tests would be resurrected.
+                    let has_folded_inline = has_inline_test_omission_marker(&c.rendered);
+                    let candidate = if has_folded_inline {
+                        trim_unified_diff_context(&c.rendered, 0)?
+                    } else {
+                        trim_unified_diff_context(&c.rendered, 0)
+                            .filter(|u0| u0.len() <= c.raw_chunk.len() + 120)
+                            .unwrap_or_else(|| c.raw_chunk.clone())
+                    };
+                    let marked = set_degraded_header_marker(&candidate, "[degraded to -U0]");
+                    (marked.len() < c.rendered.len()).then_some((i, marked))
                 })
-                .map(|(i, _)| i)
                 .collect();
-            prod_u0_indices.sort_by(|&a, &b| {
-                let save_a = items[a]
-                    .rendered
-                    .len()
-                    .saturating_sub(items[a].raw_chunk.len());
-                let save_b = items[b]
-                    .rendered
-                    .len()
-                    .saturating_sub(items[b].raw_chunk.len());
+            prod_u0.sort_by(|(a, ca), (b, cb)| {
+                let save_a = items[*a].rendered.len().saturating_sub(ca.len());
+                let save_b = items[*b].rendered.len().saturating_sub(cb.len());
                 save_b.cmp(&save_a)
             });
-            for idx in prod_u0_indices {
-                if total_bytes(&items) <= tier4_max {
+            for (idx, marked) in prod_u0 {
+                if total_bytes(&items) <= tier5_max {
                     break;
                 }
-                items[idx].rendered = items[idx].raw_chunk.clone();
-                states[idx] = ChunkState::DegradedU0;
+                items[idx].rendered = marked;
+                items[idx].orig_line_map = None;
             }
         }
 
-        if total_bytes(&items) > tier4_max {
+        if total_bytes(&items) > tier5_max {
             let mut rem_indices: Vec<usize> = items
                 .iter()
                 .enumerate()
@@ -2683,7 +3568,7 @@ pub(super) fn apply_patch_budget(
 
             for pos in 0..rem_indices.len() {
                 let cur_total = total_bytes(&items);
-                if cur_total <= tier4_max {
+                if cur_total <= tier5_max {
                     break;
                 }
                 let idx = rem_indices[pos];
@@ -2693,11 +3578,11 @@ pub(super) fn apply_patch_budget(
                     .collect();
                 let remaining_sum: usize = remaining_sizes.iter().sum();
                 let fixed_now = cur_total.saturating_sub(remaining_sum);
-                let avail_now = tier4_max.saturating_sub(fixed_now);
+                let avail_now = tier5_max.saturating_sub(fixed_now);
                 let cap = compute_waterfill_cap(&remaining_sizes, avail_now);
 
                 let other_bytes = cur_total.saturating_sub(items[idx].rendered.len());
-                let needed_only_from_this = tier4_max.saturating_sub(other_bytes);
+                let needed_only_from_this = tier5_max.saturating_sub(other_bytes);
 
                 // Water-filling invariant: chunks <= cap are preserved untouched unless rounding
                 // leaves a few bytes over budget on the largest remaining chunk.
@@ -2711,65 +3596,118 @@ pub(super) fn apply_patch_budget(
                     .max(needed_only_from_this)
                     .min(items[idx].rendered.len());
                 if let Some(ref p) = items[idx].path {
-                    let (replacement, new_state) = if chunk_budget >= 512 {
+                    let replacement = if chunk_budget >= 512 {
                         match truncate_chunk_head_tail(
                             &items[idx].rendered,
                             &items[idx].raw_chunk,
+                            items[idx].orig_line_map.as_deref(),
                             p,
                             items[idx].is_new,
                             chunk_budget,
                         ) {
-                            Some(truncated) => (truncated, ChunkState::Truncated),
-                            None => (
-                                summarize_budget_omitted_chunk(&items[idx].raw_chunk, p),
-                                ChunkState::Omitted,
+                            Some(truncated) => truncated,
+                            None => summarize_budget_omitted_chunk_with_toc(
+                                &items[idx].raw_chunk,
+                                &items[idx].rendered,
+                                p,
+                                items[idx].is_new,
+                                items[idx].is_deleted,
+                                chunk_budget,
                             ),
                         }
                     } else {
-                        (
-                            summarize_budget_omitted_chunk(&items[idx].raw_chunk, p),
-                            ChunkState::Omitted,
+                        summarize_budget_omitted_chunk_with_toc(
+                            &items[idx].raw_chunk,
+                            &items[idx].rendered,
+                            p,
+                            items[idx].is_new,
+                            items[idx].is_deleted,
+                            chunk_budget,
                         )
                     };
                     if replacement.len() < items[idx].rendered.len() {
                         items[idx].rendered = replacement;
                         items[idx].is_omitted = true;
-                        states[idx] = new_state;
+                        items[idx].orig_line_map = None;
                     }
                 }
             }
         }
     }
 
-    let degraded_u3 = states
-        .iter()
-        .filter(|&&s| s == ChunkState::DegradedU3)
-        .count();
-    let degraded_u0 = states
-        .iter()
-        .filter(|&&s| s == ChunkState::DegradedU0)
-        .count();
-    let truncated_count = states
-        .iter()
-        .filter(|&&s| s == ChunkState::Truncated)
-        .count();
-    let omitted_count = states.iter().filter(|&&s| s == ChunkState::Omitted).count();
-    let compacted_count = degraded_u3 + degraded_u0 + truncated_count + omitted_count;
+    // Derive banner counts directly from final emitted markers so banner and body match 1:1.
+    let pre_omitted_count = items.iter().filter(|c| c.pre_omitted).count();
+    let mut inline_tests_omitted_count = 0usize;
+    let mut degraded_u3 = 0usize;
+    let mut degraded_u0 = 0usize;
+    let mut skeletonized_count = 0usize;
+    let mut truncated_count = 0usize;
+    let mut budget_omitted_count = 0usize;
+    let mut compacted_files = 0usize;
+
+    for c in &items {
+        if c.pre_omitted {
+            continue;
+        }
+        let has_inline = has_inline_test_omission_marker(&c.rendered);
+        let has_u3 = has_file_header_marker(&c.rendered, "[degraded to -U3]");
+        let has_u0 = has_file_header_marker(&c.rendered, "[degraded to -U0]");
+        let has_skel = has_file_header_marker(&c.rendered, "[skeletonized:");
+        let has_trunc = c
+            .rendered
+            .lines()
+            .any(|l| l.starts_with("... [truncated due to patch budget:"));
+        let has_omit = c
+            .rendered
+            .lines()
+            .any(|l| l.starts_with("[omitted due to patch budget:"));
+
+        if has_inline {
+            inline_tests_omitted_count += 1;
+        }
+        if has_u3 {
+            degraded_u3 += 1;
+        }
+        if has_u0 {
+            degraded_u0 += 1;
+        }
+        if has_skel {
+            skeletonized_count += 1;
+        }
+        if has_trunc {
+            truncated_count += 1;
+        }
+        if has_omit {
+            budget_omitted_count += 1;
+        }
+        if has_inline || has_u3 || has_u0 || has_skel || has_trunc || has_omit {
+            compacted_files += 1;
+        }
+    }
 
     let mut banner = String::new();
-    if compacted_count > 0 {
+    if compacted_files > 0 {
         let mut detail_parts = Vec::new();
+        if pre_omitted_count > 0 {
+            detail_parts.push(format!("{pre_omitted_count} pre-omitted"));
+        }
+        if inline_tests_omitted_count > 0 {
+            detail_parts.push(format!("{inline_tests_omitted_count} inline-tests-omitted"));
+        }
         if degraded_u3 > 0 {
             detail_parts.push(format!("{degraded_u3} degraded to -U3"));
         }
         if degraded_u0 > 0 {
             detail_parts.push(format!("{degraded_u0} degraded to -U0"));
         }
+        if skeletonized_count > 0 {
+            detail_parts.push(format!("{skeletonized_count} skeletonized"));
+        }
         if truncated_count > 0 {
             detail_parts.push(format!("{truncated_count} truncated"));
         }
-        if omitted_count > 0 {
-            detail_parts.push(format!("{omitted_count} omitted"));
+        if budget_omitted_count > 0 {
+            detail_parts.push(format!("{budget_omitted_count} budget-omitted"));
         }
         let budget_label = format_budget_size(max_bytes);
         let candidate_banner = format!(
@@ -2781,7 +3719,7 @@ pub(super) fn apply_patch_budget(
         }
 
         let msg = format!(
-            "diff output exceeded patch budget ({max_bytes} bytes); compacted {compacted_count} file chunk(s) ({})",
+            "diff output exceeded patch budget ({max_bytes} bytes); compacted {compacted_files} file chunk(s) ({})",
             detail_parts.join(", ")
         );
         if !warnings.contains(&msg) {
@@ -2858,35 +3796,54 @@ pub fn generate_expanded_diff_for_source(
             .into_iter()
             .map(|chunk| {
                 let info = extract_target_path_from_diff_chunk(&chunk);
-                if let Some((target_path, _, _, is_new, _)) = info {
+                if let Some((target_path, _, is_deleted, is_new, is_special_mode)) = info {
                     let path_is_test = is_test_file_path(&target_path);
-                    if is_lockfile_or_generated(&target_path) {
+                    let is_generated = is_lockfile_or_generated(&target_path)
+                        || has_generated_file_header(&chunk)
+                        || (!is_deleted
+                            && !is_new
+                            && !is_special_mode
+                            && has_generated_source_header_for_file(
+                                &repo_root,
+                                &target_path,
+                                source,
+                            ));
+                    if is_generated {
                         let omitted = summarize_omitted_chunk(&chunk, &target_path);
                         return RenderedChunk {
                             path: Some(target_path),
                             is_test: path_is_test,
                             is_new,
+                            is_deleted,
+                            pre_omitted: true,
                             is_omitted: true,
                             raw_chunk: chunk,
                             rendered: omitted,
+                            orig_line_map: None,
                         };
                     }
                     return RenderedChunk {
                         path: Some(target_path),
                         is_test: path_is_test,
                         is_new,
+                        is_deleted,
+                        pre_omitted: false,
                         is_omitted: false,
                         raw_chunk: chunk.clone(),
                         rendered: chunk,
+                        orig_line_map: None,
                     };
                 }
                 RenderedChunk {
                     path: None,
                     is_test: false,
                     is_new: false,
+                    is_deleted: false,
+                    pre_omitted: false,
                     is_omitted: false,
                     raw_chunk: chunk.clone(),
                     rendered: chunk,
+                    orig_line_map: None,
                 }
             })
             .collect();
@@ -2894,7 +3851,7 @@ pub fn generate_expanded_diff_for_source(
         Ok(apply_patch_budget(
             &prefix,
             rendered,
-            DEFAULT_PATCH_BUDGET_BYTES,
+            resolve_patch_budget_bytes(),
             warnings,
         ))
     }
@@ -3020,9 +3977,13 @@ pub fn generate_expanded_diff_for_source(
                                     path: None,
                                     is_test: false,
                                     is_new: false,
+                                    is_deleted: false,
+                                    pre_omitted: false,
                                     is_omitted: false,
                                     raw_chunk: chunk.clone(),
                                     rendered: chunk.clone(),
+                                    orig_line_map: None,
+                                    inline_test_blocks: Vec::new(),
                                 },
                                 file_warnings,
                             ))
@@ -3031,16 +3992,20 @@ pub fn generate_expanded_diff_for_source(
 
                 let path_is_test = is_test_file_path(&target_path);
 
-                if is_lockfile_or_generated(&target_path) {
+                if is_lockfile_or_generated(&target_path) || has_generated_file_header(chunk) {
                     let omitted = summarize_omitted_chunk(chunk, &target_path);
                     return Ok((
                         RenderedChunk {
                             path: Some(target_path),
                             is_test: path_is_test,
                             is_new,
+                            is_deleted,
+                            pre_omitted: true,
                             is_omitted: true,
                             raw_chunk: chunk.clone(),
                             rendered: omitted,
+                            orig_line_map: None,
+                            inline_test_blocks: Vec::new(),
                         },
                         file_warnings,
                     ));
@@ -3055,14 +4020,18 @@ pub fn generate_expanded_diff_for_source(
                                 path: Some(target_path),
                                 is_test: true,
                                 is_new: true,
+                                is_deleted: false,
+                                pre_omitted: true,
                                 is_omitted: true,
                                 raw_chunk: chunk.clone(),
                                 rendered: test_summary,
+                                orig_line_map: None,
+                                inline_test_blocks: Vec::new(),
                             },
                             file_warnings,
                         ));
                     }
-                    if let Some(moved_summary) =
+                    if let Some((moved_summary, moved_line_map)) =
                         summarize_moved_new_file_chunk(chunk, &target_path, &moved_deleted_map)
                     {
                         return Ok((
@@ -3070,9 +4039,13 @@ pub fn generate_expanded_diff_for_source(
                                 path: Some(target_path),
                                 is_test: path_is_test,
                                 is_new: true,
+                                is_deleted: false,
+                                pre_omitted: false,
                                 is_omitted: false,
                                 raw_chunk: chunk.clone(),
                                 rendered: moved_summary,
+                                orig_line_map: Some(moved_line_map),
+                                inline_test_blocks: Vec::new(),
                             },
                             file_warnings,
                         ));
@@ -3092,15 +4065,20 @@ pub fn generate_expanded_diff_for_source(
                             path: Some(target_path),
                             is_test: path_is_test,
                             is_new,
+                            is_deleted,
+                            pre_omitted: false,
                             is_omitted: false,
                             raw_chunk: chunk.clone(),
                             rendered: chunk.clone(),
+                            orig_line_map: None,
+                            inline_test_blocks: Vec::new(),
                         },
                         file_warnings,
                     ));
                 }
 
-                let diff_str = match SupportedLanguage::from_path(&target_path) {
+                let (diff_str, inline_test_blocks) = match SupportedLanguage::from_path(&target_path)
+                {
                     Some(lang) => {
                         match expand_chunk_with_treesitter(
                             &repo_root,
@@ -3110,39 +4088,115 @@ pub fn generate_expanded_diff_for_source(
                             lang,
                             &moved_deleted_map,
                         ) {
-                            Ok(Some(expanded)) if !expanded.trim().is_empty() => expanded,
-                            Ok(Some(_)) | Ok(None) => {
+                            Ok(Some(TreeSitterExpandResult::Generated)) => {
+                                let omitted = summarize_omitted_chunk(chunk, &target_path);
+                                return Ok((
+                                    RenderedChunk {
+                                        path: Some(target_path),
+                                        is_test: path_is_test,
+                                        is_new: false,
+                                        is_deleted: false,
+                                        pre_omitted: true,
+                                        is_omitted: true,
+                                        raw_chunk: chunk.clone(),
+                                        rendered: omitted,
+                                        orig_line_map: None,
+                                        inline_test_blocks: Vec::new(),
+                                    },
+                                    file_warnings,
+                                ));
+                            }
+                            Ok(Some(TreeSitterExpandResult::Expanded(expanded, blocks)))
+                                if !expanded.trim().is_empty() =>
+                            {
+                                (expanded, blocks)
+                            }
+                            Ok(Some(TreeSitterExpandResult::Expanded(_, _))) | Ok(None) => {
                                 file_warnings.push(format!(
                                     "tree-sitter: could not expand '{}'; falling back to git diff -W",
                                     target_path.display()
                                 ));
-                                git_diff_w_for_file(
-                                    &repo_root,
-                                    &target_path,
-                                    old_path.as_deref(),
-                                    source,
-                                )?
+                                (
+                                    git_diff_w_for_file(
+                                        &repo_root,
+                                        &target_path,
+                                        old_path.as_deref(),
+                                        source,
+                                    )?,
+                                    Vec::new(),
+                                )
                             }
                             Err(e) => {
+                                if has_generated_source_header_for_file(
+                                    &repo_root,
+                                    &target_path,
+                                    source,
+                                ) {
+                                    let omitted = summarize_omitted_chunk(chunk, &target_path);
+                                    return Ok((
+                                        RenderedChunk {
+                                            path: Some(target_path),
+                                            is_test: path_is_test,
+                                            is_new: false,
+                                            is_deleted: false,
+                                            pre_omitted: true,
+                                            is_omitted: true,
+                                            raw_chunk: chunk.clone(),
+                                            rendered: omitted,
+                                            orig_line_map: None,
+                                            inline_test_blocks: Vec::new(),
+                                        },
+                                        file_warnings,
+                                    ));
+                                }
                                 file_warnings.push(format!(
                                     "tree-sitter: failed for '{}' ({e}); falling back to git diff -W",
                                     target_path.display()
                                 ));
-                                git_diff_w_for_file(
-                                    &repo_root,
-                                    &target_path,
-                                    old_path.as_deref(),
-                                    source,
-                                )?
+                                (
+                                    git_diff_w_for_file(
+                                        &repo_root,
+                                        &target_path,
+                                        old_path.as_deref(),
+                                        source,
+                                    )?,
+                                    Vec::new(),
+                                )
                             }
                         }
                     }
                     None => {
+                        if has_generated_source_header_for_file(&repo_root, &target_path, source) {
+                            let omitted = summarize_omitted_chunk(chunk, &target_path);
+                            return Ok((
+                                RenderedChunk {
+                                    path: Some(target_path),
+                                    is_test: path_is_test,
+                                    is_new: false,
+                                    is_deleted: false,
+                                    pre_omitted: true,
+                                    is_omitted: true,
+                                    raw_chunk: chunk.clone(),
+                                    rendered: omitted,
+                                    orig_line_map: None,
+                                    inline_test_blocks: Vec::new(),
+                                },
+                                file_warnings,
+                            ));
+                        }
                         file_warnings.push(format!(
                             "tree-sitter: unsupported language for '{}'; falling back to git diff -W",
                             target_path.display()
                         ));
-                        git_diff_w_for_file(&repo_root, &target_path, old_path.as_deref(), source)?
+                        (
+                            git_diff_w_for_file(
+                                &repo_root,
+                                &target_path,
+                                old_path.as_deref(),
+                                source,
+                            )?,
+                            Vec::new(),
+                        )
                     }
                 };
                 Ok((
@@ -3150,9 +4204,13 @@ pub fn generate_expanded_diff_for_source(
                         path: Some(target_path),
                         is_test: path_is_test,
                         is_new: false,
+                        is_deleted: false,
+                        pre_omitted: false,
                         is_omitted: false,
                         raw_chunk: chunk.clone(),
                         rendered: diff_str,
+                        orig_line_map: None,
+                        inline_test_blocks,
                     },
                     file_warnings,
                 ))
@@ -3201,7 +4259,7 @@ pub fn generate_expanded_diff_for_source(
         Ok(apply_patch_budget(
             &prefix,
             rendered_chunks,
-            DEFAULT_PATCH_BUDGET_BYTES,
+            resolve_patch_budget_bytes(),
             warnings,
         ))
     }
@@ -3302,6 +4360,29 @@ mod common_tests {
     use super::*;
     use std::process::Command;
 
+    fn mk_chunk(
+        path: &str,
+        is_test: bool,
+        is_new: bool,
+        pre_omitted: bool,
+        raw_chunk: String,
+        rendered: String,
+    ) -> RenderedChunk {
+        RenderedChunk {
+            path: Some(PathBuf::from(path)),
+            is_test,
+            is_new,
+            is_deleted: false,
+            pre_omitted,
+            is_omitted: pre_omitted,
+            raw_chunk,
+            rendered,
+            orig_line_map: None,
+            #[cfg(feature = "tree-sitter")]
+            inline_test_blocks: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_expanded_lockfile_and_generated_detection() {
         for p in [
@@ -3320,18 +4401,53 @@ mod common_tests {
             "lib/user.freezed.dart",
             "Models/Order.g.cs",
             "Models/Order.generated.cs",
+            "src/rpc/generated/anticrumb_ffi.rs",
+            "pkg/Generated/types.go",
         ] {
             assert!(
                 is_lockfile_or_generated(Path::new(p)),
                 "Expected generated/lockfile detection for {p}"
             );
         }
-        for p in ["src/main.rs", "src/app.ts", "src/order.cs", "README.md"] {
+        for p in [
+            "src/main.rs",
+            "src/app.ts",
+            "src/order.cs",
+            "src/generated_helper.rs",
+            "README.md",
+        ] {
             assert!(
                 !is_lockfile_or_generated(Path::new(p)),
                 "Unexpected generated/lockfile false positive for {p}"
             );
         }
+
+        let gen_go = "diff --git a/pkg/db.go b/pkg/db.go\nnew file mode 100644\n--- /dev/null\n+++ b/pkg/db.go\n@@ -0,0 +1,4 @@\n+// Code generated by sqlc. DO NOT EDIT.\n+package db\n";
+        assert!(has_generated_file_header(gen_go));
+
+        let gen_at = "diff --git a/src/a.rs b/src/a.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.rs\n@@ -0,0 +1,3 @@\n+// @generated\n+pub const X: i32 = 1;\n";
+        assert!(has_generated_file_header(gen_at));
+
+        let gen_py = "diff --git a/api.py b/api.py\nnew file mode 100644\n--- /dev/null\n+++ b/api.py\n@@ -0,0 +1,3 @@\n+# Automatically generated - DO NOT MODIFY\n+X = 1\n";
+        assert!(has_generated_file_header(gen_py));
+
+        // Code containing "@generated" inside a string literal must NOT false-positive
+        let normal_rs = "diff --git a/src/check.rs b/src/check.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/check.rs\n@@ -0,0 +1,4 @@\n+pub fn is_gen(s: &str) -> bool {\n+    s.contains(\"@generated\")\n+}\n";
+        assert!(!has_generated_file_header(normal_rs));
+    }
+
+    #[test]
+    fn test_parse_patch_budget_kib_override_and_clamping() {
+        use super::super::{parse_patch_budget_kib, DEFAULT_PATCH_BUDGET_BYTES};
+        assert_eq!(DEFAULT_PATCH_BUDGET_BYTES, 512 * 1024);
+        assert_eq!(parse_patch_budget_kib(None), 512 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some("")), 512 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some("0")), 512 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some("invalid")), 512 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some("256")), 256 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some(" 768 ")), 768 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some("1")), 16 * 1024);
+        assert_eq!(parse_patch_budget_kib(Some("999999")), 16 * 1024 * 1024);
     }
 
     #[test]
@@ -3348,95 +4464,82 @@ mod common_tests {
             s
         };
 
-        // Tier 1: Expanded test chunk shrinks to its raw `-U0` diff before being omitted
+        // Tier 2: Expanded test chunk shrinks to its raw `-U0` diff (with marker) before being omitted
         let test_raw = make_chunk("tests/foo_test.rs", 8);
         let test_expanded = make_chunk("tests/foo_test.rs", 25);
         let prod_raw = make_chunk("src/prod.rs", 10);
         let prod_expanded = make_chunk("src/prod.rs", 25);
         let items_t1 = vec![
-            RenderedChunk {
-                path: Some(PathBuf::from("tests/foo_test.rs")),
-                is_test: true,
-                is_new: false,
-                is_omitted: false,
-                raw_chunk: test_raw.clone(),
-                rendered: test_expanded,
-            },
-            RenderedChunk {
-                path: Some(PathBuf::from("src/prod.rs")),
-                is_test: false,
-                is_new: false,
-                is_omitted: false,
-                raw_chunk: prod_raw.clone(),
-                rendered: prod_expanded.clone(),
-            },
+            mk_chunk(
+                "tests/foo_test.rs",
+                true,
+                false,
+                false,
+                test_raw.clone(),
+                test_expanded,
+            ),
+            mk_chunk(
+                "src/prod.rs",
+                false,
+                false,
+                false,
+                prod_raw.clone(),
+                prod_expanded.clone(),
+            ),
         ];
         let mut warnings = Vec::new();
         let out_t1 = apply_patch_budget(
             "",
             items_t1,
-            test_raw.len() + prod_expanded.len() + 20,
+            test_raw.len() + prod_expanded.len() + 30,
             &mut warnings,
         );
         assert!(
             out_t1.contains("+let line_7"),
-            "Tier 1 must preserve raw -U0 test diff lines instead of omitting test file!"
+            "Tier 2 must preserve raw -U0 test diff lines instead of omitting test file!"
         );
+        assert!(out_t1.contains("[degraded to -U0]"));
         assert!(!out_t1.contains("[omitted due to patch budget"));
         assert!(out_t1.contains("+let line_24"));
         assert!(warnings.iter().any(|w| w.contains("exceeded patch budget")));
 
-        // Tier 2 & 3: When even raw `-U0` exceeds budget, Tier 3 omits test chunk while preserving production chunk
+        // Tier 2c: When even raw `-U0` exceeds budget, omit test chunk while preserving production chunk
         let items_t3 = vec![
-            RenderedChunk {
-                path: Some(PathBuf::from("tests/foo_test.rs")),
-                is_test: true,
-                is_new: false,
-                is_omitted: false,
-                raw_chunk: test_raw.clone(),
-                rendered: test_raw,
-            },
-            RenderedChunk {
-                path: Some(PathBuf::from("src/prod.rs")),
-                is_test: false,
-                is_new: false,
-                is_omitted: false,
-                raw_chunk: prod_raw.clone(),
-                rendered: prod_expanded.clone(),
-            },
+            mk_chunk(
+                "tests/foo_test.rs",
+                true,
+                false,
+                false,
+                test_raw.clone(),
+                test_raw,
+            ),
+            mk_chunk(
+                "src/prod.rs",
+                false,
+                false,
+                false,
+                prod_raw.clone(),
+                prod_expanded.clone(),
+            ),
         ];
         let mut warnings3 = Vec::new();
         let out_t3 = apply_patch_budget("", items_t3, prod_raw.len() + 300, &mut warnings3);
         assert!(out_t3.contains("[omitted due to patch budget: tests/foo_test.rs"));
         assert!(out_t3.contains("+let line_9"));
 
-        // Tier 4: Multiple equal-sized oversized production chunks are water-fill head/tail truncated
-        // rather than completely omitting the largest production files
+        // Tier 5: Multiple equal-sized oversized production chunks (non-function statements so
+        // skeletonization does not apply) are water-fill head/tail truncated with `[resuming at L...]`.
         let p1 = make_chunk("src/core_a.rs", 80);
         let p2 = make_chunk("src/core_b.rs", 80);
         let items_t4 = vec![
-            RenderedChunk {
-                path: Some(PathBuf::from("src/core_a.rs")),
-                is_test: false,
-                is_new: true,
-                is_omitted: false,
-                raw_chunk: p1.clone(),
-                rendered: p1,
-            },
-            RenderedChunk {
-                path: Some(PathBuf::from("src/core_b.rs")),
-                is_test: false,
-                is_new: true,
-                is_omitted: false,
-                raw_chunk: p2.clone(),
-                rendered: p2,
-            },
+            mk_chunk("src/core_a.rs", false, true, false, p1.clone(), p1),
+            mk_chunk("src/core_b.rs", false, true, false, p2.clone(), p2),
         ];
         let mut warnings4 = Vec::new();
-        let out_t4 = apply_patch_budget("", items_t4, 2400, &mut warnings4);
+        let out_t4 = apply_patch_budget("", items_t4, 2600, &mut warnings4);
         assert!(
-            out_t4.len() <= 2400,
-            "Tier 4 exceeded budget: {}",
+            out_t4.len() <= 2600,
+            "Tier 5 exceeded budget: {}",
             out_t4.len()
         );
         assert!(
@@ -3447,9 +4550,13 @@ mod common_tests {
             out_t4.contains("[truncated due to patch budget: src/core_b.rs"),
             "Expected core_b.rs to be head/tail truncated, not omitted: {out_t4}"
         );
+        assert!(
+            out_t4.contains("[resuming at L"),
+            "Truncated chunks must include explicit [resuming at L...] line anchors: {out_t4}"
+        );
         assert!(out_t4.contains("+let line_79"));
         assert!(
-            out_t4.contains("[patch-budget: 2400 B hit; 2 truncated]"),
+            out_t4.contains("[patch-budget: 2600 B hit; 2 truncated]"),
             "Expected top patch-budget metadata banner in compacted output: {out_t4}"
         );
     }
@@ -3472,9 +4579,14 @@ mod common_tests {
             "diff --git a/src/small_mod.rs b/src/small_mod.rs\nindex 1111111..2222222 100644\n--- a/src/small_mod.rs\n+++ b/src/small_mod.rs\n@@ -21,1 +21,1 @@\n-    let answer = old_value();\n+    let answer = new_value();\n",
         );
 
-        // Build a tiny modified file (~350 bytes) that old proportional Tier 4 could drop below 512 B and omit
+        // Build a tiny modified file (~350 bytes) that water-filling must keep intact
         let tiny_mod = String::from(
             "diff --git a/src/tiny.rs b/src/tiny.rs\nindex 1111111..2222222 100644\n--- a/src/tiny.rs\n+++ b/src/tiny.rs\n@@ -1,4 +1,4 @@ fn tiny() {\n fn tiny() {\n-    let a = 1;\n+    let a = 2;\n     a\n }\n",
+        );
+
+        // Build a pre-omitted lockfile to verify banner distinguishes pre-omitted from budget-omitted
+        let pre_omitted_lock = String::from(
+            "diff --git a/Cargo.lock b/Cargo.lock\nindex 1111111..2222222 100644\n--- a/Cargo.lock\n+++ b/Cargo.lock\n[omitted: Cargo.lock (+500/-100 lines)]\n\n",
         );
 
         // Build a large newly added production file (~25 KiB) that forces budget compaction
@@ -3490,36 +4602,44 @@ mod common_tests {
         }
 
         let items = vec![
-            RenderedChunk {
-                path: Some(PathBuf::from("src/small_mod.rs")),
-                is_test: false,
-                is_new: false,
-                is_omitted: false,
-                raw_chunk: raw_mod_u0,
-                rendered: expanded_mod,
-            },
-            RenderedChunk {
-                path: Some(PathBuf::from("src/tiny.rs")),
-                is_test: false,
-                is_new: false,
-                is_omitted: false,
-                raw_chunk: tiny_mod.clone(),
-                rendered: tiny_mod,
-            },
-            RenderedChunk {
-                path: Some(PathBuf::from("src/huge_new.rs")),
-                is_test: false,
-                is_new: true,
-                is_omitted: false,
-                raw_chunk: huge_new.clone(),
-                rendered: huge_new,
-            },
+            mk_chunk(
+                "Cargo.lock",
+                false,
+                false,
+                true,
+                pre_omitted_lock.clone(),
+                pre_omitted_lock,
+            ),
+            mk_chunk(
+                "src/small_mod.rs",
+                false,
+                false,
+                false,
+                raw_mod_u0,
+                expanded_mod,
+            ),
+            mk_chunk(
+                "src/tiny.rs",
+                false,
+                false,
+                false,
+                tiny_mod.clone(),
+                tiny_mod,
+            ),
+            mk_chunk(
+                "src/huge_new.rs",
+                false,
+                true,
+                false,
+                huge_new.clone(),
+                huge_new,
+            ),
         ];
 
         let mut warnings = Vec::new();
         let budget = 16 * 1024;
         let out = apply_patch_budget(
-            "commit abc123\n\n---\n 3 files changed\n\n",
+            "commit abc123\n\n---\n 4 files changed\n\n",
             items,
             budget,
             &mut warnings,
@@ -3531,16 +4651,10 @@ mod common_tests {
             out.len(),
             budget
         );
-        // Banner appears right below prefix and never double-counts
+        // Modified file carries `[degraded to -U3]` right after file header & retains AST signature
         assert!(
-            out.contains("[patch-budget: 16 KiB hit; 1 degraded to -U3, 1 truncated]"),
-            "Expected accurate patch-budget banner, got:\n{}",
-            &out[..out.len().min(600)]
-        );
-        // Modified file keeps -U3 context + AST signature instead of regressing to -U0
-        assert!(
-            out.contains("@@ -18,7 +18,7 @@ impl Router > fn dispatch(req: &Req) {"),
-            "Modified file must retain -U3 context and AST signature:\n{out}"
+            out.contains("+++ b/src/small_mod.rs\n[degraded to -U3]\n@@ -18,7 +18,7 @@ impl Router > fn dispatch(req: &Req) {"),
+            "Modified file must mark [degraded to -U3] and retain -U3 context + AST signature:\n{out}"
         );
         assert!(out.contains("     let pre_18 = compute_step(18);"));
         assert!(out.contains("     let post_24 = finish_step(24);"));
@@ -3548,19 +4662,52 @@ mod common_tests {
             !out.contains("     let pre_1 = compute_step(1);"),
             "Unchanged outer AST context beyond -U3 should have been trimmed"
         );
-        // Tiny modified file is 100% intact (never truncated or omitted by water-filling)
+        // Tiny modified file is 100% intact
         assert!(out.contains("-    let a = 1;\n+    let a = 2;\n"));
         assert!(!out.contains("truncated due to patch budget: src/tiny.rs"));
         assert!(!out.contains("omitted due to patch budget: src/tiny.rs"));
-        // Large new file is truncated cleanly (and when tree-sitter is enabled, lists omitted defs)
-        assert!(out.contains("[truncated due to patch budget: src/huge_new.rs"));
-        #[cfg(feature = "tree-sitter")]
-        assert!(
-            out.contains("defs: fn generated_helper_"),
-            "Expected AST mini-TOC of omitted defs in truncation marker:\n{out}"
-        );
 
-        // Mid-function truncation on a giant single function annotates `resuming in fn mega_engine`
+        // Under tree-sitter, Tier 4 progressively skeletonizes huge_new.rs preserving ALL 50 signatures!
+        #[cfg(feature = "tree-sitter")]
+        {
+            assert!(
+                out.contains(
+                    "[patch-budget: 16 KiB hit; 1 pre-omitted, 1 degraded to -U3, 1 skeletonized]"
+                ),
+                "Expected accurate 1:1 patch-budget banner, got:\n{}",
+                &out[..out.len().min(600)]
+            );
+            assert!(
+                out.contains("+++ b/src/huge_new.rs\n[skeletonized:"),
+                "Expected [skeletonized:] file header marker for huge_new.rs:\n{out}"
+            );
+            assert!(
+                out.contains("{ /* ... 16 lines (L"),
+                "Expected folded body with line range:\n{out}"
+            );
+            for f in 0..50 {
+                assert!(
+                    out.contains(&format!("fn generated_helper_{f}(x: i32) -> i32")),
+                    "Tier 4 skeleton must preserve every function signature (missing {f})"
+                );
+            }
+        }
+        // Without tree-sitter, falls back cleanly to Tier 5 Head+Tail truncation with [resuming at L...]
+        #[cfg(not(feature = "tree-sitter"))]
+        {
+            assert!(
+                out.contains(
+                    "[patch-budget: 16 KiB hit; 1 pre-omitted, 1 degraded to -U3, 1 truncated]"
+                ),
+                "Expected accurate patch-budget banner without tree-sitter, got:\n{}",
+                &out[..out.len().min(600)]
+            );
+            assert!(out.contains("[truncated due to patch budget: src/huge_new.rs"));
+            assert!(out.contains("[resuming at L"));
+        }
+
+        // Mid-function truncation on a giant single function annotates both `resuming in fn mega_engine`
+        // AND explicit `[resuming at L...]` line anchor
         #[cfg(feature = "tree-sitter")]
         {
             let mut mega = String::from(
@@ -3571,12 +4718,16 @@ mod common_tests {
             }
             mega.push_str("+    acc\n+}\n");
             let truncated =
-                truncate_chunk_head_tail(&mega, &mega, Path::new("src/mega.rs"), true, 4096)
+                truncate_chunk_head_tail(&mega, &mega, None, Path::new("src/mega.rs"), true, 4096)
                     .expect("expected mega.rs to truncate within 4096 B");
             assert!(truncated.len() <= 4096);
             assert!(
                 truncated.contains("resuming in fn mega_engine"),
                 "Mid-function truncation must report resuming scope, got:\n{truncated}"
+            );
+            assert!(
+                truncated.contains("[resuming at L"),
+                "Mid-function truncation must emit explicit [resuming at L...] anchor, got:\n{truncated}"
             );
         }
     }
@@ -3617,5 +4768,247 @@ mod common_tests {
             "Lockfile body must not appear in patch! Got:\n{patch}"
         );
         assert!(patch.contains("+hello world"));
+    }
+
+    #[test]
+    fn test_truncate_head_tail_shrinks_head_with_long_single_tail_and_avoids_l0() {
+        // 1. Long single tail line (`tail_start + 1 == lines.len()` with `head_bytes < tail_bytes`)
+        //    must still shrink `head_end` down toward `header_end` instead of prematurely breaking.
+        let mut long_tail_chunk = String::from(
+            "diff --git a/src/long_tail.txt b/src/long_tail.txt\nnew file mode 100644\n--- /dev/null\n+++ b/src/long_tail.txt\n@@ -0,0 +1,40 @@\n",
+        );
+        for i in 1..40 {
+            long_tail_chunk.push_str(&format!("+short_head_line_{i:02}_padding_012345\n"));
+        }
+        // Single long final line (~360 B)
+        long_tail_chunk.push_str(&format!("+final_tail_{}\n", "x".repeat(350)));
+
+        // Budget where 1 tail line (~363 B) > initial head_budget after header (~250 B) once shrunk,
+        // yet header + a few head lines + marker + 1 tail line fits strictly within budget!
+        let budget = 950;
+        let truncated = truncate_chunk_head_tail(
+            &long_tail_chunk,
+            &long_tail_chunk,
+            None,
+            Path::new("src/long_tail.txt"),
+            true,
+            budget,
+        )
+        .expect("Expected head to continue shrinking so long single tail still fits within budget");
+        assert!(
+            truncated.len() <= budget,
+            "Truncated len {} exceeded budget {}",
+            truncated.len(),
+            budget
+        );
+        assert!(truncated.contains("+final_tail_"));
+        assert!(truncated.contains("diff lines)"));
+
+        // 2. Deleted file (`@@ -1,120 +0,0 @@`) must NEVER emit `L0` anchors; tracks old line numbers.
+        let mut deleted_chunk = String::from(
+            "diff --git a/src/legacy.rs b/src/legacy.rs\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/src/legacy.rs\n+++ /dev/null\n@@ -1,120 +0,0 @@\n",
+        );
+        for i in 1..=120 {
+            deleted_chunk.push_str(&format!("-let legacy_item_{i:03} = {i} * 42;\n"));
+        }
+        let del_lines: Vec<&str> = deleted_chunk.split_inclusive('\n').collect();
+        let del_map = compute_diff_line_numbers(&del_lines);
+        assert!(
+            !del_map.contains(&Some((0, 0))),
+            "Deleted file line map must never contain Some((0, 0))"
+        );
+        let first_del_idx = del_lines
+            .iter()
+            .position(|l| l.starts_with("-let "))
+            .unwrap();
+        assert_eq!(del_map[first_del_idx], Some((1, 1)));
+        assert_eq!(*del_map.last().unwrap(), Some((120, 120)));
+
+        let del_trunc = truncate_chunk_head_tail(
+            &deleted_chunk,
+            &deleted_chunk,
+            None,
+            Path::new("src/legacy.rs"),
+            false,
+            1200,
+        )
+        .expect("Deleted file should head/tail truncate");
+        assert!(del_trunc.len() <= 1200);
+        assert!(
+            !del_trunc.contains("L0"),
+            "Deleted file truncation must never emit L0 anchor:\n{del_trunc}"
+        );
+        assert!(
+            del_trunc.contains("[resuming at L"),
+            "Deleted file truncation should resume at old-file line number:\n{del_trunc}"
+        );
+
+        // 3. Modified file top-of-file pure deletion hunk (`@@ -1,40 +0,0 @@`) must map `-` lines
+        //    to `None` (never `Some(0)` -> never `L0`), while subsequent hunks keep new-file lines.
+        let mut top_del_mod = String::from(
+            "diff --git a/src/mod.rs b/src/mod.rs\nindex 1111111..2222222 100644\n--- a/src/mod.rs\n+++ b/src/mod.rs\n@@ -1,40 +0,0 @@\n",
+        );
+        for i in 1..=40 {
+            top_del_mod.push_str(&format!("-let removed_header_{i:02} = {i};\n"));
+        }
+        top_del_mod.push_str("@@ -50,2 +10,2 @@ fn kept() {\n-let a = 1;\n+let a = 2;\n");
+        let mod_lines: Vec<&str> = top_del_mod.split_inclusive('\n').collect();
+        let mod_map = compute_diff_line_numbers(&mod_lines);
+        assert!(
+            !mod_map.contains(&Some((0, 0))),
+            "Top-of-file pure deletion hunk in modified file must never emit Some((0, 0))"
+        );
+        let top_del_trunc = truncate_chunk_head_tail(
+            &top_del_mod,
+            &top_del_mod,
+            None,
+            Path::new("src/mod.rs"),
+            false,
+            900,
+        )
+        .expect("Modified file with top deletion should truncate");
+        assert!(top_del_trunc.len() <= 900);
+        assert!(
+            !top_del_trunc.contains("L0"),
+            "Top-of-file pure deletion truncation must never emit L0:\n{top_del_trunc}"
+        );
+    }
+
+    #[test]
+    fn test_generated_header_deleted_files_and_hash_preprocessor_guards() {
+        // 1. Fully deleted generated file (`queries.sql.go`, not matched by filename pattern)
+        let deleted_sqlc = "\
+diff --git a/db/queries.sql.go b/db/queries.sql.go
+deleted file mode 100644
+index 1111111..0000000
+--- a/db/queries.sql.go
++++ /dev/null
+@@ -1,10 +0,0 @@
+-// Code generated by sqlc. DO NOT EDIT.
+-package db
+";
+        assert!(
+            has_generated_file_header(deleted_sqlc),
+            "Deleted auto-generated file must be detected via `-` lines"
+        );
+
+        // 2. Modified file that REMOVES `@generated` header at line 1 (converting to hand-maintained)
+        //    must NOT be falsely classified as generated!
+        let removed_header_mod = "\
+diff --git a/src/hand_owned.rs b/src/hand_owned.rs
+index 1111111..2222222 100644
+--- a/src/hand_owned.rs
++++ b/src/hand_owned.rs
+@@ -1,2 +0,0 @@
+-// @generated
+-// Do not edit
+";
+        assert!(
+            !has_generated_file_header(removed_header_mod),
+            "Modified file removing its generated header must NOT be treated as generated"
+        );
+
+        // 3. C/C++ preprocessor `#define`, Rust crate attribute `#![doc = ...]`, and Markdown heading
+        //    containing `@generated` must NOT false-positive as `#` comments!
+        let cpp_define = "\
+diff --git a/include/markers.h b/include/markers.h
+new file mode 100644
+--- /dev/null
++++ b/include/markers.h
+@@ -0,0 +1,3 @@
++#define GENERATED_MARKER \"@generated\"
++int check_header(const char *s);
+";
+        assert!(
+            !has_generated_file_header(cpp_define),
+            "C/C++ #define with @generated must NOT false-positive"
+        );
+
+        let rust_inner_attr = "\
+diff --git a/src/detector.rs b/src/detector.rs
+new file mode 100644
+--- /dev/null
++++ b/src/detector.rs
+@@ -0,0 +1,3 @@
++#![doc = \"Checks @generated headers in diff chunks\"]
++pub fn detect() {}
+";
+        assert!(
+            !has_generated_file_header(rust_inner_attr),
+            "Rust #![doc = ...] with @generated must NOT false-positive"
+        );
+
+        let md_heading = "\
+diff --git a/docs/generated.md b/docs/generated.md
+new file mode 100644
+--- /dev/null
++++ b/docs/generated.md
+@@ -0,0 +1,3 @@
++# Handling @generated files
++Documentation text.
+";
+        assert!(
+            !has_generated_file_header(md_heading),
+            "Markdown heading with @generated must NOT false-positive"
+        );
+
+        // 4. Unknown extension with `#define` / `#[doc = ...]` heuristic guard
+        let unknown_define = "\
+diff --git a/scripts/markers.custom b/scripts/markers.custom
+new file mode 100644
+--- /dev/null
++++ b/scripts/markers.custom
+@@ -0,0 +1,2 @@
++#define TAG \"@generated\"
+";
+        assert!(!has_generated_file_header(unknown_define));
+
+        // 5. JS script with shebang on line 1 + `// @generated` on line 2 MUST still be detected
+        let js_shebang_gen = "\
+diff --git a/bin/cli.js b/bin/cli.js
+new file mode 100644
+--- /dev/null
++++ b/bin/cli.js
+@@ -0,0 +1,3 @@
++#!/usr/bin/env node
++// @generated
++console.log('hi');
+";
+        assert!(
+            has_generated_file_header(js_shebang_gen),
+            "Script with shebang + line-2 @generated comment should be detected"
+        );
+
+        // 6. Hand-written doc/prose comments mentioning `@generated` must NOT false-positive,
+        //    while real `@generated` markers across languages (including XML `<?xml ...?>`,
+        //    PHP `<?php`, SQL `--`, and UTF-8 BOM) MUST be detected.
+        for non_gen in [
+            "diff --git a/src/handler.rs b/src/handler.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/handler.rs\n@@ -0,0 +1,2 @@\n+//! Handles @generated files and lockfiles.\n+pub fn run() {}\n",
+            "diff --git a/src/handler2.rs b/src/handler2.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/handler2.rs\n@@ -0,0 +1,2 @@\n+//! @generated files are ignored by this pass.\n+pub fn run() {}\n",
+            "diff --git a/src/util.ts b/src/util.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/util.ts\n@@ -0,0 +1,2 @@\n+// Utility for detecting @generated markers in diffs\n+export const x = 1;\n",
+            "diff --git a/src/util.py b/src/util.py\nnew file mode 100644\n--- /dev/null\n+++ b/src/util.py\n@@ -0,0 +1,2 @@\n+# Checks @generated headers safely\n+X = 1\n",
+            "diff --git a/src/not_gen.rs b/src/not_gen.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/not_gen.rs\n@@ -0,0 +1,2 @@\n+// @not-generated\n+pub fn run() {}\n",
+            "diff --git a/src/ident.rs b/src/ident.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/ident.rs\n@@ -0,0 +1,2 @@\n+// @generated_helper\n+pub fn run() {}\n",
+        ] {
+            assert!(
+                !has_generated_file_header(non_gen),
+                "Hand-written comment mentioning @generated must NOT false-positive:\n{non_gen}"
+            );
+        }
+
+        for real_gen in [
+            "diff --git a/src/a.rs b/src/a.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.rs\n@@ -0,0 +1,2 @@\n+// @generated SignedSource<<abcdef123456>>\n+pub const A: i32 = 1;\n",
+            "diff --git a/src/b.kt b/src/b.kt\nnew file mode 100644\n--- /dev/null\n+++ b/src/b.kt\n@@ -0,0 +1,2 @@\n+/* @generated by ksp */\n+class B\n",
+            "diff --git a/schema/mig.sql b/schema/mig.sql\nnew file mode 100644\n--- /dev/null\n+++ b/schema/mig.sql\n@@ -0,0 +1,2 @@\n+-- @generated\n+SELECT 1;\n",
+            "diff --git a/res/layout.xml b/res/layout.xml\nnew file mode 100644\n--- /dev/null\n+++ b/res/layout.xml\n@@ -0,0 +1,3 @@\n+<?xml version=\"1.0\" encoding=\"utf-8\"?>\n+<!-- Auto-generated by xjc. Do not edit. -->\n+<root/>\n",
+            "diff --git a/web/client.php b/web/client.php\nnew file mode 100644\n--- /dev/null\n+++ b/web/client.php\n@@ -0,0 +1,3 @@\n+<?php\n+// @generated\n+class Client {}\n",
+            "diff --git a/src/bom.cs b/src/bom.cs\nnew file mode 100644\n--- /dev/null\n+++ b/src/bom.cs\n@@ -0,0 +1,2 @@\n+\u{feff}// @generated\n+class Bom {}\n",
+            "diff --git a/src/two.go b/src/two.go\nnew file mode 100644\n--- /dev/null\n+++ b/src/two.go\n@@ -0,0 +1,3 @@\n+// Copyright 2026 Acme (@generated)\n+// Do not edit manually.\n+package two\n",
+        ] {
+            assert!(
+                has_generated_file_header(real_gen),
+                "Real @generated header must be detected:\n{real_gen}"
+            );
+        }
     }
 }
