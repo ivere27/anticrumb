@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -eu
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+exec cargo run --locked -q -p xtask --manifest-path "$ROOT_DIR/Cargo.toml" -- bench "$@"

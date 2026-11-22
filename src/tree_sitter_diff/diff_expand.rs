@@ -6,8 +6,8 @@ use super::{
     MAX_TREESITTER_FILE_BYTES, TREESITTER_PARSE_TIMEOUT_MICROS,
 };
 use super::{
-    get_repo_root, git_cmd, is_test_file_path, resolve_patch_budget_bytes, unquote_c_style,
-    GitDiffSource,
+    get_repo_root, git_cmd, hybrid, is_test_file_path, resolve_patch_budget_bytes, unquote_c_style,
+    GitDiffSource, HybridConfig,
 };
 use crate::domain::{Result, ServiceError};
 #[cfg(feature = "tree-sitter")]
@@ -66,13 +66,27 @@ pub(super) fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usiz
 }
 
 #[cfg(feature = "tree-sitter")]
+const SIG_ONLY_MIN_BODY_LINES: usize = 25;
+
+#[cfg(feature = "tree-sitter")]
+struct MergedHunkSig {
+    sig: String,
+    bare_name: Option<String>,
+    is_clamped: bool,
+    def_span: usize,
+    extra_defs: usize,
+    extra_names: Vec<String>,
+}
+
+#[cfg(feature = "tree-sitter")]
 struct MergedHunk {
     exp_start: usize,
     exp_end: usize,
     full_start: usize,
     full_end: usize,
     is_inline_test: bool,
-    sigs: Vec<(String, bool, usize, usize)>,
+    sigs: Vec<MergedHunkSig>,
+    sig_only_body_lines: Option<usize>,
     hunks: Vec<ParsedHunk>,
 }
 
@@ -782,46 +796,359 @@ fn find_enclosing_parent_scope_for_line(
 }
 
 #[cfg(feature = "tree-sitter")]
-fn select_merged_signature(m: &MergedHunk, is_clamped: bool) -> Option<String> {
-    let mut unique: Vec<(&str, bool, usize, usize)> = Vec::new();
-    for (sig, clamped, span, extra) in &m.sigs {
-        if let Some(existing) = unique.iter_mut().find(|(s, _, _, _)| *s == sig.as_str()) {
-            existing.1 |= *clamped;
-            existing.2 = existing.2.max(*span);
-            existing.3 = existing.3.max(*extra);
+fn select_merged_signature(
+    m: &MergedHunk,
+    is_clamped: bool,
+    hybrid: HybridConfig,
+) -> Option<String> {
+    struct UniqueHunkSig<'a> {
+        sig: &'a str,
+        bare_name: Option<&'a str>,
+        is_clamped: bool,
+        def_span: usize,
+        extra_defs: usize,
+        extra_names: Vec<String>,
+    }
+
+    let mut unique: Vec<UniqueHunkSig<'_>> = Vec::new();
+    for entry in &m.sigs {
+        if let Some(existing) = unique.iter_mut().find(|u| u.sig == entry.sig.as_str()) {
+            existing.is_clamped |= entry.is_clamped;
+            existing.def_span = existing.def_span.max(entry.def_span);
+            existing.extra_defs = existing.extra_defs.max(entry.extra_defs);
+            for nm in &entry.extra_names {
+                if !existing.extra_names.contains(nm) {
+                    existing.extra_names.push(nm.clone());
+                }
+            }
         } else {
-            unique.push((sig.as_str(), *clamped, *span, *extra));
+            unique.push(UniqueHunkSig {
+                sig: entry.sig.as_str(),
+                bare_name: entry.bare_name.as_deref(),
+                is_clamped: entry.is_clamped,
+                def_span: entry.def_span,
+                extra_defs: entry.extra_defs,
+                extra_names: entry.extra_names.clone(),
+            });
         }
     }
     if unique.is_empty() {
         return None;
     }
 
-    let chosen = if is_clamped {
+    let chosen_idx = if is_clamped {
         unique
             .iter()
-            .filter(|(_, c, _, _)| *c)
-            .max_by_key(|(_, _, span, _)| *span)
-            .or_else(|| unique.iter().max_by_key(|(_, _, span, _)| *span))
-            .copied()
-            .unwrap_or(unique[0])
-            .0
+            .enumerate()
+            .filter(|(_, u)| u.is_clamped)
+            .max_by_key(|(_, u)| u.def_span)
+            .or_else(|| unique.iter().enumerate().max_by_key(|(_, u)| u.def_span))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     } else {
-        unique[0].0
+        0
     };
+    let chosen = unique[chosen_idx].sig;
+    let chosen_bare_owned = unique[chosen_idx]
+        .bare_name
+        .map(str::to_string)
+        .unwrap_or_else(|| compact_bare_from_sig(chosen));
+    let chosen_bare = (!chosen_bare_owned.is_empty()).then_some(chosen_bare_owned.as_str());
 
-    let total_defs: usize = unique.iter().map(|(_, _, _, extra)| 1 + *extra).sum();
-    if total_defs > 1 {
-        Some(format!("{chosen} (+{} more)", total_defs - 1))
-    } else {
-        Some(chosen.to_string())
+    // Collect deduplicated extra bare symbol names and any unnamed excess so overlapping
+    // hunks never double-count the same definition in `total_defs` or append a phantom `,+1 more`.
+    let mut extra_list: Vec<String> = Vec::new();
+    let mut unnamed_excess: usize = 0;
+    for u in &unique {
+        if u.sig != chosen {
+            let label = u
+                .bare_name
+                .map(str::to_string)
+                .unwrap_or_else(|| compact_bare_from_sig(u.sig));
+            if !label.is_empty()
+                && chosen_bare != Some(label.as_str())
+                && !extra_list.contains(&label)
+            {
+                extra_list.push(label);
+            }
+        }
+        for nm in &u.extra_names {
+            if chosen_bare != Some(nm.as_str()) && !extra_list.contains(nm) {
+                extra_list.push(nm.clone());
+            }
+        }
+        unnamed_excess += u.extra_defs.saturating_sub(u.extra_names.len());
     }
+
+    let total_defs: usize = 1 + extra_list.len() + unnamed_excess;
+    if total_defs <= 1 {
+        return Some(chosen.to_string());
+    }
+
+    if !hybrid.layer2 || extra_list.is_empty() {
+        return Some(format!("{chosen} (+{} more)", total_defs - 1));
+    }
+
+    let max_header_chars = 210usize;
+    let chosen_chars = chosen.chars().count();
+    let avail = max_header_chars.saturating_sub(chosen_chars + 6);
+    if avail < 12 {
+        return Some(format!("{chosen} (+{} more)", total_defs - 1));
+    }
+
+    let mut packed = String::new();
+    let mut packed_chars = 0usize;
+    let mut included = 0usize;
+    for (idx, name) in extra_list.iter().enumerate() {
+        let sep = if idx == 0 { "" } else { ", " };
+        let rem_after = extra_list.len().saturating_sub(idx + 1);
+        let tail_reserve = if rem_after > 0 { 12 } else { 0 };
+        let add_chars = sep.chars().count() + name.chars().count();
+        if idx > 0 && packed_chars + add_chars + tail_reserve > avail {
+            let unshown = total_defs
+                .saturating_sub(1 + included)
+                .max(extra_list.len() - idx);
+            packed.push_str(&format!(", +{unshown} more"));
+            break;
+        }
+        packed.push_str(sep);
+        packed.push_str(name);
+        packed_chars += add_chars;
+        included += 1;
+    }
+    let missing = total_defs.saturating_sub(1 + extra_list.len());
+    if included == extra_list.len() && missing > 0 {
+        packed.push_str(&format!(", +{missing} more"));
+    }
+    Some(format!("{chosen} [+ {packed}]"))
+}
+
+#[cfg(feature = "tree-sitter")]
+fn compact_bare_from_sig(sig: &str) -> String {
+    let after_scope = sig
+        .rsplit_once(" › ")
+        .map(|(_, rhs)| rhs)
+        .or_else(|| sig.rsplit_once(" > ").map(|(_, rhs)| rhs))
+        .unwrap_or(sig);
+    let cut = ast_compact::find_sig_head_cut(after_scope, &['(', '{', '<']);
+    let head = after_scope[..cut]
+        .trim()
+        .trim_end_matches(['=', ':'])
+        .trim();
+    let token = head.split_whitespace().last().unwrap_or(head);
+    signature::truncate_preview(token, 40)
+}
+
+#[cfg(feature = "tree-sitter")]
+struct ExpandedChunkData {
+    rendered: String,
+    inline_test_blocks: Vec<ast_compact::InlineTestBlock>,
+    changed_symbols: Vec<String>,
+    local_context: Vec<hybrid::ContextEntry>,
+    cross_query: Option<hybrid::FileRefQuery>,
+    exposed_defs: Vec<String>,
 }
 
 #[cfg(feature = "tree-sitter")]
 enum TreeSitterExpandResult {
-    Expanded(String, Vec<ast_compact::InlineTestBlock>),
+    Expanded(Box<ExpandedChunkData>),
     Generated,
+}
+
+/// Checks whether a Rust `#[...]` attribute is purely non-semantic (`#[inline]`, `#[allow(...)]`,
+/// `#[must_use]`, `#[doc...]`, `#[cold]`, `#[track_caller]`) rather than semantic/ABI/gating
+/// (`#[cfg(...)]`, `#[no_mangle]`, `#[export_name]`, `#[repr(...)]`, `#[tokio::main]`, etc.).
+#[cfg(feature = "tree-sitter")]
+fn is_safe_non_semantic_rust_attr(attr: &str) -> bool {
+    let inner = attr
+        .trim()
+        .trim_start_matches("#[")
+        .trim_end_matches(']')
+        .trim();
+    inner == "inline"
+        || inner.starts_with("inline(")
+        || inner.starts_with("allow(")
+        || inner.starts_with("warn(")
+        || inner == "must_use"
+        || inner.starts_with("must_use ")
+        || inner.starts_with("must_use=")
+        || inner == "doc"
+        || inner.starts_with("doc(")
+        || inner.starts_with("doc ")
+        || inner.starts_with("doc=")
+        || inner == "cold"
+        || inner == "track_caller"
+}
+
+/// Strips only non-semantic visibility/export/inheritance/inline qualifiers from a normalized
+/// single-line signature header so we can verify whether parameter types, return type, `async`,
+/// `unsafe`, `const`, `static`, `extern`, `default`, semantic attributes, generics, and function
+/// name remained identical.
+#[cfg(feature = "tree-sitter")]
+fn strip_safe_visibility_qualifiers(sig: &str) -> String {
+    let mut s = sig.trim();
+    loop {
+        let before = s;
+        // Rust `pub(...)` visibility
+        if let Some(rest) = s.strip_prefix("pub(") {
+            if let Some(close) = rest.find(')') {
+                s = rest[close + 1..].trim_start();
+                continue;
+            }
+        }
+        // Only strip allowlisted non-semantic Rust `#[...]` attributes (preserving `#[cfg(...)]`,
+        // `#[no_mangle]`, etc. so semantic attribute edits never fold the function body).
+        if s.starts_with("#[") {
+            if let Some(close) = s.find(']') {
+                let attr = &s[..=close];
+                if is_safe_non_semantic_rust_attr(attr) {
+                    s = s[close + 1..].trim_start();
+                    continue;
+                }
+            }
+        }
+        let mut matched_kw = false;
+        for kw in [
+            "pub ",
+            "public ",
+            "protected ",
+            "private ",
+            "internal ",
+            "export ",
+            "final ",
+            "sealed ",
+            "virtual ",
+            "override ",
+            "inline ",
+        ] {
+            if let Some(rest) = s.strip_prefix(kw) {
+                s = rest.trim_start();
+                matched_kw = true;
+                break;
+            }
+        }
+        if !matched_kw && s == before {
+            break;
+        }
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Returns true ONLY when the signature hunk changed purely non-semantic visibility, export,
+/// or attribute/comment qualifiers — NEVER when parameter types, return types, default values,
+/// `async`/`unsafe`/`static`/`const`/`extern`/`default`, semantic attributes, generics, or
+/// function names changed (which require inspecting the body to verify body-contract consistency!).
+#[cfg(feature = "tree-sitter")]
+fn is_safe_visibility_only_sig_change(hunk: &ParsedHunk, lang: SupportedLanguage) -> bool {
+    let mut old_lines = Vec::new();
+    let mut new_lines = Vec::new();
+    for raw in &hunk.lines {
+        if let Some(rest) = raw.strip_prefix('-') {
+            let t = rest.trim();
+            if !t.is_empty() {
+                old_lines.push(t);
+            }
+        } else if let Some(rest) = raw.strip_prefix('+') {
+            let t = rest.trim();
+            if !t.is_empty() {
+                new_lines.push(t);
+            }
+        }
+    }
+    // Pure addition/deletion of lines (e.g. adding `#[inline]` or doc comment) is safe only if
+    // all changed lines are non-security attributes/comments; removing `[Authorize]` / `@Transactional`
+    // must NOT fold the body!
+    if old_lines.is_empty() || new_lines.is_empty() {
+        let lines_to_check = if old_lines.is_empty() {
+            &new_lines
+        } else {
+            &old_lines
+        };
+        let has_c_comments = !matches!(
+            lang,
+            SupportedLanguage::Python | SupportedLanguage::Ruby | SupportedLanguage::Bash
+        );
+        return lines_to_check.iter().all(|l| {
+            (has_c_comments
+                && (l.starts_with("//")
+                    || l.starts_with("/*")
+                    || l == &"*"
+                    || l.starts_with("*/")
+                    || l.starts_with("* ")
+                    || l.starts_with("*\t")))
+                || (matches!(
+                    lang,
+                    SupportedLanguage::Python | SupportedLanguage::Ruby | SupportedLanguage::Bash
+                ) && l.starts_with('#'))
+                || (lang == SupportedLanguage::Rust
+                    && l.starts_with("#[")
+                    && l.ends_with(']')
+                    && is_safe_non_semantic_rust_attr(l))
+        });
+    }
+
+    let old_joined = old_lines.join(" ");
+    let new_joined = new_lines.join(" ");
+    let old_core = strip_safe_visibility_qualifiers(&old_joined);
+    let new_core = strip_safe_visibility_qualifiers(&new_joined);
+    !old_core.is_empty() && old_core == new_core
+}
+
+/// Checks whether a hunk strictly modifies only the non-semantic signature/visibility/annotations
+/// of a function (zero body statements modified or deleted, and parameter/return-type contract
+/// unchanged), carefully handling brace-on-same-line languages.
+#[cfg(feature = "tree-sitter")]
+fn is_hunk_signature_only(
+    lang: SupportedLanguage,
+    hunk: &ParsedHunk,
+    change_start: usize,
+    change_end: usize,
+    body_start_line: usize,
+    body_start_col: usize,
+    new_lines: &[&str],
+) -> bool {
+    if hunk.new_count == 0 {
+        return false;
+    }
+    if change_end > body_start_line {
+        return false;
+    }
+    if !is_safe_visibility_only_sig_change(hunk, lang) {
+        return false;
+    }
+    let is_indent_lang = matches!(lang, SupportedLanguage::Python | SupportedLanguage::Ruby);
+    if is_indent_lang {
+        // In Python/Ruby, `body` starts on the first line AFTER `def ...:` / `def ...`
+        return change_end < body_start_line;
+    }
+    // For brace languages, `{` often sits on the last signature line (`body_start_line`).
+    if change_end == body_start_line {
+        if let Some(line) = new_lines.get(body_start_line.saturating_sub(1)) {
+            let trimmed_nl = line.trim_end_matches(['\r', '\n']);
+            let after_brace = body_start_col + 1;
+            if after_brace <= trimmed_nl.len() && trimmed_nl.is_char_boundary(after_brace) {
+                let tail = trimmed_nl[after_brace..].trim();
+                if !tail.is_empty() && !tail.starts_with("//") && !tail.starts_with("/*") {
+                    return false;
+                }
+            }
+        }
+    }
+    // Ensure deleted `-` lines did not delete body lines after an opening `{`
+    let mut saw_deleted_open_brace = false;
+    for l in &hunk.lines {
+        if let Some(del) = l.strip_prefix('-') {
+            let d = del.trim();
+            if saw_deleted_open_brace && !d.is_empty() {
+                return false;
+            }
+            if d.ends_with('{') || d.contains(") {") || d.contains(" {") {
+                saw_deleted_open_brace = true;
+            }
+        }
+    }
+    let _ = change_start;
+    true
 }
 
 /// Expands a single file's raw diff chunk with Tree-Sitter AST context, also returning any
@@ -835,6 +1162,7 @@ fn expand_chunk_with_treesitter(
     source: GitDiffSource<'_>,
     lang: SupportedLanguage,
     moved_deleted_map: &HashMap<[u8; 32], MovedSource>,
+    hybrid: HybridConfig,
 ) -> Result<Option<TreeSitterExpandResult>> {
     // Read new content with size limit checks to prevent memory spikes on huge files
     let new_content = match source {
@@ -919,10 +1247,16 @@ fn expand_chunk_with_treesitter(
 
     let new_lines: Vec<&str> = new_content.split_inclusive('\n').collect();
     if new_lines.is_empty() {
-        return Ok(Some(TreeSitterExpandResult::Expanded(
-            chunk.to_string(),
-            Vec::new(),
-        )));
+        return Ok(Some(TreeSitterExpandResult::Expanded(Box::new(
+            ExpandedChunkData {
+                rendered: chunk.to_string(),
+                inline_test_blocks: Vec::new(),
+                changed_symbols: Vec::new(),
+                local_context: Vec::new(),
+                cross_query: None,
+                exposed_defs: Vec::new(),
+            },
+        ))));
     }
     let plain_lines: Vec<&str> = new_content.lines().collect();
 
@@ -967,10 +1301,16 @@ fn expand_chunk_with_treesitter(
     }
 
     if hunks.is_empty() {
-        return Ok(Some(TreeSitterExpandResult::Expanded(
-            chunk.to_string(),
-            inline_test_blocks,
-        )));
+        return Ok(Some(TreeSitterExpandResult::Expanded(Box::new(
+            ExpandedChunkData {
+                rendered: chunk.to_string(),
+                inline_test_blocks,
+                changed_symbols: Vec::new(),
+                local_context: Vec::new(),
+                cross_query: None,
+                exposed_defs: Vec::new(),
+            },
+        ))));
     }
 
     struct ExpandedEntry {
@@ -978,11 +1318,17 @@ fn expand_chunk_with_treesitter(
         exp_end: usize,
         full_start: usize,
         full_end: usize,
+        change_start: usize,
+        change_end: usize,
         signature: Option<String>,
+        bare_name: Option<String>,
         def_span: usize,
         extra_defs: usize,
+        extra_names: Vec<String>,
         is_entry_clamped: bool,
         use_raw_sig_fallback: bool,
+        sig_only_candidate: Option<(usize, usize, usize)>, // (body_start_line, body_end_line, body_span)
+        sig_only_body_lines: Option<usize>,
         hunk: ParsedHunk,
     }
 
@@ -1021,11 +1367,17 @@ fn expand_chunk_with_treesitter(
                 exp_end,
                 full_start: exp_start,
                 full_end: exp_end,
+                change_start: hunk.new_start.max(1),
+                change_end: (hunk.new_start + hunk.new_count.saturating_sub(1)).max(1),
                 signature: sig_opt,
+                bare_name: None,
                 def_span: 0,
                 extra_defs: 0,
+                extra_names: Vec::new(),
                 is_entry_clamped: false,
                 use_raw_sig_fallback: true,
+                sig_only_candidate: None,
+                sig_only_body_lines: None,
                 hunk,
             });
             continue;
@@ -1041,11 +1393,17 @@ fn expand_chunk_with_treesitter(
                 exp_end,
                 full_start: exp_start,
                 full_end: exp_end,
+                change_start: 1,
+                change_end: 1,
                 signature: None,
+                bare_name: None,
                 def_span: 0,
                 extra_defs: 0,
+                extra_names: Vec::new(),
                 is_entry_clamped: false,
                 use_raw_sig_fallback: false,
+                sig_only_candidate: None,
+                sig_only_body_lines: None,
                 hunk,
             });
             continue;
@@ -1092,6 +1450,7 @@ fn expand_chunk_with_treesitter(
             &new_content,
             Some(path),
             hunk.old_count,
+            hybrid,
         );
 
         let full_start_raw = matched.full_start.max(1);
@@ -1134,11 +1493,17 @@ fn expand_chunk_with_treesitter(
                     exp_end,
                     full_start: exp_start,
                     full_end: exp_end,
+                    change_start,
+                    change_end,
                     signature: container_sig,
+                    bare_name: None,
                     def_span: 0,
                     extra_defs: 0,
+                    extra_names: Vec::new(),
                     is_entry_clamped: false,
                     use_raw_sig_fallback: false,
+                    sig_only_candidate: None,
+                    sig_only_body_lines: None,
                     hunk,
                 });
                 continue;
@@ -1146,13 +1511,35 @@ fn expand_chunk_with_treesitter(
         }
 
         let mut sig = matched.signature;
+        let mut bare_name = matched.bare_name;
         let mut extra_defs = matched.extra_defs;
+        let mut extra_names = matched.extra_names;
         let mut full_start = full_start_raw;
         let mut full_end = full_end_raw;
         let mut exp_start = matched.exp_start.min(change_start).max(1);
         let mut exp_end = matched.exp_end.max(change_end).min(new_lines.len());
         let mut is_entry_clamped = matched.is_clamped;
         let mut def_span = full_end.saturating_sub(full_start) + 1;
+        let mut sig_only_candidate = None;
+
+        if hybrid.layer2 && !is_entry_clamped {
+            if let Some((body_s, body_col, body_e)) = matched.func_body_span {
+                let body_span = body_e.saturating_sub(body_s) + 1;
+                if body_span >= SIG_ONLY_MIN_BODY_LINES
+                    && is_hunk_signature_only(
+                        lang,
+                        &hunk,
+                        change_start,
+                        change_end,
+                        body_s,
+                        body_col,
+                        &new_lines,
+                    )
+                {
+                    sig_only_candidate = Some((body_s, body_e, body_span));
+                }
+            }
+        }
 
         // If a hunk modifies the tail of a definition AND simultaneously deletes a large block
         // extending beyond the definition boundary (`old_count > 2 * def_span`), mark trailing deletions.
@@ -1195,6 +1582,7 @@ fn expand_chunk_with_treesitter(
                         &new_content,
                         Some(path),
                         0,
+                        hybrid,
                     );
                     if let Some(la_sig) = la.signature {
                         if !la_sig.starts_with("#[")
@@ -1208,6 +1596,8 @@ fn expand_chunk_with_treesitter(
                             full_end = change_end.max(la_full_end).min(new_lines.len());
                             def_span = full_end.saturating_sub(full_start) + 1;
                             extra_defs = la.extra_defs;
+                            extra_names = la.extra_names;
+                            bare_name = la.bare_name;
 
                             if def_span > ATTR_ONLY_MAX_EXPANSION_LINES {
                                 // Cap attribute/comment-only edits on large functions to signature + top of body
@@ -1248,6 +1638,8 @@ fn expand_chunk_with_treesitter(
                 is_entry_clamped = false;
                 def_span = 0;
                 extra_defs = 0;
+                extra_names.clear();
+                bare_name = None;
                 if hunk.new_count == 0 {
                     sig = find_enclosing_parent_scope_for_line(
                         lang,
@@ -1270,6 +1662,7 @@ fn expand_chunk_with_treesitter(
                 .max(full_start);
             exp_end = (change_end + CLAMPED_CONTEXT_LINES).min(full_end);
             is_entry_clamped = full_start < exp_start || full_end > exp_end;
+            sig_only_candidate = None;
         }
 
         // Pure insertion with 0 context around the newly added definition:
@@ -1291,16 +1684,94 @@ fn expand_chunk_with_treesitter(
             exp_end,
             full_start,
             full_end,
+            change_start,
+            change_end,
             signature: sig,
+            bare_name,
             def_span,
             extra_defs,
+            extra_names,
             is_entry_clamped,
             use_raw_sig_fallback,
+            sig_only_candidate,
+            sig_only_body_lines: None,
             hunk,
         });
     }
 
+    // Layer 2: apply signature-only suppression ONLY when zero other hunks in the file modify
+    // that function's body lines (`body_first_line..=body_e`), keeping valid unified diff (-U3).
+    if hybrid.layer2 {
+        let is_indent_lang = matches!(lang, SupportedLanguage::Python | SupportedLanguage::Ruby);
+        let all_change_ranges: Vec<(usize, usize, bool)> = entries
+            .iter()
+            .map(|e| (e.change_start, e.change_end, e.hunk.new_count == 0))
+            .collect();
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            if let Some((body_s, body_e, body_span)) = entry.sig_only_candidate {
+                let other_touches_body =
+                    all_change_ranges
+                        .iter()
+                        .enumerate()
+                        .any(|(j, &(cs, ce, is_pure_del))| {
+                            let touch_start = if is_indent_lang {
+                                if is_pure_del {
+                                    body_s.saturating_sub(1)
+                                } else {
+                                    body_s
+                                }
+                            } else if is_pure_del {
+                                body_s
+                            } else {
+                                body_s.saturating_add(1)
+                            };
+                            j != idx && ce >= touch_start && cs <= body_e
+                        });
+                if !other_touches_body {
+                    entry.exp_start = entry.full_start.min(entry.change_start).max(1);
+                    entry.exp_end = (entry.change_end + 3)
+                        .min(entry.full_end)
+                        .min(new_lines.len());
+                    entry.is_entry_clamped = false;
+                    entry.sig_only_body_lines = Some(body_span);
+                }
+            }
+        }
+    }
+
     entries.sort_by_key(|e| (e.exp_start, e.hunk.new_start));
+
+    // Collect changed symbols (for Layer 1, prioritizing non-inline-test symbols) and change ranges
+    let mut prod_changed_symbols: Vec<String> = Vec::new();
+    let mut all_changed_symbols: Vec<String> = Vec::new();
+    let mut changed_ranges: Vec<(usize, usize)> = Vec::new();
+    for entry in &entries {
+        let is_inline_test = inline_test_blocks
+            .iter()
+            .any(|b| entry.exp_start >= b.start_line && entry.exp_end <= b.end_line);
+        changed_ranges.push((entry.change_start, entry.change_end));
+        if let Some(ref bn) = entry.bare_name {
+            if !all_changed_symbols.contains(bn) {
+                all_changed_symbols.push(bn.clone());
+            }
+            if !is_inline_test && !prod_changed_symbols.contains(bn) {
+                prod_changed_symbols.push(bn.clone());
+            }
+        }
+        for nm in &entry.extra_names {
+            if !all_changed_symbols.contains(nm) {
+                all_changed_symbols.push(nm.clone());
+            }
+            if !is_inline_test && !prod_changed_symbols.contains(nm) {
+                prod_changed_symbols.push(nm.clone());
+            }
+        }
+    }
+    let changed_symbols = if !prod_changed_symbols.is_empty() {
+        prod_changed_symbols
+    } else {
+        all_changed_symbols
+    };
 
     // Merge overlapping or adjacent expanded hunks (avoiding merging non-overlapping production
     // hunks with adjacent inline-test hunks so Tier 2 can cleanly fold inline test hunks).
@@ -1311,14 +1782,23 @@ fn expand_chunk_with_treesitter(
             .any(|b| entry.exp_start >= b.start_line && entry.exp_end <= b.end_line);
         let mut entry_sigs = Vec::new();
         if let Some(s) = entry.signature {
-            entry_sigs.push((s, entry.is_entry_clamped, entry.def_span, entry.extra_defs));
+            entry_sigs.push(MergedHunkSig {
+                sig: s,
+                bare_name: entry.bare_name,
+                is_clamped: entry.is_entry_clamped,
+                def_span: entry.def_span,
+                extra_defs: entry.extra_defs,
+                extra_names: entry.extra_names,
+            });
         } else if entry.use_raw_sig_fallback && !entry.hunk.signature.is_empty() {
-            entry_sigs.push((
-                entry.hunk.signature.clone(),
-                entry.is_entry_clamped,
-                entry.def_span,
-                entry.extra_defs,
-            ));
+            entry_sigs.push(MergedHunkSig {
+                sig: entry.hunk.signature.clone(),
+                bare_name: entry.bare_name,
+                is_clamped: entry.is_entry_clamped,
+                def_span: entry.def_span,
+                extra_defs: entry.extra_defs,
+                extra_names: entry.extra_names,
+            });
         }
 
         if let Some(last) = merged.last_mut() {
@@ -1331,6 +1811,8 @@ fn expand_chunk_with_treesitter(
                 last.full_end = last.full_end.max(entry.full_end);
                 last.is_inline_test &= entry_is_inline_test;
                 last.sigs.extend(entry_sigs);
+                // If merged with another hunk, clear sig-only annotation
+                last.sig_only_body_lines = None;
                 last.hunks.push(entry.hunk);
                 continue;
             }
@@ -1342,6 +1824,7 @@ fn expand_chunk_with_treesitter(
             full_end: entry.full_end,
             is_inline_test: entry_is_inline_test,
             sigs: entry_sigs,
+            sig_only_body_lines: entry.sig_only_body_lines,
             hunks: vec![entry.hunk],
         });
     }
@@ -1349,6 +1832,38 @@ fn expand_chunk_with_treesitter(
     for m in &mut merged {
         m.hunks.sort_by_key(|h| (h.new_start, h.old_start));
     }
+
+    let exposed_ranges: Vec<(usize, usize)> = merged
+        .iter()
+        .map(|m| (m.exp_start, m.exp_end.min(new_lines.len())))
+        .collect();
+
+    let deleted_hunk_lines: Vec<&str> = merged
+        .iter()
+        .filter(|m| !m.is_inline_test)
+        .flat_map(|m| m.hunks.iter())
+        .flat_map(|h| h.lines.iter())
+        .filter_map(|l| l.strip_prefix('-'))
+        .collect();
+
+    let (local_context, cross_query, exposed_defs) =
+        if !is_test_file_path(path) && (hybrid.layer3_local || hybrid.layer3_cross) {
+            hybrid::extract_local_and_query_from_ast(
+                lang,
+                path,
+                &root,
+                &new_content,
+                &plain_lines,
+                &changed_ranges,
+                &deleted_hunk_lines,
+                &exposed_ranges,
+                &inline_test_blocks,
+                hybrid.layer3_local,
+                hybrid.layer3_cross,
+            )
+        } else {
+            (Vec::new(), None, Vec::new())
+        };
 
     let file_has_no_newline = !new_content.ends_with('\n');
 
@@ -1445,14 +1960,22 @@ fn expand_chunk_with_treesitter(
             first_hunk.old_start.saturating_sub(pre_context).max(1)
         };
 
-        let is_clamped = m.full_start < exp_start || m.full_end > exp_end;
-        let chosen_sig = select_merged_signature(&m, is_clamped);
+        let is_sig_only = m.sig_only_body_lines.is_some();
+        let is_clamped = !is_sig_only && (m.full_start < exp_start || m.full_end > exp_end);
+        let chosen_sig = select_merged_signature(&m, is_clamped, hybrid);
         let base_sig = chosen_sig.as_deref().unwrap_or("");
         let clamped_suffix = format!(
             "[clamped] (lines {exp_start}-{exp_end} of {}-{})",
             m.full_start, m.full_end
         );
-        let header_sig = if is_clamped {
+        let header_sig = if let Some(body_n) = m.sig_only_body_lines {
+            let note = format!("[sig-only; body unchanged: {body_n} lines]");
+            if base_sig.is_empty() {
+                note
+            } else {
+                format!("{base_sig} {note}")
+            }
+        } else if is_clamped {
             if base_sig.is_empty() {
                 clamped_suffix
             } else if !base_sig.contains("[clamped]") {
@@ -1478,10 +2001,16 @@ fn expand_chunk_with_treesitter(
         }
     }
 
-    Ok(Some(TreeSitterExpandResult::Expanded(
-        result,
-        inline_test_blocks,
-    )))
+    Ok(Some(TreeSitterExpandResult::Expanded(Box::new(
+        ExpandedChunkData {
+            rendered: result,
+            inline_test_blocks,
+            changed_symbols,
+            local_context,
+            cross_query,
+            exposed_defs,
+        },
+    ))))
 }
 
 #[cfg(not(feature = "tree-sitter"))]
@@ -2298,12 +2827,19 @@ fn format_budget_size(bytes: usize) -> String {
 }
 
 pub(super) fn strip_clamped_suffix(sig: &str) -> String {
-    if let Some(idx) = sig.find(" [clamped] (lines ") {
-        sig[..idx].trim_end().to_string()
+    let base = if let Some(idx) = sig.find(" [clamped] (lines ") {
+        sig[..idx].trim_end()
     } else if sig.starts_with("[clamped] (lines ") {
+        ""
+    } else {
+        sig
+    };
+    if let Some(idx) = base.find(" [sig-only; body unchanged: ") {
+        base[..idx].trim_end().to_string()
+    } else if base.starts_with("[sig-only; body unchanged: ") {
         String::new()
     } else {
-        sig.to_string()
+        base.to_string()
     }
 }
 
@@ -3218,6 +3754,7 @@ fn compute_waterfill_cap(sizes: &[usize], budget: usize) -> usize {
     sorted.last().copied().unwrap_or(budget)
 }
 
+#[derive(Default)]
 pub(super) struct RenderedChunk {
     pub(super) path: Option<PathBuf>,
     pub(super) is_test: bool,
@@ -3230,6 +3767,20 @@ pub(super) struct RenderedChunk {
     pub(super) orig_line_map: Option<Vec<Option<(usize, usize)>>>,
     #[cfg(feature = "tree-sitter")]
     pub(super) inline_test_blocks: Vec<ast_compact::InlineTestBlock>,
+    pub(super) hybrid_meta: ChunkHybridMeta,
+}
+
+#[derive(Default)]
+pub(super) struct ChunkHybridMeta {
+    pub(super) added_lines: usize,
+    pub(super) deleted_lines: usize,
+    pub(super) changed_symbols: Vec<String>,
+    #[cfg(feature = "tree-sitter")]
+    pub(super) local_context: Vec<hybrid::ContextEntry>,
+    #[cfg(feature = "tree-sitter")]
+    pub(super) cross_query: Option<hybrid::FileRefQuery>,
+    #[cfg(feature = "tree-sitter")]
+    pub(super) exposed_defs: Vec<String>,
 }
 
 fn split_raw_diff_chunks(raw_diff: &str) -> (String, Vec<String>) {
@@ -3255,22 +3806,225 @@ fn split_raw_diff_chunks(raw_diff: &str) -> (String, Vec<String>) {
     (commit_header, chunks)
 }
 
+#[cfg(test)]
 pub(super) fn apply_patch_budget(
     prefix: &str,
-    mut items: Vec<RenderedChunk>,
+    items: Vec<RenderedChunk>,
     max_bytes: usize,
     warnings: &mut Vec<String>,
 ) -> String {
+    #[cfg(feature = "tree-sitter")]
+    {
+        apply_patch_budget_with_hybrid(
+            prefix,
+            items,
+            max_bytes,
+            HybridConfig::off(),
+            None,
+            warnings,
+        )
+    }
+    #[cfg(not(feature = "tree-sitter"))]
+    {
+        apply_patch_budget_with_hybrid(prefix, items, max_bytes, HybridConfig::off(), warnings)
+    }
+}
+
+fn build_layer1_entries_from_items(items: &[RenderedChunk]) -> Vec<hybrid::Layer1FileEntry> {
+    items
+        .iter()
+        .filter_map(|c| {
+            let m = &c.hybrid_meta;
+            let path = c.path.as_ref()?.to_string_lossy().replace('\\', "/");
+            let status = if c.is_new {
+                'A'
+            } else if c.is_deleted {
+                'D'
+            } else {
+                'M'
+            };
+            let is_large_new = c.is_new && m.added_lines >= 200;
+            let mut tags = Vec::new();
+            if is_large_new {
+                tags.push("large new");
+            }
+            if c.pre_omitted {
+                tags.push("pre-omitted");
+            } else {
+                if has_inline_test_omission_marker(&c.rendered) {
+                    tags.push("inline-tests-omitted");
+                }
+                if has_file_header_marker(&c.rendered, "[degraded to -U3]") {
+                    tags.push("-U3");
+                }
+                if has_file_header_marker(&c.rendered, "[degraded to -U0]") {
+                    tags.push("-U0");
+                }
+                if has_file_header_marker(&c.rendered, "[skeletonized:") {
+                    tags.push("skeletonized");
+                }
+                if c.rendered
+                    .lines()
+                    .any(|l| l.starts_with("... [truncated due to patch budget:"))
+                {
+                    tags.push("truncated");
+                }
+                if c.rendered
+                    .lines()
+                    .any(|l| l.starts_with("[omitted due to patch budget:"))
+                {
+                    tags.push("budget-omitted");
+                }
+            }
+            Some(hybrid::Layer1FileEntry {
+                path,
+                status,
+                added: m.added_lines,
+                deleted: m.deleted_lines,
+                is_large_new,
+                tags,
+                symbols: m.changed_symbols.clone(),
+            })
+        })
+        .collect()
+}
+
+fn apply_patch_budget_with_hybrid(
+    prefix: &str,
+    mut items: Vec<RenderedChunk>,
+    max_bytes: usize,
+    hybrid: HybridConfig,
+    #[cfg(feature = "tree-sitter")] cross_ctx: Option<(&Path, GitDiffSource<'_>)>,
+    warnings: &mut Vec<String>,
+) -> String {
+    let stripped_prefix = hybrid::strip_redundant_stat_lines(prefix);
+    let raw_l1_cap = if hybrid.layer1 {
+        hybrid::layer1_budget_bytes(max_bytes)
+    } else {
+        0
+    };
+
+    // Estimate Layer 1 upfront so compaction reserves its exact byte footprint (or 0 if skipped).
+    // When the diff will exceed `max_bytes`, cap Layer 1 tightly (<= 3 KiB) so it never pushes
+    // Layer 2 into additional truncation. Only strip `--stat` from `prefix` when Layer 1 is
+    // actually emitted.
+    let initial_rendered_bytes: usize = items.iter().map(|c| c.rendered.len()).sum();
+    let will_compact = stripped_prefix.len() + raw_l1_cap + initial_rendered_bytes > max_bytes;
+    let l1_cap = if will_compact {
+        raw_l1_cap.min(3 * 1024)
+    } else {
+        raw_l1_cap
+    };
+    let initial_l1_opt = if hybrid.layer1 {
+        let entries = build_layer1_entries_from_items(&items);
+        hybrid::render_layer1_index(&entries, l1_cap, initial_rendered_bytes)
+    } else {
+        None
+    };
+    let base_prefix = if initial_l1_opt.is_some() {
+        stripped_prefix
+    } else {
+        prefix.to_string()
+    };
+    let initial_l1_len = initial_l1_opt
+        .as_ref()
+        .map_or(0, |s| (s.len() + 64).min(l1_cap));
+
     let total_bytes = |list: &[RenderedChunk]| -> usize {
-        prefix.len() + list.iter().map(|c| c.rendered.len()).sum::<usize>()
+        base_prefix.len() + initial_l1_len + list.iter().map(|c| c.rendered.len()).sum::<usize>()
+    };
+
+    #[cfg(feature = "tree-sitter")]
+    let collect_layer3_entries = |list: &[RenderedChunk],
+                                  include_cross: bool,
+                                  l3_budget: usize|
+     -> Vec<hybrid::ContextEntry> {
+        if !hybrid.layer3_local && !(include_cross && hybrid.layer3_cross) {
+            return Vec::new();
+        }
+        let mut all_entries: Vec<hybrid::ContextEntry> = Vec::new();
+        let mut exposed_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queries: Vec<hybrid::FileRefQuery> = Vec::new();
+
+        for c in list {
+            let m = &c.hybrid_meta;
+            for d in &m.exposed_defs {
+                exposed_set.insert(d.clone());
+            }
+            if c.is_new && !c.is_test && !c.pre_omitted {
+                for s in &m.changed_symbols {
+                    exposed_set.insert(s.clone());
+                }
+            }
+            if hybrid.layer3_local {
+                all_entries.extend(m.local_context.iter().cloned());
+            }
+            if include_cross && hybrid.layer3_cross {
+                if let Some(ref q) = m.cross_query {
+                    queries.push(q.clone());
+                }
+            }
+        }
+        let mut local_est_bytes = 64usize;
+        for e in &all_entries {
+            exposed_set.insert(e.symbol_name.clone());
+            local_est_bytes += e.snippet.len() + 48;
+        }
+        // Only pay cross-file git/AST cost if meaningful budget remains after local entries
+        // (2 KiB floor for very large diffs > 256 KiB so near-full budgets skip ~400ms overhead)
+        let cross_min_rem = if initial_rendered_bytes > 256 * 1024 {
+            2048
+        } else {
+            512
+        };
+        if include_cross
+            && hybrid.layer3_cross
+            && !queries.is_empty()
+            && l3_budget.saturating_sub(local_est_bytes) >= cross_min_rem
+        {
+            if let Some((repo_root, src)) = cross_ctx {
+                let cross = hybrid::resolve_cross_file_context(
+                    repo_root,
+                    src,
+                    &queries,
+                    &exposed_set,
+                    hybrid.scope_sep(),
+                );
+                all_entries.extend(cross);
+            }
+        }
+        all_entries
     };
 
     if total_bytes(&items) <= max_bytes {
-        let mut out = String::with_capacity(total_bytes(&items));
-        out.push_str(prefix);
+        let layer1_str = initial_l1_opt.unwrap_or_default();
+        let layer2_bytes: usize = items.iter().map(|c| c.rendered.len()).sum();
+        let used_so_far = base_prefix.len() + layer1_str.len() + layer2_bytes;
+        #[cfg(feature = "tree-sitter")]
+        let layer3_str = if hybrid.layer3_local || hybrid.layer3_cross {
+            let rem = max_bytes.saturating_sub(used_so_far);
+            let l3_budget = hybrid::compute_layer3_budget(max_bytes, layer2_bytes, rem, false);
+            if l3_budget >= 160 {
+                let entries = collect_layer3_entries(&items, hybrid.layer3_cross, l3_budget);
+                hybrid::render_layer3_context(entries, l3_budget, !hybrid.layer3_cross)
+                    .map(|(s, _)| s)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        #[cfg(not(feature = "tree-sitter"))]
+        let layer3_str = String::new();
+
+        let mut out = String::with_capacity(used_so_far + layer3_str.len());
+        out.push_str(&base_prefix);
+        out.push_str(&layer1_str);
         for item in items {
             out.push_str(&item.rendered);
         }
+        out.push_str(&layer3_str);
         return out;
     }
 
@@ -3685,6 +4439,27 @@ pub(super) fn apply_patch_budget(
         }
     }
 
+    let prod_compacted = degraded_u3 > 0
+        || degraded_u0 > 0
+        || skeletonized_count > 0
+        || truncated_count > 0
+        || budget_omitted_count > 0;
+    let final_layer2_bytes: usize = items.iter().map(|c| c.rendered.len()).sum();
+
+    let banner_reserve = if compacted_files > 0 && max_bytes >= 16 * 1024 {
+        BUDGET_BANNER_RESERVE_BYTES
+    } else {
+        0
+    };
+    let layer1_str = if hybrid.layer1 {
+        let entries = build_layer1_entries_from_items(&items);
+        let avail_l1 = l1_cap
+            .min(max_bytes.saturating_sub(base_prefix.len() + final_layer2_bytes + banner_reserve));
+        hybrid::render_layer1_index(&entries, avail_l1, final_layer2_bytes).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let mut banner = String::new();
     if compacted_files > 0 {
         let mut detail_parts = Vec::new();
@@ -3714,7 +4489,9 @@ pub(super) fn apply_patch_budget(
             "[patch-budget: {budget_label} hit; {}]\n\n",
             detail_parts.join(", ")
         );
-        if total_bytes(&items) + candidate_banner.len() <= max_bytes {
+        if base_prefix.len() + layer1_str.len() + final_layer2_bytes + candidate_banner.len()
+            <= max_bytes
+        {
             banner = candidate_banner;
         }
 
@@ -3727,12 +4504,37 @@ pub(super) fn apply_patch_budget(
         }
     }
 
-    let mut out = String::with_capacity(total_bytes(&items) + banner.len());
-    out.push_str(prefix);
+    let used_before_l3 = base_prefix.len() + layer1_str.len() + banner.len() + final_layer2_bytes;
+    #[cfg(feature = "tree-sitter")]
+    let layer3_str = if hybrid.layer3_local || hybrid.layer3_cross {
+        let rem = max_bytes.saturating_sub(used_before_l3);
+        let l3_budget =
+            hybrid::compute_layer3_budget(max_bytes, final_layer2_bytes, rem, prod_compacted);
+        // Under production compaction pressure, skip cross-file resolution completely (0ms waste!)
+        let include_cross = !prod_compacted && hybrid.layer3_cross;
+        if l3_budget >= 160 && (hybrid.layer3_local || include_cross) {
+            let entries = collect_layer3_entries(&items, include_cross, l3_budget);
+            hybrid::render_layer3_context(entries, l3_budget, !include_cross)
+                .map(|(s, _)| s)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    #[cfg(not(feature = "tree-sitter"))]
+    let layer3_str = String::new();
+    let _ = prod_compacted;
+
+    let mut out = String::with_capacity(used_before_l3 + layer3_str.len());
+    out.push_str(&base_prefix);
+    out.push_str(&layer1_str);
     out.push_str(&banner);
     for item in items {
         out.push_str(&item.rendered);
     }
+    out.push_str(&layer3_str);
     out
 }
 
@@ -3778,6 +4580,24 @@ pub fn generate_expanded_diff_for_source(
     source: GitDiffSource<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<String> {
+    generate_expanded_diff_with_config(
+        workspace,
+        source,
+        resolve_patch_budget_bytes(),
+        HybridConfig::full(),
+        warnings,
+    )
+}
+
+/// Generates an expanded diff with explicit byte budget and `HybridConfig` ablation flags
+/// (used by A/B benchmarking tools and tests without mutating environment variables).
+pub fn generate_expanded_diff_with_config(
+    workspace: &Path,
+    source: GitDiffSource<'_>,
+    max_bytes: usize,
+    hybrid: HybridConfig,
+    warnings: &mut Vec<String>,
+) -> Result<String> {
     let repo_root = get_repo_root(workspace)?;
 
     #[cfg(not(feature = "tree-sitter"))]
@@ -3795,6 +4615,12 @@ pub fn generate_expanded_diff_for_source(
         let rendered: Vec<RenderedChunk> = chunks
             .into_iter()
             .map(|chunk| {
+                let (added_lines, deleted_lines) = count_diff_churn(&chunk);
+                let meta = ChunkHybridMeta {
+                    added_lines,
+                    deleted_lines,
+                    ..ChunkHybridMeta::default()
+                };
                 let info = extract_target_path_from_diff_chunk(&chunk);
                 if let Some((target_path, _, is_deleted, is_new, is_special_mode)) = info {
                     let path_is_test = is_test_file_path(&target_path);
@@ -3820,6 +4646,7 @@ pub fn generate_expanded_diff_for_source(
                             raw_chunk: chunk,
                             rendered: omitted,
                             orig_line_map: None,
+                            hybrid_meta: meta,
                         };
                     }
                     return RenderedChunk {
@@ -3832,6 +4659,7 @@ pub fn generate_expanded_diff_for_source(
                         raw_chunk: chunk.clone(),
                         rendered: chunk,
                         orig_line_map: None,
+                        hybrid_meta: meta,
                     };
                 }
                 RenderedChunk {
@@ -3844,15 +4672,13 @@ pub fn generate_expanded_diff_for_source(
                     raw_chunk: chunk.clone(),
                     rendered: chunk,
                     orig_line_map: None,
+                    hybrid_meta: meta,
                 }
             })
             .collect();
 
-        Ok(apply_patch_budget(
-            &prefix,
-            rendered,
-            resolve_patch_budget_bytes(),
-            warnings,
+        Ok(apply_patch_budget_with_hybrid(
+            &prefix, rendered, max_bytes, hybrid, warnings,
         ))
     }
 
@@ -3967,6 +4793,12 @@ pub fn generate_expanded_diff_for_source(
             .par_iter()
             .map(|chunk| {
                 let mut file_warnings = Vec::new();
+                let (added_lines, deleted_lines) = count_diff_churn(chunk);
+                let base_meta = || ChunkHybridMeta {
+                    added_lines,
+                    deleted_lines,
+                    ..ChunkHybridMeta::default()
+                };
 
                 let (target_path, old_path, is_deleted, is_new, is_special_mode) =
                     match extract_target_path_from_diff_chunk(chunk) {
@@ -3984,6 +4816,7 @@ pub fn generate_expanded_diff_for_source(
                                     rendered: chunk.clone(),
                                     orig_line_map: None,
                                     inline_test_blocks: Vec::new(),
+                                    hybrid_meta: base_meta(),
                                 },
                                 file_warnings,
                             ))
@@ -4006,15 +4839,35 @@ pub fn generate_expanded_diff_for_source(
                             rendered: omitted,
                             orig_line_map: None,
                             inline_test_blocks: Vec::new(),
+                            hybrid_meta: base_meta(),
                         },
                         file_warnings,
                     ));
                 }
 
+                // Collect concise symbol index for new files when Layer 1 is enabled (especially 200+ line files)
+                let new_file_symbols = if hybrid.layer1 && is_new && !is_special_mode {
+                    collect_ast_def_spans_for_new_chunk(chunk, &target_path)
+                        .map(|defs| {
+                            let mut syms = Vec::new();
+                            for d in defs {
+                                if !syms.contains(&d.bare_name) {
+                                    syms.push(d.bare_name);
+                                }
+                            }
+                            syms
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
                 // Summarize large newly added test files with a TOC of definitions
                 if chunk.starts_with("diff --git ") && is_new && !is_special_mode {
                     if let Some(test_summary) = summarize_large_new_test_chunk(chunk, &target_path)
                     {
+                        let mut meta = base_meta();
+                        meta.changed_symbols = new_file_symbols;
                         return Ok((
                             RenderedChunk {
                                 path: Some(target_path),
@@ -4027,6 +4880,7 @@ pub fn generate_expanded_diff_for_source(
                                 rendered: test_summary,
                                 orig_line_map: None,
                                 inline_test_blocks: Vec::new(),
+                                hybrid_meta: meta,
                             },
                             file_warnings,
                         ));
@@ -4034,6 +4888,8 @@ pub fn generate_expanded_diff_for_source(
                     if let Some((moved_summary, moved_line_map)) =
                         summarize_moved_new_file_chunk(chunk, &target_path, &moved_deleted_map)
                     {
+                        let mut meta = base_meta();
+                        meta.changed_symbols = new_file_symbols;
                         return Ok((
                             RenderedChunk {
                                 path: Some(target_path),
@@ -4046,6 +4902,7 @@ pub fn generate_expanded_diff_for_source(
                                 rendered: moved_summary,
                                 orig_line_map: Some(moved_line_map),
                                 inline_test_blocks: Vec::new(),
+                                hybrid_meta: meta,
                             },
                             file_warnings,
                         ));
@@ -4060,6 +4917,8 @@ pub fn generate_expanded_diff_for_source(
                     || is_special_mode
                     || !chunk.contains("\n@@")
                 {
+                    let mut meta = base_meta();
+                    meta.changed_symbols = new_file_symbols;
                     return Ok((
                         RenderedChunk {
                             path: Some(target_path),
@@ -4072,13 +4931,13 @@ pub fn generate_expanded_diff_for_source(
                             rendered: chunk.clone(),
                             orig_line_map: None,
                             inline_test_blocks: Vec::new(),
+                            hybrid_meta: meta,
                         },
                         file_warnings,
                     ));
                 }
 
-                let (diff_str, inline_test_blocks) = match SupportedLanguage::from_path(&target_path)
-                {
+                let expanded_data = match SupportedLanguage::from_path(&target_path) {
                     Some(lang) => {
                         match expand_chunk_with_treesitter(
                             &repo_root,
@@ -4087,6 +4946,7 @@ pub fn generate_expanded_diff_for_source(
                             source,
                             lang,
                             &moved_deleted_map,
+                            hybrid,
                         ) {
                             Ok(Some(TreeSitterExpandResult::Generated)) => {
                                 let omitted = summarize_omitted_chunk(chunk, &target_path);
@@ -4102,29 +4962,34 @@ pub fn generate_expanded_diff_for_source(
                                         rendered: omitted,
                                         orig_line_map: None,
                                         inline_test_blocks: Vec::new(),
+                                        hybrid_meta: base_meta(),
                                     },
                                     file_warnings,
                                 ));
                             }
-                            Ok(Some(TreeSitterExpandResult::Expanded(expanded, blocks)))
-                                if !expanded.trim().is_empty() =>
+                            Ok(Some(TreeSitterExpandResult::Expanded(data)))
+                                if !data.rendered.trim().is_empty() =>
                             {
-                                (expanded, blocks)
+                                *data
                             }
-                            Ok(Some(TreeSitterExpandResult::Expanded(_, _))) | Ok(None) => {
+                            Ok(Some(TreeSitterExpandResult::Expanded(_))) | Ok(None) => {
                                 file_warnings.push(format!(
                                     "tree-sitter: could not expand '{}'; falling back to git diff -W",
                                     target_path.display()
                                 ));
-                                (
-                                    git_diff_w_for_file(
+                                ExpandedChunkData {
+                                    rendered: git_diff_w_for_file(
                                         &repo_root,
                                         &target_path,
                                         old_path.as_deref(),
                                         source,
                                     )?,
-                                    Vec::new(),
-                                )
+                                    inline_test_blocks: Vec::new(),
+                                    changed_symbols: Vec::new(),
+                                    local_context: Vec::new(),
+                                    cross_query: None,
+                                    exposed_defs: Vec::new(),
+                                }
                             }
                             Err(e) => {
                                 if has_generated_source_header_for_file(
@@ -4145,6 +5010,7 @@ pub fn generate_expanded_diff_for_source(
                                             rendered: omitted,
                                             orig_line_map: None,
                                             inline_test_blocks: Vec::new(),
+                                            hybrid_meta: base_meta(),
                                         },
                                         file_warnings,
                                     ));
@@ -4153,15 +5019,19 @@ pub fn generate_expanded_diff_for_source(
                                     "tree-sitter: failed for '{}' ({e}); falling back to git diff -W",
                                     target_path.display()
                                 ));
-                                (
-                                    git_diff_w_for_file(
+                                ExpandedChunkData {
+                                    rendered: git_diff_w_for_file(
                                         &repo_root,
                                         &target_path,
                                         old_path.as_deref(),
                                         source,
                                     )?,
-                                    Vec::new(),
-                                )
+                                    inline_test_blocks: Vec::new(),
+                                    changed_symbols: Vec::new(),
+                                    local_context: Vec::new(),
+                                    cross_query: None,
+                                    exposed_defs: Vec::new(),
+                                }
                             }
                         }
                     }
@@ -4180,6 +5050,7 @@ pub fn generate_expanded_diff_for_source(
                                     rendered: omitted,
                                     orig_line_map: None,
                                     inline_test_blocks: Vec::new(),
+                                    hybrid_meta: base_meta(),
                                 },
                                 file_warnings,
                             ));
@@ -4188,15 +5059,19 @@ pub fn generate_expanded_diff_for_source(
                             "tree-sitter: unsupported language for '{}'; falling back to git diff -W",
                             target_path.display()
                         ));
-                        (
-                            git_diff_w_for_file(
+                        ExpandedChunkData {
+                            rendered: git_diff_w_for_file(
                                 &repo_root,
                                 &target_path,
                                 old_path.as_deref(),
                                 source,
                             )?,
-                            Vec::new(),
-                        )
+                            inline_test_blocks: Vec::new(),
+                            changed_symbols: Vec::new(),
+                            local_context: Vec::new(),
+                            cross_query: None,
+                            exposed_defs: Vec::new(),
+                        }
                     }
                 };
                 Ok((
@@ -4208,9 +5083,17 @@ pub fn generate_expanded_diff_for_source(
                         pre_omitted: false,
                         is_omitted: false,
                         raw_chunk: chunk.clone(),
-                        rendered: diff_str,
+                        rendered: expanded_data.rendered,
                         orig_line_map: None,
-                        inline_test_blocks,
+                        inline_test_blocks: expanded_data.inline_test_blocks,
+                        hybrid_meta: ChunkHybridMeta {
+                            added_lines,
+                            deleted_lines,
+                            changed_symbols: expanded_data.changed_symbols,
+                            local_context: expanded_data.local_context,
+                            cross_query: expanded_data.cross_query,
+                            exposed_defs: expanded_data.exposed_defs,
+                        },
                     },
                     file_warnings,
                 ))
@@ -4256,10 +5139,12 @@ pub fn generate_expanded_diff_for_source(
         let mut prefix = preamble;
         prefix.push_str(&commit_header);
 
-        Ok(apply_patch_budget(
+        Ok(apply_patch_budget_with_hybrid(
             &prefix,
             rendered_chunks,
-            resolve_patch_budget_bytes(),
+            max_bytes,
+            hybrid,
+            Some((&repo_root, source)),
             warnings,
         ))
     }
@@ -4298,7 +5183,7 @@ pub fn git_expanded_patch_file(
         GitDiffSource::Staged => "git-staged+.patch".to_string(),
         GitDiffSource::Unstaged => "git-diff+.patch".to_string(),
         GitDiffSource::Commit(sha) => {
-            let short = &sha[..sha.len().min(12)];
+            let short: String = sha.chars().take(12).collect();
             format!("git-{short}+.patch")
         }
     };
@@ -4380,6 +5265,7 @@ mod common_tests {
             orig_line_map: None,
             #[cfg(feature = "tree-sitter")]
             inline_test_blocks: Vec::new(),
+            hybrid_meta: ChunkHybridMeta::default(),
         }
     }
 
@@ -5010,5 +5896,23 @@ new file mode 100644
                 "Real @generated header must be detected:\n{real_gen}"
             );
         }
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_compact_bare_from_sig_and_safe_rust_attr_allowlist() {
+        assert_eq!(
+            compact_bare_from_sig("impl<T> Foo > pub fn baz(x: T) -> T"),
+            "baz"
+        );
+        assert_eq!(compact_bare_from_sig("Mod › fn bar()"), "bar");
+        assert_eq!(compact_bare_from_sig("fn top_level(a: i32)"), "top_level");
+
+        assert!(is_safe_non_semantic_rust_attr("#[doc = \"summary\"]"));
+        assert!(is_safe_non_semantic_rust_attr("#[doc(hidden)]"));
+        assert!(is_safe_non_semantic_rust_attr("#[must_use = \"check\"]"));
+        assert!(!is_safe_non_semantic_rust_attr("#[docker_test]"));
+        assert!(!is_safe_non_semantic_rust_attr("#[document_api]"));
+        assert!(!is_safe_non_semantic_rust_attr("#[no_mangle]"));
     }
 }

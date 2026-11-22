@@ -28,6 +28,7 @@ Only local IPC exposes workspace execution. File, shell, and external MCP tools 
 | Chrome, CDP, and external browsing | [browser_host.rs](../src/browser_host.rs), [cdp.rs](../src/cdp.rs), [browser_control/](../src/browser_control/), [browser_network.rs](../src/browser_network.rs) |
 | IPC, RPC, and public interfaces | [anticrumb.proto](../proto/anticrumb.proto), [rpc/](../src/rpc/), [http.rs](../src/http.rs), [mcp_sdk.rs](../src/mcp_sdk.rs) |
 | Persistence and search | [store.rs](../src/store.rs), [knowledge.rs](../src/knowledge.rs) |
+| 3-Layer Hybrid Git+AST diff (`@git:diff+`) | [tree_sitter_diff.rs](../src/tree_sitter_diff.rs), [tree_sitter_diff/](../src/tree_sitter_diff/), [git-diff-hybrid.md](git-diff-hybrid.md) |
 
 ## Browser Sessions
 

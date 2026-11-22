@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod bench;
 pub mod build;
 pub mod generate;
 pub mod github;
