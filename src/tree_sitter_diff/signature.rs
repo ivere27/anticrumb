@@ -641,8 +641,11 @@ fn find_parameter_list_span_impl(
 
     scanner.scan_str(sig, |sc, idx, ch, prev_ch| {
         if depth == 0 && b_depth == 0 && inner_p_depth == 0 {
-            if prev_ch == ' ' && ch == '>' && sig[idx..].starts_with("> ") {
-                // " > " is the scope separator (e.g. "impl<T: Foo<Bar... > fn f(...)");
+            if prev_ch == ' '
+                && ((ch == '>' && sig[idx..].starts_with("> "))
+                    || (ch == '›' && sig[idx..].starts_with("› ")))
+            {
+                // " > " / " › " is the scope separator (e.g. "impl<T: Foo<Bar... › fn f(...)");
                 // reset any unclosed angle brackets from truncated parent_scope.
                 sc.a_depth = 0;
                 return ScanAction::Continue;
@@ -1740,7 +1743,11 @@ fn find_ast_signature_bounds<'a>(
             if found_non_anno {
                 break;
             }
-        } else if k.contains("attribute") || k.contains("comment") || k.contains("annotation") {
+        } else if k == "decorator"
+            || k.contains("attribute")
+            || k.contains("comment")
+            || k.contains("annotation")
+        {
             last_anno_end = Some(child.end_byte());
         } else {
             break;
@@ -1755,14 +1762,421 @@ fn find_ast_signature_bounds<'a>(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SigFormatOpts {
+    pub(super) max_chars: usize,
+    pub(super) scope_sep: &'static str,
+    pub(super) preserve_key_decorators: bool,
+    pub(super) greedy_params: bool,
+}
+
+/// Splits inner contents of a C# attribute list (e.g. `Authorize, HttpPost("/refunds")`) at
+/// top-level commas outside parentheses/brackets/strings.
+fn split_top_level_attr_items(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, ch) in inner.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            ',' if paren == 0 && bracket == 0 => {
+                let item = inner[start..i].trim();
+                if !item.is_empty() {
+                    out.push(item);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn is_key_csharp_attr_item(item: &str) -> bool {
+    if item.contains('\n') || item.chars().count() > 48 {
+        return false;
+    }
+    // Split parameter list first so route constraints (`{id:int}`) or quoted values (`"admin:billing"`)
+    // inside `(...)` are never misparsed as attribute target specifiers (`method:`, `return:`).
+    let before_paren = item.split('(').next().unwrap_or(item).trim();
+    let after_target = before_paren
+        .split_once(':')
+        .map_or(before_paren, |(_, rhs)| rhs)
+        .trim();
+    let short_head = after_target
+        .rsplit('.')
+        .next()
+        .unwrap_or(after_target)
+        .trim();
+    matches!(
+        short_head,
+        "HttpGet"
+            | "HttpPost"
+            | "HttpPut"
+            | "HttpDelete"
+            | "HttpPatch"
+            | "Route"
+            | "Authorize"
+            | "AllowAnonymous"
+            | "ApiController"
+            | "ValidateAntiForgeryToken"
+            | "Transactional"
+            | "Flags"
+    )
+}
+
+fn sig_contains_decorator(sig: &str, dec: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(pos) = sig[offset..].find(dec) {
+        let end = offset + pos + dec.len();
+        let next_ok = sig[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, ']' | ')' | '>' | ',' | ':' | ';'));
+        if next_ok {
+            return true;
+        }
+        offset += pos + dec.len();
+    }
+    // Also match individual C# attribute items inside compound `[Attr1, Attr2(...)]` blocks
+    if let Some(inner_dec) = dec
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .map(str::trim)
+    {
+        let mut i = 0usize;
+        let bytes = sig.as_bytes();
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                i += 1;
+                let mut esc = false;
+                while i < bytes.len() {
+                    if esc {
+                        esc = false;
+                    } else if bytes[i] == b'\\' {
+                        esc = true;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i] == b'[' {
+                let start = i + 1;
+                let mut j = start;
+                let mut p_d = 0usize;
+                let mut b_d = 1usize;
+                let mut in_q = false;
+                let mut esc = false;
+                let mut close_idx = None;
+                while j < bytes.len() {
+                    let b = bytes[j];
+                    if in_q {
+                        if esc {
+                            esc = false;
+                        } else if b == b'\\' {
+                            esc = true;
+                        } else if b == b'"' {
+                            in_q = false;
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    match b {
+                        b'"' => in_q = true,
+                        b'(' => p_d += 1,
+                        b')' => p_d = p_d.saturating_sub(1),
+                        b'[' if p_d == 0 => b_d += 1,
+                        b']' if p_d == 0 => {
+                            b_d -= 1;
+                            if b_d == 0 {
+                                close_idx = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if let Some(end) = close_idx {
+                    let inner = &sig[start..end];
+                    if split_top_level_attr_items(inner)
+                        .into_iter()
+                        .any(|item| item == inner_dec)
+                    {
+                        return true;
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Extracts short, semantically critical decorators/annotations for Python, Java, C#, Rust, and TS
+/// (e.g. `@classmethod`, `@property`, `@Transactional`, `[HttpGet]`, `[Authorize]`) while
+/// intentionally skipping noisy/boilerplate ones (`@Override`, `@SuppressWarnings`, large multiline).
+fn extract_key_decorators_list(
+    lang: SupportedLanguage,
+    node: &tree_sitter::Node,
+    source: &str,
+) -> Vec<String> {
+    let mut raw_decs: Vec<String> = Vec::new();
+    match lang {
+        SupportedLanguage::Python => {
+            if node.kind() == "decorated_definition" {
+                let mut cursor = node.walk();
+                for ch in node.named_children(&mut cursor) {
+                    if ch.kind() == "decorator" {
+                        if let Some(txt) = source.get(ch.start_byte()..ch.end_byte()) {
+                            raw_decs.push(txt.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        SupportedLanguage::Java => {
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                if ch.kind() == "modifiers" {
+                    let mut mc = ch.walk();
+                    for m in ch.named_children(&mut mc) {
+                        if matches!(m.kind(), "marker_annotation" | "annotation") {
+                            if let Some(txt) = source.get(m.start_byte()..m.end_byte()) {
+                                raw_decs.push(txt.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SupportedLanguage::CSharp => {
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                if ch.kind() == "attribute_list" {
+                    if let Some(txt) = source.get(ch.start_byte()..ch.end_byte()) {
+                        let t = txt.trim();
+                        let inner = t.trim_start_matches('[').trim_end_matches(']').trim();
+                        let items = split_top_level_attr_items(inner);
+                        if items.len() > 1 {
+                            for item in items {
+                                if is_key_csharp_attr_item(item) {
+                                    raw_decs.push(format!("[{item}]"));
+                                }
+                            }
+                        } else {
+                            raw_decs.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        SupportedLanguage::TypeScript | SupportedLanguage::Tsx | SupportedLanguage::JavaScript => {
+            // In tree-sitter-typescript, class_declaration / export_statement may own `decorator` children,
+            // while `method_definition` inside `class_body` has preceding `decorator` siblings.
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                if ch.kind() == "decorator" {
+                    if let Some(txt) = source.get(ch.start_byte()..ch.end_byte()) {
+                        raw_decs.push(txt.trim().to_string());
+                    }
+                }
+            }
+            if node.kind() == "export_statement" {
+                if let Some(decl) = node.child_by_field_name("declaration") {
+                    let mut dc = decl.walk();
+                    for ch in decl.named_children(&mut dc) {
+                        if ch.kind() == "decorator" {
+                            if let Some(txt) = source.get(ch.start_byte()..ch.end_byte()) {
+                                let t = txt.trim().to_string();
+                                if !raw_decs.contains(&t) {
+                                    raw_decs.push(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut sib_decs = Vec::new();
+            let mut prev_opt = node.prev_named_sibling();
+            let mut steps = 0usize;
+            while let Some(prev) = prev_opt {
+                if prev.kind() != "decorator" || steps >= 4 {
+                    break;
+                }
+                if let Some(txt) = source.get(prev.start_byte()..prev.end_byte()) {
+                    let t = txt.trim().to_string();
+                    if !raw_decs.contains(&t) {
+                        sib_decs.push(t);
+                    }
+                }
+                prev_opt = prev.prev_named_sibling();
+                steps += 1;
+            }
+            sib_decs.reverse();
+            if !sib_decs.is_empty() {
+                sib_decs.extend(raw_decs);
+                raw_decs = sib_decs;
+            }
+        }
+        SupportedLanguage::Rust => {
+            // In Rust, `#[must_use]` is a preceding `attribute_item` sibling node
+            let mut prev_opt = node.prev_named_sibling();
+            let mut steps = 0usize;
+            while let Some(prev) = prev_opt {
+                if prev.kind() != "attribute_item" || steps >= 3 {
+                    break;
+                }
+                if let Some(txt) = source.get(prev.start_byte()..prev.end_byte()) {
+                    raw_decs.push(txt.trim().to_string());
+                }
+                prev_opt = prev.prev_named_sibling();
+                steps += 1;
+            }
+            raw_decs.reverse();
+        }
+        _ => return Vec::new(),
+    }
+
+    let is_key_dec = |d: &str| -> bool {
+        if d.contains('\n') || d.chars().count() > 48 {
+            return false;
+        }
+        match lang {
+            SupportedLanguage::Rust => {
+                let inner = d.trim_start_matches("#[").trim_end_matches(']').trim();
+                inner == "must_use"
+                    || inner.starts_with("must_use(")
+                    || inner.starts_with("must_use ")
+                    || inner.starts_with("must_use=")
+            }
+            SupportedLanguage::Python => {
+                let head = d.split('(').next().unwrap_or(d).trim();
+                matches!(
+                    head,
+                    "@staticmethod"
+                        | "@classmethod"
+                        | "@property"
+                        | "@abstractmethod"
+                        | "@dataclass"
+                        | "@contextmanager"
+                        | "@asynccontextmanager"
+                        | "@lru_cache"
+                        | "@cache"
+                        | "@cached_property"
+                        | "@login_required"
+                        | "@transaction.atomic"
+                ) || head.ends_with(".setter")
+                    || head.ends_with(".deleter")
+                    || head.starts_with("@app.")
+                    || head.starts_with("@router.")
+            }
+            SupportedLanguage::Java => {
+                let head = d.split('(').next().unwrap_or(d).trim();
+                matches!(
+                    head,
+                    "@Transactional"
+                        | "@Async"
+                        | "@Scheduled"
+                        | "@Synchronized"
+                        | "@Nullable"
+                        | "@NonNull"
+                        | "@NotNull"
+                        | "@GetMapping"
+                        | "@PostMapping"
+                        | "@PutMapping"
+                        | "@DeleteMapping"
+                        | "@PatchMapping"
+                        | "@RequestMapping"
+                        | "@PreAuthorize"
+                        | "@Secured"
+                        | "@RolesAllowed"
+                        | "@Cacheable"
+                        | "@Bean"
+                )
+            }
+            SupportedLanguage::CSharp => {
+                let inner = d.trim_start_matches('[').trim_end_matches(']').trim();
+                split_top_level_attr_items(inner)
+                    .into_iter()
+                    .any(is_key_csharp_attr_item)
+            }
+            SupportedLanguage::TypeScript
+            | SupportedLanguage::Tsx
+            | SupportedLanguage::JavaScript => {
+                let head = d.split('(').next().unwrap_or(d).trim();
+                matches!(
+                    head,
+                    "@Get"
+                        | "@Post"
+                        | "@Put"
+                        | "@Delete"
+                        | "@Patch"
+                        | "@Controller"
+                        | "@Injectable"
+                        | "@UseGuards"
+                        | "@Transactional"
+                        | "@Auth"
+                        | "@Roles"
+                        | "@computed"
+                        | "@action"
+                        | "@observable"
+                )
+            }
+            _ => false,
+        }
+    };
+
+    let mut kept = Vec::new();
+    let mut total_chars = 0usize;
+    for d in raw_decs {
+        if is_key_dec(&d) {
+            let len = d.chars().count();
+            if kept.len() >= 2 || total_chars + len > 48 {
+                break;
+            }
+            kept.push(d);
+            total_chars += len + 1;
+        }
+    }
+    kept
+}
+
 /// Builds a compacted signature directly from AST byte slices (`sig_start..p_start`,
-/// first AST parameter child, `p_end..body_start`) without reverse-searching `combined`.
+/// AST parameter children, `p_end..body_start`) without reverse-searching `combined`.
 fn compact_signature_from_ast_slices(
     lang: SupportedLanguage,
     node: &tree_sitter::Node,
     parent_prefix: Option<&str>,
+    decorators: &[String],
     source: &str,
-    max_chars: usize,
+    opts: SigFormatOpts,
 ) -> Option<String> {
     let (target, sig_start, body_start) = find_ast_signature_bounds(lang, node, source)?;
     let params_node = find_ast_parameters_node(lang, &target)?;
@@ -1830,7 +2244,13 @@ fn compact_signature_from_ast_slices(
     let mut before_paren = String::new();
     if let Some(p) = parent_prefix {
         before_paren.push_str(p);
-        before_paren.push_str(" > ");
+        before_paren.push_str(opts.scope_sep);
+    }
+    for dec in decorators {
+        if !sig_contains_decorator(&before_clean, dec) {
+            before_paren.push_str(dec);
+            before_paren.push(' ');
+        }
     }
     before_paren.push_str(&before_clean);
     if need_space_before_paren {
@@ -1852,6 +2272,50 @@ fn compact_signature_from_ast_slices(
             param_children.push(ch);
         }
     }
+
+    if opts.greedy_params && !param_children.is_empty() {
+        let mut packed = Vec::new();
+        let mut truncated = false;
+        for (idx, p_node) in param_children.iter().enumerate() {
+            let p_text = strip_ast_comments_in_range(
+                source,
+                p_node,
+                p_node.start_byte(),
+                p_node.end_byte(),
+                allow_rust_lifetime,
+                allow_backtick_escapes,
+            );
+            let p_trim = p_text.trim();
+            if p_trim.is_empty() {
+                continue;
+            }
+            let mut trial = packed.clone();
+            trial.push(p_trim.to_string());
+            let has_more = idx + 1 < param_children.len();
+            let candidate = if has_more {
+                format!("{before_paren}{}, ...{after_paren}", trial.join(", "))
+            } else {
+                format!("{before_paren}{}{after_paren}", trial.join(", "))
+            };
+            if candidate.chars().count() <= opts.max_chars {
+                packed = trial;
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+        if !packed.is_empty() {
+            let res = if truncated {
+                format!("{before_paren}{}, ...{after_paren}", packed.join(", "))
+            } else {
+                format!("{before_paren}{}{after_paren}", packed.join(", "))
+            };
+            if res.chars().count() <= opts.max_chars {
+                return Some(res);
+            }
+        }
+    }
+
     let first_ast_param = param_children.first().map(|first| {
         strip_ast_comments_in_range(
             source,
@@ -1878,12 +2342,12 @@ fn compact_signature_from_ast_slices(
         } else {
             format!("{before_paren}...{after_paren}")
         };
-        if c1.chars().count() <= max_chars {
+        if c1.chars().count() <= opts.max_chars {
             return Some(c1);
         }
     }
     let c2 = format!("{before_paren}...{after_paren}");
-    if c2.chars().count() <= max_chars {
+    if c2.chars().count() <= opts.max_chars {
         return Some(c2);
     }
     None
@@ -1954,13 +2418,62 @@ pub(super) fn compact_definition_signature_with_ast(
     source: &str,
     max_chars: usize,
 ) -> Option<String> {
+    compact_definition_signature_with_ast_opts(
+        lang,
+        node,
+        parent_scope,
+        raw_sig,
+        source,
+        SigFormatOpts {
+            max_chars,
+            scope_sep: " > ",
+            preserve_key_decorators: false,
+            greedy_params: false,
+        },
+    )
+}
+
+pub(super) fn compact_definition_signature_with_ast_opts(
+    lang: SupportedLanguage,
+    node: &tree_sitter::Node,
+    parent_scope: Option<&str>,
+    raw_sig: Option<&str>,
+    source: &str,
+    opts: SigFormatOpts,
+) -> Option<String> {
     let allow_rust_lifetime = lang == SupportedLanguage::Rust;
     let allow_backtick_escapes = lang != SupportedLanguage::Go;
 
-    let (combined, parent_short) = match (parent_scope, raw_sig) {
+    let dec_list = if opts.preserve_key_decorators {
+        extract_key_decorators_list(lang, node, source)
+    } else {
+        Vec::new()
+    };
+
+    let decorated_raw = raw_sig.map(|s| {
+        // Inspect only the header before the parameter list so parameter annotations
+        // (e.g. `(@Nullable String key)`) never suppress a matching method annotation.
+        let header_slice =
+            match find_parameter_list_span_impl(s, allow_rust_lifetime, allow_backtick_escapes) {
+                Some((open, _)) => &s[..open],
+                None => s,
+            };
+        let missing: Vec<&str> = dec_list
+            .iter()
+            .map(String::as_str)
+            .filter(|d| !sig_contains_decorator(header_slice, d))
+            .collect();
+        if missing.is_empty() {
+            s.to_string()
+        } else {
+            format!("{} {s}", missing.join(" "))
+        }
+    });
+
+    let (combined, parent_short) = match (parent_scope, decorated_raw.as_deref()) {
         (Some(p), Some(s)) => {
             let p_short = truncate_preview(p, 45);
-            let combined = format!("{p_short} > {s}");
+            let combined = format!("{p_short}{}{s}", opts.scope_sep);
             (combined, Some(p_short))
         }
         (None, Some(s)) => (s.to_string(), None),
@@ -1968,7 +2481,7 @@ pub(super) fn compact_definition_signature_with_ast(
         (None, None) => return None,
     };
 
-    if combined.chars().count() <= max_chars {
+    if combined.chars().count() <= opts.max_chars {
         return Some(combined);
     }
 
@@ -1977,8 +2490,9 @@ pub(super) fn compact_definition_signature_with_ast(
             lang,
             node,
             parent_short.as_deref(),
+            &dec_list,
             source,
-            max_chars,
+            opts,
         ) {
             return Some(compacted);
         }
@@ -1986,7 +2500,7 @@ pub(super) fn compact_definition_signature_with_ast(
 
     Some(compact_signature_preview_with_opts(
         &combined,
-        max_chars,
+        opts.max_chars,
         allow_rust_lifetime,
         allow_backtick_escapes,
     ))

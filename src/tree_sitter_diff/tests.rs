@@ -3863,8 +3863,8 @@ fn test_round2_merged_hunk_preserves_clamped_signature_and_range_telemetry() {
         "Merged hunk with clamped function must display the clamped function signature! Got: {header}"
     );
     assert!(
-        header.contains("(+1 more)"),
-        "Merged hunk covering two definitions must include (+1 more)! Got: {header}"
+        header.contains("[+ MAGIC_OFFSET]") || header.contains("(+1 more)"),
+        "Merged hunk covering two definitions must include extra symbol telemetry ([+ MAGIC_OFFSET] or (+1 more))! Got: {header}"
     );
     assert!(
         header.contains("[clamped] (lines "),
@@ -4948,6 +4948,7 @@ mod common_tests {
         rendered: rust_diff,
         orig_line_map: None,
         inline_test_blocks: Vec::new(),
+        hybrid_meta: Default::default(),
     }];
     let mut warnings = Vec::new();
     let out = apply_patch_budget("", items, prod_only_budget, &mut warnings);
@@ -5050,6 +5051,7 @@ mod common_tests {
         rendered: expanded_chunk,
         orig_line_map: None,
         inline_test_blocks: inline_blocks,
+        hybrid_meta: Default::default(),
     }];
     let mut w_budget = Vec::new();
     let compacted_mod = apply_patch_budget("", items_mod, tight_budget, &mut w_budget);
@@ -5555,6 +5557,7 @@ fn test_tier5_line_anchor_accuracy_bare_symbols_omitted_toc_and_banner_1_to_1() 
         rendered: after_t2.clone(),
         orig_line_map: Some(map_t2),
         inline_test_blocks: Vec::new(),
+        hybrid_meta: Default::default(),
     }];
     let mut warnings = Vec::new();
     let out = apply_patch_budget("", items, 1500, &mut warnings);
@@ -5637,6 +5640,7 @@ fn test_tier5_line_anchor_accuracy_bare_symbols_omitted_toc_and_banner_1_to_1() 
             rendered: pre_omitted_lock,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
         RenderedChunk {
             path: Some(PathBuf::from("src/omitted_new.rs")),
@@ -5649,6 +5653,7 @@ fn test_tier5_line_anchor_accuracy_bare_symbols_omitted_toc_and_banner_1_to_1() 
             rendered: new_omitted_diff,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
         RenderedChunk {
             path: Some(PathBuf::from("src/omitted_mod.rs")),
@@ -5661,6 +5666,7 @@ fn test_tier5_line_anchor_accuracy_bare_symbols_omitted_toc_and_banner_1_to_1() 
             rendered: mod_omitted_diff,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
     ];
     let mut w_omit = Vec::new();
@@ -5782,6 +5788,7 @@ pub fn small_helper(x: i32) -> i32 {
             rendered: mod_chunk.clone(),
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
         RenderedChunk {
             path: Some(PathBuf::from("src/big_new.rs")),
@@ -5794,6 +5801,7 @@ pub fn small_helper(x: i32) -> i32 {
             rendered: big_new_diff,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
         RenderedChunk {
             path: Some(PathBuf::from("src/small_new.rs")),
@@ -5806,6 +5814,7 @@ pub fn small_helper(x: i32) -> i32 {
             rendered: small_new_diff,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
     ];
     let mut w_t4 = Vec::new();
@@ -5849,6 +5858,7 @@ pub fn check_markers(s: &str) -> bool {
             rendered: dogfood_diff,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
         RenderedChunk {
             path: Some(PathBuf::from("src/big_new2.rs")),
@@ -5861,6 +5871,7 @@ pub fn check_markers(s: &str) -> bool {
             rendered: big_new_diff2,
             orig_line_map: None,
             inline_test_blocks: Vec::new(),
+            hybrid_meta: Default::default(),
         },
     ];
     let mut w_dog = Vec::new();
@@ -6537,6 +6548,7 @@ fn test_round_two_multilang_span_map_ruby_spec_blank_indent_and_unsupported_gen(
         rendered: rs_skel,
         orig_line_map: Some(rs_map),
         inline_test_blocks: Vec::new(),
+        hybrid_meta: Default::default(),
     }];
     let mut w_rs = Vec::new();
     let out_rs = apply_patch_budget("", items_rs, 1400, &mut w_rs);
@@ -6837,4 +6849,247 @@ deploy_release() {
             "Hand-written Kotlin file mentioning `@generated` in prose must NOT be omitted:\n{patch}"
         );
     }
+}
+
+#[test]
+fn test_sig_only_python_star_args_and_brace_first_line_deletion_safety() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    // 1. Python multiline signature adding `*args` / `*,` / `**kwargs` must NEVER fold body as `[sig-only]`
+    let py_body: String = (0..30).map(|i| format!("    v_{i} = a + {i}\n")).collect();
+    let py_orig = format!("def process(\n    a: int,\n):\n{py_body}    return v_29\n");
+    std::fs::write(repo.join("app.py"), &py_orig).unwrap();
+
+    // 2. Rust function where line 1 removes `fn` -> `pub fn` AND a second hunk deletes line right after `{`
+    let mut rs_orig = String::from("fn check_limits(\n    a: i32,\n    b: i32,\n    c: i32,\n    d: i32,\n) -> i32 {\n    let removed_guard = if a < 0 { return -1; } else { 0 };\n");
+    for i in 0..28 {
+        rs_orig.push_str(&format!("    let step_{i} = a + b + c + d + {i};\n"));
+    }
+    rs_orig.push_str("    step_27\n}\n");
+    std::fs::write(repo.join("guard.rs"), &rs_orig).unwrap();
+
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-q", "-m", "init"])
+        .status()
+        .unwrap();
+
+    let py_mod = format!(
+        "def process(\n    a: int,\n    *args,\n    **kwargs,\n):\n{py_body}    return v_29\n"
+    );
+    std::fs::write(repo.join("app.py"), &py_mod).unwrap();
+
+    let rs_mod = rs_orig
+        .replacen("fn check_limits(", "pub fn check_limits(", 1)
+        .replace(
+            "    let removed_guard = if a < 0 { return -1; } else { 0 };\n",
+            "",
+        );
+    std::fs::write(repo.join("guard.rs"), &rs_mod).unwrap();
+
+    let mut warnings = Vec::new();
+    let out = generate_expanded_diff(repo, false, &mut warnings).unwrap();
+    assert!(
+        out.contains("v_29 = a + 29"),
+        "Adding `*args`/`**kwargs` in Python signature must NOT fold body as [sig-only]:\n{out}"
+    );
+    assert!(
+        !out.contains("@@ -1,4 +1,6 @@ def process") && !out.contains("[sig-only;"),
+        "Neither Python `*args` nor Rust opening-brace body deletion may trigger [sig-only]:\n{out}"
+    );
+    assert!(
+        out.contains("let step_27 ="),
+        "Pure deletion right after opening brace must prevent [sig-only] suppression:\n{out}"
+    );
+}
+
+#[test]
+fn test_decorators_csharp_compound_ts_methods_java_dedup_and_rust_must_use() {
+    let parse_first = |lang: SupportedLanguage, src: &str| -> String {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.language_fn()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let lines: Vec<&str> = src.lines().collect();
+        // Find first function/method/class node
+        fn find_fn<'a>(
+            lang: SupportedLanguage,
+            n: tree_sitter::Node<'a>,
+        ) -> Option<tree_sitter::Node<'a>> {
+            let k = n.kind();
+            let hit = match lang {
+                SupportedLanguage::Rust => k == "function_item",
+                SupportedLanguage::CSharp => k == "method_declaration",
+                SupportedLanguage::Java => k == "method_declaration",
+                SupportedLanguage::TypeScript => k == "method_definition",
+                _ => false,
+            };
+            if hit {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for ch in n.named_children(&mut c) {
+                if let Some(f) = find_fn(lang, ch) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let target = find_fn(lang, tree.root_node()).unwrap();
+        let parent = extract_parent_scope_prefix(lang, &target, &lines, src);
+        let raw_sig = extract_signature(lang, &target, &lines, src);
+        compact_definition_signature_with_ast_opts(
+            lang,
+            &target,
+            parent.as_deref(),
+            raw_sig.as_deref(),
+            src,
+            SigFormatOpts {
+                max_chars: 180,
+                scope_sep: " › ",
+                preserve_key_decorators: true,
+                greedy_params: true,
+            },
+        )
+        .unwrap()
+    };
+
+    // 1. Rust #[must_use = "..."]
+    let rs_src = "#[must_use = \"check error result\"]\npub fn verify(x: i32) -> bool { x > 0 }\n";
+    let rs_sig = parse_first(SupportedLanguage::Rust, rs_src);
+    assert!(
+        rs_sig.contains("#[must_use = \"check error result\"]"),
+        "Rust #[must_use = \"...\"] must be preserved: {rs_sig}"
+    );
+
+    // 2. C# compound [Authorize, HttpPost("/refunds")]
+    let cs_src = "class Api {\n    [Authorize, HttpPost(\"/refunds\")]\n    public bool Refund(int id) { return id > 0; }\n}\n";
+    let cs_sig = parse_first(SupportedLanguage::CSharp, cs_src);
+    assert!(
+        cs_sig.contains("[Authorize]") && cs_sig.contains("[HttpPost(\"/refunds\")]"),
+        "C# compound attribute list must preserve both key attributes: {cs_sig}"
+    );
+
+    // 3. TS class method decorator (preceding sibling in `class_body`)
+    let ts_src = "export class OrderController {\n    @Get('/orders')\n    @UseGuards(AuthGuard)\n    list(limit: number): boolean { return limit > 0; }\n}\n";
+    let ts_sig = parse_first(SupportedLanguage::TypeScript, ts_src);
+    assert!(
+        ts_sig.contains("@Get('/orders')") && ts_sig.contains("@UseGuards(AuthGuard)"),
+        "TS method sibling decorators must be preserved: {ts_sig}"
+    );
+    assert_eq!(ts_sig.matches("@Get('/orders')").count(), 1);
+
+    // 4. Java `public @Transactional` inline after modifier must NOT duplicate `@Transactional`
+    let java_src = "class Svc {\n    public @Transactional boolean placeOrder(String orderId, int retries, boolean strictMode, long timeoutMillis) { return true; }\n}\n";
+    let java_sig = parse_first(SupportedLanguage::Java, java_src);
+    assert_eq!(
+        java_sig.matches("@Transactional").count(),
+        1,
+        "Java inline @Transactional must appear exactly once: {java_sig}"
+    );
+    // Also check uncompacted short Java inline annotation
+    let java_short =
+        "class Svc {\n    public @Transactional boolean ok(int a) { return true; }\n}\n";
+    let java_short_sig = parse_first(SupportedLanguage::Java, java_short);
+    assert_eq!(
+        java_short_sig.matches("@Transactional").count(),
+        1,
+        "Short Java inline @Transactional must appear exactly once: {java_short_sig}"
+    );
+
+    // 5. Java parameter annotation matching method annotation must NOT suppress the method annotation
+    for java_nullable_src in [
+        "class Repo {\n    @Nullable public String find(@Nullable String key) { return key; }\n}\n",
+        "class Repo {\n    public @Nullable String find(@Nullable String key) { return key; }\n}\n",
+    ] {
+        let sig = parse_first(SupportedLanguage::Java, java_nullable_src);
+        let head = sig.split('(').next().unwrap_or("");
+        assert!(
+            head.contains("@Nullable"),
+            "Method @Nullable annotation must not be suppressed by parameter @Nullable: {sig}"
+        );
+        assert_eq!(
+            sig.matches("@Nullable").count(),
+            2,
+            "Expected both method and parameter @Nullable in signature: {sig}"
+        );
+    }
+
+    // 6. C# route constraints & colons inside arguments (`{id:int}`, `{id:guid}`, `"admin:billing"`)
+    for (cs_attr_src, expected_sub) in [
+        (
+            "class Api {\n    [HttpGet(\"/orders/{id:int}\")]\n    public bool GetOrder(int id) { return id > 0; }\n}\n",
+            "[HttpGet(\"/orders/{id:int}\")]",
+        ),
+        (
+            "class Api {\n    [Route(\"api/{id:guid}\")]\n    public bool GetGuid(string id) { return !string.IsNullOrEmpty(id); }\n}\n",
+            "[Route(\"api/{id:guid}\")]",
+        ),
+        (
+            "class Api {\n    [Authorize(Roles = \"admin:billing\")]\n    public bool AdminOp(int id) { return id > 0; }\n}\n",
+            "[Authorize(Roles = \"admin:billing\")]",
+        ),
+        (
+            "class Api {\n    [method: HttpPost(\"/refunds/{id:int}\")]\n    public bool PostRefund(int id) { return id > 0; }\n}\n",
+            "[method: HttpPost(\"/refunds/{id:int}\")]",
+        ),
+    ] {
+        let sig = parse_first(SupportedLanguage::CSharp, cs_attr_src);
+        assert!(
+            sig.contains(expected_sub),
+            "C# attribute `{expected_sub}` with colon in route/arg must be preserved: {sig}"
+        );
+    }
+
+    // 7. Defensive dedup: if fallback `raw_sig` retains compound `[Authorize, HttpPost("/refunds")]`,
+    // neither `[Authorize]` nor `[HttpPost("/refunds")]` may be prepended twice.
+    let mut parser = Parser::new();
+    parser
+        .set_language(&SupportedLanguage::CSharp.language_fn())
+        .unwrap();
+    let cs_compound_src = "class Api {\n    [Authorize, HttpPost(\"/refunds\")]\n    public bool Refund(int id) { return id > 0; }\n}\n";
+    let tree = parser.parse(cs_compound_src, None).unwrap();
+    fn find_cs_method<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+        if n.kind() == "method_declaration" {
+            return Some(n);
+        }
+        let mut c = n.walk();
+        for ch in n.named_children(&mut c) {
+            if let Some(m) = find_cs_method(ch) {
+                return Some(m);
+            }
+        }
+        None
+    }
+    let cs_method = find_cs_method(tree.root_node()).unwrap();
+    let compound_raw_sig = compact_definition_signature_with_ast_opts(
+        SupportedLanguage::CSharp,
+        &cs_method,
+        Some("class Api"),
+        Some("[Authorize, HttpPost(\"/refunds\")] public bool Refund(int id) {"),
+        cs_compound_src,
+        SigFormatOpts {
+            max_chars: 180,
+            scope_sep: " › ",
+            preserve_key_decorators: true,
+            greedy_params: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        compound_raw_sig.matches("Authorize").count(),
+        1,
+        "Compound C# attribute must not duplicate Authorize: {compound_raw_sig}"
+    );
+    assert_eq!(
+        compound_raw_sig.matches("HttpPost(\"/refunds\")").count(),
+        1,
+        "Compound C# attribute must not duplicate HttpPost: {compound_raw_sig}"
+    );
 }

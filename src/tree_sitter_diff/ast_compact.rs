@@ -1295,9 +1295,9 @@ pub(super) fn fold_inline_tests_in_new_chunk(
     }
 }
 
-/// Parses an optional trailing ` (+N more)` count from a merged hunk signature, strips
-/// a redundant leading `<scope> > ` prefix when it already matches `scope_label`, and
-/// returns `None` when the signature is just the enclosing `scope_label` itself (e.g. `use`
+/// Parses an optional trailing ` (+N more)` or ` [+ a, b, ...]` count from a merged hunk signature,
+/// strips a redundant leading `<scope> > ` / `<scope> › ` prefix when it already matches `scope_label`,
+/// and returns `None` when the signature is just the enclosing `scope_label` itself (e.g. `use`
 /// edits inside `mod tests` outside any test function).
 fn normalize_modified_inline_sig(
     sig: &str,
@@ -1305,8 +1305,12 @@ fn normalize_modified_inline_sig(
 ) -> (Option<String>, Option<usize>) {
     let mut trimmed = sig.trim();
     if let Some(scope) = scope_label {
-        let prefix = format!("{scope} > ");
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+        let prefix_gt = format!("{scope} > ");
+        let prefix_guil = format!("{scope} › ");
+        if let Some(rest) = trimmed
+            .strip_prefix(&prefix_gt)
+            .or_else(|| trimmed.strip_prefix(&prefix_guil))
+        {
             trimmed = rest.trim();
         } else {
             let head = trimmed.trim_end_matches(['{', ':']).trim();
@@ -1322,7 +1326,26 @@ fn normalize_modified_inline_sig(
     let extra_count = trimmed
         .strip_suffix(" more)")
         .and_then(|before| before.rsplit_once(" (+"))
-        .and_then(|(_, num)| num.parse::<usize>().ok());
+        .and_then(|(_, num)| num.parse::<usize>().ok())
+        .or_else(|| {
+            let inner = trimmed
+                .strip_suffix(']')
+                .and_then(|before| before.rsplit_once(" [+ "))
+                .map(|(_, list)| list)?;
+            let mut count = 0usize;
+            for item in inner.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(n) = item
+                    .strip_prefix('+')
+                    .and_then(|r| r.strip_suffix(" more"))
+                    .and_then(|n| n.parse::<usize>().ok())
+                {
+                    count += n;
+                } else {
+                    count += 1;
+                }
+            }
+            (count > 0).then_some(count)
+        });
     (
         Some(trimmed.to_string()),
         extra_count.map(|extra| 1 + extra),
@@ -1457,7 +1480,7 @@ fn first_non_empty_indent<'a>(
     default_indent
 }
 
-fn is_foldable_function_node(lang: SupportedLanguage, node: &tree_sitter::Node) -> bool {
+pub(super) fn is_foldable_function_node(lang: SupportedLanguage, node: &tree_sitter::Node) -> bool {
     let kind = node.kind();
     match lang {
         SupportedLanguage::Rust => matches!(kind, "function_item" | "macro_definition"),

@@ -8,6 +8,7 @@ use std::{
 #[cfg(feature = "tree-sitter")]
 mod ast_compact;
 mod diff_expand;
+pub mod hybrid;
 #[cfg(feature = "tree-sitter")]
 mod signature;
 #[cfg(feature = "tree-sitter")]
@@ -17,13 +18,15 @@ mod tests;
 
 pub use diff_expand::{
     generate_expanded_commit_diff, generate_expanded_diff, generate_expanded_diff_for_source,
-    git_commit_expanded_file, git_diff_expanded_file, git_expanded_patch_file,
-    is_lockfile_or_generated,
+    generate_expanded_diff_with_config, git_commit_expanded_file, git_diff_expanded_file,
+    git_expanded_patch_file, is_lockfile_or_generated,
 };
+pub use hybrid::HybridConfig;
 
 /// 1-based inclusive source line span `(start_line, end_line)` for a rendered diff line.
 type SourceLineSpan = (usize, usize);
 /// Per-line mapping from rendered diff lines to optional 1-based source line spans.
+#[cfg(feature = "tree-sitter")]
 type SourceLineMap = Vec<Option<SourceLineSpan>>;
 
 /// Maximum number of lines an AST definition is allowed to expand to for general code.
@@ -85,7 +88,7 @@ const MAX_TREESITTER_FILE_BYTES: usize = 1024 * 1024;
 const TREESITTER_PARSE_TIMEOUT_MICROS: u64 = 500_000;
 
 /// Languages with built-in Tree-Sitter grammars supported for diff context expansion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SupportedLanguage {
     Rust,
     Python,
@@ -306,16 +309,44 @@ fn get_node_text_same_line<'a>(node: &tree_sitter::Node, lines: &[&'a str]) -> O
 /// Computes the bounding line range of named children in `container` that intersect
 /// `[start_row, end_row]`. Returns `(start_line, end_line, primary_child, def_count)`.
 #[cfg(feature = "tree-sitter")]
+#[allow(dead_code)]
 fn bounding_range_of_intersecting_children<'a>(
     lang: SupportedLanguage,
     container: &tree_sitter::Node<'a>,
     start_row: usize,
     end_row: usize,
 ) -> Option<(usize, usize, Option<tree_sitter::Node<'a>>, usize)> {
+    let bounds =
+        bounding_range_of_intersecting_children_with_defs(lang, container, start_row, end_row)?;
+    Some((
+        bounds.start_line,
+        bounds.end_line,
+        bounds.primary_child,
+        bounds.def_count,
+    ))
+}
+
+#[cfg(feature = "tree-sitter")]
+struct IntersectingChildrenBounds<'a> {
+    start_line: usize,
+    end_line: usize,
+    primary_child: Option<tree_sitter::Node<'a>>,
+    def_count: usize,
+    primary_defs: Vec<tree_sitter::Node<'a>>,
+}
+
+#[cfg(feature = "tree-sitter")]
+fn bounding_range_of_intersecting_children_with_defs<'a>(
+    lang: SupportedLanguage,
+    container: &tree_sitter::Node<'a>,
+    start_row: usize,
+    end_row: usize,
+) -> Option<IntersectingChildrenBounds<'a>> {
     let mut min_row = None;
     let mut max_row = None;
     let mut primary_child = None;
     let mut def_count = 0;
+    let mut primary_defs = Vec::new();
 
     let mut cursor = container.walk();
     for child in container.named_children(&mut cursor) {
@@ -324,9 +355,11 @@ fn bounding_range_of_intersecting_children<'a>(
         if c_end >= start_row && c_start <= end_row {
             min_row = Some(min_row.map_or(c_start, |m: usize| m.min(c_start)));
             max_row = Some(max_row.map_or(c_end, |m: usize| m.max(c_end)));
-            let is_primary = check_primary_definition(lang, &child).is_some();
-            if is_primary {
+            let matched_primary = check_primary_definition(lang, &child);
+            let is_primary = matched_primary.is_some();
+            if let Some(mp) = matched_primary {
                 def_count += 1;
+                primary_defs.push(mp);
             }
             let should_replace = match &primary_child {
                 None => true,
@@ -345,7 +378,13 @@ fn bounding_range_of_intersecting_children<'a>(
     }
 
     if let (Some(s), Some(e)) = (min_row, max_row) {
-        Some((s + 1, e + 1, primary_child, def_count))
+        Some(IntersectingChildrenBounds {
+            start_line: s + 1,
+            end_line: e + 1,
+            primary_child,
+            def_count,
+            primary_defs,
+        })
     } else {
         None
     }
@@ -795,11 +834,15 @@ struct EnclosingMatch {
     exp_start: usize,
     exp_end: usize,
     signature: Option<String>,
+    bare_name: Option<String>,
     parent_scope: Option<String>,
     is_clamped: bool,
     full_start: usize,
     full_end: usize,
     extra_defs: usize,
+    extra_names: Vec<String>,
+    /// For single-function matches: `(body_start_line_1idx, body_start_col_bytes, body_end_line_1idx)`.
+    func_body_span: Option<(usize, usize, usize)>,
 }
 
 /// Finds the enclosing definition AST node spanning `[start_line, end_line]` (1-indexed),
@@ -823,6 +866,7 @@ fn find_enclosing_definition_full_range(
         source,
         file_path,
         deleted_lines,
+        HybridConfig::off(),
     );
     let sig = match (m.signature, m.extra_defs) {
         (Some(s), extra) if extra > 0 => Some(format!("{s} (+{extra} more)")),
@@ -839,6 +883,7 @@ fn find_enclosing_definition_full_range(
 }
 
 #[cfg(feature = "tree-sitter")]
+#[allow(clippy::too_many_arguments)]
 fn find_enclosing_definition_detail(
     lang: SupportedLanguage,
     root: &tree_sitter::Node,
@@ -847,6 +892,7 @@ fn find_enclosing_definition_detail(
     source: &str,
     file_path: Option<&Path>,
     deleted_lines: usize,
+    hybrid: HybridConfig,
 ) -> EnclosingMatch {
     let start_row = start_line.saturating_sub(1);
     let end_row = end_line.saturating_sub(1);
@@ -887,17 +933,6 @@ fn find_enclosing_definition_detail(
             let matched_start = (matched.start_position().row + 1).min(max_line);
             let matched_end = (matched.end_position().row + 1).min(max_line);
             let span = matched_end.saturating_sub(matched_start) + 1;
-            let raw_sig = signature::extract_signature(lang, &matched, &lines, source);
-            let parent_scope =
-                signature::extract_parent_scope_prefix(lang, &matched, &lines, source);
-            let sig = signature::compact_definition_signature_with_ast(
-                lang,
-                &matched,
-                parent_scope.as_deref(),
-                raw_sig.as_deref(),
-                source,
-                120,
-            );
 
             let is_test = test_scope::is_test_scope(lang, &matched, file_path, &lines);
             let change_span = (end_line.saturating_sub(start_line) + 1).max(deleted_lines);
@@ -912,43 +947,120 @@ fn find_enclosing_definition_detail(
             let full_start = matched_start.min(start_line);
             let full_end = matched_end.max(end_line).min(max_line);
 
-            if span <= max_allowed && !is_low_churn {
-                return EnclosingMatch {
-                    exp_start: full_start,
-                    exp_end: full_end,
-                    signature: sig,
-                    parent_scope,
-                    is_clamped: false,
-                    full_start,
-                    full_end,
-                    extra_defs: 0,
-                };
+            let (exp_start, exp_end, is_clamped) = if span <= max_allowed && !is_low_churn {
+                (full_start, full_end, false)
             } else {
-                let clamped_start = start_line
+                let cs = start_line
                     .saturating_sub(CLAMPED_CONTEXT_LINES)
                     .max(matched_start);
-                let clamped_end = (end_line + CLAMPED_CONTEXT_LINES).min(matched_end);
-                let is_clamped = clamped_start > matched_start || clamped_end < matched_end;
-                return EnclosingMatch {
-                    exp_start: clamped_start,
-                    exp_end: clamped_end,
-                    signature: sig,
-                    parent_scope,
-                    is_clamped,
-                    full_start,
-                    full_end,
-                    extra_defs: 0,
+                let ce = (end_line + CLAMPED_CONTEXT_LINES).min(matched_end);
+                (cs, ce, cs > matched_start || ce < matched_end)
+            };
+
+            let decl_cut_off = exp_start > matched_start;
+            let sig_max_chars = if hybrid.layer2 && decl_cut_off {
+                200
+            } else {
+                120
+            };
+            let raw_sig = signature::extract_signature(lang, &matched, &lines, source);
+            let parent_scope =
+                signature::extract_parent_scope_prefix(lang, &matched, &lines, source);
+            let sig = signature::compact_definition_signature_with_ast_opts(
+                lang,
+                &matched,
+                parent_scope.as_deref(),
+                raw_sig.as_deref(),
+                source,
+                signature::SigFormatOpts {
+                    max_chars: sig_max_chars,
+                    scope_sep: hybrid.scope_sep(),
+                    preserve_key_decorators: hybrid.layer2,
+                    greedy_params: hybrid.layer2,
+                },
+            );
+            let bare_name = ast_compact::bare_def_name(lang, &matched, &lines, source);
+            let func_body_span = if ast_compact::is_foldable_function_node(lang, &matched)
+                || matched.kind() == "decorated_definition"
+                || matched.kind() == "export_statement"
+            {
+                let inner = match matched.kind() {
+                    "decorated_definition" => {
+                        matched.child_by_field_name("definition").unwrap_or(matched)
+                    }
+                    "export_statement" => matched
+                        .child_by_field_name("declaration")
+                        .unwrap_or(matched),
+                    _ => matched,
                 };
-            }
+                if ast_compact::is_foldable_function_node(lang, &inner) {
+                    signature::find_ast_body_node(lang, &inner).map(|b| {
+                        (
+                            b.start_position().row + 1,
+                            b.start_position().column,
+                            (b.end_position().row + 1).min(max_line),
+                        )
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            return EnclosingMatch {
+                exp_start,
+                exp_end,
+                signature: sig,
+                bare_name,
+                parent_scope,
+                is_clamped,
+                full_start,
+                full_end,
+                extra_defs: 0,
+                extra_names: Vec::new(),
+                func_body_span,
+            };
         }
 
         if is_root || is_module_level_container_node(lang, &node) {
-            if let Some((raw_c_start, raw_c_end, sig_node, def_count)) =
-                bounding_range_of_intersecting_children(lang, &node, start_row, end_row)
+            if let Some(IntersectingChildrenBounds {
+                start_line: raw_c_start,
+                end_line: raw_c_end,
+                primary_child: sig_node,
+                def_count,
+                primary_defs,
+            }) =
+                bounding_range_of_intersecting_children_with_defs(lang, &node, start_row, end_row)
             {
                 if def_count > 0 || is_root {
                     let c_start = raw_c_start.min(max_line);
                     let c_end = raw_c_end.min(max_line);
+                    let extra_defs = def_count.saturating_sub(1);
+                    let span = c_end.saturating_sub(c_start) + 1;
+                    let is_test = test_scope::is_test_scope(lang, &node, file_path, &lines)
+                        || sig_node.as_ref().is_some_and(|sn| {
+                            test_scope::is_test_scope(lang, sn, file_path, &lines)
+                        });
+                    let max_allowed = if is_test {
+                        MAX_TEST_EXPANSION_LINES
+                    } else {
+                        MAX_EXPANSION_LINES
+                    };
+
+                    let full_start = c_start.min(start_line);
+                    let full_end = c_end.max(end_line).min(max_line);
+
+                    let (exp_start, exp_end, is_clamped) = if span <= max_allowed {
+                        (full_start, full_end, false)
+                    } else {
+                        let cs = start_line
+                            .saturating_sub(CLAMPED_CONTEXT_LINES)
+                            .max(c_start);
+                        let ce = (end_line + CLAMPED_CONTEXT_LINES).min(c_end);
+                        (cs, ce, cs > c_start || ce < c_end)
+                    };
+
                     let parent_scope = if def_count > 0 {
                         sig_node.as_ref().and_then(|n| {
                             signature::extract_parent_scope_prefix(lang, n, &lines, source)
@@ -970,61 +1082,58 @@ fn find_enclosing_definition_detail(
                     } else {
                         None
                     };
+                    let sig_max_chars = if hybrid.layer2 && exp_start > c_start {
+                        200
+                    } else {
+                        120
+                    };
                     let sig = if let Some(sn) = &sig_node {
-                        signature::compact_definition_signature_with_ast(
+                        signature::compact_definition_signature_with_ast_opts(
                             lang,
                             sn,
                             parent_scope.as_deref(),
                             raw_sig.as_deref(),
                             source,
-                            120,
+                            signature::SigFormatOpts {
+                                max_chars: sig_max_chars,
+                                scope_sep: hybrid.scope_sep(),
+                                preserve_key_decorators: hybrid.layer2,
+                                greedy_params: hybrid.layer2,
+                            },
                         )
                     } else {
                         None
                     };
-                    let extra_defs = def_count.saturating_sub(1);
-                    let span = c_end.saturating_sub(c_start) + 1;
-                    let is_test = test_scope::is_test_scope(lang, &node, file_path, &lines)
-                        || sig_node.as_ref().is_some_and(|sn| {
-                            test_scope::is_test_scope(lang, sn, file_path, &lines)
-                        });
-                    let max_allowed = if is_test {
-                        MAX_TEST_EXPANSION_LINES
-                    } else {
-                        MAX_EXPANSION_LINES
-                    };
-
-                    let full_start = c_start.min(start_line);
-                    let full_end = c_end.max(end_line).min(max_line);
-
-                    if span <= max_allowed {
-                        return EnclosingMatch {
-                            exp_start: full_start,
-                            exp_end: full_end,
-                            signature: sig,
-                            parent_scope,
-                            is_clamped: false,
-                            full_start,
-                            full_end,
-                            extra_defs,
-                        };
-                    } else {
-                        let clamped_start = start_line
-                            .saturating_sub(CLAMPED_CONTEXT_LINES)
-                            .max(c_start);
-                        let clamped_end = (end_line + CLAMPED_CONTEXT_LINES).min(c_end);
-                        let is_clamped = clamped_start > c_start || clamped_end < c_end;
-                        return EnclosingMatch {
-                            exp_start: clamped_start,
-                            exp_end: clamped_end,
-                            signature: sig,
-                            parent_scope,
-                            is_clamped,
-                            full_start,
-                            full_end,
-                            extra_defs,
-                        };
+                    let bare_name = sig_node
+                        .as_ref()
+                        .and_then(|sn| ast_compact::bare_def_name(lang, sn, &lines, source));
+                    let mut extra_names = Vec::new();
+                    if hybrid.layer2 && primary_defs.len() > 1 {
+                        for def in &primary_defs {
+                            if let Some(nm) = ast_compact::bare_def_name(lang, def, &lines, source)
+                            {
+                                if bare_name.as_deref() != Some(nm.as_str())
+                                    && !extra_names.contains(&nm)
+                                {
+                                    extra_names.push(nm);
+                                }
+                            }
+                        }
                     }
+
+                    return EnclosingMatch {
+                        exp_start,
+                        exp_end,
+                        signature: sig,
+                        bare_name,
+                        parent_scope,
+                        is_clamped,
+                        full_start,
+                        full_end,
+                        extra_defs,
+                        extra_names,
+                        func_body_span: None,
+                    };
                 }
             }
             if is_root {
@@ -1042,10 +1151,13 @@ fn find_enclosing_definition_detail(
         exp_start: start_line,
         exp_end: end_line,
         signature: None,
+        bare_name: None,
         parent_scope: None,
         is_clamped: false,
         full_start: start_line,
         full_end: end_line,
         extra_defs: 0,
+        extra_names: Vec::new(),
+        func_body_span: None,
     }
 }
