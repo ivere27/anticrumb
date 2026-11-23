@@ -947,6 +947,7 @@ struct ExpandedChunkData {
     local_context: Vec<hybrid::ContextEntry>,
     cross_query: Option<hybrid::FileRefQuery>,
     exposed_defs: Vec<String>,
+    reverse_targets: Vec<hybrid::ReverseTarget>,
 }
 
 #[cfg(feature = "tree-sitter")]
@@ -1176,42 +1177,27 @@ fn expand_chunk_with_treesitter(
             cat_arg.push(path.as_os_str());
             let mut cat_cmd = git_cmd(repo_root);
             cat_cmd.arg("cat-file").arg("blob").arg(&cat_arg);
-            let mut child = match cat_cmd
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(c) => c,
+            let output = match super::run_cmd_with_timeout(
+                cat_cmd,
+                std::time::Duration::from_secs(5),
+                Some(MAX_TREESITTER_FILE_BYTES + 1),
+            ) {
+                Ok(o) => o,
                 Err(_) => return Ok(None),
             };
-
-            let mut stdout = child.stdout.take().expect("stdout piped");
-            let mut bytes = Vec::new();
-            use std::io::Read;
-            let mut take_reader = (&mut stdout).take(MAX_TREESITTER_FILE_BYTES as u64 + 1);
-            if take_reader.read_to_end(&mut bytes).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if output.timed_out {
                 return Ok(None);
             }
-            if bytes.len() > MAX_TREESITTER_FILE_BYTES {
-                drop(stdout);
-                let _ = child.kill();
-                let _ = child.wait();
+            if output.truncated || output.stdout.len() > MAX_TREESITTER_FILE_BYTES {
                 return Err(ServiceError::invalid(format!(
                     "file size ({} bytes) exceeds tree-sitter limit (1 MiB)",
-                    bytes.len()
+                    output.stdout.len()
                 )));
             }
-            drop(stdout);
-            let status = match child.wait() {
-                Ok(s) => s,
-                Err(_) => return Ok(None),
-            };
-            if !status.success() {
+            if !output.status.is_some_and(|s| s.success()) {
                 return Ok(None);
             }
-            String::from_utf8_lossy(&bytes).into_owned()
+            String::from_utf8_lossy(&output.stdout).into_owned()
         }
         GitDiffSource::Unstaged => {
             let full_path = repo_root.join(path);
@@ -1255,6 +1241,7 @@ fn expand_chunk_with_treesitter(
                 local_context: Vec::new(),
                 cross_query: None,
                 exposed_defs: Vec::new(),
+                reverse_targets: Vec::new(),
             },
         ))));
     }
@@ -1309,6 +1296,7 @@ fn expand_chunk_with_treesitter(
                 local_context: Vec::new(),
                 cross_query: None,
                 exposed_defs: Vec::new(),
+                reverse_targets: Vec::new(),
             },
         ))));
     }
@@ -1322,9 +1310,13 @@ fn expand_chunk_with_treesitter(
         change_end: usize,
         signature: Option<String>,
         bare_name: Option<String>,
+        is_type_def: bool,
+        parent_hints: Vec<String>,
+        func_sig_end_line: Option<usize>,
+        changed_is_attr_or_comment: bool,
         def_span: usize,
         extra_defs: usize,
-        extra_names: Vec<String>,
+        extra_names: Vec<(String, bool)>,
         is_entry_clamped: bool,
         use_raw_sig_fallback: bool,
         sig_only_candidate: Option<(usize, usize, usize)>, // (body_start_line, body_end_line, body_span)
@@ -1371,6 +1363,10 @@ fn expand_chunk_with_treesitter(
                 change_end: (hunk.new_start + hunk.new_count.saturating_sub(1)).max(1),
                 signature: sig_opt,
                 bare_name: None,
+                is_type_def: false,
+                parent_hints: Vec::new(),
+                func_sig_end_line: None,
+                changed_is_attr_or_comment: false,
                 def_span: 0,
                 extra_defs: 0,
                 extra_names: Vec::new(),
@@ -1397,6 +1393,10 @@ fn expand_chunk_with_treesitter(
                 change_end: 1,
                 signature: None,
                 bare_name: None,
+                is_type_def: false,
+                parent_hints: Vec::new(),
+                func_sig_end_line: None,
+                changed_is_attr_or_comment: false,
                 def_span: 0,
                 extra_defs: 0,
                 extra_names: Vec::new(),
@@ -1497,6 +1497,10 @@ fn expand_chunk_with_treesitter(
                     change_end,
                     signature: container_sig,
                     bare_name: None,
+                    is_type_def: false,
+                    parent_hints: Vec::new(),
+                    func_sig_end_line: None,
+                    changed_is_attr_or_comment: false,
                     def_span: 0,
                     extra_defs: 0,
                     extra_names: Vec::new(),
@@ -1512,6 +1516,9 @@ fn expand_chunk_with_treesitter(
 
         let mut sig = matched.signature;
         let mut bare_name = matched.bare_name;
+        let mut is_type_def = matched.is_type_def;
+        let mut parent_hints = hybrid::extract_parent_hint_tokens(matched.parent_scope.as_deref());
+        let mut func_sig_end_line = matched.func_body_span.map(|(bs, _, _)| bs);
         let mut extra_defs = matched.extra_defs;
         let mut extra_names = matched.extra_names;
         let mut full_start = full_start_raw;
@@ -1598,6 +1605,10 @@ fn expand_chunk_with_treesitter(
                             extra_defs = la.extra_defs;
                             extra_names = la.extra_names;
                             bare_name = la.bare_name;
+                            is_type_def = la.is_type_def;
+                            parent_hints =
+                                hybrid::extract_parent_hint_tokens(la.parent_scope.as_deref());
+                            func_sig_end_line = la.func_body_span.map(|(bs, _, _)| bs);
 
                             if def_span > ATTR_ONLY_MAX_EXPANSION_LINES {
                                 // Cap attribute/comment-only edits on large functions to signature + top of body
@@ -1640,6 +1651,9 @@ fn expand_chunk_with_treesitter(
                 extra_defs = 0;
                 extra_names.clear();
                 bare_name = None;
+                is_type_def = false;
+                parent_hints.clear();
+                func_sig_end_line = None;
                 if hunk.new_count == 0 {
                     sig = find_enclosing_parent_scope_for_line(
                         lang,
@@ -1688,6 +1702,10 @@ fn expand_chunk_with_treesitter(
             change_end,
             signature: sig,
             bare_name,
+            is_type_def,
+            parent_hints,
+            func_sig_end_line,
+            changed_is_attr_or_comment,
             def_span,
             extra_defs,
             extra_names,
@@ -1741,10 +1759,16 @@ fn expand_chunk_with_treesitter(
 
     entries.sort_by_key(|e| (e.exp_start, e.hunk.new_start));
 
-    // Collect changed symbols (for Layer 1, prioritizing non-inline-test symbols) and change ranges
+    // Collect changed symbols (for Layer 1, prioritizing non-inline-test symbols),
+    // change ranges, and Layer 3-③ reverse caller targets.
     let mut prod_changed_symbols: Vec<String> = Vec::new();
     let mut all_changed_symbols: Vec<String> = Vec::new();
     let mut changed_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut reverse_targets: Vec<hybrid::ReverseTarget> = Vec::new();
+    let collect_rev = !is_test_file_path(path)
+        && hybrid.layer3_callers
+        && !matches!(lang, SupportedLanguage::Json | SupportedLanguage::Bash);
+    let mut seen_rev_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &entries {
         let is_inline_test = inline_test_blocks
             .iter()
@@ -1758,12 +1782,73 @@ fn expand_chunk_with_treesitter(
                 prod_changed_symbols.push(bn.clone());
             }
         }
-        for nm in &entry.extra_names {
+        for (nm, _) in &entry.extra_names {
             if !all_changed_symbols.contains(nm) {
                 all_changed_symbols.push(nm.clone());
             }
             if !is_inline_test && !prod_changed_symbols.contains(nm) {
                 prod_changed_symbols.push(nm.clone());
+            }
+        }
+        if collect_rev && !is_inline_test {
+            let comment_only_edit = entry.changed_is_attr_or_comment && entry.hunk.new_count > 0;
+            if !comment_only_edit {
+                let base_sig_changed = entry.sig_only_body_lines.is_some()
+                    || entry
+                        .func_sig_end_line
+                        .is_some_and(|sb| entry.change_start <= sb)
+                    || entry.change_start <= entry.full_start.saturating_add(1);
+                if let Some(ref bn) = entry.bare_name {
+                    if seen_rev_syms.insert(bn.clone()) {
+                        reverse_targets.push(hybrid::ReverseTarget {
+                            symbol: bn.clone(),
+                            def_file: path.to_path_buf(),
+                            lang,
+                            is_type: entry.is_type_def,
+                            sig_changed: entry.is_type_def || base_sig_changed,
+                            parent_hints: entry.parent_hints.clone(),
+                        });
+                    }
+                }
+                for (nm, nm_is_type) in &entry.extra_names {
+                    if seen_rev_syms.insert(nm.clone()) {
+                        reverse_targets.push(hybrid::ReverseTarget {
+                            symbol: nm.clone(),
+                            def_file: path.to_path_buf(),
+                            lang,
+                            is_type: *nm_is_type,
+                            sig_changed: *nm_is_type || base_sig_changed,
+                            parent_hints: entry.parent_hints.clone(),
+                        });
+                    }
+                }
+            }
+            let extract_deleted_defs = (entry.hunk.new_count == 0
+                && (entry.bare_name.is_none() || entry.is_type_def))
+                || (entry.hunk.new_count > 0
+                    && entry.hunk.old_count > 0
+                    && (entry.bare_name.is_none()
+                        || entry.is_type_def
+                        || entry.sig_only_body_lines.is_some()
+                        || entry
+                            .func_sig_end_line
+                            .is_some_and(|sb| entry.change_start <= sb)
+                        || entry.change_start <= entry.full_start.saturating_add(1)));
+            if extract_deleted_defs {
+                let del_lines: Vec<&str> = entry
+                    .hunk
+                    .lines
+                    .iter()
+                    .filter_map(|l| l.strip_prefix('-'))
+                    .collect();
+                if !del_lines.is_empty() {
+                    for rt in hybrid::collect_deleted_lines_reverse_targets(&del_lines, path, lang)
+                    {
+                        if seen_rev_syms.insert(rt.symbol.clone()) {
+                            reverse_targets.push(rt);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1781,6 +1866,7 @@ fn expand_chunk_with_treesitter(
             .iter()
             .any(|b| entry.exp_start >= b.start_line && entry.exp_end <= b.end_line);
         let mut entry_sigs = Vec::new();
+        let extra_sig_names: Vec<String> = entry.extra_names.into_iter().map(|(s, _)| s).collect();
         if let Some(s) = entry.signature {
             entry_sigs.push(MergedHunkSig {
                 sig: s,
@@ -1788,7 +1874,7 @@ fn expand_chunk_with_treesitter(
                 is_clamped: entry.is_entry_clamped,
                 def_span: entry.def_span,
                 extra_defs: entry.extra_defs,
-                extra_names: entry.extra_names,
+                extra_names: extra_sig_names,
             });
         } else if entry.use_raw_sig_fallback && !entry.hunk.signature.is_empty() {
             entry_sigs.push(MergedHunkSig {
@@ -1797,7 +1883,7 @@ fn expand_chunk_with_treesitter(
                 is_clamped: entry.is_entry_clamped,
                 def_span: entry.def_span,
                 extra_defs: entry.extra_defs,
-                extra_names: entry.extra_names,
+                extra_names: extra_sig_names,
             });
         }
 
@@ -2009,6 +2095,7 @@ fn expand_chunk_with_treesitter(
             local_context,
             cross_query,
             exposed_defs,
+            reverse_targets,
         },
     ))))
 }
@@ -2054,10 +2141,12 @@ fn git_diff_w_all(repo_root: &Path, source: GitDiffSource<'_>) -> Result<String>
             ]);
         }
     }
-    let output = cmd
-        .output()
+    let output = super::run_cmd_with_timeout(cmd, std::time::Duration::from_secs(15), None)
         .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
-    if !output.status.success() {
+    if output.timed_out {
+        return Err(ServiceError::invalid("git fallback diff -W timed out"));
+    }
+    if !output.status.is_some_and(|s| s.success()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ServiceError::invalid(format!(
             "git fallback diff -W failed: {stderr}"
@@ -2125,10 +2214,12 @@ fn git_diff_w_for_file(
         }
     }
     cmd.arg(path);
-    let output = cmd
-        .output()
+    let output = super::run_cmd_with_timeout(cmd, std::time::Duration::from_secs(15), None)
         .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
-    if !output.status.success() {
+    if output.timed_out {
+        return Err(ServiceError::invalid("git fallback diff -W timed out"));
+    }
+    if !output.status.is_some_and(|s| s.success()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ServiceError::invalid(format!(
             "git fallback diff -W failed: {stderr}"
@@ -2673,29 +2764,20 @@ fn has_generated_source_header_for_file(
             cat_arg.push(path.as_os_str());
             let mut cat_cmd = git_cmd(repo_root);
             cat_cmd.arg("cat-file").arg("blob").arg(&cat_arg);
-            let Ok(mut child) = cat_cmd
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            else {
+            let Ok(output) = super::run_cmd_with_timeout(
+                cat_cmd,
+                std::time::Duration::from_secs(5),
+                Some(HEADER_READ_LIMIT as usize),
+            ) else {
                 return false;
             };
-            let mut stdout = child.stdout.take().expect("stdout piped");
-            let mut buf = Vec::with_capacity(HEADER_READ_LIMIT as usize);
-            let read_res = (&mut stdout).take(HEADER_READ_LIMIT).read_to_end(&mut buf);
-            drop(stdout);
-            if read_res.is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if output.timed_out
+                || output.stdout.is_empty()
+                || (!output.truncated && !output.status.is_some_and(|s| s.success()))
+            {
                 return false;
             }
-            if buf.len() as u64 >= HEADER_READ_LIMIT {
-                let _ = child.kill();
-                let _ = child.wait();
-            } else if !child.wait().is_ok_and(|s| s.success()) {
-                return false;
-            }
-            buf
+            output.stdout
         }
     };
 
@@ -3781,6 +3863,8 @@ pub(super) struct ChunkHybridMeta {
     pub(super) cross_query: Option<hybrid::FileRefQuery>,
     #[cfg(feature = "tree-sitter")]
     pub(super) exposed_defs: Vec<String>,
+    #[cfg(feature = "tree-sitter")]
+    pub(super) reverse_targets: Vec<hybrid::ReverseTarget>,
 }
 
 fn split_raw_diff_chunks(raw_diff: &str) -> (String, Vec<String>) {
@@ -3939,21 +4023,35 @@ fn apply_patch_budget_with_hybrid(
                                   include_cross: bool,
                                   l3_budget: usize|
      -> Vec<hybrid::ContextEntry> {
-        if !hybrid.layer3_local && !(include_cross && hybrid.layer3_cross) {
+        if !hybrid.layer3_local
+            && !(include_cross && (hybrid.layer3_cross || hybrid.layer3_callers))
+        {
             return Vec::new();
         }
         let mut all_entries: Vec<hybrid::ContextEntry> = Vec::new();
-        let mut exposed_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut exposed_set: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut modified_files_norm: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut queries: Vec<hybrid::FileRefQuery> = Vec::new();
+        let mut reverse_targets: Vec<hybrid::ReverseTarget> = Vec::new();
 
         for c in list {
             let m = &c.hybrid_meta;
-            for d in &m.exposed_defs {
-                exposed_set.insert(d.clone());
-            }
-            if c.is_new && !c.is_test && !c.pre_omitted {
-                for s in &m.changed_symbols {
-                    exposed_set.insert(s.clone());
+            let path_norm = c
+                .path
+                .as_ref()
+                .map(|p| hybrid::normalize_path_key(p))
+                .unwrap_or_default();
+            if !path_norm.is_empty() {
+                modified_files_norm.insert(path_norm.clone());
+                for d in &m.exposed_defs {
+                    exposed_set.insert((path_norm.clone(), d.clone()));
+                }
+                if c.is_new && !c.is_test && !c.pre_omitted {
+                    for s in &m.changed_symbols {
+                        exposed_set.insert((path_norm.clone(), s.clone()));
+                    }
                 }
             }
             if hybrid.layer3_local {
@@ -3964,11 +4062,17 @@ fn apply_patch_budget_with_hybrid(
                     queries.push(q.clone());
                 }
             }
+            if include_cross && hybrid.layer3_callers {
+                reverse_targets.extend(m.reverse_targets.iter().cloned());
+            }
         }
-        let mut local_est_bytes = 64usize;
+        let mut est_bytes = 64usize;
         for e in &all_entries {
-            exposed_set.insert(e.symbol_name.clone());
-            local_est_bytes += e.snippet.len() + 48;
+            let p_norm = hybrid::normalize_path_key(&e.file_path);
+            if !p_norm.is_empty() {
+                exposed_set.insert((p_norm, e.symbol_name.clone()));
+            }
+            est_bytes += e.snippet.len() + 48;
         }
         // Only pay cross-file git/AST cost if meaningful budget remains after local entries
         // (2 KiB floor for very large diffs > 256 KiB so near-full budgets skip ~400ms overhead)
@@ -3980,7 +4084,7 @@ fn apply_patch_budget_with_hybrid(
         if include_cross
             && hybrid.layer3_cross
             && !queries.is_empty()
-            && l3_budget.saturating_sub(local_est_bytes) >= cross_min_rem
+            && l3_budget.saturating_sub(est_bytes) >= cross_min_rem
         {
             if let Some((repo_root, src)) = cross_ctx {
                 let cross = hybrid::resolve_cross_file_context(
@@ -3990,7 +4094,28 @@ fn apply_patch_budget_with_hybrid(
                     &exposed_set,
                     hybrid.scope_sep(),
                 );
+                for e in &cross {
+                    if e.pinned_by_import {
+                        est_bytes += e.snippet.len() + 48;
+                    }
+                }
                 all_entries.extend(cross);
+            }
+        }
+        if include_cross
+            && hybrid.layer3_callers
+            && !reverse_targets.is_empty()
+            && l3_budget.saturating_sub(est_bytes) >= cross_min_rem
+        {
+            if let Some((repo_root, src)) = cross_ctx {
+                let callers = hybrid::resolve_reverse_callers_context(
+                    repo_root,
+                    src,
+                    &reverse_targets,
+                    &modified_files_norm,
+                    hybrid.scope_sep(),
+                );
+                all_entries.extend(callers);
             }
         }
         all_entries
@@ -4001,12 +4126,13 @@ fn apply_patch_budget_with_hybrid(
         let layer2_bytes: usize = items.iter().map(|c| c.rendered.len()).sum();
         let used_so_far = base_prefix.len() + layer1_str.len() + layer2_bytes;
         #[cfg(feature = "tree-sitter")]
-        let layer3_str = if hybrid.layer3_local || hybrid.layer3_cross {
+        let layer3_str = if hybrid.layer3_local || hybrid.layer3_cross || hybrid.layer3_callers {
             let rem = max_bytes.saturating_sub(used_so_far);
             let l3_budget = hybrid::compute_layer3_budget(max_bytes, layer2_bytes, rem, false);
             if l3_budget >= 160 {
-                let entries = collect_layer3_entries(&items, hybrid.layer3_cross, l3_budget);
-                hybrid::render_layer3_context(entries, l3_budget, !hybrid.layer3_cross)
+                let include_cross = hybrid.layer3_cross || hybrid.layer3_callers;
+                let entries = collect_layer3_entries(&items, include_cross, l3_budget);
+                hybrid::render_layer3_context(entries, l3_budget, !include_cross)
                     .map(|(s, _)| s)
                     .unwrap_or_default()
             } else {
@@ -4506,12 +4632,12 @@ fn apply_patch_budget_with_hybrid(
 
     let used_before_l3 = base_prefix.len() + layer1_str.len() + banner.len() + final_layer2_bytes;
     #[cfg(feature = "tree-sitter")]
-    let layer3_str = if hybrid.layer3_local || hybrid.layer3_cross {
+    let layer3_str = if hybrid.layer3_local || hybrid.layer3_cross || hybrid.layer3_callers {
         let rem = max_bytes.saturating_sub(used_before_l3);
         let l3_budget =
             hybrid::compute_layer3_budget(max_bytes, final_layer2_bytes, rem, prod_compacted);
-        // Under production compaction pressure, skip cross-file resolution completely (0ms waste!)
-        let include_cross = !prod_compacted && hybrid.layer3_cross;
+        // Under production compaction pressure, skip cross-file & reverse-caller resolution completely (0ms waste!)
+        let include_cross = !prod_compacted && (hybrid.layer3_cross || hybrid.layer3_callers);
         if l3_budget >= 160 && (hybrid.layer3_local || include_cross) {
             let entries = collect_layer3_entries(&items, include_cross, l3_budget);
             hybrid::render_layer3_context(entries, l3_budget, !include_cross)
@@ -4557,12 +4683,15 @@ fn generate_diff_preamble(repo_root: &Path, source: GitDiffSource<'_>) -> String
         stat_cmd.arg("--staged");
     }
 
-    let stat_str = stat_cmd
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+    let stat_str = super::run_cmd_with_timeout(
+        stat_cmd,
+        std::time::Duration::from_secs(5),
+        Some(256 * 1024),
+    )
+    .ok()
+    .filter(|o| !o.timed_out && o.status.is_some_and(|s| s.success()))
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .unwrap_or_default();
 
     let trimmed = stat_str.trim_matches(|c| c == '\r' || c == '\n');
     if trimmed.is_empty() {
@@ -4721,10 +4850,12 @@ pub fn generate_expanded_diff_with_config(
                 ]);
             }
         }
-        let output = cmd
-            .output()
+        let output = super::run_cmd_with_timeout(cmd, std::time::Duration::from_secs(15), None)
             .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
-        if !output.status.success() {
+        if output.timed_out {
+            return Err(ServiceError::invalid("git diff command timed out"));
+        }
+        if !output.status.is_some_and(|s| s.success()) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.to_ascii_lowercase().contains("not a git repository") {
                 return Err(ServiceError::invalid("not a git repository"));
@@ -4758,8 +4889,12 @@ pub fn generate_expanded_diff_with_config(
                 "--format=",
                 sha,
             ]);
-            if let Ok(stat_output) = stat_cmd.output() {
-                if stat_output.status.success() {
+            if let Ok(stat_output) = super::run_cmd_with_timeout(
+                stat_cmd,
+                std::time::Duration::from_secs(5),
+                Some(256 * 1024),
+            ) {
+                if !stat_output.timed_out && stat_output.status.is_some_and(|s| s.success()) {
                     let stat_str = String::from_utf8_lossy(&stat_output.stdout);
                     let trimmed = stat_str.trim_matches(|c| c == '\r' || c == '\n');
                     if !trimmed.is_empty() {
@@ -4919,6 +5054,15 @@ pub fn generate_expanded_diff_with_config(
                 {
                     let mut meta = base_meta();
                     meta.changed_symbols = new_file_symbols;
+                    if is_deleted && !path_is_test && !is_special_mode && hybrid.layer3_callers {
+                        if let Some(lang) = SupportedLanguage::from_path(&target_path) {
+                            meta.reverse_targets = hybrid::collect_deleted_reverse_targets(
+                                chunk,
+                                &target_path,
+                                lang,
+                            );
+                        }
+                    }
                     return Ok((
                         RenderedChunk {
                             path: Some(target_path),
@@ -4989,6 +5133,7 @@ pub fn generate_expanded_diff_with_config(
                                     local_context: Vec::new(),
                                     cross_query: None,
                                     exposed_defs: Vec::new(),
+                                    reverse_targets: Vec::new(),
                                 }
                             }
                             Err(e) => {
@@ -5031,6 +5176,7 @@ pub fn generate_expanded_diff_with_config(
                                     local_context: Vec::new(),
                                     cross_query: None,
                                     exposed_defs: Vec::new(),
+                                    reverse_targets: Vec::new(),
                                 }
                             }
                         }
@@ -5071,6 +5217,7 @@ pub fn generate_expanded_diff_with_config(
                             local_context: Vec::new(),
                             cross_query: None,
                             exposed_defs: Vec::new(),
+                            reverse_targets: Vec::new(),
                         }
                     }
                 };
@@ -5093,6 +5240,7 @@ pub fn generate_expanded_diff_with_config(
                             local_context: expanded_data.local_context,
                             cross_query: expanded_data.cross_query,
                             exposed_defs: expanded_data.exposed_defs,
+                            reverse_targets: expanded_data.reverse_targets,
                         },
                     },
                     file_warnings,

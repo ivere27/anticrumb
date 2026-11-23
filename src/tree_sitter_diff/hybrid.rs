@@ -1,14 +1,14 @@
 //! 3-Layer Hybrid diff pipeline components for 1-turn LLM code review:
 //! - `HybridConfig`: configuration flags (default: `HybridConfig::full()`, with ablation presets for benchmarks)
 //! - Layer 1: Compact upfront commit symbol index (+ large new-file index)
-//! - Layer 3: Lightweight LSP-free Tree-sitter external AST context (same-file + 1-hop cross-file)
+//! - Layer 3: Lightweight LSP-free Tree-sitter external AST context (same-file + 1-hop forward & reverse)
 
 #[cfg(feature = "tree-sitter")]
 use super::{
     ast_compact, check_primary_definition,
-    diff_expand::{is_lockfile_or_generated, parse_with_timeout},
-    git_cmd, is_test_file_path, signature, GitDiffSource, SupportedLanguage,
-    MAX_TREESITTER_FILE_BYTES,
+    diff_expand::{has_generated_source_header, is_lockfile_or_generated, parse_with_timeout},
+    git_cmd, is_test_file_path, run_cmd_with_timeout, signature, test_scope, GitDiffSource,
+    SupportedLanguage, MAX_TREESITTER_FILE_BYTES,
 };
 #[cfg(feature = "tree-sitter")]
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "tree-sitter")]
 use std::process::Stdio;
 #[cfg(feature = "tree-sitter")]
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+#[cfg(feature = "tree-sitter")]
+use std::time::Duration;
 
 /// Configuration flags controlling the 3-Layer Hybrid diff pipeline.
 /// All layers default to `true` (`HybridConfig::full()`); individual layers can be toggled
@@ -35,6 +37,8 @@ pub struct HybridConfig {
     pub layer3_local: bool,
     /// Layer 3-②: 1-hop cross-file type definitions and body-stripped function signatures.
     pub layer3_cross: bool,
+    /// Layer 3-③: 1-hop reverse callers referencing modified or deleted production symbols.
+    pub layer3_callers: bool,
 }
 
 impl Default for HybridConfig {
@@ -50,6 +54,7 @@ impl HybridConfig {
             layer2: false,
             layer3_local: false,
             layer3_cross: false,
+            layer3_callers: false,
         }
     }
 
@@ -59,11 +64,12 @@ impl HybridConfig {
             layer2: true,
             layer3_local: true,
             layer3_cross: true,
+            layer3_callers: true,
         }
     }
 
     pub fn is_any_enabled(self) -> bool {
-        self.layer1 || self.layer2 || self.layer3_local || self.layer3_cross
+        self.layer1 || self.layer2 || self.layer3_local || self.layer3_cross || self.layer3_callers
     }
 
     pub fn parse(raw: Option<&str>) -> Self {
@@ -84,9 +90,11 @@ impl HybridConfig {
                 "l2" | "layer2" => cfg.layer2 = true,
                 "l3_local" | "l3-local" | "local" => cfg.layer3_local = true,
                 "l3_cross" | "l3-cross" | "cross" => cfg.layer3_cross = true,
+                "l3_callers" | "l3-callers" | "callers" => cfg.layer3_callers = true,
                 "l3" | "layer3" => {
                     cfg.layer3_local = true;
                     cfg.layer3_cross = true;
+                    cfg.layer3_callers = true;
                 }
                 "all" | "full" => return Self::full(),
                 _ => {}
@@ -277,7 +285,19 @@ pub(super) struct ContextEntry {
     pub(super) is_local: bool,
     pub(super) is_type_def: bool,
     pub(super) pinned_by_import: bool,
+    pub(super) is_caller: bool,
     pub(super) snippet: String,
+}
+
+#[cfg(feature = "tree-sitter")]
+#[derive(Clone, Debug)]
+pub(super) struct ReverseTarget {
+    pub(super) symbol: String,
+    pub(super) def_file: PathBuf,
+    pub(super) lang: SupportedLanguage,
+    pub(super) is_type: bool,
+    pub(super) sig_changed: bool,
+    pub(super) parent_hints: Vec<String>,
 }
 
 #[cfg(feature = "tree-sitter")]
@@ -300,14 +320,72 @@ pub(super) struct FileRefQuery {
 #[cfg(feature = "tree-sitter")]
 const MAX_CROSS_FILE_CANDIDATES: usize = 24;
 #[cfg(feature = "tree-sitter")]
-const MAX_CROSS_FILE_WALL_MS: u64 = 400;
+const MAX_CROSS_FILE_PARSE_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(feature = "tree-sitter")]
 const MAX_TYPE_SNIPPET_LINES: usize = 35;
+#[cfg(feature = "tree-sitter")]
+const MAX_GREP_LINE_BYTES: usize = 4 * 1024;
+#[cfg(feature = "tree-sitter")]
+const MAX_GREP_RAW_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "tree-sitter")]
+const MAX_GREP_RECORDS_PER_FILE: usize = 12;
+#[cfg(feature = "tree-sitter")]
+const MAX_GREP_RECORDS: usize = 400;
+#[cfg(feature = "tree-sitter")]
+const MAX_REVERSE_TARGET_SYMBOLS: usize = 32;
+#[cfg(feature = "tree-sitter")]
+const MAX_CALLER_CANDIDATE_FILES: usize = 24;
+#[cfg(feature = "tree-sitter")]
+const MAX_CALLERS_PER_TARGET: usize = 4;
+#[cfg(feature = "tree-sitter")]
+const BATCH_CAT_FILE_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(feature = "tree-sitter")]
+pub(super) fn normalize_path_key(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(feature = "tree-sitter")]
+pub(super) fn extract_parent_hint_tokens(parent: Option<&str>) -> Vec<String> {
+    parent
+        .map(|p| {
+            p.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|tok| {
+                    !tok.is_empty()
+                        && !matches!(
+                            *tok,
+                            "class"
+                                | "struct"
+                                | "enum"
+                                | "interface"
+                                | "trait"
+                                | "record"
+                                | "impl"
+                                | "for"
+                                | "where"
+                                | "mod"
+                                | "module"
+                                | "namespace"
+                                | "abstract"
+                                | "pub"
+                        )
+                })
+                .map(normalize_alnum_lower)
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Ubiquitous stdlib / language-builtin / overly generic identifiers to skip in Layer 3 matching.
 #[cfg(feature = "tree-sitter")]
 fn is_noise_or_builtin_ident(name: &str) -> bool {
-    if name.len() < 3 {
+    let long_enough = if name.is_ascii() {
+        name.len() >= 3
+    } else {
+        name.chars().count() >= 2
+    };
+    if !long_enough {
         return true;
     }
     matches!(
@@ -381,34 +459,35 @@ fn is_noise_or_builtin_ident(name: &str) -> bool {
     )
 }
 
-/// Checks whether a token is a valid identifier (rejecting punctuation fragments like `")"`
-/// from chained calls `foo.iter().all(...)`).
+/// Checks whether a token is a valid UTF-8 identifier (rejecting punctuation fragments like `")"`
+/// from chained calls `foo.iter().all(...)`, while supporting Unicode/non-ASCII symbols).
 #[cfg(feature = "tree-sitter")]
-fn is_valid_ident(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    !bytes.is_empty()
-        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
-        && bytes
-            .iter()
-            .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'?' || b == b'!')
+pub(super) fn is_valid_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+    let core = s.strip_suffix(['?', '!']).unwrap_or(s);
+    core.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 #[cfg(feature = "tree-sitter")]
 fn looks_like_type_or_const(name: &str) -> bool {
-    if name.len() < 3 {
-        return false;
-    }
-    let first = name.chars().next().unwrap_or('_');
-    if first.is_ascii_uppercase() {
-        return true;
-    }
-    false
+    let long_enough = if name.is_ascii() {
+        name.len() >= 3
+    } else {
+        name.chars().count() >= 2
+    };
+    long_enough && name.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 /// Checks if a primary definition AST node is a type/constant/interface definition suitable for
 /// Layer 3-① (same-file unmodified context) and Layer 3-② (cross-file type definitions).
 #[cfg(feature = "tree-sitter")]
-fn is_type_or_const_def_node(lang: SupportedLanguage, node: &tree_sitter::Node) -> bool {
+pub(super) fn is_type_or_const_def_node(lang: SupportedLanguage, node: &tree_sitter::Node) -> bool {
     let target = match node.kind() {
         "decorated_definition" => node.child_by_field_name("definition").unwrap_or(*node),
         "export_statement" => node.child_by_field_name("declaration").unwrap_or(*node),
@@ -899,7 +978,7 @@ fn collect_file_imports(
 ) {
     fn is_valid_import_alias(s: &str) -> bool {
         is_valid_ident(s)
-            && s.len() >= 2
+            && s.chars().count() >= 2
             && !matches!(
                 s,
                 "of" | "in"
@@ -1208,7 +1287,7 @@ fn collect_file_imports(
                                         && is_valid_import_alias(ns)
                                     {
                                         if let Some(stem) = derive_js_module_stem(&spec) {
-                                            if stem.chars().any(|c| c.is_ascii_alphanumeric())
+                                            if stem.chars().any(|c| c.is_alphanumeric())
                                                 && ns != stem
                                             {
                                                 alias_map.insert(ns.to_string(), stem);
@@ -1312,7 +1391,7 @@ fn collect_file_imports(
                                             && is_valid_import_alias(var_name)
                                         {
                                             if let Some(stem) = derive_js_module_stem(&spec) {
-                                                if stem.chars().any(|c| c.is_ascii_alphanumeric())
+                                                if stem.chars().any(|c| c.is_alphanumeric())
                                                     && var_name != stem
                                                 {
                                                     alias_map.insert(var_name.to_string(), stem);
@@ -1587,16 +1666,27 @@ fn expand_rust_use_tree(
     walk_tree("", body, record, alias_map);
 }
 
+#[cfg(feature = "tree-sitter")]
+fn advance_escape(s: &str, backslash_idx: usize) -> usize {
+    let next_start = backslash_idx + 1;
+    let next_len = s
+        .get(next_start..)
+        .and_then(|rest| rest.chars().next())
+        .map_or(0, char::len_utf8);
+    (next_start + next_len).min(s.len())
+}
+
 /// Splits a call target expression at its rightmost top-level separator (`"::"`, `"."`, or `"->"`),
 /// ignoring delimiters inside `(...)`, `[...]`, `<...>`, strings/chars, and turbofish `::<`.
+/// Returns `(lhs, rhs, is_static_colon_sep)`.
 #[cfg(feature = "tree-sitter")]
-fn split_rightmost_call_sep(lang: SupportedLanguage, raw: &str) -> Option<(&str, &str)> {
+fn split_rightmost_call_sep(lang: SupportedLanguage, raw: &str) -> Option<(&str, &str, bool)> {
     let bytes = raw.as_bytes();
     let mut i = 0usize;
     let mut paren = 0usize;
     let mut bracket = 0usize;
     let mut angle = 0usize;
-    let mut best: Option<(usize, usize)> = None;
+    let mut best: Option<(usize, usize, bool)> = None;
     let allow_char_or_lifetime = matches!(
         lang,
         SupportedLanguage::Rust
@@ -1608,45 +1698,50 @@ fn split_rightmost_call_sep(lang: SupportedLanguage, raw: &str) -> Option<(&str,
     );
 
     while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'"' || b == b'`' {
-            let q = b;
-            i += 1;
+        let ch = raw[i..].chars().next()?;
+        let ch_len = ch.len_utf8();
+        if ch == '"' || ch == '`' {
+            let q = ch;
+            i += ch_len;
             while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
-                } else if bytes[i] == q {
-                    i += 1;
+                let sc = raw[i..].chars().next()?;
+                if sc == '\\' {
+                    i = advance_escape(raw, i);
+                } else if sc == q {
+                    i += sc.len_utf8();
                     break;
                 } else {
-                    i += 1;
+                    i += sc.len_utf8();
                 }
             }
             continue;
         }
-        if b == b'\'' {
+        if ch == '\'' {
             if allow_char_or_lifetime {
-                if raw.is_char_boundary(i) {
-                    if let Some(lit_len) = signature::char_literal_len(&raw[i..]) {
-                        i = (i + lit_len).min(bytes.len());
-                        continue;
-                    }
+                if let Some(lit_len) = signature::char_literal_len(&raw[i..]) {
+                    i = (i + lit_len).min(bytes.len());
+                    continue;
                 }
                 i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
+                while let Some(c) = raw[i..].chars().next() {
+                    if c.is_alphanumeric() || c == '_' {
+                        i += c.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
                 continue;
             } else {
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == b'\'' {
+                    let sc = raw[i..].chars().next()?;
+                    if sc == '\\' {
+                        i = advance_escape(raw, i);
+                    } else if sc == '\'' {
                         i += 1;
                         break;
                     } else {
-                        i += 1;
+                        i += sc.len_utf8();
                     }
                 }
                 continue;
@@ -1654,35 +1749,35 @@ fn split_rightmost_call_sep(lang: SupportedLanguage, raw: &str) -> Option<(&str,
         }
 
         if paren == 0 && bracket == 0 && angle == 0 {
-            if i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
+            if raw[i..].starts_with("::") {
                 // Skip turbofish `::<...>` so `<...>` is attached to the method/fn on the RHS
                 if bytes.get(i + 2) == Some(&b'<') {
                     i += 2;
                     continue;
                 }
-                best = Some((i, i + 2));
+                best = Some((i, i + 2, true));
                 i += 2;
                 continue;
             }
-            if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'>' {
-                best = Some((i, i + 2));
+            if raw[i..].starts_with("->") {
+                best = Some((i, i + 2, false));
                 i += 2;
                 continue;
             }
-            if b == b'.' {
-                best = Some((i, i + 1));
+            if ch == '.' {
+                best = Some((i, i + 1, false));
                 i += 1;
                 continue;
             }
         }
 
-        match b {
-            b'(' => paren += 1,
-            b')' => paren = paren.saturating_sub(1),
-            b'[' => bracket += 1,
-            b']' => bracket = bracket.saturating_sub(1),
-            b'<' => angle += 1,
-            b'>' => {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '<' => angle += 1,
+            '>' => {
                 let prev = i.checked_sub(1).map(|p| bytes[p]);
                 if prev != Some(b'-') && prev != Some(b'=') {
                     angle = angle.saturating_sub(1);
@@ -1690,10 +1785,10 @@ fn split_rightmost_call_sep(lang: SupportedLanguage, raw: &str) -> Option<(&str,
             }
             _ => {}
         }
-        i += 1;
+        i += ch_len;
     }
 
-    best.map(|(sep_start, sep_end)| (&raw[..sep_start], &raw[sep_end..]))
+    best.map(|(sep_start, sep_end, is_colon)| (&raw[..sep_start], &raw[sep_end..], is_colon))
 }
 
 /// Extracts receiver qualifier identifier(s) from the LHS of a call separator.
@@ -1714,11 +1809,11 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
                 continue;
             }
         }
-        if !matches!(lang, SupportedLanguage::Ruby | SupportedLanguage::Python)
-            && trimmed.ends_with('?')
-        {
-            trimmed = trimmed[..trimmed.len() - 1].trim_end();
-            continue;
+        if !matches!(lang, SupportedLanguage::Ruby | SupportedLanguage::Python) {
+            if let Some(rest) = trimmed.strip_suffix('?') {
+                trimmed = rest.trim_end();
+                continue;
+            }
         }
         if matches!(
             lang,
@@ -1726,10 +1821,11 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
                 | SupportedLanguage::Tsx
                 | SupportedLanguage::JavaScript
                 | SupportedLanguage::CSharp
-        ) && trimmed.ends_with('!')
-        {
-            trimmed = trimmed[..trimmed.len() - 1].trim_end();
-            continue;
+        ) {
+            if let Some(rest) = trimmed.strip_suffix('!') {
+                trimmed = rest.trim_end();
+                continue;
+            }
         }
         if trimmed == before {
             break;
@@ -1739,8 +1835,8 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
         return Vec::new();
     }
 
-    let last_ch = trimmed.as_bytes()[trimmed.len() - 1];
-    if !matches!(last_ch, b')' | b']' | b'>') && !trimmed.contains(['(', '[', '<']) {
+    let last_ch = trimmed.chars().next_back();
+    if !matches!(last_ch, Some(')') | Some(']') | Some('>')) && !trimmed.contains(['(', '[', '<']) {
         let q = trimmed
             .rsplit([':', '.', '>', '(', ' ', '[', ']'])
             .next()
@@ -1771,58 +1867,73 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
     let mut out = Vec::new();
 
     while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'"' || b == b'`' {
-            let q = b;
-            i += 1;
+        let Some(ch) = trimmed[i..].chars().next() else {
+            break;
+        };
+        let ch_len = ch.len_utf8();
+        if ch == '"' || ch == '`' {
+            let q = ch;
+            i += ch_len;
             while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
-                } else if bytes[i] == q {
-                    i += 1;
+                let Some(sc) = trimmed[i..].chars().next() else {
+                    break;
+                };
+                if sc == '\\' {
+                    i = advance_escape(trimmed, i);
+                } else if sc == q {
+                    i += sc.len_utf8();
                     break;
                 } else {
-                    i += 1;
+                    i += sc.len_utf8();
                 }
             }
             continue;
         }
-        if b == b'\'' {
+        if ch == '\'' {
             if allow_char_or_lifetime {
-                if trimmed.is_char_boundary(i) {
-                    if let Some(lit_len) = signature::char_literal_len(&trimmed[i..]) {
-                        i = (i + lit_len).min(bytes.len());
-                        continue;
-                    }
+                if let Some(lit_len) = signature::char_literal_len(&trimmed[i..]) {
+                    i = (i + lit_len).min(bytes.len());
+                    continue;
                 }
                 i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
+                while let Some(c) = trimmed[i..].chars().next() {
+                    if c.is_alphanumeric() || c == '_' {
+                        i += c.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
                 continue;
             } else {
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == b'\'' {
+                    let Some(sc) = trimmed[i..].chars().next() else {
+                        break;
+                    };
+                    if sc == '\\' {
+                        i = advance_escape(trimmed, i);
+                    } else if sc == '\'' {
                         i += 1;
                         break;
                     } else {
-                        i += 1;
+                        i += sc.len_utf8();
                     }
                 }
                 continue;
             }
         }
-        if paren == 0 && bracket == 0 && angle == 0 && (b.is_ascii_alphabetic() || b == b'_') {
+        if paren == 0 && bracket == 0 && angle == 0 && (ch.is_alphabetic() || ch == '_') {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric()
-                    || bytes[i] == b'_'
-                    || (lang == SupportedLanguage::Ruby && matches!(bytes[i], b'?' | b'!')))
-            {
-                i += 1;
+            i += ch_len;
+            while let Some(ic) = trimmed[i..].chars().next() {
+                if ic.is_alphanumeric()
+                    || ic == '_'
+                    || (lang == SupportedLanguage::Ruby && matches!(ic, '?' | '!'))
+                {
+                    i += ic.len_utf8();
+                } else {
+                    break;
+                }
             }
             let tok = &trimmed[start..i];
             if is_valid_ident(tok)
@@ -1833,13 +1944,13 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
             }
             continue;
         }
-        match b {
-            b'(' => paren += 1,
-            b')' => paren = paren.saturating_sub(1),
-            b'[' => bracket += 1,
-            b']' => bracket = bracket.saturating_sub(1),
-            b'<' => angle += 1,
-            b'>' => {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '<' => angle += 1,
+            '>' => {
                 let prev = i.checked_sub(1).map(|p| bytes[p]);
                 if prev != Some(b'-') && prev != Some(b'=') {
                     angle = angle.saturating_sub(1);
@@ -1847,14 +1958,14 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
             }
             _ => {}
         }
-        i += 1;
+        i += ch_len;
     }
     out
 }
 
 /// Scans deleted (`-`) diff lines in changed hunks for PascalCase/SCREAMING_CASE constants, types,
-/// qualified calls (`Foo::bar`, `Foo.bar`), and direct function calls so removed invariants
-/// (e.g. `BPS_DENOMINATOR`, `RefundLimits.CanAutoRefund`) are also surfaced in Layer 3.
+/// Unicode identifiers, qualified calls (`Foo::bar`, `Foo.bar`), and direct function calls so removed
+/// invariants (e.g. `BPS_DENOMINATOR`, `RefundLimits.CanAutoRefund`) are also surfaced in Layer 3.
 #[cfg(feature = "tree-sitter")]
 fn collect_refs_from_deleted_lines(
     lang: SupportedLanguage,
@@ -1877,23 +1988,30 @@ fn collect_refs_from_deleted_lines(
         let mut i = 0usize;
         let mut prev_ident: Option<(&str, bool)> = None; // (ident, followed_by_sep)
         while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'"' {
-                i += 1;
+            let Some(ch) = trimmed[i..].chars().next() else {
+                break;
+            };
+            let ch_len = ch.len_utf8();
+            if ch == '"' || (ch == '`' && !matches!(lang, SupportedLanguage::Python)) {
+                let q = ch;
+                i += ch_len;
                 while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == b'"' {
-                        i += 1;
+                    let Some(sc) = trimmed[i..].chars().next() else {
+                        break;
+                    };
+                    if sc == '\\' && !(q == '`' && lang == SupportedLanguage::Go) {
+                        i = advance_escape(trimmed, i);
+                    } else if sc == q {
+                        i += sc.len_utf8();
                         break;
                     } else {
-                        i += 1;
+                        i += sc.len_utf8();
                     }
                 }
                 prev_ident = None;
                 continue;
             }
-            if b == b'\'' {
+            if ch == '\'' {
                 if matches!(lang, SupportedLanguage::C | SupportedLanguage::Cpp)
                     && i > 0
                     && bytes[i - 1].is_ascii_digit()
@@ -1912,18 +2030,19 @@ fn collect_refs_from_deleted_lines(
                         | SupportedLanguage::CSharp
                         | SupportedLanguage::Go
                 ) {
-                    if trimmed.is_char_boundary(i) {
-                        if let Some(lit_len) = signature::char_literal_len(&trimmed[i..]) {
-                            i = (i + lit_len).min(bytes.len());
-                            prev_ident = None;
-                            continue;
-                        }
+                    if let Some(lit_len) = signature::char_literal_len(&trimmed[i..]) {
+                        i = (i + lit_len).min(bytes.len());
+                        prev_ident = None;
+                        continue;
                     }
                     // Rust lifetime (`'a`, `'static`, `'_`) or unmatched char quote
                     i += 1;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                    {
-                        i += 1;
+                    while let Some(lc) = trimmed[i..].chars().next() {
+                        if lc.is_alphanumeric() || lc == '_' {
+                            i += lc.len_utf8();
+                        } else {
+                            break;
+                        }
                     }
                     prev_ident = None;
                     continue;
@@ -1931,22 +2050,33 @@ fn collect_refs_from_deleted_lines(
                 // Python / JS / TS / Ruby single-quoted string literal
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == b'\'' {
+                    let Some(sc) = trimmed[i..].chars().next() else {
+                        break;
+                    };
+                    if sc == '\\' {
+                        i = advance_escape(trimmed, i);
+                    } else if sc == '\'' {
                         i += 1;
                         break;
                     } else {
-                        i += 1;
+                        i += sc.len_utf8();
                     }
                 }
                 prev_ident = None;
                 continue;
             }
-            if b.is_ascii_alphabetic() || b == b'_' {
+            if ch.is_alphabetic() || ch == '_' {
                 let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
+                i += ch_len;
+                while let Some(ic) = trimmed[i..].chars().next() {
+                    if ic.is_alphanumeric()
+                        || ic == '_'
+                        || (lang == SupportedLanguage::Ruby && matches!(ic, '?' | '!'))
+                    {
+                        i += ic.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
                 let tok = &trimmed[start..i];
                 let after = trimmed[i..].trim_start();
@@ -1961,7 +2091,7 @@ fn collect_refs_from_deleted_lines(
                     }
                 }
                 if !is_noise_or_builtin_ident(tok) {
-                    if looks_like_type_or_const(tok) {
+                    if looks_like_type_or_const(tok) || (!tok.is_ascii() && !is_call) {
                         type_refs.insert(tok.to_string());
                         if is_call {
                             call_refs.insert(tok.to_string());
@@ -1979,7 +2109,7 @@ fn collect_refs_from_deleted_lines(
                 continue;
             }
             prev_ident = None;
-            i += 1;
+            i += ch_len;
         }
     }
 }
@@ -2116,7 +2246,7 @@ pub(super) fn extract_local_and_query_from_ast(
                     let q_last = q.rsplit("::").next().unwrap_or(q).trim();
                     let sym_clean = sym.trim();
                     if is_valid_ident(sym_clean) && !is_noise_or_builtin_ident(sym_clean) {
-                        if looks_like_type_or_const(sym_clean) {
+                        if looks_like_type_or_const(sym_clean) || !sym_clean.is_ascii() {
                             type_refs.insert(sym_clean.to_string());
                         }
                         if is_valid_ident(q_last) {
@@ -2124,7 +2254,7 @@ pub(super) fn extract_local_and_query_from_ast(
                         }
                     }
                     if is_valid_ident(q_last)
-                        && looks_like_type_or_const(q_last)
+                        && (looks_like_type_or_const(q_last) || !q_last.is_ascii())
                         && !is_noise_or_builtin_ident(q_last)
                     {
                         type_refs.insert(q_last.to_string());
@@ -2182,7 +2312,7 @@ pub(super) fn extract_local_and_query_from_ast(
                     .get(fn_n.start_byte()..fn_n.end_byte())
                     .unwrap_or("")
                     .trim();
-                if let Some((lhs, rhs)) = split_rightmost_call_sep(lang, raw) {
+                if let Some((lhs, rhs, _)) = split_rightmost_call_sep(lang, raw) {
                     let rhs_no_turbo = rhs.split("::<").next().unwrap_or(rhs);
                     let sym = rhs_no_turbo.split(['<', '(']).next().unwrap_or("").trim();
                     if is_valid_ident(sym) && !is_noise_or_builtin_ident(sym) {
@@ -2210,11 +2340,15 @@ pub(super) fn extract_local_and_query_from_ast(
             }
         }
 
-        // Capture uppercase identifiers (types, enums, SCREAMING_CASE constants)
+        // Capture uppercase / caseless non-ASCII identifiers (types, enums, SCREAMING_CASE constants)
         if matches!(kind, "identifier" | "constant" | "field_identifier") {
             if let Some(txt) = source.get(node.start_byte()..node.end_byte()) {
                 let t = txt.trim();
-                if looks_like_type_or_const(t) && !is_noise_or_builtin_ident(t) {
+                let is_non_ascii_type_or_const =
+                    !t.is_ascii() && kind != "field_identifier" && is_valid_ident(t);
+                if (looks_like_type_or_const(t) || is_non_ascii_type_or_const)
+                    && !is_noise_or_builtin_ident(t)
+                {
                     type_refs.insert(t.to_string());
                 }
             }
@@ -2238,7 +2372,13 @@ pub(super) fn extract_local_and_query_from_ast(
         ) {
             if let Some(txt) = source.get(node.start_byte()..node.end_byte()) {
                 let t = txt.trim();
-                if looks_like_type_or_const(t) && !is_noise_or_builtin_ident(t) {
+                let allow_explicit_type =
+                    matches!(kind, "type_identifier" | "type_name") && is_valid_ident(t);
+                if (allow_explicit_type
+                    || looks_like_type_or_const(t)
+                    || (!t.is_ascii() && is_valid_ident(t)))
+                    && !is_noise_or_builtin_ident(t)
+                {
                     out.insert(t.to_string());
                 }
             }
@@ -2329,6 +2469,7 @@ pub(super) fn extract_local_and_query_from_ast(
                             is_local: true,
                             is_type_def: true,
                             pinned_by_import: true,
+                            is_caller: false,
                             snippet,
                         });
                     }
@@ -2439,6 +2580,26 @@ pub(super) fn extract_local_and_query_from_ast(
     (local_entries, query, exposed_def_names)
 }
 
+/// Returns true if `p` is an eligible non-generated, non-vendor, non-test code file
+/// for cross-file forward or reverse Layer 3 resolution.
+#[cfg(feature = "tree-sitter")]
+fn is_eligible_repo_source_path(p: &Path) -> bool {
+    let s = normalize_path_key(p);
+    !s.is_empty()
+        && !s.starts_with("vendor/")
+        && !s.contains("/vendor/")
+        && !s.starts_with("node_modules/")
+        && !s.contains("/node_modules/")
+        && !s.starts_with("dist/")
+        && !s.contains("/dist/")
+        && !s.starts_with("target/")
+        && !s.contains("/target/")
+        && !is_lockfile_or_generated(p)
+        && !is_test_file_path(p)
+        && SupportedLanguage::from_path(p)
+            .is_some_and(|l| !matches!(l, SupportedLanguage::Json | SupportedLanguage::Bash))
+}
+
 /// Lists tracked repository source files for the exact `GitDiffSource` snapshot using `-z`
 /// NUL-delimited output so non-ASCII paths are never octal-escaped by `core.quotepath`.
 #[cfg(feature = "tree-sitter")]
@@ -2452,32 +2613,24 @@ fn list_tracked_source_files(repo_root: &Path, source: GitDiffSource<'_>) -> Vec
             cmd.args(["ls-files", "-z"]);
         }
     }
-    let Ok(output) = cmd.output() else {
+    let Ok(output) = run_cmd_with_timeout(cmd, Duration::from_secs(8), None) else {
         return Vec::new();
     };
-    if !output.status.success() {
+    if output.timed_out || !output.status.is_some_and(|s| s.success()) {
         return Vec::new();
     }
     output
         .stdout
         .split(|&b| b == 0)
         .filter(|slice| !slice.is_empty())
-        .map(|slice| PathBuf::from(String::from_utf8_lossy(slice).trim()))
-        .filter(|p| {
-            let s = p.to_string_lossy();
-            !s.is_empty()
-                && !s.starts_with("vendor/")
-                && !s.contains("/vendor/")
-                && !s.starts_with("node_modules/")
-                && !s.contains("/node_modules/")
-                && !s.starts_with("dist/")
-                && !s.starts_with("target/")
-                && !is_lockfile_or_generated(p)
-                && !is_test_file_path(p)
-                && SupportedLanguage::from_path(p).is_some_and(|l| {
-                    !matches!(l, SupportedLanguage::Json | SupportedLanguage::Bash)
-                })
+        .map(|slice| {
+            PathBuf::from(
+                String::from_utf8_lossy(slice)
+                    .trim_matches(['\r', '\n'])
+                    .trim(),
+            )
         })
+        .filter(|p| is_eligible_repo_source_path(p))
         .collect()
 }
 
@@ -2903,12 +3056,13 @@ fn resolve_candidate_files_for_query(
                     let base = normalize_rel(src_dir, spec);
                     let exts = ["ts", "tsx", "mts", "js", "jsx", "mjs"];
                     add_rel_path(&mut scored, base.clone(), true, false, None);
-                    // Strip trailing .js/.mjs if TS imports compiled extension
-                    let stripped = base
-                        .to_string_lossy()
-                        .trim_end_matches(".js")
-                        .trim_end_matches(".mjs")
-                        .trim_end_matches(".cjs")
+                    // Strip trailing .js/.mjs/.cjs if TS imports compiled extension
+                    let base_str = base.to_string_lossy();
+                    let stripped = base_str
+                        .strip_suffix(".js")
+                        .or_else(|| base_str.strip_suffix(".mjs"))
+                        .or_else(|| base_str.strip_suffix(".cjs"))
+                        .unwrap_or(&base_str)
                         .to_string();
                     for ext in exts {
                         add_rel_path(
@@ -3081,10 +3235,11 @@ fn find_rust_crate_src_dir(path: &Path) -> PathBuf {
 }
 
 /// Reads multiple file blobs at the exact `GitDiffSource` snapshot:
-/// - `Commit(sha)` / `Staged`: single batched `git cat-file --batch` pipe (zero per-file subprocess overhead!)
+/// - `Commit(sha)` / `Staged`: single batched `git cat-file --batch` pipe bounded by `BATCH_CAT_FILE_TIMEOUT`
+///   and protected against `\n`/`\r` protocol injection in paths.
 /// - `Unstaged`: bounded `std::fs::read` (skipping symlinks and > 1 MiB files).
 #[cfg(feature = "tree-sitter")]
-fn read_snapshot_files_batch(
+pub(super) fn read_snapshot_files_batch(
     repo_root: &Path,
     source: GitDiffSource<'_>,
     paths: &[PathBuf],
@@ -3120,6 +3275,22 @@ fn read_snapshot_files_batch(
                 GitDiffSource::Commit(sha) => format!("{sha}:"),
                 GitDiffSource::Unstaged => unreachable!(),
             };
+            // Filter out any paths containing `\n`/`\r` so stdin and stdout responses remain strictly 1:1.
+            let valid_specs: Vec<(PathBuf, String)> = paths
+                .iter()
+                .filter_map(|p| {
+                    let norm = normalize_path_key(p);
+                    if norm.is_empty() || norm.contains('\n') || norm.contains('\r') {
+                        None
+                    } else {
+                        Some((p.clone(), format!("{prefix}{norm}")))
+                    }
+                })
+                .collect();
+            if valid_specs.is_empty() {
+                return out;
+            }
+
             let mut cmd = git_cmd(repo_root);
             cmd.args(["cat-file", "--batch"])
                 .stdin(Stdio::piped())
@@ -3131,30 +3302,34 @@ fn read_snapshot_files_batch(
 
             let stdin_opt = child.stdin.take();
             let stdout_opt = child.stdout.take();
-            std::thread::scope(|s| {
-                if let Some(mut stdin) = stdin_opt {
-                    let prefix_ref = &prefix;
-                    s.spawn(move || {
-                        for p in paths {
-                            let norm = p.to_string_lossy().replace('\\', "/");
-                            if writeln!(stdin, "{prefix_ref}{norm}").is_err() {
-                                break;
-                            }
-                        }
-                    });
-                }
+            let specs_for_writer: Vec<String> =
+                valid_specs.iter().map(|(_, spec)| spec.clone()).collect();
+            let paths_for_reader: Vec<PathBuf> = valid_specs.into_iter().map(|(p, _)| p).collect();
 
-                if let Some(stdout) = stdout_opt {
+            let writer_handle = stdin_opt.map(|mut stdin| {
+                std::thread::spawn(move || {
+                    for spec in specs_for_writer {
+                        if writeln!(stdin, "{spec}").is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            let reader_handle = stdout_opt.map(|stdout| {
+                std::thread::spawn(move || {
+                    let mut map = HashMap::new();
                     let mut reader = BufReader::new(stdout);
                     let mut header = String::new();
-                    for p in paths {
+                    for p in paths_for_reader {
                         header.clear();
                         let Ok(n) = reader.read_line(&mut header) else {
                             break;
                         };
                         if n == 0 {
                             break;
-                        };
+                        }
                         let trimmed = header.trim_end_matches(['\r', '\n']);
                         if trimmed.ends_with(" missing") || trimmed.ends_with(" ambiguous") {
                             continue;
@@ -3167,7 +3342,6 @@ fn read_snapshot_files_batch(
                             None => break,
                         };
                         if obj_type != Some("blob") || size > MAX_TREESITTER_FILE_BYTES {
-                            // Drain exact payload + trailing '\n'
                             let mut drain = (&mut reader).take((size + 1) as u64);
                             let _ = std::io::copy(&mut drain, &mut std::io::sink());
                             continue;
@@ -3176,16 +3350,38 @@ fn read_snapshot_files_batch(
                         if reader.read_exact(&mut buf).is_err() {
                             break;
                         }
-                        // Consume trailing LF written by git cat-file --batch
                         let mut lf = [0u8; 1];
                         let _ = reader.read_exact(&mut lf);
                         if !buf.contains(&0) {
-                            out.insert(p.clone(), String::from_utf8_lossy(&buf).into_owned());
+                            map.insert(p, String::from_utf8_lossy(&buf).into_owned());
                         }
                     }
-                }
+                    let _ = tx.send(map);
+                })
             });
-            let _ = child.wait();
+
+            match rx.recv_timeout(BATCH_CAT_FILE_TIMEOUT) {
+                Ok(map) => {
+                    out = map;
+                    let _ = child.wait();
+                    if let Some(h) = writer_handle {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = reader_handle {
+                        let _ = h.join();
+                    }
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(h) = writer_handle {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = reader_handle {
+                        let _ = h.join();
+                    }
+                }
+            }
         }
     }
 
@@ -3209,25 +3405,25 @@ struct CandidateWanted {
 #[cfg(feature = "tree-sitter")]
 fn normalize_alnum_lower(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
 /// Resolves Layer 3-② cross-file 1-hop AST type definitions and body-stripped function signatures.
+/// Uses deterministic candidate/byte bounds (`MAX_CROSS_FILE_CANDIDATES`, `MAX_CROSS_FILE_PARSE_BYTES`)
+/// and file-scoped `already_exposed` keys `(norm_path, symbol_name)`.
 #[cfg(feature = "tree-sitter")]
 pub(super) fn resolve_cross_file_context(
     repo_root: &Path,
     source: GitDiffSource<'_>,
     queries: &[FileRefQuery],
-    already_exposed: &HashSet<String>,
+    already_exposed: &HashSet<(String, String)>,
     scope_sep: &'static str,
 ) -> Vec<ContextEntry> {
     if queries.is_empty() {
         return Vec::new();
     }
-    let started = Instant::now();
-    let deadline = Duration::from_millis(MAX_CROSS_FILE_WALL_MS);
 
     let tracked_files = list_tracked_source_files(repo_root, source);
     if tracked_files.is_empty() {
@@ -3240,9 +3436,6 @@ pub(super) fn resolve_cross_file_context(
     let mut candidate_rank: HashMap<PathBuf, CandidateWanted> = HashMap::new();
 
     for q in queries {
-        if started.elapsed() >= deadline {
-            break;
-        }
         // Only Go shares package-level unqualified functions across sibling files without imports;
         // Java/C# methods require explicit receiver/type/static-import qualification.
         let allow_same_pkg_bare_calls = q.lang == SupportedLanguage::Go;
@@ -3252,28 +3445,22 @@ pub(super) fn resolve_cross_file_context(
         let mut q_qual_calls: HashMap<String, HashSet<String>> = HashMap::new();
 
         for t in &q.type_or_const_refs {
-            if !already_exposed.contains(t) {
-                q_types.insert(t.clone());
-            }
+            q_types.insert(t.clone());
         }
         for (qual, sym) in &q.qualified_refs {
-            if !already_exposed.contains(sym) {
-                if looks_like_type_or_const(sym) {
-                    q_types.insert(sym.clone());
-                }
-                q_qual_calls
-                    .entry(sym.clone())
-                    .or_default()
-                    .insert(qual.clone());
+            if looks_like_type_or_const(sym) || !sym.is_ascii() {
+                q_types.insert(sym.clone());
             }
+            q_qual_calls
+                .entry(sym.clone())
+                .or_default()
+                .insert(qual.clone());
         }
         for c in &q.call_refs {
-            if !already_exposed.contains(c) {
-                if q.imported_symbols.contains_key(c) {
-                    q_direct_calls.insert(c.clone());
-                } else if allow_same_pkg_bare_calls {
-                    q_pinned_calls.insert(c.clone());
-                }
+            if q.imported_symbols.contains_key(c) {
+                q_direct_calls.insert(c.clone());
+            } else if allow_same_pkg_bare_calls {
+                q_pinned_calls.insert(c.clone());
             }
         }
         if q_types.is_empty()
@@ -3320,19 +3507,24 @@ pub(super) fn resolve_cross_file_context(
     let to_read: Vec<PathBuf> = ranked_paths.iter().map(|(p, _)| p.clone()).collect();
     let blobs = read_snapshot_files_batch(repo_root, source, &to_read);
 
-    // Collect candidate matches grouped by symbol name for ambiguity filtering
-    let mut matches_by_symbol: HashMap<String, Vec<ContextEntry>> = HashMap::new();
+    // Collect candidate matches grouped deterministically by symbol name for ambiguity filtering
+    let mut matches_by_symbol: BTreeMap<String, Vec<ContextEntry>> = BTreeMap::new();
+    let mut parsed_bytes = 0usize;
 
     for (cand_path, cw) in ranked_paths {
-        if started.elapsed() >= deadline {
-            break;
-        }
         let Some(lang) = SupportedLanguage::from_path(&cand_path) else {
             continue;
         };
         let Some(content) = blobs.get(&cand_path) else {
             continue;
         };
+        if parsed_bytes + content.len() > MAX_CROSS_FILE_PARSE_BYTES {
+            break;
+        }
+        if has_generated_source_header(content, Some(&cand_path)) {
+            continue;
+        }
+        parsed_bytes += content.len();
         let Ok(tree) = parse_with_timeout(lang, content) else {
             continue;
         };
@@ -3356,24 +3548,25 @@ pub(super) fn resolve_cross_file_context(
         } else {
             normalize_alnum_lower(raw_stem)
         };
+        let cand_norm = normalize_path_key(&cand_path);
 
         #[allow(clippy::too_many_arguments)]
         fn walk_exports(
             lang: SupportedLanguage,
             cand_path: &Path,
+            cand_norm: &str,
             cand_stem_norm: &str,
             node: tree_sitter::Node,
             lines: &[&str],
             source: &str,
             inline_tests: &[ast_compact::InlineTestBlock],
             cw: &CandidateWanted,
-            already_exposed: &HashSet<String>,
+            already_exposed: &HashSet<(String, String)>,
             scope_sep: &'static str,
-            out: &mut HashMap<String, Vec<ContextEntry>>,
+            out: &mut BTreeMap<String, Vec<ContextEntry>>,
         ) {
             let n_start = node.start_position().row + 1;
             let n_end = node.end_position().row + 1;
-            // Skip inline test blocks (`#[cfg(test)] mod tests`, etc.) inside production files
             if inline_tests
                 .iter()
                 .any(|b| n_start >= b.start_line && n_end <= b.end_line)
@@ -3382,39 +3575,13 @@ pub(super) fn resolve_cross_file_context(
             }
             if let Some(matched) = check_primary_definition(lang, &node) {
                 if let Some(name) = ast_compact::bare_def_name(lang, &matched, lines, source) {
-                    if !already_exposed.contains(&name) && !is_noise_or_builtin_ident(&name) {
+                    if !already_exposed.contains(&(cand_norm.to_string(), name.clone()))
+                        && !is_noise_or_builtin_ident(&name)
+                    {
                         let is_type = is_type_or_const_def_node(lang, &matched);
                         let parent =
                             signature::extract_parent_scope_prefix(lang, &matched, lines, source);
-                        let parent_tokens: Vec<String> = parent
-                            .as_deref()
-                            .map(|p| {
-                                p.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                    .filter(|tok| {
-                                        !tok.is_empty()
-                                            && !matches!(
-                                                *tok,
-                                                "class"
-                                                    | "struct"
-                                                    | "enum"
-                                                    | "interface"
-                                                    | "trait"
-                                                    | "record"
-                                                    | "impl"
-                                                    | "for"
-                                                    | "where"
-                                                    | "mod"
-                                                    | "module"
-                                                    | "namespace"
-                                                    | "abstract"
-                                                    | "pub"
-                                            )
-                                    })
-                                    .map(normalize_alnum_lower)
-                                    .filter(|t| !t.is_empty())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                        let parent_tokens = extract_parent_hint_tokens(parent.as_deref());
 
                         let qual_matched = !is_type
                             && cw.qual_calls.get(&name).is_some_and(|quals| {
@@ -3423,9 +3590,6 @@ pub(super) fn resolve_cross_file_context(
                                     if q_norm.is_empty() {
                                         return false;
                                     }
-                                    // 1) Qualifier matches candidate file stem (e.g. `archive::extract_archive` -> `archive.rs`,
-                                    //    or imported TS/JS namespace `fmt` -> `./format.ts`). Not applied to unimported Java/C# classes
-                                    //    where files do not act as importable module namespaces.
                                     if !cand_stem_norm.is_empty()
                                         && (!matches!(
                                             lang,
@@ -3435,16 +3599,12 @@ pub(super) fn resolve_cross_file_context(
                                     {
                                         return true;
                                     }
-                                    // 2) Qualifier matches enclosing parent type/class/impl token (e.g. `RateLimiter.allow?`)
                                     if !parent_tokens.is_empty() && parent_tokens.contains(&q_norm)
                                     {
                                         return true;
                                     }
-                                    // 3) Receiver variable call (`inventory.reserveStock`, `rb.write`):
-                                    //    allow when the enclosing class/type is itself referenced in `cw.types`
-                                    //    OR (when explicitly imported) matches the candidate file stem.
                                     let is_lowercase_receiver =
-                                        q.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+                                        q.chars().next().is_some_and(|c| c.is_lowercase());
                                     if is_lowercase_receiver && !parent_tokens.is_empty() {
                                         let parent_in_types = cw.types.iter().any(|t| {
                                             let norm_t = normalize_alnum_lower(t);
@@ -3514,6 +3674,7 @@ pub(super) fn resolve_cross_file_context(
                                         is_local: false,
                                         is_type_def: is_type,
                                         pinned_by_import: cw.pinned || cw.same_pkg,
+                                        is_caller: false,
                                         snippet: snip,
                                     });
                                 }
@@ -3530,6 +3691,7 @@ pub(super) fn resolve_cross_file_context(
                 walk_exports(
                     lang,
                     cand_path,
+                    cand_norm,
                     cand_stem_norm,
                     ch,
                     lines,
@@ -3546,6 +3708,7 @@ pub(super) fn resolve_cross_file_context(
         walk_exports(
             lang,
             &cand_path,
+            &cand_norm,
             &cand_stem_norm,
             tree.root_node(),
             &lines,
@@ -3575,7 +3738,6 @@ pub(super) fn resolve_cross_file_context(
         if distinct_files.len() > 2 {
             continue;
         }
-        // Keep at most 2 definitions per symbol name (e.g. trait + struct or 2 overloads)
         cands.sort_by(|a, b| {
             b.is_type_def
                 .cmp(&a.is_type_def)
@@ -3584,6 +3746,2026 @@ pub(super) fn resolve_cross_file_context(
         });
         cands.truncate(2);
         final_entries.extend(cands);
+    }
+
+    final_entries
+}
+
+/// Extracts non-test top-level/class-member definitions from a whole deleted file chunk (`is_deleted`)
+/// as `ReverseTarget`s so unmodified external callers breaking due to a deletion are surfaced.
+#[cfg(feature = "tree-sitter")]
+fn complete_deleted_header_syntax(reconstructed: &str, lang: SupportedLanguage) -> Option<String> {
+    let trimmed = reconstructed.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match lang {
+        SupportedLanguage::Python => {
+            let last_code = trimmed
+                .lines()
+                .rev()
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            if last_code.ends_with(':') {
+                return Some(format!("{trimmed}\n    pass\n"));
+            }
+            let open_p = trimmed.matches('(').count();
+            let close_p = trimmed.matches(')').count();
+            if open_p > close_p {
+                return Some(format!("{trimmed}):\n    pass\n"));
+            }
+            None
+        }
+        SupportedLanguage::Ruby => {
+            let has_header = trimmed.lines().any(|l| {
+                let t = l.trim_start();
+                t.starts_with("def ") || t.starts_with("class ") || t.starts_with("module ")
+            });
+            if has_header {
+                Some(format!("{trimmed}\nend\n"))
+            } else {
+                None
+            }
+        }
+        SupportedLanguage::Rust
+        | SupportedLanguage::Go
+        | SupportedLanguage::C
+        | SupportedLanguage::Cpp
+        | SupportedLanguage::Java
+        | SupportedLanguage::CSharp
+        | SupportedLanguage::JavaScript
+        | SupportedLanguage::TypeScript
+        | SupportedLanguage::Tsx => {
+            let mut open_curly = 0usize;
+            let mut close_curly = 0usize;
+            let mut open_paren = 0usize;
+            let mut close_paren = 0usize;
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => open_curly += 1,
+                    '}' => close_curly += 1,
+                    '(' => open_paren += 1,
+                    ')' => close_paren += 1,
+                    _ => {}
+                }
+            }
+            if open_curly > close_curly {
+                let closes = "}".repeat(open_curly - close_curly);
+                return Some(format!("{trimmed}\n{closes}\n"));
+            }
+            if open_paren > close_paren && open_curly == 0 && close_curly == 0 {
+                let closes = ")".repeat(open_paren - close_paren);
+                return Some(format!("{trimmed}{closes} {{\n}}\n"));
+            }
+            if !trimmed.ends_with([';', '}', ':']) {
+                return Some(format!("{trimmed} {{\n}}\n"));
+            }
+            None
+        }
+        SupportedLanguage::Bash | SupportedLanguage::Json => None,
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+fn extract_deleted_targets_with_fallbacks(
+    reconstructed: &str,
+    path: &Path,
+    lang: SupportedLanguage,
+) -> Vec<ReverseTarget> {
+    let mut targets = extract_reverse_targets_from_source(reconstructed, path, lang);
+    if !targets.is_empty() {
+        return targets;
+    }
+    let completed = complete_deleted_header_syntax(reconstructed, lang);
+    if let Some(ref comp) = completed {
+        targets = extract_reverse_targets_from_source(comp, path, lang);
+        if !targets.is_empty() {
+            return targets;
+        }
+    }
+    if matches!(
+        lang,
+        SupportedLanguage::Java
+            | SupportedLanguage::CSharp
+            | SupportedLanguage::TypeScript
+            | SupportedLanguage::Tsx
+            | SupportedLanguage::JavaScript
+    ) {
+        let inner = completed.as_deref().unwrap_or(reconstructed);
+        let wrapped = format!("class __AnticrumbDelWrap {{\n{inner}\n}}\n");
+        targets = extract_reverse_targets_from_source(&wrapped, path, lang)
+            .into_iter()
+            .filter(|t| t.symbol != "__AnticrumbDelWrap")
+            .map(|mut t| {
+                t.parent_hints.retain(|h| h != "__anticrumbdelwrap");
+                t
+            })
+            .collect();
+    }
+    targets
+}
+
+#[cfg(feature = "tree-sitter")]
+pub(super) fn collect_deleted_reverse_targets(
+    chunk: &str,
+    path: &Path,
+    lang: SupportedLanguage,
+) -> Vec<ReverseTarget> {
+    if is_test_file_path(path) || matches!(lang, SupportedLanguage::Json | SupportedLanguage::Bash)
+    {
+        return Vec::new();
+    }
+    let mut in_hunk = false;
+    let mut reconstructed = String::new();
+    for raw_line in chunk.split_inclusive('\n') {
+        if raw_line.starts_with("@@ ") {
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if let Some(rest) = raw_line.strip_prefix('-') {
+            if reconstructed.len() + rest.len() > MAX_TREESITTER_FILE_BYTES {
+                break;
+            }
+            reconstructed.push_str(rest);
+            if !rest.ends_with('\n') {
+                reconstructed.push('\n');
+            }
+        } else if let Some(rest) = raw_line.strip_prefix(' ') {
+            if reconstructed.len() + rest.len() > MAX_TREESITTER_FILE_BYTES {
+                break;
+            }
+            reconstructed.push_str(rest);
+            if !rest.ends_with('\n') {
+                reconstructed.push('\n');
+            }
+        }
+    }
+    extract_deleted_targets_with_fallbacks(&reconstructed, path, lang)
+}
+
+/// Extracts non-test top-level/member definitions removed in a pure-deletion or renamed-header hunk
+/// of a modified file (dedenting uniform common indentation so deleted/renamed class/module methods
+/// and single-line signature headers parse cleanly).
+#[cfg(feature = "tree-sitter")]
+pub(super) fn collect_deleted_lines_reverse_targets(
+    deleted_lines: &[&str],
+    path: &Path,
+    lang: SupportedLanguage,
+) -> Vec<ReverseTarget> {
+    if deleted_lines.is_empty()
+        || is_test_file_path(path)
+        || matches!(lang, SupportedLanguage::Json | SupportedLanguage::Bash)
+    {
+        return Vec::new();
+    }
+    let min_indent = deleted_lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches([' ', '\t']).len())
+        .min()
+        .unwrap_or(0);
+    let mut reconstructed = String::new();
+    for l in deleted_lines {
+        let stripped = l.get(min_indent..).unwrap_or(l);
+        if reconstructed.len() + stripped.len() > MAX_TREESITTER_FILE_BYTES {
+            break;
+        }
+        reconstructed.push_str(stripped);
+        if !stripped.ends_with('\n') {
+            reconstructed.push('\n');
+        }
+    }
+    extract_deleted_targets_with_fallbacks(&reconstructed, path, lang)
+}
+
+#[cfg(feature = "tree-sitter")]
+fn extract_reverse_targets_from_source(
+    source: &str,
+    path: &Path,
+    lang: SupportedLanguage,
+) -> Vec<ReverseTarget> {
+    if source.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(tree) = parse_with_timeout(lang, source) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let inline_tests = ast_compact::find_inline_test_blocks(lang, &tree.root_node(), source);
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_deleted(
+        lang: SupportedLanguage,
+        path: &Path,
+        node: tree_sitter::Node,
+        lines: &[&str],
+        source: &str,
+        inline_tests: &[ast_compact::InlineTestBlock],
+        seen: &mut HashSet<String>,
+        out: &mut Vec<ReverseTarget>,
+    ) {
+        let n_start = node.start_position().row + 1;
+        let n_end = node.end_position().row + 1;
+        if inline_tests
+            .iter()
+            .any(|b| n_start >= b.start_line && n_end <= b.end_line)
+        {
+            return;
+        }
+        if let Some(matched) = check_primary_definition(lang, &node) {
+            if !test_scope::is_test_scope(lang, &matched, Some(path), lines) {
+                if let Some(name) = ast_compact::bare_def_name(lang, &matched, lines, source) {
+                    if name != "__AnticrumbDelWrap"
+                        && is_valid_ident(&name)
+                        && !is_noise_or_builtin_ident(&name)
+                        && seen.insert(name.clone())
+                    {
+                        let is_type = is_type_or_const_def_node(lang, &matched);
+                        let parent =
+                            signature::extract_parent_scope_prefix(lang, &matched, lines, source);
+                        let parent_hints = extract_parent_hint_tokens(parent.as_deref());
+                        out.push(ReverseTarget {
+                            symbol: name,
+                            def_file: path.to_path_buf(),
+                            lang,
+                            is_type,
+                            sig_changed: true,
+                            parent_hints,
+                        });
+                    }
+                }
+            }
+            if ast_compact::is_foldable_function_node(lang, &matched)
+                || !super::diff_expand::is_container_definition_node(&matched)
+            {
+                return;
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            walk_deleted(lang, path, ch, lines, source, inline_tests, seen, out);
+        }
+    }
+
+    walk_deleted(
+        lang,
+        path,
+        tree.root_node(),
+        &lines,
+        source,
+        &inline_tests,
+        &mut seen,
+        &mut out,
+    );
+    out
+}
+
+#[cfg(feature = "tree-sitter")]
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// UTF-8-aware whole-identifier check (handles Korean/Unicode identifiers and Ruby `?`/`!` suffixes).
+#[cfg(feature = "tree-sitter")]
+fn contains_utf8_ident(haystack: &str, needle: &str, ruby_suffix_mode: bool) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    let needle_has_suffix_punct = ruby_suffix_mode && needle.ends_with(['?', '!']);
+    let mut offset = 0usize;
+    while let Some(rel) = haystack[offset..].find(needle) {
+        let pos = offset + rel;
+        let end = pos + needle.len();
+        let before_ok = haystack[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let next_ch = haystack[end..].chars().next();
+        let after_ok = next_ch.is_none_or(|c| {
+            if !ruby_suffix_mode || needle_has_suffix_punct {
+                !is_ident_char(c)
+            } else {
+                !is_ident_char(c) && !matches!(c, '?' | '!')
+            }
+        });
+        if before_ok && after_ok {
+            return true;
+        }
+        if let Some(ch) = haystack[pos..].chars().next() {
+            offset = pos + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "tree-sitter")]
+fn stem_for_path_norm(p: &Path) -> String {
+    let raw_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    if matches!(raw_stem, "mod" | "__init__" | "index") {
+        p.parent()
+            .and_then(|pr| pr.file_name())
+            .and_then(|s| s.to_str())
+            .map(normalize_alnum_lower)
+            .unwrap_or_else(|| normalize_alnum_lower(raw_stem))
+    } else {
+        normalize_alnum_lower(raw_stem)
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+fn import_spec_matches_target_file(
+    cand_lang: SupportedLanguage,
+    cand_path: &Path,
+    spec: &str,
+    target_def_file: &Path,
+    target_def_norm: &str,
+    target_stem_norm: &str,
+) -> bool {
+    let cand_dir = cand_path.parent().unwrap_or_else(|| Path::new(""));
+    let normalize_rel = |base: &Path, rel: &str| -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for comp in base.join(rel).components() {
+            match comp {
+                std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+                std::path::Component::ParentDir => {
+                    parts.pop();
+                }
+                _ => {}
+            }
+        }
+        parts.join("/")
+    };
+
+    match cand_lang {
+        SupportedLanguage::Rust => {
+            let parts: Vec<&str> = spec.split("::").filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                return false;
+            }
+            if parts[0] == "mod" && parts.len() >= 2 {
+                let m = parts[1];
+                let p1 = normalize_rel(cand_dir, &format!("{m}.rs"));
+                let p2 = normalize_rel(cand_dir, &format!("{m}/mod.rs"));
+                if target_def_norm == p1 || target_def_norm == p2 {
+                    return true;
+                }
+                if let Some(cstem) = cand_path.file_stem().and_then(|s| s.to_str()) {
+                    if cstem != "mod" && cstem != "lib" && cstem != "main" {
+                        let p3 = normalize_rel(cand_dir, &format!("{cstem}/{m}.rs"));
+                        let p4 = normalize_rel(cand_dir, &format!("{cstem}/{m}/mod.rs"));
+                        if target_def_norm == p3 || target_def_norm == p4 {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            if parts[0] == "crate" {
+                let crate_src = find_rust_crate_src_dir(cand_path);
+                let segs = &parts[1..];
+                for take in [segs.len(), segs.len().saturating_sub(1)] {
+                    if take == 0 {
+                        continue;
+                    }
+                    let sub: PathBuf = segs[..take].iter().collect();
+                    let c1 = normalize_path_key(&crate_src.join(&sub).with_extension("rs"));
+                    let c2 = normalize_path_key(&crate_src.join(&sub).join("mod.rs"));
+                    if target_def_norm == c1 || target_def_norm == c2 {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if parts[0] == "super" {
+                let mut base = cand_dir.to_path_buf();
+                let mut idx = 0usize;
+                if let Some(stem) = cand_path.file_stem().and_then(|s| s.to_str()) {
+                    if stem != "mod" && stem != "lib" && stem != "main" {
+                        if let Some(dir_name) = base.file_name().and_then(|n| n.to_str()) {
+                            if let Some(parent) = base.parent() {
+                                if target_def_norm
+                                    == normalize_path_key(&parent.join(format!("{dir_name}.rs")))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        if target_def_norm == normalize_path_key(&base.join("mod.rs")) {
+                            return true;
+                        }
+                        idx = 1;
+                    }
+                }
+                while idx < parts.len() && parts[idx] == "super" {
+                    base.pop();
+                    idx += 1;
+                }
+                let segs = &parts[idx..];
+                for take in [segs.len(), segs.len().saturating_sub(1)] {
+                    if take == 0 {
+                        continue;
+                    }
+                    let sub: PathBuf = segs[..take].iter().collect();
+                    let c1 = normalize_path_key(&base.join(&sub).with_extension("rs"));
+                    let c2 = normalize_path_key(&base.join(&sub).join("mod.rs"));
+                    if target_def_norm == c1 || target_def_norm == c2 {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if parts[0] == "self" {
+                let segs = &parts[1..];
+                for take in [segs.len(), segs.len().saturating_sub(1)] {
+                    if take == 0 {
+                        continue;
+                    }
+                    let sub: PathBuf = segs[..take].iter().collect();
+                    let c1 = normalize_path_key(&cand_dir.join(&sub).with_extension("rs"));
+                    let c2 = normalize_path_key(&cand_dir.join(&sub).join("mod.rs"));
+                    if target_def_norm == c1 || target_def_norm == c2 {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if matches!(parts[0], "std" | "core" | "alloc" | "proc_macro" | "test")
+                || target_stem_norm.is_empty()
+                || parts.len() < 2
+            {
+                return false;
+            }
+            // Fallback for multi-crate paths (`subcrate::mod::Sym`), avoiding false pinning
+            // on stdlib/external imports or ubiquitous file stems (`io`, `sync`, `error`, etc.)
+            let is_generic_stem = target_stem_norm.len() < 4
+                || matches!(
+                    target_stem_norm,
+                    "mod"
+                        | "lib"
+                        | "main"
+                        | "error"
+                        | "errors"
+                        | "types"
+                        | "utils"
+                        | "util"
+                        | "helpers"
+                        | "helper"
+                        | "common"
+                        | "config"
+                        | "sync"
+                        | "fmt"
+                        | "time"
+                        | "task"
+                        | "test"
+                );
+            let mod_segs = if parts
+                .last()
+                .is_some_and(|p| p.chars().next().is_some_and(|c| c.is_uppercase()))
+            {
+                &parts[..parts.len() - 1]
+            } else {
+                &parts[..]
+            };
+            let target_dir_norms: Vec<String> = target_def_file
+                .parent()
+                .map(|p| {
+                    p.components()
+                        .filter_map(|c| match c {
+                            std::path::Component::Normal(s) => {
+                                let n = normalize_alnum_lower(&s.to_string_lossy());
+                                (!n.is_empty() && n != "src").then_some(n)
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let crate_root_norm = normalize_alnum_lower(parts[0]);
+            let has_crate_or_parent_dir_match =
+                !crate_root_norm.is_empty() && target_dir_norms.contains(&crate_root_norm);
+            let is_crate_lib = target_def_file.file_stem().and_then(|s| s.to_str()) == Some("lib")
+                && has_crate_or_parent_dir_match;
+            if is_crate_lib {
+                return true;
+            }
+            if is_generic_stem {
+                has_crate_or_parent_dir_match
+                    && mod_segs
+                        .iter()
+                        .any(|p| normalize_alnum_lower(p) == target_stem_norm)
+            } else {
+                mod_segs[1..]
+                    .iter()
+                    .any(|p| normalize_alnum_lower(p) == target_stem_norm)
+                    || (has_crate_or_parent_dir_match
+                        && mod_segs
+                            .iter()
+                            .any(|p| normalize_alnum_lower(p) == target_stem_norm))
+            }
+        }
+        SupportedLanguage::Python => {
+            if spec.starts_with('.') {
+                let dots = spec.chars().take_while(|&c| c == '.').count();
+                let rest = &spec[dots..];
+                let mut base = cand_dir.to_path_buf();
+                for _ in 1..dots {
+                    base.pop();
+                }
+                if rest.is_empty() {
+                    if !target_stem_norm.is_empty() {
+                        let target_dir = target_def_file.parent().unwrap_or_else(|| Path::new(""));
+                        return normalize_path_key(target_dir) == normalize_path_key(&base);
+                    }
+                    return target_def_norm == normalize_path_key(&base.join("__init__.py"));
+                }
+                let sub: PathBuf = rest.split('.').filter(|s| !s.is_empty()).collect();
+                let c1 = normalize_path_key(&base.join(&sub).with_extension("py"));
+                let c2 = normalize_path_key(&base.join(&sub).join("__init__.py"));
+                target_def_norm == c1 || target_def_norm == c2
+            } else {
+                let slash = spec.replace('.', "/");
+                target_def_norm.ends_with(&format!("{slash}.py"))
+                    || target_def_norm.ends_with(&format!("{slash}/__init__.py"))
+            }
+        }
+        SupportedLanguage::JavaScript | SupportedLanguage::TypeScript | SupportedLanguage::Tsx => {
+            if spec.starts_with('.') {
+                let rel = normalize_rel(cand_dir, spec);
+                if target_def_norm == rel {
+                    return true;
+                }
+                let stripped = rel
+                    .strip_suffix(".js")
+                    .or_else(|| rel.strip_suffix(".mjs"))
+                    .or_else(|| rel.strip_suffix(".cjs"))
+                    .unwrap_or(&rel);
+                for ext in ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"] {
+                    if target_def_norm == format!("{stripped}.{ext}")
+                        || target_def_norm == format!("{rel}/index.{ext}")
+                    {
+                        return true;
+                    }
+                }
+                false
+            } else if let Some(alias_rest) =
+                spec.strip_prefix("@/").or_else(|| spec.strip_prefix("~/"))
+            {
+                ["ts", "tsx", "js", "jsx"].iter().any(|ext| {
+                    target_def_norm.ends_with(&format!("{alias_rest}.{ext}"))
+                        || target_def_norm.ends_with(&format!("{alias_rest}/index.{ext}"))
+                })
+            } else {
+                false
+            }
+        }
+        SupportedLanguage::Go => {
+            let target_dir = target_def_file
+                .parent()
+                .map(normalize_path_key)
+                .unwrap_or_default();
+            if target_dir.is_empty() {
+                return false;
+            }
+            let parts: Vec<&str> = spec.split('/').filter(|s| !s.is_empty()).collect();
+            (0..parts.len().min(3)).any(|skip| {
+                let tail = parts[skip..].join("/");
+                target_dir == tail || target_dir.ends_with(&format!("/{tail}"))
+            })
+        }
+        SupportedLanguage::Java => {
+            let clean = spec.strip_suffix(".*").unwrap_or(spec);
+            let slash = clean.replace('.', "/");
+            target_def_norm.ends_with(&format!("{slash}.java"))
+                || (spec.ends_with(".*") && target_def_norm.contains(&format!("{slash}/")))
+        }
+        SupportedLanguage::CSharp => {
+            let target_dir = target_def_file
+                .parent()
+                .map(normalize_path_key)
+                .unwrap_or_default();
+            let last_ns = spec.rsplit('.').next().unwrap_or(spec);
+            !last_ns.is_empty()
+                && target_dir
+                    .split('/')
+                    .any(|seg| seg.eq_ignore_ascii_case(last_ns))
+        }
+        SupportedLanguage::C | SupportedLanguage::Cpp => {
+            let rel = normalize_rel(cand_dir, spec);
+            if target_def_norm == rel || target_def_norm.ends_with(&format!("/{spec}")) {
+                return true;
+            }
+            // In C/C++, callers `#include "foo.h"` when implementation changes happen in `foo.c`/`foo.cpp`
+            let spec_stem = Path::new(spec)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(normalize_alnum_lower)
+                .unwrap_or_default();
+            !spec_stem.is_empty() && spec_stem == target_stem_norm
+        }
+        SupportedLanguage::Ruby => {
+            if let Some(rel) = spec.strip_prefix("./") {
+                let n = normalize_rel(cand_dir, rel);
+                target_def_norm == n || target_def_norm == format!("{n}.rb")
+            } else {
+                let rb = if spec.ends_with(".rb") {
+                    spec.to_string()
+                } else {
+                    format!("{spec}.rb")
+                };
+                target_def_norm == rb || target_def_norm.ends_with(&format!("/{rb}"))
+            }
+        }
+        SupportedLanguage::Bash | SupportedLanguage::Json => false,
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+struct ReverseGrepRecord {
+    path: PathBuf,
+    matched_syms: Vec<String>,
+}
+
+#[cfg(feature = "tree-sitter")]
+struct GrepBatchResult {
+    records: Vec<ReverseGrepRecord>,
+    capped_early: bool,
+}
+
+#[cfg(feature = "tree-sitter")]
+enum GrepLineRead {
+    Line(usize),
+    Eof(usize),
+    RawLimitExceeded,
+}
+
+#[cfg(feature = "tree-sitter")]
+fn read_grep_line_bounded<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_line_bytes: usize,
+    max_raw_bytes: usize,
+) -> std::io::Result<GrepLineRead> {
+    buf.clear();
+    let mut consumed_total = 0usize;
+    let mut nul_count = 0usize;
+    let mut text_kept = 0usize;
+    // Allow up to 4 KiB for `path\0line_no\0` metadata plus up to `max_line_bytes` of matched source text.
+    let hard_buf_cap = max_line_bytes.saturating_add(4096);
+
+    loop {
+        let avail = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            return Ok(GrepLineRead::Eof(consumed_total));
+        }
+        let nl_opt = avail.iter().position(|&b| b == b'\n');
+        let step_len = nl_opt.map_or(avail.len(), |p| p + 1);
+        if consumed_total.saturating_add(step_len) > max_raw_bytes {
+            return Ok(GrepLineRead::RawLimitExceeded);
+        }
+        let copy_slice = match nl_opt {
+            Some(p) => &avail[..p],
+            None => avail,
+        };
+        for &b in copy_slice {
+            if b == 0 && nul_count < 2 {
+                nul_count += 1;
+                if buf.len() < hard_buf_cap {
+                    buf.push(b);
+                }
+                continue;
+            }
+            if nul_count < 2 {
+                if buf.len() < 4096 {
+                    buf.push(b);
+                }
+            } else if text_kept < max_line_bytes && buf.len() < hard_buf_cap {
+                buf.push(b);
+                text_kept += 1;
+            }
+        }
+        consumed_total += step_len;
+        reader.consume(step_len);
+        if nl_opt.is_some() {
+            return Ok(GrepLineRead::Line(consumed_total));
+        }
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+fn run_git_grep_for_symbols(
+    repo_root: &Path,
+    source: GitDiffSource<'_>,
+    syms: &[&str],
+    word_boundary: bool,
+    modified_files_norm: &HashSet<String>,
+) -> GrepBatchResult {
+    if syms.is_empty() {
+        return GrepBatchResult {
+            records: Vec::new(),
+            capped_early: false,
+        };
+    }
+    let mut cmd = git_cmd(repo_root);
+    cmd.args(["grep", "-n", "-z", "-F", "-I"]);
+    if word_boundary {
+        cmd.arg("-w");
+    }
+    if matches!(source, GitDiffSource::Staged) {
+        cmd.arg("--cached");
+    }
+    for s in syms {
+        cmd.arg("-e").arg(s);
+    }
+    if let GitDiffSource::Commit(sha) = source {
+        cmd.arg(sha);
+    }
+    cmd.arg("--")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let Ok(mut child) = cmd.spawn() else {
+        return GrepBatchResult {
+            records: Vec::new(),
+            capped_early: false,
+        };
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return GrepBatchResult {
+            records: Vec::new(),
+            capped_early: false,
+        };
+    };
+
+    let sha_prefix = match source {
+        GitDiffSource::Commit(sha) => Some(format!("{sha}:")),
+        GitDiffSource::Staged | GitDiffSource::Unstaged => None,
+    };
+    let owned_syms: Vec<String> = syms.iter().map(|s| (*s).to_string()).collect();
+    let mod_norm_cloned = modified_files_norm.clone();
+
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line_buf = Vec::with_capacity(1024);
+        let mut records = Vec::new();
+        let mut raw_bytes_read = 0usize;
+        let mut capped_early = false;
+        let mut per_file_counts: HashMap<String, usize> = HashMap::new();
+        let mut per_file_syms: HashMap<String, HashSet<String>> = HashMap::new();
+
+        loop {
+            let rem_raw = MAX_GREP_RAW_BYTES.saturating_sub(raw_bytes_read);
+            if rem_raw == 0 {
+                capped_early = true;
+                break;
+            }
+            match read_grep_line_bounded(&mut reader, &mut line_buf, MAX_GREP_LINE_BYTES, rem_raw) {
+                Ok(GrepLineRead::Line(n)) => {
+                    raw_bytes_read += n;
+                }
+                Ok(GrepLineRead::Eof(n)) => {
+                    raw_bytes_read += n;
+                    if line_buf.is_empty() {
+                        break;
+                    }
+                }
+                Ok(GrepLineRead::RawLimitExceeded) => {
+                    capped_early = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+
+            if line_buf.is_empty() {
+                continue;
+            }
+            if line_buf.last() == Some(&b'\r') {
+                line_buf.pop();
+            }
+
+            let mut fields = line_buf.splitn(3, |&b| b == 0);
+            let Some(path_b) = fields.next() else {
+                continue;
+            };
+            let Some(lno_b) = fields.next() else {
+                continue;
+            };
+            let Some(text_b) = fields.next() else {
+                continue;
+            };
+            let path_raw = String::from_utf8_lossy(path_b);
+            let rel_str = match &sha_prefix {
+                Some(pref) => path_raw.strip_prefix(pref).unwrap_or(&path_raw),
+                None => &path_raw,
+            };
+            if rel_str.is_empty() {
+                continue;
+            }
+            let Ok(line_no) = std::str::from_utf8(lno_b).unwrap_or("").parse::<usize>() else {
+                continue;
+            };
+            if line_no == 0 {
+                continue;
+            }
+
+            // Pre-filter modified/test/docs/vendor/generated paths and non-matching lines BEFORE
+            // counting against `MAX_GREP_RECORDS` or per-file quotas.
+            let path = PathBuf::from(rel_str);
+            let p_norm = normalize_path_key(&path);
+            if mod_norm_cloned.contains(&p_norm) || !is_eligible_repo_source_path(&path) {
+                continue;
+            }
+
+            let is_ruby = SupportedLanguage::from_path(&path) == Some(SupportedLanguage::Ruby);
+            let line_text = String::from_utf8_lossy(text_b);
+            let mut matched_syms = Vec::new();
+            for sym in &owned_syms {
+                if contains_utf8_ident(&line_text, sym, is_ruby) {
+                    matched_syms.push(sym.clone());
+                }
+            }
+            if matched_syms.is_empty() {
+                continue;
+            }
+
+            let f_count = per_file_counts.entry(p_norm.clone()).or_insert(0);
+            let seen_syms = per_file_syms.entry(p_norm).or_default();
+            let introduces_new_sym = matched_syms.iter().any(|s| !seen_syms.contains(s));
+            if *f_count >= MAX_GREP_RECORDS_PER_FILE
+                && (!introduces_new_sym || *f_count >= MAX_GREP_RECORDS_PER_FILE + 8)
+            {
+                continue;
+            }
+            *f_count += 1;
+            for s in &matched_syms {
+                seen_syms.insert(s.clone());
+            }
+
+            records.push(ReverseGrepRecord { path, matched_syms });
+            if records.len() >= MAX_GREP_RECORDS {
+                capped_early = true;
+                break;
+            }
+        }
+        let _ = tx.send(GrepBatchResult {
+            records,
+            capped_early,
+        });
+    });
+
+    match rx.recv_timeout(Duration::from_secs(6)) {
+        Ok(res) => {
+            if res.capped_early {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                res
+            } else {
+                let exit_ok = child
+                    .wait()
+                    .ok()
+                    .is_some_and(|st| matches!(st.code(), Some(0) | Some(1)));
+                let _ = reader_handle.join();
+                if exit_ok {
+                    res
+                } else {
+                    GrepBatchResult {
+                        records: Vec::new(),
+                        capped_early: false,
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader_handle.join();
+            GrepBatchResult {
+                records: Vec::new(),
+                capped_early: false,
+            }
+        }
+    }
+}
+
+/// Resolves Layer 3-③ 1-hop reverse callers referencing modified or deleted production symbols
+/// across all 10 Tree-sitter code languages using snapshot-safe `git grep` + `git cat-file --batch`
+/// + AST call/type-ref verification (never worktree leakage, never comments/strings/imports/tests).
+#[cfg(feature = "tree-sitter")]
+pub(super) fn resolve_reverse_callers_context(
+    repo_root: &Path,
+    source: GitDiffSource<'_>,
+    targets: &[ReverseTarget],
+    modified_files_norm: &HashSet<String>,
+    scope_sep: &'static str,
+) -> Vec<ContextEntry> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    // Group & rank unique target symbols, prioritizing signature changes and type/const changes.
+    let mut grouped: HashMap<String, Vec<ReverseTarget>> = HashMap::new();
+    for t in targets {
+        if is_valid_ident(&t.symbol) && !is_noise_or_builtin_ident(&t.symbol) {
+            grouped.entry(t.symbol.clone()).or_default().push(t.clone());
+        }
+    }
+    if grouped.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked_syms: Vec<(String, bool, bool)> = grouped
+        .iter()
+        .map(|(sym, ts)| {
+            let best_sig = ts.iter().any(|t| t.sig_changed);
+            let best_type = ts.iter().any(|t| t.is_type);
+            (sym.clone(), best_sig, best_type)
+        })
+        .collect();
+    ranked_syms.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked_syms.truncate(MAX_REVERSE_TARGET_SYMBOLS);
+
+    let sym_flags: HashMap<String, (bool, bool)> = ranked_syms
+        .iter()
+        .map(|(s, sc, it)| (s.clone(), (*sc, *it)))
+        .collect();
+    let selected_syms: Vec<String> = ranked_syms.into_iter().map(|(s, _, _)| s).collect();
+    let mut word_syms: Vec<&str> = Vec::new();
+    let mut literal_syms: Vec<&str> = Vec::new();
+    for s in &selected_syms {
+        if s.is_ascii() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            word_syms.push(s.as_str());
+        } else {
+            literal_syms.push(s.as_str());
+        }
+    }
+
+    let word_batch =
+        run_git_grep_for_symbols(repo_root, source, &word_syms, true, modified_files_norm);
+    let mut all_records = word_batch.records;
+    if word_batch.capped_early {
+        let seen_word: HashSet<String> = all_records
+            .iter()
+            .flat_map(|r| r.matched_syms.iter().cloned())
+            .collect();
+        let missed_prio: Vec<&str> = word_syms
+            .iter()
+            .copied()
+            .filter(|s| {
+                !seen_word.contains(*s) && sym_flags.get(*s).is_some_and(|&(sc, it)| sc || it)
+            })
+            .collect();
+        if !missed_prio.is_empty() {
+            all_records.extend(
+                run_git_grep_for_symbols(
+                    repo_root,
+                    source,
+                    &missed_prio,
+                    true,
+                    modified_files_norm,
+                )
+                .records,
+            );
+        }
+    }
+
+    let literal_batch =
+        run_git_grep_for_symbols(repo_root, source, &literal_syms, false, modified_files_norm);
+    let lit_offset = all_records.len();
+    all_records.extend(literal_batch.records);
+    if literal_batch.capped_early {
+        let seen_lit: HashSet<String> = all_records[lit_offset..]
+            .iter()
+            .flat_map(|r| r.matched_syms.iter().cloned())
+            .collect();
+        let missed_prio: Vec<&str> = literal_syms
+            .iter()
+            .copied()
+            .filter(|s| {
+                !seen_lit.contains(*s) && sym_flags.get(*s).is_some_and(|&(sc, it)| sc || it)
+            })
+            .collect();
+        if !missed_prio.is_empty() {
+            all_records.extend(
+                run_git_grep_for_symbols(
+                    repo_root,
+                    source,
+                    &missed_prio,
+                    false,
+                    modified_files_norm,
+                )
+                .records,
+            );
+        }
+    }
+
+    if all_records.is_empty() {
+        return Vec::new();
+    }
+
+    // Aggregate eligible candidate files and preserve `(has_sig_changed, has_type_target)` priority.
+    struct CandScore {
+        path: PathBuf,
+        matched_syms: HashSet<String>,
+        hit_count: usize,
+        has_sig_changed: bool,
+        has_type_target: bool,
+    }
+    let mut cand_map: HashMap<String, CandScore> = HashMap::new();
+    for rec in all_records {
+        let p_norm = normalize_path_key(&rec.path);
+        let entry = cand_map.entry(p_norm).or_insert_with(|| CandScore {
+            path: rec.path,
+            matched_syms: HashSet::new(),
+            hit_count: 0,
+            has_sig_changed: false,
+            has_type_target: false,
+        });
+        entry.hit_count += 1;
+        for h in rec.matched_syms {
+            if let Some(&(sc, it)) = sym_flags.get(&h) {
+                entry.has_sig_changed |= sc;
+                entry.has_type_target |= it;
+            }
+            entry.matched_syms.insert(h);
+        }
+    }
+    if cand_map.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cand_list: Vec<CandScore> = cand_map.into_values().collect();
+    cand_list.sort_by(|a, b| {
+        b.has_sig_changed
+            .cmp(&a.has_sig_changed)
+            .then_with(|| b.has_type_target.cmp(&a.has_type_target))
+            .then_with(|| b.matched_syms.len().cmp(&a.matched_syms.len()))
+            .then_with(|| b.hit_count.cmp(&a.hit_count))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    cand_list.truncate(MAX_CALLER_CANDIDATE_FILES);
+
+    let to_read: Vec<PathBuf> = cand_list.iter().map(|c| c.path.clone()).collect();
+    let blobs = read_snapshot_files_batch(repo_root, source, &to_read);
+
+    // Precompute normalized metadata per target
+    struct TargetMeta<'a> {
+        target: &'a ReverseTarget,
+        def_norm: String,
+        def_dir_norm: String,
+        pkg_dir_norm: String,
+        stem_norm: String,
+    }
+    let mut target_meta_map: HashMap<&str, Vec<TargetMeta<'_>>> = HashMap::new();
+    for sym in &selected_syms {
+        if let Some(ts) = grouped.get(sym) {
+            let metas = ts
+                .iter()
+                .map(|t| TargetMeta {
+                    target: t,
+                    def_norm: normalize_path_key(&t.def_file),
+                    def_dir_norm: t
+                        .def_file
+                        .parent()
+                        .map(normalize_path_key)
+                        .unwrap_or_default(),
+                    pkg_dir_norm: t
+                        .def_file
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                        .map(normalize_alnum_lower)
+                        .unwrap_or_default(),
+                    stem_norm: stem_for_path_norm(&t.def_file),
+                })
+                .collect();
+            target_meta_map.insert(sym.as_str(), metas);
+        }
+    }
+
+    #[derive(Clone)]
+    struct CallerMatch {
+        entry: ContextEntry,
+        enc_line: usize,
+        pinned: bool,
+    }
+    let mut callers_by_target: BTreeMap<String, Vec<CallerMatch>> = BTreeMap::new();
+    let mut parsed_bytes = 0usize;
+
+    for cand in cand_list {
+        let Some(cand_lang) = SupportedLanguage::from_path(&cand.path) else {
+            continue;
+        };
+        let Some(content) = blobs.get(&cand.path) else {
+            continue;
+        };
+        if parsed_bytes + content.len() > MAX_CROSS_FILE_PARSE_BYTES {
+            break;
+        }
+        if has_generated_source_header(content, Some(&cand.path)) {
+            continue;
+        }
+        parsed_bytes += content.len();
+        let Ok(tree) = parse_with_timeout(cand_lang, content) else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let inline_tests =
+            ast_compact::find_inline_test_blocks(cand_lang, &tree.root_node(), content);
+
+        let mut import_specs = Vec::new();
+        let mut imported_symbols = HashMap::new();
+        let mut alias_map = HashMap::new();
+        collect_file_imports(
+            cand_lang,
+            &tree.root_node(),
+            content,
+            &mut import_specs,
+            &mut imported_symbols,
+            &mut alias_map,
+        );
+
+        let cand_dir_norm = cand
+            .path
+            .parent()
+            .map(normalize_path_key)
+            .unwrap_or_default();
+
+        // Check import/same-pkg pinning per wanted symbol present in this candidate file
+        let mut sym_pinned: HashMap<String, bool> = HashMap::new();
+        let mut local_name_to_targets: HashMap<String, Vec<String>> = HashMap::new();
+
+        for sym in &cand.matched_syms {
+            let Some(metas) = target_meta_map.get(sym.as_str()) else {
+                continue;
+            };
+            let pinned = metas.iter().any(|tm| {
+                if let Some(specs) = imported_symbols.get(sym) {
+                    if specs.iter().any(|sp| {
+                        import_spec_matches_target_file(
+                            cand_lang,
+                            &cand.path,
+                            sp,
+                            &tm.target.def_file,
+                            &tm.def_norm,
+                            &tm.stem_norm,
+                        )
+                    }) {
+                        return true;
+                    }
+                }
+                if import_specs.iter().any(|sp| {
+                    import_spec_matches_target_file(
+                        cand_lang,
+                        &cand.path,
+                        sp,
+                        &tm.target.def_file,
+                        &tm.def_norm,
+                        &tm.stem_norm,
+                    )
+                }) {
+                    return true;
+                }
+                // Same-package Go sibling or same-directory C/C++/Java/C# sibling for matching family
+                let same_family = cand_lang == tm.target.lang
+                    || matches!(
+                        (cand_lang, tm.target.lang),
+                        (SupportedLanguage::C, SupportedLanguage::Cpp)
+                            | (SupportedLanguage::Cpp, SupportedLanguage::C)
+                    );
+                same_family
+                    && cand_dir_norm == tm.def_dir_norm
+                    && matches!(
+                        cand_lang,
+                        SupportedLanguage::Go
+                            | SupportedLanguage::Java
+                            | SupportedLanguage::CSharp
+                            | SupportedLanguage::C
+                            | SupportedLanguage::Cpp
+                    )
+                    && (cand_lang == SupportedLanguage::Go
+                        || tm.target.is_type
+                        || !matches!(
+                            cand_lang,
+                            SupportedLanguage::Java | SupportedLanguage::CSharp
+                        ))
+            });
+            sym_pinned.insert(sym.clone(), pinned);
+            local_name_to_targets
+                .entry(sym.clone())
+                .or_default()
+                .push(sym.clone());
+        }
+        // Propagate aliases (`real as alias` in candidate file) if alias itself appears in candidate!
+        let is_ruby_cand = cand_lang == SupportedLanguage::Ruby;
+        for (alias, orig) in &alias_map {
+            if let Some(metas) = target_meta_map.get(orig.as_str()) {
+                if contains_utf8_ident(content, alias, is_ruby_cand) {
+                    let pinned = metas.iter().any(|tm| {
+                        imported_symbols.get(alias).is_some_and(|specs| {
+                            specs.iter().any(|sp| {
+                                import_spec_matches_target_file(
+                                    cand_lang,
+                                    &cand.path,
+                                    sp,
+                                    &tm.target.def_file,
+                                    &tm.def_norm,
+                                    &tm.stem_norm,
+                                )
+                            })
+                        }) || import_specs.iter().any(|sp| {
+                            import_spec_matches_target_file(
+                                cand_lang,
+                                &cand.path,
+                                sp,
+                                &tm.target.def_file,
+                                &tm.def_norm,
+                                &tm.stem_norm,
+                            )
+                        })
+                    });
+                    sym_pinned
+                        .entry(orig.clone())
+                        .and_modify(|p| *p |= pinned)
+                        .or_insert(pinned);
+                    local_name_to_targets
+                        .entry(alias.clone())
+                        .or_default()
+                        .push(orig.clone());
+                }
+            }
+        }
+
+        if local_name_to_targets.is_empty() {
+            continue;
+        }
+
+        #[derive(Clone)]
+        struct VerifiedHit {
+            target_sym: String,
+            call_line: usize,
+            enc_line: usize,
+            enc_sig: Option<String>,
+            pinned: bool,
+        }
+
+        let is_qualifier_compatible = |qual_opt: Option<&str>,
+                                       target_sym: &str,
+                                       is_static_sep: bool|
+         -> bool {
+            let Some(qual) = qual_opt.map(str::trim).filter(|q| !q.is_empty()) else {
+                return true;
+            };
+            if matches!(qual, "self" | "this" | "super" | "crate") {
+                return true;
+            }
+            let Some(metas) = target_meta_map.get(target_sym) else {
+                return false;
+            };
+            let alias_target = alias_map.get(qual).map(String::as_str);
+            let q_resolved = alias_target.unwrap_or(qual);
+            let q_norm = normalize_alnum_lower(q_resolved);
+            if q_norm.is_empty() {
+                return true;
+            }
+            for tm in metas {
+                if !tm.stem_norm.is_empty() && q_norm == tm.stem_norm {
+                    return true;
+                }
+                if !tm.target.parent_hints.is_empty() && tm.target.parent_hints.contains(&q_norm) {
+                    return true;
+                }
+                if cand_lang == SupportedLanguage::Go
+                    && !tm.pkg_dir_norm.is_empty()
+                    && q_norm == tm.pkg_dir_norm
+                {
+                    return true;
+                }
+            }
+            // Reject:
+            // 1) uppercase static type/class qualifiers (`OtherType::foo()`, `OtherService.reserve(...)`)
+            // 2) explicit import/namespace aliases resolving to a different module (`other_ns.foo()`)
+            // 3) Rust static `mod_other::foo()` / `crate::mod_other::foo` where module does not match stem/alias/parent
+            let is_upper_static = q_resolved.chars().next().is_some_and(|c| c.is_uppercase());
+            if is_upper_static
+                || alias_target.is_some()
+                || (cand_lang == SupportedLanguage::Rust && is_static_sep)
+            {
+                return false;
+            }
+            true
+        };
+
+        let is_skip_ast_kind = |kind: &str| -> bool {
+            matches!(
+                kind,
+                "comment"
+                    | "line_comment"
+                    | "block_comment"
+                    | "documentation_comment"
+                    | "use_declaration"
+                    | "import_statement"
+                    | "import_from_statement"
+                    | "import_declaration"
+                    | "using_directive"
+                    | "preproc_include"
+                    | "jsx_closing_element"
+                    | "string_literal"
+                    | "raw_string_literal"
+                    | "char_literal"
+                    | "character_literal"
+                    | "interpreted_string_literal"
+                    | "rune_literal"
+                    | "string_fragment"
+                    | "string_content"
+                    | "text_block"
+                    | "verbatim_string_literal"
+                    | "regex"
+                    | "simple_symbol"
+                    | "symbol"
+            )
+        };
+
+        let is_binding_or_decl_name_pos = |node: &tree_sitter::Node| -> bool {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            let pk = parent.kind();
+            if parent
+                .child_by_field_name("name")
+                .is_some_and(|c| c.id() == node.id())
+                && matches!(
+                    pk,
+                    "parameter"
+                        | "required_parameter"
+                        | "optional_parameter"
+                        | "formal_parameter"
+                        | "parameter_declaration"
+                        | "default_parameter"
+                        | "typed_default_parameter"
+                        | "keyword_parameter"
+                        | "splat_parameter"
+                        | "hash_splat_parameter"
+                        | "block_parameter"
+                        | "variable_declarator"
+                        | "function_item"
+                        | "function_declaration"
+                        | "function_definition"
+                        | "method_declaration"
+                        | "method_definition"
+                        | "method"
+                        | "singleton_method"
+                        | "struct_item"
+                        | "enum_item"
+                        | "trait_item"
+                        | "type_item"
+                        | "const_item"
+                        | "static_item"
+                        | "class_definition"
+                        | "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                        | "type_alias_declaration"
+                        | "type_spec"
+                        | "field_declaration"
+                        | "property_declaration"
+                )
+            {
+                return true;
+            }
+            if matches!(
+                pk,
+                "parameter"
+                    | "let_declaration"
+                    | "short_var_declaration"
+                    | "var_spec"
+                    | "const_spec"
+            ) && parent
+                .child_by_field_name("pattern")
+                .is_some_and(|c| c.id() == node.id())
+            {
+                return true;
+            }
+            if matches!(
+                pk,
+                "function_declarator"
+                    | "init_declarator"
+                    | "parameter_declaration"
+                    | "optional_parameter_declaration"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+            ) && parent
+                .child_by_field_name("declarator")
+                .is_some_and(|c| c.id() == node.id())
+            {
+                return true;
+            }
+            if pk == "assignment"
+                && parent
+                    .child_by_field_name("left")
+                    .is_some_and(|c| c.id() == node.id())
+            {
+                return true;
+            }
+            if pk == "typed_parameter"
+                && node.kind() == "identifier"
+                && parent
+                    .child_by_field_name("type")
+                    .is_none_or(|t| t.id() != node.id())
+            {
+                return true;
+            }
+            if pk == "parameter_declaration" && node.kind() == "identifier" {
+                return true;
+            }
+            if pk == "identifier_pattern" {
+                return true;
+            }
+            false
+        };
+
+        let mut raw_hits: Vec<VerifiedHit> = Vec::new();
+
+        #[allow(clippy::too_many_arguments)]
+        fn walk_caller_ast<'a>(
+            lang: SupportedLanguage,
+            cand_path: &Path,
+            node: tree_sitter::Node<'a>,
+            lines: &[&str],
+            source: &str,
+            inline_tests: &[ast_compact::InlineTestBlock],
+            local_name_to_targets: &HashMap<String, Vec<String>>,
+            sym_pinned: &HashMap<String, bool>,
+            is_qualifier_compatible: &dyn Fn(Option<&str>, &str, bool) -> bool,
+            is_skip_ast_kind: &dyn Fn(&str) -> bool,
+            is_binding_or_decl_name_pos: &dyn Fn(&tree_sitter::Node) -> bool,
+            enclosing_stack: &mut Vec<tree_sitter::Node<'a>>,
+            target_meta_map: &HashMap<&str, Vec<TargetMeta<'_>>>,
+            scope_sep: &'static str,
+            out_hits: &mut Vec<VerifiedHit>,
+        ) {
+            let kind = node.kind();
+            if is_skip_ast_kind(kind) {
+                return;
+            }
+            let n_start = node.start_position().row + 1;
+            let n_end = node.end_position().row + 1;
+            if inline_tests
+                .iter()
+                .any(|b| n_start >= b.start_line && n_end <= b.end_line)
+            {
+                return;
+            }
+
+            // Skip plain Ruby/Python `"string"` and JS/TS `template_string` and C# `interpolated_string_expression`
+            // bodies unless descending into explicit interpolation nodes.
+            if (kind == "string"
+                && matches!(
+                    lang,
+                    SupportedLanguage::Python
+                        | SupportedLanguage::Ruby
+                        | SupportedLanguage::JavaScript
+                        | SupportedLanguage::TypeScript
+                        | SupportedLanguage::Tsx
+                ))
+                || kind == "template_string"
+                || kind == "interpolated_string_expression"
+            {
+                let mut cursor = node.walk();
+                for ch in node.named_children(&mut cursor) {
+                    if matches!(ch.kind(), "interpolation" | "template_substitution") {
+                        walk_caller_ast(
+                            lang,
+                            cand_path,
+                            ch,
+                            lines,
+                            source,
+                            inline_tests,
+                            local_name_to_targets,
+                            sym_pinned,
+                            is_qualifier_compatible,
+                            is_skip_ast_kind,
+                            is_binding_or_decl_name_pos,
+                            enclosing_stack,
+                            target_meta_map,
+                            scope_sep,
+                            out_hits,
+                        );
+                    }
+                }
+                return;
+            }
+
+            // Skip Ruby `require` / `require_relative`
+            if lang == SupportedLanguage::Ruby && kind == "call" {
+                if let Some(m) = node.child_by_field_name("method") {
+                    if matches!(
+                        source.get(m.start_byte()..m.end_byte()),
+                        Some("require" | "require_relative")
+                    ) {
+                        return;
+                    }
+                }
+            }
+
+            // Skip test-attributed functions/blocks in production files
+            let pushed_def = if let Some(matched) = check_primary_definition(lang, &node) {
+                if matched.id() == node.id() {
+                    if test_scope::is_test_scope(lang, &matched, Some(cand_path), lines) {
+                        return;
+                    }
+                    enclosing_stack.push(matched);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let record_hit = |local_sym: &str,
+                              qual_opt: Option<&str>,
+                              hit_line: usize,
+                              is_static_sep: bool,
+                              stack: &[tree_sitter::Node<'a>],
+                              out: &mut Vec<VerifiedHit>| {
+                let Some(orig_syms) = local_name_to_targets.get(local_sym) else {
+                    return;
+                };
+                for orig_sym in orig_syms {
+                    let pinned = *sym_pinned.get(orig_sym).unwrap_or(&false);
+                    if !is_qualifier_compatible(qual_opt, orig_sym, is_static_sep) {
+                        continue;
+                    }
+                    // Pick innermost enclosing function/method (fallback to class/type if at class level)
+                    let enc_node = stack
+                        .iter()
+                        .rev()
+                        .find(|n| {
+                            ast_compact::is_foldable_function_node(lang, n)
+                                || matches!(n.kind(), "decorated_definition" | "export_statement")
+                        })
+                        .or_else(|| stack.last());
+                    let (enc_line, enc_sig) = if let Some(en) = enc_node {
+                        let parent =
+                            signature::extract_parent_scope_prefix(lang, en, lines, source);
+                        let raw_sig = signature::extract_signature(lang, en, lines, source);
+                        let compact = signature::compact_definition_signature_with_ast_opts(
+                            lang,
+                            en,
+                            parent.as_deref(),
+                            raw_sig.as_deref(),
+                            source,
+                            signature::SigFormatOpts {
+                                max_chars: 120,
+                                scope_sep,
+                                preserve_key_decorators: false,
+                                greedy_params: true,
+                            },
+                        )
+                        .map(|s| s.trim_end_matches('{').trim_end().to_string());
+                        (en.start_position().row + 1, compact)
+                    } else {
+                        (hit_line, None)
+                    };
+                    out.push(VerifiedHit {
+                        target_sym: orig_sym.clone(),
+                        call_line: hit_line,
+                        enc_line,
+                        enc_sig,
+                        pinned,
+                    });
+                }
+            };
+
+            // Detect direct callee / property / attribute / trailing member positions already evaluated
+            // (or governed) by an enclosing qualified expression, so a rejected `OtherClass.foo()`
+            // or `<OtherNS.PriceTag />` never leaks through as an unqualified `foo` on child recursion.
+            let is_direct_callee_or_member_leaf = node.parent().is_some_and(|p| {
+                let pk = p.kind();
+                p.child_by_field_name("function")
+                    .is_some_and(|c| c.id() == node.id())
+                    || p.child_by_field_name("name")
+                        .is_some_and(|c| c.id() == node.id())
+                    || p.child_by_field_name("method")
+                        .is_some_and(|c| c.id() == node.id())
+                    || p.child_by_field_name("macro")
+                        .is_some_and(|c| c.id() == node.id())
+                    || p.child_by_field_name("constructor")
+                        .is_some_and(|c| c.id() == node.id())
+                    || (matches!(pk, "object_creation_expression" | "generic_type")
+                        && p.child_by_field_name("type")
+                            .is_some_and(|c| c.id() == node.id()))
+                    || (pk == "attribute"
+                        && p.child_by_field_name("attribute")
+                            .is_some_and(|c| c.id() == node.id()))
+                    || (matches!(
+                        pk,
+                        "member_expression" | "jsx_member_expression" | "nested_identifier"
+                    ) && p
+                        .child_by_field_name("property")
+                        .is_some_and(|c| c.id() == node.id()))
+                    || (matches!(pk, "field_expression" | "selector_expression")
+                        && p.child_by_field_name("field")
+                            .is_some_and(|c| c.id() == node.id()))
+                    || (matches!(
+                        pk,
+                        "method_reference" | "jsx_namespace_name" | "scoped_type_identifier"
+                    ) && p.named_child(0).is_some_and(|c| c.id() != node.id()))
+            });
+
+            // 1. Call expressions & invocations across all 10 languages
+            if matches!(
+                kind,
+                "call_expression" | "call" | "method_invocation" | "invocation_expression"
+            ) {
+                if kind == "method_invocation"
+                    || (lang == SupportedLanguage::Ruby && kind == "call")
+                {
+                    let (obj_f, name_f) = if kind == "method_invocation" {
+                        ("object", "name")
+                    } else {
+                        ("receiver", "method")
+                    };
+                    let obj = node
+                        .child_by_field_name(obj_f)
+                        .and_then(|n| source.get(n.start_byte()..n.end_byte()))
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if let Some(name_n) = node.child_by_field_name(name_f) {
+                        let name = source
+                            .get(name_n.start_byte()..name_n.end_byte())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let hit_line = name_n.start_position().row + 1;
+                        let quals = extract_lhs_qualifiers(lang, obj);
+                        if let Some(&q) = quals.last() {
+                            record_hit(name, Some(q), hit_line, false, enclosing_stack, out_hits);
+                        } else if obj.is_empty() || matches!(obj, "this" | "self" | "super") {
+                            record_hit(name, None, hit_line, false, enclosing_stack, out_hits);
+                        }
+                    }
+                } else if let Some(fn_n) = node
+                    .child_by_field_name("function")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .or_else(|| node.child_by_field_name("method"))
+                {
+                    let raw = source
+                        .get(fn_n.start_byte()..fn_n.end_byte())
+                        .unwrap_or("")
+                        .trim();
+                    let hit_line = fn_n
+                        .child_by_field_name("field")
+                        .or_else(|| fn_n.child_by_field_name("property"))
+                        .or_else(|| fn_n.child_by_field_name("attribute"))
+                        .or_else(|| fn_n.child_by_field_name("name"))
+                        .map_or_else(
+                            || fn_n.start_position().row + 1,
+                            |n| n.start_position().row + 1,
+                        );
+                    if let Some((lhs, rhs, is_static_sep)) = split_rightmost_call_sep(lang, raw) {
+                        let rhs_no_turbo = rhs.split("::<").next().unwrap_or(rhs);
+                        let raw_sym = rhs_no_turbo.split(['<', '(']).next().unwrap_or("").trim();
+                        let sym = if lang == SupportedLanguage::Ruby {
+                            raw_sym
+                        } else {
+                            raw_sym.trim_end_matches(['?', '!'])
+                        };
+                        let quals = extract_lhs_qualifiers(lang, lhs);
+                        let qual_opt = quals.last().copied();
+                        record_hit(
+                            sym,
+                            qual_opt,
+                            hit_line,
+                            is_static_sep,
+                            enclosing_stack,
+                            out_hits,
+                        );
+                    } else {
+                        let raw_no_turbo = raw.split("::<").next().unwrap_or(raw);
+                        let raw_sym = raw_no_turbo.split(['<', '(']).next().unwrap_or("").trim();
+                        let sym = if lang == SupportedLanguage::Ruby {
+                            raw_sym
+                        } else {
+                            raw_sym.trim_end_matches(['?', '!'])
+                        };
+                        record_hit(sym, None, hit_line, false, enclosing_stack, out_hits);
+                    }
+                }
+            } else if kind == "macro_invocation" {
+                if let Some(m_n) = node.child_by_field_name("macro") {
+                    let raw = source
+                        .get(m_n.start_byte()..m_n.end_byte())
+                        .unwrap_or("")
+                        .trim();
+                    let (qual, sym, is_static_sep) = match raw.rsplit_once("::") {
+                        Some((l, r)) => (
+                            Some(l.rsplit("::").next().unwrap_or(l).trim()),
+                            r.trim(),
+                            true,
+                        ),
+                        None => (None, raw, false),
+                    };
+                    record_hit(
+                        sym,
+                        qual,
+                        m_n.start_position().row + 1,
+                        is_static_sep,
+                        enclosing_stack,
+                        out_hits,
+                    );
+                }
+            } else if matches!(kind, "new_expression" | "object_creation_expression") {
+                if let Some(t_n) = node
+                    .child_by_field_name("constructor")
+                    .or_else(|| node.child_by_field_name("type"))
+                {
+                    let raw = source
+                        .get(t_n.start_byte()..t_n.end_byte())
+                        .unwrap_or("")
+                        .trim();
+                    let no_gen = raw.split('<').next().unwrap_or(raw).trim();
+                    if let Some((lhs, rhs, is_static_sep)) = split_rightmost_call_sep(lang, no_gen)
+                    {
+                        let quals = extract_lhs_qualifiers(lang, lhs);
+                        record_hit(
+                            rhs.trim(),
+                            quals.last().copied(),
+                            t_n.start_position().row + 1,
+                            is_static_sep,
+                            enclosing_stack,
+                            out_hits,
+                        );
+                    } else {
+                        record_hit(
+                            no_gen,
+                            None,
+                            t_n.start_position().row + 1,
+                            false,
+                            enclosing_stack,
+                            out_hits,
+                        );
+                    }
+                }
+            } else if kind == "method_reference" {
+                if let Some(raw) = source.get(node.start_byte()..node.end_byte()) {
+                    if let Some((l, r)) = raw.trim().rsplit_once("::") {
+                        let qual = l.rsplit(['.', ':']).next().map(str::trim);
+                        record_hit(r.trim(), qual, n_start, true, enclosing_stack, out_hits);
+                    }
+                }
+            } else if matches!(kind, "jsx_opening_element" | "jsx_self_closing_element") {
+                if let Some(name_n) = node.child_by_field_name("name") {
+                    let raw = source
+                        .get(name_n.start_byte()..name_n.end_byte())
+                        .unwrap_or("")
+                        .trim();
+                    let (qual, sym) = if let Some((l, r)) = raw.rsplit_once(['.', ':']) {
+                        (
+                            Some(l.rsplit(['.', ':']).next().unwrap_or(l).trim()),
+                            r.trim(),
+                        )
+                    } else {
+                        (None, raw)
+                    };
+                    record_hit(
+                        sym,
+                        qual,
+                        name_n.start_position().row + 1,
+                        false,
+                        enclosing_stack,
+                        out_hits,
+                    );
+                }
+            } else if kind == "attribute"
+                && lang == SupportedLanguage::Python
+                && !is_direct_callee_or_member_leaf
+                && !is_binding_or_decl_name_pos(&node)
+            {
+                if let (Some(obj_n), Some(attr_n)) = (
+                    node.child_by_field_name("object"),
+                    node.child_by_field_name("attribute"),
+                ) {
+                    let obj = source
+                        .get(obj_n.start_byte()..obj_n.end_byte())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let attr = source
+                        .get(attr_n.start_byte()..attr_n.end_byte())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if let Some(orig_syms) = local_name_to_targets.get(attr) {
+                        let has_type_target = orig_syms.iter().any(|os| {
+                            target_meta_map
+                                .get(os.as_str())
+                                .is_some_and(|ms| ms.iter().any(|m| m.target.is_type))
+                        });
+                        let pinned = orig_syms
+                            .iter()
+                            .any(|os| *sym_pinned.get(os).unwrap_or(&false));
+                        if has_type_target || pinned {
+                            let quals = extract_lhs_qualifiers(lang, obj);
+                            record_hit(
+                                attr,
+                                quals.last().copied(),
+                                attr_n.start_position().row + 1,
+                                false,
+                                enclosing_stack,
+                                out_hits,
+                            );
+                        }
+                    }
+                }
+            } else if matches!(
+                kind,
+                "type_identifier"
+                    | "type_name"
+                    | "qualified_type"
+                    | "scoped_type_identifier"
+                    | "generic_name"
+            ) && !is_direct_callee_or_member_leaf
+                && !is_binding_or_decl_name_pos(&node)
+            {
+                if let Some(raw) = source.get(node.start_byte()..node.end_byte()) {
+                    let clean = raw.split('<').next().unwrap_or(raw).trim();
+                    if let Some((lhs, rhs, is_static_sep)) = split_rightmost_call_sep(lang, clean) {
+                        let quals = extract_lhs_qualifiers(lang, lhs);
+                        record_hit(
+                            rhs.trim(),
+                            quals.last().copied(),
+                            n_start,
+                            is_static_sep,
+                            enclosing_stack,
+                            out_hits,
+                        );
+                    } else {
+                        record_hit(clean, None, n_start, false, enclosing_stack, out_hits);
+                    }
+                }
+            } else if matches!(
+                kind,
+                "scoped_identifier" | "qualified_identifier" | "identifier" | "constant"
+            ) && !is_direct_callee_or_member_leaf
+                && !is_binding_or_decl_name_pos(&node)
+            {
+                if let Some(raw) = source.get(node.start_byte()..node.end_byte()) {
+                    let t = raw.trim();
+                    if kind == "scoped_identifier" || kind == "qualified_identifier" {
+                        if let Some((lhs, rhs, is_static_sep)) = split_rightmost_call_sep(lang, t) {
+                            let quals = extract_lhs_qualifiers(lang, lhs);
+                            record_hit(
+                                rhs.trim(),
+                                quals.last().copied(),
+                                n_start,
+                                is_static_sep,
+                                enclosing_stack,
+                                out_hits,
+                            );
+                        }
+                    } else if let Some(orig_syms) = local_name_to_targets.get(t) {
+                        let has_type_target = orig_syms.iter().any(|os| {
+                            target_meta_map
+                                .get(os.as_str())
+                                .is_some_and(|ms| ms.iter().any(|m| m.target.is_type))
+                        });
+                        let pinned = orig_syms
+                            .iter()
+                            .any(|os| *sym_pinned.get(os).unwrap_or(&false));
+                        if has_type_target || pinned {
+                            record_hit(t, None, n_start, false, enclosing_stack, out_hits);
+                        }
+                    }
+                }
+            }
+
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                walk_caller_ast(
+                    lang,
+                    cand_path,
+                    ch,
+                    lines,
+                    source,
+                    inline_tests,
+                    local_name_to_targets,
+                    sym_pinned,
+                    is_qualifier_compatible,
+                    is_skip_ast_kind,
+                    is_binding_or_decl_name_pos,
+                    enclosing_stack,
+                    target_meta_map,
+                    scope_sep,
+                    out_hits,
+                );
+            }
+            if pushed_def {
+                enclosing_stack.pop();
+            }
+        }
+
+        let mut enclosing_stack = Vec::new();
+        walk_caller_ast(
+            cand_lang,
+            &cand.path,
+            tree.root_node(),
+            &lines,
+            content,
+            &inline_tests,
+            &local_name_to_targets,
+            &sym_pinned,
+            &is_qualifier_compatible,
+            &is_skip_ast_kind,
+            &is_binding_or_decl_name_pos,
+            &mut enclosing_stack,
+            &target_meta_map,
+            scope_sep,
+            &mut raw_hits,
+        );
+
+        // Deduplicate per `(target_sym, enc_line)` within this file so one caller with 5 calls
+        // uses 1 slot instead of exhausting `MAX_CALLERS_PER_TARGET`.
+        let mut per_sym_enc: HashSet<(String, usize)> = HashSet::new();
+        for hit in raw_hits {
+            if !per_sym_enc.insert((hit.target_sym.clone(), hit.enc_line)) {
+                continue;
+            }
+            let call_code_raw = lines
+                .get(hit.call_line.saturating_sub(1))
+                .map(|l| l.trim())
+                .unwrap_or("");
+            if call_code_raw.is_empty() {
+                continue;
+            }
+            let call_code = if call_code_raw.len() > 120 {
+                format!("{}...", truncate_utf8_bytes(call_code_raw, 117).trim_end())
+            } else {
+                call_code_raw.to_string()
+            };
+            let snippet = match hit.enc_sig {
+                Some(ref esig) if esig != &call_code => {
+                    format!("[caller of {}] {esig} -> {call_code}", hit.target_sym)
+                }
+                _ => format!("[caller of {}] {call_code}", hit.target_sym),
+            };
+            callers_by_target
+                .entry(hit.target_sym.clone())
+                .or_default()
+                .push(CallerMatch {
+                    entry: ContextEntry {
+                        file_path: cand.path.clone(),
+                        symbol_name: hit.target_sym,
+                        start_line: hit.call_line,
+                        end_line: hit.call_line,
+                        is_local: false,
+                        is_type_def: false,
+                        pinned_by_import: hit.pinned,
+                        is_caller: true,
+                        snippet,
+                    },
+                    enc_line: hit.enc_line,
+                    pinned: hit.pinned,
+                });
+        }
+    }
+
+    let mut final_entries = Vec::new();
+    for (_sym, mut cands) in callers_by_target {
+        cands.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| a.entry.file_path.cmp(&b.entry.file_path))
+                .then_with(|| a.enc_line.cmp(&b.enc_line))
+                .then_with(|| a.entry.start_line.cmp(&b.entry.start_line))
+        });
+        cands.truncate(MAX_CALLERS_PER_TARGET);
+        final_entries.extend(cands.into_iter().map(|c| c.entry));
     }
 
     final_entries
@@ -3615,9 +5797,12 @@ pub(super) fn compute_layer3_budget(
 }
 
 /// Renders Layer 3 external AST context block strictly within `max_bytes`, prioritizing:
-/// 1) Same-file unmodified type/const definitions (`is_local && is_type_def`)
-/// 2) Cross-file pinned type definitions (`!is_local && is_type_def && pinned_by_import`)
-/// 3) Cross-file function/method signatures (`!is_local && !is_type_def`)
+/// 0) Same-file unmodified type/const definitions (`is_local`)
+/// 1) Cross-file pinned type definitions (`!is_caller && is_type_def && pinned_by_import`)
+/// 2) Cross-file pinned function/method signatures (`!is_caller && !is_type_def && pinned_by_import`)
+/// 3) Pinned reverse 1-hop callers (`is_caller && pinned_by_import`)
+/// 4) Unpinned cross-file forward types/signatures (`!is_caller && !pinned_by_import`)
+/// 5) Unpinned reverse 1-hop callers (`is_caller && !pinned_by_import`)
 #[cfg(feature = "tree-sitter")]
 pub(super) fn render_layer3_context(
     mut entries: Vec<ContextEntry>,
@@ -3634,18 +5819,40 @@ pub(super) fn render_layer3_context(
         }
     }
 
-    // Deduplicate by (file_path, symbol_name, start_line)
+    let entry_priority = |e: &ContextEntry| -> u8 {
+        if e.is_local {
+            0
+        } else if !e.is_caller && e.is_type_def && e.pinned_by_import {
+            1
+        } else if !e.is_caller && !e.is_type_def && e.pinned_by_import {
+            2
+        } else if e.is_caller && e.pinned_by_import {
+            3
+        } else if !e.is_caller && !e.pinned_by_import {
+            4
+        } else {
+            5
+        }
+    };
+
     entries.sort_by(|a, b| {
-        b.is_local
-            .cmp(&a.is_local)
+        entry_priority(a)
+            .cmp(&entry_priority(b))
             .then_with(|| b.is_type_def.cmp(&a.is_type_def))
-            .then_with(|| b.pinned_by_import.cmp(&a.pinned_by_import))
             .then_with(|| a.file_path.cmp(&b.file_path))
             .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.is_caller.cmp(&b.is_caller))
+            .then_with(|| a.symbol_name.cmp(&b.symbol_name))
     });
-    let mut seen_keys: HashSet<(PathBuf, String, usize)> = HashSet::new();
-    entries
-        .retain(|e| seen_keys.insert((e.file_path.clone(), e.symbol_name.clone(), e.start_line)));
+    let mut seen_keys: HashSet<(PathBuf, String, usize, bool)> = HashSet::new();
+    entries.retain(|e| {
+        seen_keys.insert((
+            e.file_path.clone(),
+            e.symbol_name.clone(),
+            e.start_line,
+            e.is_caller,
+        ))
+    });
 
     // Pack highest-priority entries first within `max_bytes`, then group selected entries by file
     let header = "\n=== External AST Context (1-hop, unmodified) ===\n";
@@ -3656,8 +5863,9 @@ pub(super) fn render_layer3_context(
 
     for e in entries {
         // Deduplicate method signatures whose full enclosing class/struct (<= 18 lines, unstripped)
-        // is already included verbatim in Layer 3 for the same file.
+        // is already included verbatim in Layer 3 for the same file (never drop reverse callers).
         if !e.is_type_def
+            && !e.is_caller
             && selected_full_type_ranges
                 .iter()
                 .any(|(fp, s, en)| *fp == e.file_path && e.start_line >= *s && e.end_line <= *en)
@@ -3695,7 +5903,7 @@ pub(super) fn render_layer3_context(
     let mut grouped: BTreeMap<(u8, String), Vec<ContextEntry>> = BTreeMap::new();
     for e in selected {
         let rank = if e.is_local { 0 } else { 1 };
-        let key = e.file_path.to_string_lossy().replace('\\', "/");
+        let key = normalize_path_key(&e.file_path);
         grouped.entry((rank, key)).or_default().push(e);
     }
 
@@ -3704,7 +5912,7 @@ pub(super) fn render_layer3_context(
     for ((rank, path_str), mut list) in grouped {
         let scope_tag = if rank == 0 { "same-file" } else { "cross-file" };
         out.push_str(&format!("--- {scope_tag}: {path_str} ---\n"));
-        list.sort_by_key(|e| e.start_line);
+        list.sort_by_key(|e| (e.is_caller, e.start_line));
         for e in list {
             out.push_str(&format_context_entry(&e));
         }
@@ -3743,15 +5951,33 @@ mod tests {
         assert_eq!(HybridConfig::parse(Some("all")), HybridConfig::full());
 
         let b1 = HybridConfig::parse(Some("l1,l2"));
-        assert!(b1.layer1 && b1.layer2 && !b1.layer3_local && !b1.layer3_cross);
+        assert!(
+            b1.layer1 && b1.layer2 && !b1.layer3_local && !b1.layer3_cross && !b1.layer3_callers
+        );
         assert_eq!(b1.scope_sep(), " › ");
         assert_eq!(HybridConfig::off().scope_sep(), " > ");
 
         let b2 = HybridConfig::parse(Some("l1+l2+l3_local"));
-        assert!(b2.layer1 && b2.layer2 && b2.layer3_local && !b2.layer3_cross);
+        assert!(
+            b2.layer1 && b2.layer2 && b2.layer3_local && !b2.layer3_cross && !b2.layer3_callers
+        );
+
+        let b3 = HybridConfig::parse(Some("l1+l2+l3_local+l3_cross"));
+        assert!(b3.layer1 && b3.layer2 && b3.layer3_local && b3.layer3_cross && !b3.layer3_callers);
+
+        let callers_only = HybridConfig::parse(Some("callers"));
+        assert!(
+            !callers_only.layer1
+                && !callers_only.layer2
+                && !callers_only.layer3_local
+                && !callers_only.layer3_cross
+                && callers_only.layer3_callers
+        );
 
         let l3 = HybridConfig::parse(Some("l3"));
-        assert!(!l3.layer1 && !l3.layer2 && l3.layer3_local && l3.layer3_cross);
+        assert!(
+            !l3.layer1 && !l3.layer2 && l3.layer3_local && l3.layer3_cross && l3.layer3_callers
+        );
     }
 
     #[test]
@@ -4236,17 +6462,18 @@ pub fn run_thing(x: i32) -> i32 { x + 1 }
         .unwrap();
         run(&["add", "src/caller.rs", "src/py_app.py", "src/ts_app.ts"]);
 
-        // Add DIRTY worktree-only marker to src/client.rs AFTER `git add` so Staged/Commit must NOT see it!
+        // Add DIRTY worktree-only markers to src/client.rs AFTER `git add` so Staged/Commit must NOT see them!
+        // Avoid short pure-hex numeric sentinels like `"999"` because git commit/blob SHAs are `[0-9a-f]+`.
         std::fs::write(
             repo.join("src/client.rs"),
             "/// DIRTY_WORKTREE_ONLY_DOC\n\
-             pub struct GatewayCfg { pub retries: u32 }\n\
-             pub struct OrderClient { cfg: GatewayCfg }\n\
+             pub struct GatewayCfg { pub dirty_retries: u32 }\n\
+             pub struct OrderClient { dirty_cfg: GatewayCfg }\n\
              impl OrderClient {\n\
-                 pub fn new() -> Self { Self { cfg: GatewayCfg { retries: 999 } } }\n\
-                 pub fn send_order(&self, id: u64) -> bool { id > 999 }\n\
+                 pub fn new() -> Self { Self { dirty_cfg: GatewayCfg { dirty_retries: 9_999_888 } } }\n\
+                 pub fn send_order(&self, dirty_id: u64) -> bool { dirty_id > 9_999_888 }\n\
              }\n\
-             pub fn call_api<T>(v: u64) -> bool { v > 999 }\n",
+             pub fn call_api<T>(dirty_v: u64) -> bool { dirty_v > 9_999_888 }\n",
         )
         .unwrap();
 
@@ -4262,7 +6489,12 @@ pub fn run_thing(x: i32) -> i32 { x + 1 }
 
         // Snapshot isolation: git cat-file --batch read index (:0:src/client.rs), NOT dirty worktree
         assert!(
-            !staged_out.contains("DIRTY_WORKTREE_ONLY_DOC") && !staged_out.contains("999"),
+            !staged_out.contains("DIRTY_WORKTREE_ONLY_DOC")
+                && !staged_out.contains("dirty_retries")
+                && !staged_out.contains("dirty_cfg")
+                && !staged_out.contains("dirty_id")
+                && !staged_out.contains("dirty_v")
+                && !staged_out.contains("9_999_888"),
             "GitDiffSource::Staged must read from git cat-file --batch index, not worktree:\n{staged_out}"
         );
         // Chained call & turbofish resolution
@@ -4320,7 +6552,12 @@ pub fn run_thing(x: i32) -> i32 { x + 1 }
         )
         .unwrap();
         assert!(
-            !commit_out.contains("DIRTY_WORKTREE_ONLY_DOC") && !commit_out.contains("999"),
+            !commit_out.contains("DIRTY_WORKTREE_ONLY_DOC")
+                && !commit_out.contains("dirty_retries")
+                && !commit_out.contains("dirty_cfg")
+                && !commit_out.contains("dirty_id")
+                && !commit_out.contains("dirty_v")
+                && !commit_out.contains("9_999_888"),
             "GitDiffSource::Commit must read git cat-file --batch at {head_sha}, not dirty worktree:\n{commit_out}"
         );
         assert!(
@@ -4605,5 +6842,1316 @@ pub fn run_thing(x: i32) -> i32 { x + 1 }
             out.contains("send_order(&self, id: u64)"),
             "Rust `.await?.` chain must extract AsyncClient/connect qualifiers for send_order:\n{out}"
         );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_file_scoped_exposed_set_and_cat_file_newline_path_safety() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/ext.rs"),
+            "pub struct CustomLedgerRule { pub max_hops: u8 }\n\
+             /// External validator rule.\n\
+             pub fn verify_rule(v: u64) -> bool { v > 10 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/local.rs"),
+            "pub fn verify_rule(v: u64) -> bool { v > 0 }\n\
+             pub fn run_check(x: u64) -> bool {\n\
+                 crate::ext::verify_rule(x)\n\
+             }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        // Modify both `local::verify_rule` (so `verify_rule` is in `exposed_set` for `src/local.rs`)
+        // AND `local::run_check` calling `crate::ext::verify_rule`.
+        // File-scoped `(norm_path, symbol_name)` dedup MUST still resolve `src/ext.rs`'s `verify_rule`!
+        std::fs::write(
+            repo.join("src/local.rs"),
+            "pub fn verify_rule(v: u64) -> bool { v > 1 }\n\
+             pub fn run_check(x: u64) -> bool {\n\
+                 crate::ext::verify_rule(x + 1)\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(
+            out.contains("--- cross-file: src/ext.rs ---")
+                && out.contains("// doc: External validator rule."),
+            "Modifying `src/local.rs::verify_rule` must not suppress `src/ext.rs::verify_rule`:\n{out}"
+        );
+
+        // Ensure read_snapshot_files_batch safely skips `\n`/`\r` protocol injection paths without
+        // misaligning subsequent valid paths in `git cat-file --batch`.
+        let batch = read_snapshot_files_batch(
+            repo,
+            GitDiffSource::Commit("HEAD"),
+            &[
+                PathBuf::from("src/ext.rs"),
+                PathBuf::from("bad\n:0:src/local.rs"),
+                PathBuf::from("bad2\rpath"),
+                PathBuf::from("src/local.rs"),
+            ],
+        );
+        assert_eq!(
+            batch.len(),
+            2,
+            "Only valid paths must be returned: {:?}",
+            batch.keys()
+        );
+        assert!(batch[&PathBuf::from("src/ext.rs")].contains("CustomLedgerRule"));
+        assert!(batch[&PathBuf::from("src/local.rs")].contains("run_check"));
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_multilingual_utf8_paths_identifiers_docs_and_reverse_callers() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "테스터"]);
+        run(&["config", "user.email", "tester@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src/한글_모듈")).unwrap();
+        std::fs::write(
+            repo.join("src/한글_모듈/설정.rs"),
+            "/// 다국어 결제 한도 설정.\n\
+             pub struct 한글_결제설정 { pub 최대금액: u64 }\n\
+             /// 수수료를 원 단위로 계산합니다.\n\
+             pub fn 수수료_계산(금액: u64, 설정: &한글_결제설정) -> u64 {\n\
+                 금액.min(설정.최대금액) / 10\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/한글_모듈/결제.rs"),
+            "use super::설정::{한글_결제설정, 수수료_계산};\n\
+             pub const 기본_할인률: u64 = 5;\n\
+             /// 결제 검증 함수 (수정됨).\n\
+             pub fn 결제_검증(금액: u64, 원화모드: bool) -> bool {\n\
+                 금액 > 기본_할인률 && 원화모드\n\
+             }\n\
+             pub fn 승인_실행(설정: &한글_결제설정, 금액: u64) -> u64 {\n\
+                 if 결제_검증(금액, true) { 수수료_계산(금액, 설정) } else { 0 }\n\
+             }\n",
+        )
+        .unwrap();
+        // Unmodified external UTF-8 caller of `결제_검증` (and comments/strings that must be ignored)
+        std::fs::write(
+            repo.join("src/주문_서비스.rs"),
+            "use crate::한글_모듈::결제::결제_검증;\n\
+             pub fn 주문_처리(금액: u64) -> bool {\n\
+                 // 결제_검증 주석은 무시되어야 함\n\
+                 let _msg = \"결제_검증 문자열도 무시\";\n\
+                 결제_검증(금액, false)\n\
+             }\n",
+        )
+        .unwrap();
+        // External UTF-8 unit test caller in tests/ must be excluded
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(
+            repo.join("tests/한글_테스트.rs"),
+            "pub fn test_결제_검증_체크() -> bool {\n    결제_검증(100, true)\n}\n",
+        )
+        .unwrap();
+
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "feat: 한글 다국어 초기 커밋"]);
+
+        // Change signature of `결제_검증` and reference `기본_할인률` / `수수료_계산`
+        std::fs::write(
+            repo.join("src/한글_모듈/결제.rs"),
+            "use super::설정::{한글_결제설정, 수수료_계산};\n\
+             pub const 기본_할인률: u64 = 5;\n\
+             /// 결제 검증 함수 (수정됨).\n\
+             pub fn 결제_검증(금액: u64, 수수료_원: u64, 원화모드: bool) -> bool {\n\
+                 금액 > 수수료_원 && 원화모드\n\
+             }\n\
+             pub fn 승인_실행(설정: &한글_결제설정, 금액: u64) -> u64 {\n\
+                 if 결제_검증(금액, 10, true) { 수수료_계산(금액, 설정) } else { 0 }\n\
+             }\n",
+        )
+        .unwrap();
+        run(&["add", "src/한글_모듈/결제.rs"]);
+        run(&["commit", "-q", "-m", "fix: 결제_검증 파라미터 추가"]);
+
+        let sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let sha = sha.trim();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Commit(sha),
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        // Layer 1 UTF-8 path + symbols
+        assert!(
+            out.contains("src/한글_모듈/결제.rs") && out.contains("결제_검증"),
+            "Layer 1 must preserve UTF-8 paths and Korean symbols:\n{out}"
+        );
+        // Layer 3 local deleted const
+        assert!(
+            out.contains("pub const 기본_할인률: u64 = 5;"),
+            "Layer 3-① must recover Korean deleted-line const `기본_할인률`:\n{out}"
+        );
+        // Layer 3 forward cross-file Korean fn signature + doc
+        assert!(
+            out.contains("pub struct 한글_결제설정")
+                && out.contains("pub fn 수수료_계산(금액: u64, 설정: &한글_결제설정) -> u64")
+                && out.contains("// doc: 수수료를 원 단위로 계산합니다."),
+            "Layer 3-② must resolve Korean cross-file struct/fn/doc via super:: import:\n{out}"
+        );
+        // Layer 3 reverse caller (UTF-8 path + non-ASCII ident via git grep without `-w`)
+        assert!(
+            out.contains("--- cross-file: src/주문_서비스.rs ---")
+                && out.contains("[caller of 결제_검증]")
+                && out.contains("주문_처리")
+                && out.contains("결제_검증(금액, false)"),
+            "Layer 3-③ must resolve unmodified Korean reverse caller `주문_처리`:\n{out}"
+        );
+        // External test file must NOT appear as a reverse caller
+        assert!(
+            !out.contains("test_결제_검증_체크"),
+            "Test file must be excluded from reverse callers:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_reverse_callers_all_10_languages_deleted_guards_snapshots_and_compaction() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src/go_pkg")).unwrap();
+        std::fs::create_dir_all(repo.join("src/java_pkg")).unwrap();
+        std::fs::create_dir_all(repo.join("src/cs_pkg")).unwrap();
+
+        // 1. Rust: modified fn + inline #[cfg(test)] mod + #[test] fn + deleted whole file `legacy_rs.rs`
+        std::fs::write(
+            repo.join("src/rs_api.rs"),
+            "pub struct RsToken { pub exp: u64 }\n\
+             pub fn rs_charge(cents: u64) -> u64 { cents }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/rs_legacy.rs"),
+            "pub fn obsolete_rs_hook(id: u64) -> bool { id > 0 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/rs_caller.rs"),
+            "use crate::rs_api::rs_charge;\n\
+             use crate::rs_legacy::obsolete_rs_hook;\n\
+             pub fn rs_handle_order(v: u64) -> u64 {\n\
+                 // rs_charge(999) in comment must be ignored\n\
+                 let _s = \"rs_charge(999) in string must be ignored\";\n\
+                 if obsolete_rs_hook(v) { rs_charge(v) } else { 0 }\n\
+             }\n\
+             #[test]\n\
+             fn test_rs_charge_unit() { assert_eq!(rs_charge(1), 1); }\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+                 use super::*;\n\
+                 fn helper_in_inline_tests() { let _ = rs_charge(2); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        // 2. Python: modified function + alias caller
+        std::fs::write(
+            repo.join("src/py_math.py"),
+            "def py_tax(amount: int) -> int:\n    return amount // 10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/py_caller.py"),
+            "from src.py_math import py_tax as compute_tax_alias\n\
+             def py_invoice(subtotal: int) -> int:\n    return compute_tax_alias(subtotal)\n",
+        )
+        .unwrap();
+
+        // 3. JavaScript: CommonJS caller
+        std::fs::write(
+            repo.join("src/js_util.js"),
+            "function jsFormatPrice(cents) { return String(cents); }\n\
+             module.exports = { jsFormatPrice };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/js_caller.js"),
+            "const { jsFormatPrice } = require('./js_util');\n\
+             export function jsRenderRow(c) { return jsFormatPrice(c); }\n",
+        )
+        .unwrap();
+
+        // 4. TypeScript + 5. TSX
+        std::fs::write(
+            repo.join("src/ts_calc.ts"),
+            "export function tsComputeFee(cents: number): number { return cents * 2; }\n\
+             export function tsLegacyDeleted(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/tsx_badge.tsx"),
+            "export function PriceTag({ label }: { label: string }) { return <span>{label}</span>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/ts_consumer.ts"),
+            "import { tsComputeFee, tsLegacyDeleted } from './ts_calc';\n\
+             export function tsCheckout(v: number): number {\n\
+                 tsLegacyDeleted();\n\
+                 return tsComputeFee(v);\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/tsx_consumer.tsx"),
+            "import { PriceTag } from './tsx_badge';\n\
+             export function PageView() { return <PriceTag label=\"hi\" />; }\n",
+        )
+        .unwrap();
+
+        // 6. Go
+        std::fs::write(
+            repo.join("src/go_pkg/tax.go"),
+            "package go_pkg\nfunc GoCalcTax(cents int64) int64 { return cents / 10 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/go_pkg/order.go"),
+            "package go_pkg\nfunc GoBill(total int64) int64 { return GoCalcTax(total) }\n",
+        )
+        .unwrap();
+
+        // 7. C
+        std::fs::write(
+            repo.join("src/c_hash.c"),
+            "unsigned c_hash_buf(const char *s) { return (unsigned)*s; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/c_hash.h"),
+            "unsigned c_hash_buf(const char *s);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/c_caller.c"),
+            "#include \"c_hash.h\"\nunsigned c_index_key(const char *k) { return c_hash_buf(k); }\n",
+        )
+        .unwrap();
+
+        // 8. C++
+        std::fs::write(
+            repo.join("src/cpp_ring.hpp"),
+            "class CppRing {\npublic:\n    int cppWrite(int n) { return n; }\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/cpp_caller.cpp"),
+            "#include \"cpp_ring.hpp\"\nint cppFlush(CppRing &r, int n) { return r.cppWrite(n); }\n",
+        )
+        .unwrap();
+
+        // 9. Java
+        std::fs::write(
+            repo.join("src/java_pkg/InvSvc.java"),
+            "package java_pkg;\npublic class InvSvc {\n    public boolean javaReserve(String sku) { return true; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/java_pkg/OrderSvc.java"),
+            "package java_pkg;\npublic class OrderSvc {\n\
+                 public boolean place(InvSvc svc, String s) { return svc.javaReserve(s); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        // 10. C#
+        std::fs::write(
+            repo.join("src/cs_pkg/PolicySvc.cs"),
+            "namespace CsPkg {\n    public class PolicySvc {\n        public bool CsApprove(int cents) { return cents > 0; }\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/cs_pkg/RefundCtrl.cs"),
+            "using CsPkg;\nnamespace CsPkg {\n    public class RefundCtrl {\n        public bool Submit(PolicySvc svc, int c) { return svc.CsApprove(c); }\n    }\n}\n",
+        )
+        .unwrap();
+
+        // 11. Ruby
+        std::fs::write(
+            repo.join("src/rb_guard.rb"),
+            "class RbGuard\n  def self.allow_req?(key)\n    !key.empty?\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/rb_app.rb"),
+            "require_relative 'rb_guard'\nclass RbApp\n  def check(k)\n    RbGuard.allow_req?(k)\n  end\nend\n",
+        )
+        .unwrap();
+
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init all 10 languages"]);
+
+        // Modify all 10 targets (+ delete src/rs_legacy.rs + delete tsLegacyDeleted from src/ts_calc.ts)
+        std::fs::write(
+            repo.join("src/rs_api.rs"),
+            "pub struct RsToken { pub exp: u64, pub scope: u8 }\n\
+             pub fn rs_charge(cents: u64, rate: u32) -> u64 { cents * rate as u64 }\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repo.join("src/rs_legacy.rs")).unwrap();
+        std::fs::write(
+            repo.join("src/py_math.py"),
+            "def py_tax(amount: int, bps: int) -> int:\n    return (amount * bps) // 10000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/js_util.js"),
+            "function jsFormatPrice(cents, cur) { return `${cur}${cents}`; }\n\
+             module.exports = { jsFormatPrice };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/ts_calc.ts"),
+            "export function tsComputeFee(cents: number, taxRate: number): number { return cents * taxRate; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/tsx_badge.tsx"),
+            "export function PriceTag({ label, currency }: { label: string; currency: string }) { return <span>{currency}{label}</span>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/go_pkg/tax.go"),
+            "package go_pkg\nfunc GoCalcTax(cents int64, bps int64) int64 { return (cents * bps) / 10000 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/c_hash.c"),
+            "unsigned c_hash_buf(const char *s, unsigned len) { return len ? (unsigned)*s : 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/cpp_ring.hpp"),
+            "class CppRing {\npublic:\n    int cppWrite(int n, bool flush) { return flush ? n : 0; }\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/java_pkg/InvSvc.java"),
+            "package java_pkg;\npublic class InvSvc {\n    public boolean javaReserve(String sku, int qty) { return qty > 0; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/cs_pkg/PolicySvc.cs"),
+            "namespace CsPkg {\n    public class PolicySvc {\n        public bool CsApprove(int cents, bool strict) { return strict && cents > 0; }\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/rb_guard.rb"),
+            "class RbGuard\n  def self.allow_req?(key, cost: 1)\n    cost <= 10 && !key.empty?\n  end\nend\n",
+        )
+        .unwrap();
+
+        // Stage everything for Staged snapshot test, then overwrite caller in worktree ONLY!
+        run(&["add", "-A"]);
+        std::fs::write(
+            repo.join("src/rs_caller.rs"),
+            "pub fn DIRTY_WORKTREE_CALLER() { rs_charge(9_777_666); }\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        // Test Staged snapshot accuracy + callers across all languages
+        let staged_out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Staged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            !staged_out.contains("DIRTY_WORKTREE_CALLER") && !staged_out.contains("9_777_666"),
+            "Staged reverse callers must read staged index, never dirty worktree:\n{staged_out}"
+        );
+        // Verify exclusions in rs_caller.rs and C header forward declarations
+        assert!(
+            !staged_out.contains("test_rs_charge_unit")
+                && !staged_out.contains("helper_in_inline_tests")
+                && !staged_out.contains("rs_charge(999)")
+                && !staged_out.contains("--- cross-file: src/c_hash.h ---"),
+            "Comments, strings, #[test], #[cfg(test)] mod tests, and C header prototypes must NOT appear as callers:\n{staged_out}"
+        );
+
+        // Check callers resolved across all 10 languages (+ deleted file / deleted fn)
+        for expected in [
+            "[caller of rs_charge]",
+            "rs_handle_order",
+            "[caller of obsolete_rs_hook]",
+            "[caller of py_tax]",
+            "py_invoice",
+            "[caller of jsFormatPrice]",
+            "[caller of tsComputeFee]",
+            "[caller of tsLegacyDeleted]",
+            "[caller of PriceTag]",
+            "[caller of GoCalcTax]",
+            "[caller of c_hash_buf]",
+            "[caller of cppWrite]",
+            "[caller of javaReserve]",
+            "[caller of CsApprove]",
+            "[caller of allow_req?]",
+        ] {
+            assert!(
+                staged_out.contains(expected),
+                "Missing expected reverse caller marker `{expected}`:\n{staged_out}"
+            );
+        }
+
+        // Test layer3_callers-only mode (`layer3_local: false, layer3_cross: false, layer3_callers: true`)
+        let mut w_callers = Vec::new();
+        let callers_only_cfg = HybridConfig::parse(Some("callers"));
+        let callers_only_out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Staged,
+            512 * 1024,
+            callers_only_cfg,
+            &mut w_callers,
+        )
+        .unwrap();
+        assert!(
+            callers_only_out.contains("=== External AST Context (1-hop, unmodified) ===")
+                && callers_only_out.contains("[caller of rs_charge]"),
+            "Callers-only HybridConfig must render reverse callers even when layer3_cross=false:\n{callers_only_out}"
+        );
+
+        // Test compaction shedding: tiny budget forcing Tier 3+ must drop reverse callers
+        let mut w_tight = Vec::new();
+        let tight_out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Staged,
+            2048,
+            HybridConfig::full(),
+            &mut w_tight,
+        )
+        .unwrap();
+        assert!(
+            !tight_out.contains("[caller of "),
+            "Tight budget forcing prod compaction must shed reverse callers:\n{tight_out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_sig_only_and_deleted_renamed_single_line_headers_emit_reverse_callers() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        // 1. Direct incomplete header recovery tests without trailing newlines
+        let del_rs = collect_deleted_lines_reverse_targets(
+            &["    pub fn legacy_handler(x: u64, cfg: &Cfg) -> u64 {"],
+            Path::new("src/svc.rs"),
+            SupportedLanguage::Rust,
+        );
+        assert!(
+            del_rs
+                .iter()
+                .any(|t| t.symbol == "legacy_handler" && t.sig_changed),
+            "Incomplete Rust 1-line signature header must recover symbol: {del_rs:?}"
+        );
+
+        let del_py = collect_deleted_lines_reverse_targets(
+            &["    def legacy_py_hook(self, amount: int) -> int:"],
+            Path::new("src/svc.py"),
+            SupportedLanguage::Python,
+        );
+        assert!(
+            del_py.iter().any(|t| t.symbol == "legacy_py_hook"),
+            "Incomplete Python 1-line def header must recover symbol: {del_py:?}"
+        );
+
+        let del_ts = collect_deleted_lines_reverse_targets(
+            &["    async legacyTsMethod(id: string): Promise<number> {"],
+            Path::new("src/svc.ts"),
+            SupportedLanguage::TypeScript,
+        );
+        assert!(
+            del_ts.iter().any(|t| t.symbol == "legacyTsMethod"),
+            "Standalone deleted TS class method must recover symbol via class wrapper: {del_ts:?}"
+        );
+        assert!(
+            !del_ts.iter().any(|t| t.symbol == "__AnticrumbDelWrap"),
+            "Dummy wrapper class name must never leak: {del_ts:?}"
+        );
+
+        let del_rb = collect_deleted_lines_reverse_targets(
+            &["  def legacy_allow?(key)"],
+            Path::new("src/svc.rb"),
+            SupportedLanguage::Ruby,
+        );
+        assert!(
+            del_rb.iter().any(|t| t.symbol == "legacy_allow?"),
+            "Incomplete Ruby def header must recover predicate symbol: {del_rb:?}"
+        );
+
+        let del_multi = collect_deleted_lines_reverse_targets(
+            &[
+                "pub struct OldCfg { pub limit: u64 }",
+                "pub fn old_helper() -> u64 { 1 }",
+            ],
+            Path::new("src/cfg.rs"),
+            SupportedLanguage::Rust,
+        );
+        let cfg_t = del_multi
+            .iter()
+            .find(|t| t.symbol == "OldCfg")
+            .expect("OldCfg");
+        let fn_t = del_multi
+            .iter()
+            .find(|t| t.symbol == "old_helper")
+            .expect("old_helper");
+        assert!(
+            cfg_t.is_type,
+            "Struct target in multi-def hunk must preserve is_type=true"
+        );
+        assert!(
+            !fn_t.is_type,
+            "Function target in multi-def hunk must have is_type=false"
+        );
+
+        // 2. End-to-end `[sig-only]` edit & `[sig-only]` rename must STILL emit reverse callers!
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        let long_body: String = (0..30)
+            .map(|i| format!("    let v_{i} = x + {i};\n"))
+            .collect();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/api.rs"),
+            format!(
+                "pub struct Cfg {{ pub n: u64 }}\n\
+                 pub fn sig_only_svc(x: u64) -> u64 {{\n{long_body}    v_29\n}}\n\
+                 pub fn rename_before(x: u64) -> u64 {{\n{long_body}    v_29\n}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/caller.rs"),
+            "use crate::api::{sig_only_svc, rename_before};\n\
+             pub fn invoke_both(x: u64) -> u64 {\n\
+                 sig_only_svc(x) + rename_before(x)\n\
+             }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        // Pure visibility/param-free rename/sig edit on large bodies so Layer 2 emits `[sig-only]`
+        std::fs::write(
+            repo.join("src/api.rs"),
+            format!(
+                "pub struct Cfg {{ pub n: u64 }}\n\
+                 pub(crate) fn sig_only_svc(x: u64) -> u64 {{\n{long_body}    v_29\n}}\n\
+                 pub fn rename_after(x: u64) -> u64 {{\n{long_body}    v_29\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("[sig-only; body unchanged:"),
+            "Expected [sig-only] suppression on large unchanged bodies:\n{out}"
+        );
+        assert!(
+            out.contains("[caller of sig_only_svc]") && out.contains("invoke_both"),
+            "[sig-only] edit MUST still surface reverse caller of sig_only_svc:\n{out}"
+        );
+        assert!(
+            out.contains("[caller of rename_before]") && out.contains("invoke_both"),
+            "[sig-only] rename MUST still recover old name and surface reverse caller:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_contains_utf8_ident_ruby_vs_macros_and_nullable_reverse_callers() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        // Unit assertions for Ruby suffix isolation vs non-Ruby `?` / `!` operators
+        assert!(contains_utf8_ident("my_macro!(x)", "my_macro", false));
+        assert!(contains_utf8_ident("x: MyConfig?", "MyConfig", false));
+        assert!(contains_utf8_ident("myFunc?.()", "myFunc", false));
+        assert!(contains_utf8_ident("myVal!.run()", "myVal", false));
+        assert!(contains_utf8_ident("MY_CONST?", "MY_CONST", false));
+        assert!(!contains_utf8_ident("allow_req?(k)", "allow_req", true));
+        assert!(contains_utf8_ident("allow_req?(k)", "allow_req?", true));
+        assert!(!contains_utf8_ident("save!(rec)", "save", true));
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        // Rust macro + constant
+        std::fs::write(
+            repo.join("src/macros.rs"),
+            "#[macro_export]\nmacro_rules! my_macro {\n    ($x:expr) => { Some($x) };\n}\n\
+             pub const MY_FLAG: u8 = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/macro_caller.rs"),
+            "pub fn use_macro(v: u8) -> Option<u8> {\n    my_macro!(v)\n}\n",
+        )
+        .unwrap();
+        // TypeScript nullable config + optional chaining call + non-null call
+        std::fs::write(
+            repo.join("src/ts_cfg.ts"),
+            "export interface MyConfig { timeout: number; }\n\
+             export function optCall(v: number): number { return v + 1; }\n\
+             export function bangCall(v: number): number { return v + 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/ts_caller.ts"),
+            "import { MyConfig, optCall, bangCall } from './ts_cfg';\n\
+             export function runTs(c: MyConfig?) {\n\
+                 return (optCall?.(1) ?? 0) + bangCall!(2);\n\
+             }\n",
+        )
+        .unwrap();
+        // Ruby with predicate vs non-predicate isolation
+        std::fs::write(
+            repo.join("src/rb_svc.rb"),
+            "class RbSvc\n  def self.allow_req(k)\n    k\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/rb_only_pred.rb"),
+            "class RbPredUser\n  def check(k)\n    RbGuard.allow_req?(k)\n  end\nend\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        std::fs::write(
+            repo.join("src/macros.rs"),
+            "#[macro_export]\nmacro_rules! my_macro {\n    ($x:expr) => { Some($x + 1) };\n}\n\
+             pub const MY_FLAG: u8 = 2;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/ts_cfg.ts"),
+            "export interface MyConfig { timeout: number; retries: number; }\n\
+             export function optCall(v: number, strict: boolean): number { return strict ? v : 0; }\n\
+             export function bangCall(v: number, tag: string): number { return v + tag.length; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/rb_svc.rb"),
+            "class RbSvc\n  def self.allow_req(k, strict: true)\n    strict ? k : nil\n  end\nend\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("[caller of my_macro]") && out.contains("use_macro"),
+            "Rust macro_invocation `my_macro!(v)` must resolve reverse caller:\n{out}"
+        );
+        assert!(
+            out.contains("[caller of optCall]") && out.contains("runTs"),
+            "TS optional call `optCall?.(1)` must resolve reverse caller:\n{out}"
+        );
+        assert!(
+            out.contains("[caller of bangCall]") && out.contains("runTs"),
+            "TS non-null call `bangCall!(2)` must resolve reverse caller:\n{out}"
+        );
+        assert!(
+            !out.contains("RbPredUser") && !out.contains("rb_only_pred.rb"),
+            "Ruby `allow_req?` must NOT falsely match modified `allow_req`:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_reverse_grep_not_starved_by_docs_tests_vendor_or_minified_bundle() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::io::Cursor;
+        use std::process::Command;
+
+        // 1. Unit check `read_grep_line_bounded` on >4 KiB single line followed by another line
+        let big_line = format!("a/x.js\x001\x00{}{}\n", "x".repeat(8192), "TAIL_MARKER");
+        let second_line = "b/y.rs\x007\x00prod_call()\n";
+        let payload = format!("{big_line}{second_line}");
+        let mut reader = std::io::BufReader::new(Cursor::new(payload.as_bytes()));
+        let mut buf = Vec::new();
+        let st1 = read_grep_line_bounded(&mut reader, &mut buf, 1024, 1024 * 1024).unwrap();
+        assert!(matches!(st1, GrepLineRead::Line(_)));
+        assert!(buf.len() <= 1024 + 4096);
+        let st2 = read_grep_line_bounded(&mut reader, &mut buf, 1024, 1024 * 1024).unwrap();
+        assert!(matches!(st2, GrepLineRead::Line(_)));
+        assert_eq!(buf, b"b/y.rs\x007\x00prod_call()");
+
+        // 2. End-to-end repo where docs/ + tests/ + vendor/ + 600 KiB minified bundle precede src/
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::create_dir_all(repo.join("vendor")).unwrap();
+        std::fs::create_dir_all(repo.join("assets")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        let docs_noise: String = (0..450)
+            .map(|i| format!("Line {i}: see `target_prod_fn` for billing.\n"))
+            .collect();
+        std::fs::write(repo.join("docs/guide.md"), docs_noise).unwrap();
+        let test_noise: String = (0..120)
+            .map(|i| format!("pub fn test_case_{i}() {{ let _ = target_prod_fn({i}); }}\n"))
+            .collect();
+        std::fs::write(repo.join("tests/billing_test.rs"), test_noise).unwrap();
+        let vendor_noise: String = (0..120)
+            .map(|i| format!("pub fn v_{i}() {{ let _ = target_prod_fn({i}); }}\n"))
+            .collect();
+        std::fs::write(repo.join("vendor/third.rs"), vendor_noise).unwrap();
+        let minified_line = format!(
+            "/*minified*/var x='{}';target_prod_fn(1);{}\n",
+            "a".repeat(320 * 1024),
+            "b".repeat(320 * 1024)
+        );
+        std::fs::write(repo.join("assets/bundle.min.js"), &minified_line).unwrap();
+        std::fs::write(repo.join("assets/big_inline.js"), &minified_line).unwrap();
+
+        std::fs::write(
+            repo.join("src/prod_api.rs"),
+            "pub fn target_prod_fn(cents: u64) -> u64 { cents * 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/z_real_caller.rs"),
+            "use crate::prod_api::target_prod_fn;\n\
+             pub fn execute_charge(c: u64) -> u64 { target_prod_fn(c) }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        std::fs::write(
+            repo.join("src/prod_api.rs"),
+            "pub fn target_prod_fn(cents: u64, tax_bps: u32) -> u64 { cents + tax_bps as u64 }\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("[caller of target_prod_fn]") && out.contains("execute_charge"),
+            "Production caller after >400 docs/tests/vendor lines and >600 KiB minified bundle must NOT be starved:\n{out}"
+        );
+        assert!(
+            !out.contains("guide.md")
+                && !out.contains("billing_test.rs")
+                && !out.contains("third.rs")
+                && !out.contains("bundle.min.js")
+                && !out.contains("big_inline.js"),
+            "Non-eligible files must never appear in reverse callers:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_budget_unpinned_forward_does_not_suppress_pinned_reverse_callers() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        // 15 unimported files defining PascalCase types that will produce Tier 4 unpinned forward hits
+        for i in 0..15 {
+            std::fs::write(
+                repo.join(format!("src/unpinned_{i:02}.rs")),
+                format!("pub struct GhostRule{i:02} {{ pub f1: u64, pub f2: u64, pub f3: u64 }}\n"),
+            )
+            .unwrap();
+        }
+        let mut refs_body = String::new();
+        for i in 0..15 {
+            refs_body.push_str(&format!("    let _g{i}: Option<GhostRule{i:02}> = None;\n"));
+        }
+        std::fs::write(
+            repo.join("src/modified.rs"),
+            format!("pub fn critical_hook(x: u64) -> u64 {{\n{refs_body}    x\n}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/real_caller.rs"),
+            "use crate::modified::critical_hook;\n\
+             pub fn invoke_hook(v: u64) -> u64 { critical_hook(v) }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        std::fs::write(
+            repo.join("src/modified.rs"),
+            format!("pub fn critical_hook(x: u64, fee: u32) -> u64 {{\n{refs_body}    x + fee as u64\n}}\n"),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        // ~12 KiB budget => l3_budget ~ 1.8 KiB (< 15 unpinned forward structs, > Tier 3 pinned caller).
+        // Tier 4 unpinned forward items MUST NOT prevent running Tier 3 pinned reverse caller lookup!
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            12 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("[caller of critical_hook]") && out.contains("invoke_hook"),
+            "Tier 4 unpinned forward entries must NOT block Tier 3 pinned reverse callers:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_reverse_caller_24_file_cap_prioritizes_sig_changed_and_type_over_body_only() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        for i in 0..28 {
+            std::fs::write(
+                repo.join(format!("src/aa_body_caller_{i:02}.rs")),
+                "use crate::lib_api::helper_body_only;\n\
+                 pub fn use_body(v: u64) -> u64 { helper_body_only(v) }\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            repo.join("src/zz_sig_caller.rs"),
+            "use crate::lib_api::critical_api_sig;\n\
+             pub fn call_sig(v: u64) -> u64 { critical_api_sig(v) }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/zz_type_caller.rs"),
+            "use crate::lib_api::CriticalCfg;\n\
+             pub fn read_cfg(c: &CriticalCfg) -> u64 { c.limit }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/lib_api.rs"),
+            "pub struct CriticalCfg { pub limit: u64 }\n\
+             pub fn critical_api_sig(x: u64) -> u64 { x + 1 }\n\
+             pub fn helper_body_only(x: u64) -> u64 {\n\
+                 let a = x + 1;\n\
+                 let b = a + 2;\n\
+                 let c = b + 3;\n\
+                 let d = c + 4;\n\
+                 let e = d + 5;\n\
+                 e\n\
+             }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        std::fs::write(
+            repo.join("src/lib_api.rs"),
+            "pub struct CriticalCfg { pub limit: u64, pub strict: bool }\n\
+             pub fn critical_api_sig(x: u64, y: u64) -> u64 { x + y }\n\
+             pub fn helper_body_only(x: u64) -> u64 {\n\
+                 let a = x + 1;\n\
+                 let b = a + 2;\n\
+                 let c = b + 3;\n\
+                 let d = c + 99;\n\
+                 let e = d + 5;\n\
+                 e\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("[caller of critical_api_sig]") && out.contains("call_sig"),
+            "28 body-only callers must NOT evict sig_changed caller past 24-file cap:\n{out}"
+        );
+        assert!(
+            out.contains("[caller of CriticalCfg]") && out.contains("read_cfg"),
+            "28 body-only callers must NOT evict type target caller past 24-file cap:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_qualifier_bypass_guards_rust_overpinning_and_multilingual_qualifiers() {
+        use crate::tree_sitter_diff::generate_expanded_diff_with_config;
+        use std::process::Command;
+
+        // 1. Unit checks for `import_spec_matches_target_file` (Rust std/self/overpinning & TS `.js`)
+        assert!(!import_spec_matches_target_file(
+            SupportedLanguage::Rust,
+            Path::new("src/consumer.rs"),
+            "std::io::Read",
+            Path::new("src/io.rs"),
+            "src/io.rs",
+            "io",
+        ));
+        assert!(!import_spec_matches_target_file(
+            SupportedLanguage::Rust,
+            Path::new("src/sub/consumer.rs"),
+            "self::inner::Helper",
+            Path::new("src/io.rs"),
+            "src/io.rs",
+            "io",
+        ));
+        assert!(!import_spec_matches_target_file(
+            SupportedLanguage::Rust,
+            Path::new("src/consumer.rs"),
+            "tokio::sync::Mutex",
+            Path::new("src/sync.rs"),
+            "src/sync.rs",
+            "sync",
+        ));
+        assert!(import_spec_matches_target_file(
+            SupportedLanguage::Rust,
+            Path::new("src/consumer.rs"),
+            "crate::io::flush_io",
+            Path::new("src/io.rs"),
+            "src/io.rs",
+            "io",
+        ));
+        assert!(!import_spec_matches_target_file(
+            SupportedLanguage::TypeScript,
+            Path::new("src/app.ts"),
+            "./foo.js",
+            Path::new("src/foo.js.ts"),
+            "src/foo.js.ts",
+            "foojs",
+        ));
+
+        // 2. End-to-end AST qualifier bypass checks across Rust, Python, and TSX (including Unicode)
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "테스터"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/target_mod.rs"),
+            "pub fn rs_target(x: u64) -> u64 { x }\n\
+             pub fn 한글_검증(금액: u64) -> bool { 금액 > 0 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/other_mod.rs"),
+            "pub fn rs_target(x: u64) -> u64 { x + 1 }\n\
+             pub fn 한글_검증(금액: u64) -> bool { 금액 > 10 }\n",
+        )
+        .unwrap();
+        // Pinned import to target_mod, yet ONLY calls `other_mod::rs_target` / `.map(other_mod::한글_검증)` -> MUST reject!
+        std::fs::write(
+            repo.join("src/rs_false_caller.rs"),
+            "use crate::target_mod::{rs_target, 한글_검증};\n\
+             use crate::other_mod;\n\
+             pub fn wrong_mod(xs: &[u64]) -> Vec<bool> {\n\
+                 let _ = other_mod::rs_target(1);\n\
+                 xs.iter().copied().map(other_mod::한글_검증).collect()\n\
+             }\n",
+        )
+        .unwrap();
+        // Valid aliased static path caller -> MUST accept!
+        std::fs::write(
+            repo.join("src/rs_valid_alias.rs"),
+            "use crate::target_mod as tm;\n\
+             pub fn valid_alias_call(x: u64) -> u64 { tm::rs_target(x) }\n",
+        )
+        .unwrap();
+
+        // Python pinned import, yet ONLY calls `OtherClass.py_fn()` and `cb = OtherClass.py_fn` -> MUST reject!
+        std::fs::write(
+            repo.join("src/py_mod.py"),
+            "def py_fn(x: int) -> int:\n    return x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/py_false.py"),
+            "from src.py_mod import py_fn\n\
+             class OtherClass:\n    @staticmethod\n    def py_fn(x):\n        return x\n\
+             def bad_py(x: int):\n\
+                 cb = OtherClass.py_fn\n\
+                 return OtherClass.py_fn(x)\n",
+        )
+        .unwrap();
+
+        // TSX pinned import, yet ONLY renders `<OtherNS.BadgeView />` -> MUST reject!
+        std::fs::write(
+            repo.join("src/badge.tsx"),
+            "export function BadgeView({ n }: { n: number }) { return <b>{n}</b>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/tsx_false.tsx"),
+            "import { BadgeView } from './badge';\n\
+             import * as other_ns from './other_badge';\n\
+             export function FalsePage() {\n\
+                 return <><OtherNS.BadgeView n={1} /><other_ns.BadgeView n={2} /></>;\n\
+             }\n",
+        )
+        .unwrap();
+
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        std::fs::write(
+            repo.join("src/target_mod.rs"),
+            "pub fn rs_target(x: u64, s: bool) -> u64 { if s { x } else { 0 } }\n\
+             pub fn 한글_검증(금액: u64, 수수료: u64) -> bool { 금액 > 수수료 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/py_mod.py"),
+            "def py_fn(x: int, factor: int) -> int:\n    return x * factor\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/badge.tsx"),
+            "export function BadgeView({ n, label }: { n: number; label: string }) { return <b>{label}{n}</b>; }\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let out = generate_expanded_diff_with_config(
+            repo,
+            GitDiffSource::Unstaged,
+            512 * 1024,
+            HybridConfig::full(),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            !out.contains("rs_false_caller.rs") && !out.contains("wrong_mod"),
+            "Pinned Rust file calling only `other_mod::...` must NOT match target_mod:\n{out}"
+        );
+        assert!(
+            out.contains("rs_valid_alias.rs") && out.contains("valid_alias_call"),
+            "Aliased Rust `use crate::target_mod as tm; tm::rs_target` must still resolve:\n{out}"
+        );
+        assert!(
+            !out.contains("py_false.py") && !out.contains("bad_py"),
+            "Pinned Python file calling only `OtherClass.py_fn` must NOT bypass qualifier guard:\n{out}"
+        );
+        assert!(
+            !out.contains("tsx_false.tsx") && !out.contains("FalsePage"),
+            "Pinned TSX file rendering only `<OtherNS.BadgeView />` or `<other_ns.BadgeView />` must NOT bypass qualifier guard:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_read_stream_bounded_truncation_and_signal() {
+        use crate::tree_sitter_diff::read_stream_bounded;
+        use std::io::Cursor;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sig = AtomicBool::new(false);
+        let data = b"0123456789abcdef";
+        let (buf, truncated) = read_stream_bounded(Cursor::new(&data[..]), Some(8), Some(&sig));
+        assert_eq!(buf, b"01234567");
+        assert!(truncated);
+        assert!(sig.load(Ordering::Acquire));
+
+        let sig_ok = AtomicBool::new(false);
+        let (buf_ok, truncated_ok) =
+            read_stream_bounded(Cursor::new(&data[..]), Some(16), Some(&sig_ok));
+        assert_eq!(buf_ok, data);
+        assert!(!truncated_ok);
+        assert!(!sig_ok.load(Ordering::Acquire));
     }
 }

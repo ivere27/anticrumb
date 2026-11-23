@@ -1,9 +1,9 @@
-//! Pure-Rust A/B testing & 4-arm ablation harness for `tree_sitter_diff` (no Python dependency).
+//! Pure-Rust A/B testing & multi-arm ablation harness for `tree_sitter_diff` (no Python dependency).
 //!
 //! Subcommands:
 //!   cargo run --locked -q -p xtask -- bench fixtures --out <dir>
-//!   cargo run --locked -q -p xtask -- bench offline [--commits sha[@kib],...] [--fixtures-dir <dir>] [--arms A,B1,B2,B3] [--budget-kib 512] --out <dir>
-//!   cargo run --locked -q -p xtask -- bench run-llm --dump-dir <dir> --out <dir> [--arms A,B3] [--runs 1] [--case-filter <sub] [--model <m>] [--thinking <t>] [--anticrumb-bin <bin>]
+//!   cargo run --locked -q -p xtask -- bench offline [--commits sha[@kib],...] [--fixtures-dir <dir>] [--arms P0,P1,P2,A,B1,B2,B3,B4] [--budget-kib 512] --out <dir>
+//!   cargo run --locked -q -p xtask -- bench run-llm --dump-dir <dir> --out <dir> [--arms A,B3,B4] [--runs 1] [--case-filter <str>] [--model <m>] [--thinking <t>] [--anticrumb-bin <bin>]
 //!   cargo run --locked -q -p xtask -- bench grade --rubrics <rubrics.json> --runs-dir <dir>
 
 use crate::next_flag_value;
@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_ARMS: &str = "A,B1,B2,B3";
+const DEFAULT_ARMS: &str = "P0,P1,P2,A,B1,B2,B3,B4";
 
 const REVIEW_PROMPT: &str = r#"You are performing a strict 1-turn code review using ONLY the attached patch file.
 Do NOT assume or invent files outside the patch.
@@ -67,8 +67,8 @@ Usage: cargo run --locked -q -p xtask -- bench <subcommand> [options]
 
 Subcommands:
   fixtures  --out <dir>
-  offline   --out <dir> [--commits <sha[@kib],...>] [--fixtures-dir <dir>] [--arms A,B1,B2,B3] [--budget-kib 512]
-  run-llm   --dump-dir <dir> --out <dir> [--arms A,B3] [--runs 1] [--case-filter <str>] [--anticrumb-bin <bin>] [--model <m>] [--thinking <t>]
+  offline   --out <dir> [--commits <sha[@kib],...>] [--fixtures-dir <dir>] [--arms P0,P1,P2,A,B1,B2,B3,B4] [--budget-kib 512]
+  run-llm   --dump-dir <dir> --out <dir> [--arms A,B3,B4] [--runs 1] [--case-filter <str>] [--anticrumb-bin <bin>] [--model <m>] [--thinking <t>]
   grade     --rubrics <rubrics.json> --runs-dir <dir>"
     );
 }
@@ -813,6 +813,148 @@ pub(crate) fn stable_report(base: u64) -> u64 {{
     }))
 }
 
+fn build_case6_multilang_reverse_callers(base_dir: &Path) -> Result<Value, String> {
+    // 1. TypeScript: signature change in `src/pricing/discount.ts` breaks unmodified caller `src/checkout/cart_handler.ts`
+    let ts_discount_base =
+        r#"export function calculatePromoDiscount(amountCents: number, code: string): number {
+  if (amountCents <= 0) return 0;
+  return code === "VIP" ? Math.floor(amountCents * 0.2) : 0;
+}
+"#
+        .to_string();
+    let ts_discount_mod = r#"export function calculatePromoDiscount(
+  amountCents: number,
+  tier: "standard" | "vip",
+  maxCapCents: number,
+): number {
+  if (amountCents <= 0) return 0;
+  const raw = tier === "vip" ? Math.floor(amountCents * 0.2) : 0;
+  return Math.min(raw, maxCapCents);
+}
+"#
+    .to_string();
+    let ts_cart_caller = r#"import { calculatePromoDiscount } from "../pricing/discount";
+
+export function priceCartItem(subtotalCents: number, promoCode: string): number {
+  const discount = calculatePromoDiscount(subtotalCents, promoCode);
+  return Math.max(0, subtotalCents - discount);
+}
+"#
+    .to_string();
+
+    // 2. Go: return/parameter change in `internal/auth/token.go` breaks unmodified caller `internal/api/middleware.go`
+    let go_token_base = r#"package auth
+
+func VerifySessionToken(token string) (string, bool) {
+	if len(token) < 8 {
+		return "", false
+	}
+	return "usr_123", true
+}
+"#
+    .to_string();
+    let go_token_mod = r#"package auth
+
+import "errors"
+
+func VerifySessionToken(token string, requireFresh bool) (string, int64, error) {
+	if len(token) < 8 {
+		return "", 0, errors.New("invalid token")
+	}
+	return "usr_123", 300, nil
+}
+"#
+    .to_string();
+    let go_middleware_caller = r#"package api
+
+import "example.com/app/internal/auth"
+
+func ExtractUser(hdr string) string {
+	uid, ok := auth.VerifySessionToken(hdr)
+	if !ok {
+		return ""
+	}
+	return uid
+}
+"#
+    .to_string();
+
+    // 3. UTF-8 Korean Rust: parameter added in `src/정산/수수료.rs` breaks unmodified caller `src/주문/결제_핸들러.rs`
+    let rs_fee_base = r#"/// 원 단위 정산 수수료를 계산합니다.
+pub fn 정산_수수료_계산(금액_원: u64) -> u64 {
+    금액_원 / 100
+}
+"#
+    .to_string();
+    let rs_fee_mod = r#"/// 원 단위 정산 수수료를 계산합니다 (부가세 포함 여부 필수 전달).
+pub fn 정산_수수료_계산(금액_원: u64, 부가세_포함: bool) -> u64 {
+    let 기본 = 금액_원 / 100;
+    if 부가세_포함 { 기본 + (기본 / 10) } else { 기본 }
+}
+"#
+    .to_string();
+    let rs_order_caller = r#"use crate::정산::수수료::정산_수수료_계산;
+
+pub fn 주문_정산_금액(총액: u64) -> u64 {
+    let 수수료 = 정산_수수료_계산(총액);
+    총액.saturating_sub(수수료)
+}
+"#
+    .to_string();
+
+    let repo_dir = base_dir.join("case6_multilang_reverse_callers");
+    let sha = init_git_repo(
+        &repo_dir,
+        &[
+            ("src/pricing/discount.ts", ts_discount_base),
+            ("src/checkout/cart_handler.ts", ts_cart_caller),
+            ("internal/auth/token.go", go_token_base),
+            ("internal/api/middleware.go", go_middleware_caller),
+            ("src/lib.rs", "pub mod 정산;\npub mod 주문;\n".to_string()),
+            ("src/정산/mod.rs", "pub mod 수수료;\n".to_string()),
+            ("src/정산/수수료.rs", rs_fee_base),
+            ("src/주문/mod.rs", "pub mod 결제_핸들러;\n".to_string()),
+            ("src/주문/결제_핸들러.rs", rs_order_caller),
+        ],
+        &[
+            ("src/pricing/discount.ts", ts_discount_mod),
+            ("internal/auth/token.go", go_token_mod),
+            ("src/정산/수수료.rs", rs_fee_mod),
+        ],
+        "refactor(api): tighten discount, token freshness, and Korean fee contracts",
+    )?;
+    Ok(json!({
+        "id": "case6_multilang_reverse_callers",
+        "repo": repo_dir.display().to_string(),
+        "source": format!("commit:{sha}"),
+        "languages": ["TypeScript", "Go", "Rust(UTF-8 Korean)"],
+        "tests_hypotheses": ["layer3_callers", "utf8_non_ascii_identifiers"],
+        "expected_bugs": [
+            {
+                "id": "B1_ts_caller_arity_mismatch",
+                "file": "src/checkout/cart_handler.ts",
+                "keywords": ["calculatePromoDiscount", "cart_handler", "maxCapCents", "tier", "arguments"],
+                "description": "Unmodified caller `priceCartItem` in `src/checkout/cart_handler.ts` still calls `calculatePromoDiscount(subtotalCents, promoCode)` with old 2-argument signature after adding `tier` and `maxCapCents`.",
+                "needs_layer": "layer3_callers"
+            },
+            {
+                "id": "B2_go_caller_signature_mismatch",
+                "file": "internal/api/middleware.go",
+                "keywords": ["VerifySessionToken", "middleware.go", "requireFresh", "error", "return"],
+                "description": "Unmodified caller `ExtractUser` in `internal/api/middleware.go` still calls `uid, ok := auth.VerifySessionToken(hdr)` with 1 arg / 2 returns after change to `(token, requireFresh) -> (string, int64, error)`.",
+                "needs_layer": "layer3_callers"
+            },
+            {
+                "id": "B3_kr_rust_caller_arity_mismatch",
+                "file": "src/주문/결제_핸들러.rs",
+                "keywords": ["정산_수수료_계산", "결제_핸들러", "부가세_포함", "주문_정산_금액"],
+                "description": "Unmodified Korean caller `주문_정산_금액` still calls `정산_수수료_계산(총액)` without required `부가세_포함: bool` parameter.",
+                "needs_layer": "layer3_callers"
+            }
+        ]
+    }))
+}
+
 fn cmd_fixtures(args: &[String]) -> Result<(), String> {
     let mut out_dir: Option<PathBuf> = None;
     let mut i = 0;
@@ -831,6 +973,7 @@ fn cmd_fixtures(args: &[String]) -> Result<(), String> {
         build_case3_go_java_multilang(&out_dir)?,
         build_case4_cs_cpp_ruby(&out_dir)?,
         build_case5_negative_control(&out_dir)?,
+        build_case6_multilang_reverse_callers(&out_dir)?,
     ];
     let rubrics_path = out_dir.join("rubrics.json");
     let body = serde_json::to_string_pretty(&json!({ "cases": cases }))
@@ -1033,8 +1176,8 @@ fn cmd_offline(root: &Path, args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("write offline_report.json: {e}"))?;
 
     let mut md = String::from(
-        "# Offline 4-Arm Ablation Report\n\n\
-         | Case | Arm | Total B | Est Tok | L1 B | L2 B | L3 B | L3 (loc/x) | SigOnly | Clamped | More(+N/Named) | Compaction (U3/Skel/Trunc/Omit) | Latency ms |\n\
+        "# Offline Multi-Arm Ablation Report\n\n\
+         | Case | Arm | Total B | Est Tok | L1 B | L2 B | L3 B | L3 (loc/fwd/rev) | SigOnly | Clamped | More(+N/Named) | Compaction (U3/Skel/Trunc/Omit) | Latency ms |\n\
          |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|\n",
     );
     for r in &rows {
@@ -1046,7 +1189,7 @@ fn cmd_offline(root: &Path, args: &[String]) -> Result<(), String> {
             r["budget_omitted_files"].as_u64().unwrap_or(0),
         );
         md.push_str(&format!(
-            "| `{}` | **{}** | {} | {} | {} | {} | {} | {}/{} | {} | {} | {}/{} | {} | {:.1} |\n",
+            "| `{}` | **{}** | {} | {} | {} | {} | {} | {}/{}/{} | {} | {} | {}/{} | {} | {:.1} |\n",
             r["case_id"].as_str().unwrap_or(""),
             r["arm"].as_str().unwrap_or(""),
             fmt_commas(r["total_bytes"].as_u64().unwrap_or(0)),
@@ -1056,6 +1199,7 @@ fn cmd_offline(root: &Path, args: &[String]) -> Result<(), String> {
             fmt_commas(r["layer3_bytes"].as_u64().unwrap_or(0)),
             r["layer3_local_entries"].as_u64().unwrap_or(0),
             r["layer3_cross_entries"].as_u64().unwrap_or(0),
+            r["layer3_caller_entries"].as_u64().unwrap_or(0),
             r["sig_only_hunks"].as_u64().unwrap_or(0),
             r["clamped_hunks"].as_u64().unwrap_or(0),
             r["opaque_more_hunks"].as_u64().unwrap_or(0),
@@ -1613,5 +1757,26 @@ mod tests {
         assert_eq!(a.failed_runs, 1);
         assert_eq!(a.tp, 0);
         assert_eq!(a.expected, 1);
+    }
+
+    #[test]
+    fn test_cmd_fixtures_generates_case6_multilang_reverse_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_arg = tmp.path().display().to_string();
+        cmd_fixtures(&["--out".to_string(), out_arg]).unwrap();
+        let rubrics: Value =
+            serde_json::from_str(&fs::read_to_string(tmp.path().join("rubrics.json")).unwrap())
+                .unwrap();
+        let cases = rubrics["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 6);
+        let case6 = cases
+            .iter()
+            .find(|c| c["id"].as_str() == Some("case6_multilang_reverse_callers"))
+            .expect("expected case6_multilang_reverse_callers");
+        assert_eq!(case6["expected_bugs"].as_array().unwrap().len(), 3);
+        let repo = PathBuf::from(case6["repo"].as_str().unwrap());
+        assert!(repo.join("src/checkout/cart_handler.ts").exists());
+        assert!(repo.join("internal/api/middleware.go").exists());
+        assert!(repo.join("src/주문/결제_핸들러.rs").exists());
     }
 }
