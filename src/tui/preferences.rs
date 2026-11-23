@@ -62,6 +62,14 @@ impl Preferences {
         self.store
             .put("ui", "settings", "debug_level", &level.min(2))
     }
+    pub fn temporary(&self) -> bool {
+        self.store
+            .get::<bool>("ui", "settings", "temporary")
+            .unwrap_or(false)
+    }
+    pub fn set_temporary(&self, temporary: bool) -> Result<()> {
+        self.store.put("ui", "settings", "temporary", &temporary)
+    }
     pub fn permissions(&self) -> Option<ToolPermissions> {
         if let Ok(perms) = self
             .store
@@ -153,6 +161,12 @@ mod tests {
         assert_eq!(b.debug_level(), 2);
         a.set_debug_level(0).unwrap();
         assert_eq!(b.debug_level(), 0);
+        assert!(!a.temporary());
+        a.set_temporary(true).unwrap();
+        assert!(b.temporary());
+        assert!(Preferences::open(dir.path()).unwrap().temporary());
+        a.set_temporary(false).unwrap();
+        assert!(!b.temporary());
         a.set_model_selection("a", Some("gemini-pro"), Some("high"))
             .unwrap();
         assert_eq!(

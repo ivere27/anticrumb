@@ -2862,4 +2862,582 @@ mod tests {
         assert_eq!(message, "@missing_steer keep going");
         assert!(steer_files.is_empty());
     }
+
+    #[test]
+    fn temp_mode_toggles_persists_across_restarts_renders_status_badge_and_respects_cli_overrides()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, rx) = mpsc::sync_channel(8);
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+
+        // 1. Default is non-temp without TEMP badge on status bar.
+        assert!(!state.options.temporary);
+        assert!(state.status_text(120).contains(" · CHAT · "));
+        assert!(!state.status_text(120).contains("TEMP"));
+
+        // 2. Open `/temp` interactive menu and select Temp (index 1).
+        state.editor.set("/temp".into());
+        assert!(!state.submit(&mut tx));
+        let menu = state.menu.as_mut().expect("/temp menu opened");
+        assert_eq!(menu.selected, 0);
+        assert_eq!(menu.choices.len(), 2);
+        menu.selected = 1;
+        state.select(&mut tx);
+
+        assert!(state.options.temporary);
+        assert!(state.preferences.as_ref().unwrap().temporary());
+        assert!(state.logs().contains("Temp chat: ON"));
+        assert!(state.status_text(120).contains(" · CHAT · TEMP · "));
+        assert!(state
+            .status_spans(120)
+            .iter()
+            .any(|(text, face)| text == "TEMP" && *face == markdown::Face::CODE_BOLD));
+
+        // 3. `/status` reports Temp chat: on.
+        state.editor.set("/status".into());
+        assert!(!state.submit(&mut tx));
+        assert!(matches!(rx.try_recv().unwrap(), Command::Status));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::WebHistoryStatus(..)
+        ));
+        assert!(state
+            .logs()
+            .contains("on (anonymous · no server chat history saved)"));
+
+        // 4. Submitting a turn propagates `temporary: true` in `AgentRequest`.
+        state.editor.set("anonymous prompt".into());
+        assert!(!state.submit(&mut tx));
+        let Command::Start(req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start command");
+        };
+        assert!(req.temporary);
+        assert!(req.chat_only);
+        state.active = None;
+        state.pending = None;
+        state.phase = "ready".into();
+
+        // 5. Combine with Agent / YOLO modes and verify footer at 80 cols does not overflow.
+        state.editor.set("/mode agent".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.status_text(120).contains(" · AGENT · TEMP · "));
+        state.editor.set("/mode yolo".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.status_text(120).contains(" · YOLO · TEMP · "));
+        let mut frame80 = Vec::new();
+        state.render_frame(&mut frame80, 80, 26).unwrap();
+        let frame80_str = String::from_utf8(frame80).unwrap();
+        let footer_pos = frame80_str
+            .find("\x1b[26;1H")
+            .expect("footer ESC[26;1H cursor position");
+        let footer = &frame80_str[footer_pos..];
+        assert!(footer.contains("TEMP"));
+        let mut in_escape = false;
+        let mut printable = String::new();
+        for ch in footer.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if ch.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else {
+                printable.push(ch);
+            }
+        }
+        assert!(
+            unicode_width::UnicodeWidthStr::width(printable.as_str()) < 80,
+            "80-col footer with TEMP must stay < 80 columns"
+        );
+
+        // 6. `/mode` remains strictly for chat/agent/yolo (no Temp option); `/mode temp` prints
+        //    usage without mutating temporary mode, while `/temp` toggles it without changing agent/yolo.
+        state.parent = Some("existing-conv".into());
+        state.conversation_temporary = Some(false);
+        state.editor.set("/mode".into());
+        assert!(!state.submit(&mut tx));
+        let mode_menu = state.menu.as_ref().expect("/mode menu opened");
+        assert_eq!(mode_menu.title, "Mode · current: agent (--yolo)");
+        assert_eq!(mode_menu.choices.len(), 3);
+        assert!(mode_menu
+            .choices
+            .iter()
+            .all(|choice| !choice.label.contains("Temp")));
+        state.close_menu();
+
+        state.editor.set("/mode temp".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.options.temporary);
+        assert!(state.logs().contains("Usage: /mode [chat|agent|yolo]"));
+
+        // 7. `/temp off` and `/temp on` (with normal parent warning) update state cleanly; unknown args show usage.
+        state.editor.set("/temp off".into());
+        assert!(!state.submit(&mut tx));
+        assert!(!state.options.temporary);
+        assert!(state.options.agent && state.options.yolo);
+        assert!(!state.preferences.as_ref().unwrap().temporary());
+
+        state.editor.set("/temp on".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.options.temporary);
+        assert!(state
+            .logs()
+            .contains("local context instead of continuing the server chat"));
+
+        state.editor.set("/temp toggle".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.options.temporary);
+        assert!(state.logs().contains("Usage: /temp [on|off]"));
+
+        // Without preferences storage, confirmation omits misleading "persisted for future sessions".
+        // Running `/temp on` during a normal first turn warns about local context, whereas running
+        // `/temp on` when already in a temporary conversation omits the server-continuation warning.
+        let mut ephemeral_state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        ephemeral_state.active = Some("first-running-turn".into());
+        ephemeral_state.conversation_temporary = Some(false);
+        ephemeral_state.editor.set("/temp on".into());
+        assert!(!ephemeral_state.submit(&mut tx));
+        let eph_logs = ephemeral_state.logs();
+        assert!(eph_logs.contains("Temp chat: ON (anonymous · no server history saved)"));
+        assert!(!eph_logs.contains("persisted for future sessions"));
+        assert_eq!(
+            eph_logs
+                .matches("local context instead of continuing the server chat")
+                .count(),
+            1,
+            "active first turn without parent should warn about follow-up local context"
+        );
+        ephemeral_state.conversation_temporary = Some(true);
+        ephemeral_state.editor.set("/temp on".into());
+        assert!(!ephemeral_state.submit(&mut tx));
+        assert_eq!(
+            ephemeral_state
+                .logs()
+                .matches("local context instead of continuing the server chat")
+                .count(),
+            1,
+            "already-temporary conversation should not emit misleading server-continuation notice"
+        );
+
+        // 8. Simulated restart restores `temporary: true` from Preferences without marking CLI override.
+        let mut relaunched = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        relaunched.preferences = Some(Preferences::open(dir.path()).unwrap());
+        relaunched.load_model_preference();
+        assert!(relaunched.options.temporary);
+        assert!(!relaunched.options.overrides.contains("temporary"));
+        assert!(relaunched.status_text(120).contains(" · CHAT · TEMP · "));
+        relaunched.log_startup_banner();
+        assert!(relaunched
+            .logs()
+            .contains("Temp (anonymous, no server history)"));
+
+        // 9. Explicit `--temp` CLI flag enables temporary mode without mutating saved `false` pref.
+        let normal_prefs = Preferences::open(dir.path()).unwrap();
+        normal_prefs.set_temporary(false).unwrap();
+        let temp_opts = PromptOptions::parse(&["--temp".into()]).unwrap();
+        let mut overridden = State::new(temp_opts);
+        overridden.preferences = Some(Preferences::open(dir.path()).unwrap());
+        overridden.load_model_preference();
+        assert!(overridden.options.temporary);
+        assert!(overridden.options.overrides.contains("temporary"));
+        assert!(!overridden.preferences.as_ref().unwrap().temporary());
+        assert!(overridden.status_text(120).contains(" · CHAT · TEMP · "));
+    }
+
+    #[test]
+    fn temp_mode_warns_for_unsupported_provider_and_labels_resumed_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, _rx) = mpsc::sync_channel(8);
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+
+        let status_with_caps = json!({
+            "providers": [
+                {
+                    "id": "gemini-web",
+                    "name": "Gemini Web",
+                    "capabilities": {"temporary_sessions": true}
+                },
+                {
+                    "id": "claude-web",
+                    "name": "Claude Web",
+                    "capabilities": {"temporary_sessions": false}
+                }
+            ],
+            "accounts": [
+                {"id": "default", "provider": "gemini-web", "state": "ready", "models": []},
+                {"id": "claude", "provider": "claude-web", "state": "ready", "models": []}
+            ]
+        });
+        state.update(Update::Status(status_with_caps.clone()));
+
+        // Gemini supports temporary sessions: enabling `/temp on` stays quiet (no warning).
+        state.editor.set("/temp on".into());
+        assert!(!state.submit(&mut tx));
+        assert!(!state.logs().contains("does not support temporary sessions"));
+
+        // Switching to Claude while temp is enabled warns once.
+        state.editor.set("/provider claude".into());
+        assert!(!state.submit(&mut tx));
+        assert_eq!(state.provider_id(), "claude-web");
+        assert!(state
+            .logs()
+            .contains("Claude Web (claude-web) does not support temporary sessions"));
+
+        // Repeated status refreshes while staying on Claude do not duplicate the warning.
+        let warning_count = state
+            .logs()
+            .matches("does not support temporary sessions")
+            .count();
+        assert_eq!(warning_count, 1);
+        state.update(Update::Status(status_with_caps));
+        assert_eq!(
+            state
+                .logs()
+                .matches("does not support temporary sessions")
+                .count(),
+            1
+        );
+
+        // `/resume` conversation list tags temporary conversations with `[temp]`.
+        state.update(Update::Conversations(vec![
+            json!({
+                "id": "job-temp",
+                "state": "completed",
+                "request": {"task": "ephemeral question", "temporary": true}
+            }),
+            json!({
+                "id": "job-saved",
+                "state": "completed",
+                "request": {"task": "normal question", "temporary": false}
+            }),
+        ]));
+        let menu = state.menu.as_ref().expect("/resume menu opened");
+        assert!(menu.choices[0]
+            .label
+            .contains("completed [temp] · ephemeral question"));
+        assert!(!menu.choices[1].label.contains("[temp]"));
+    }
+
+    #[test]
+    fn exit_conversation_message_tracks_actual_conversation_state_and_grpc_temp_mode() {
+        let (mut tx, rx) = mpsc::sync_channel(4);
+
+        // 1. Run a normal conversation, then toggle `/temp on` before exiting without sending
+        //    another turn -> exit message reflects that the saved conversation IS normal/server-stored.
+        let mut state = State::new(PromptOptions::default());
+        state.editor.set("normal question".into());
+        assert!(!state.submit(&mut tx));
+        let Command::Start(req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(!req.temporary);
+        state.update(Update::Accepted(0));
+        state.update(Update::Started("job-normal".into()));
+        state.update(Update::Finished(json!({
+            "id": "job-normal",
+            "state": "completed",
+            "request": {"temporary": false},
+            "result": {"final_response": "ok"}
+        })));
+        state.editor.set("/temp on".into());
+        assert!(!state.submit(&mut tx));
+        assert!(state.options.temporary);
+        let msg = super::input_loop::exit_conversation_message("job-normal", &state);
+        assert_eq!(
+            msg,
+            "Session saved. Continue with: anticrumb resume job-normal"
+        );
+
+        // 2. Run `/new` then send a temporary turn, toggle `/temp off` right before exit ->
+        //    exit message accurately states it was a temporary conversation (not stored on server).
+        state.editor.set("/new".into());
+        assert!(!state.submit(&mut tx));
+        assert_eq!(state.conversation_temporary, None);
+        state.editor.set("/temp on".into());
+        assert!(!state.submit(&mut tx));
+        state.editor.set("temp question".into());
+        assert!(!state.submit(&mut tx));
+        let Command::Start(req2, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(req2.temporary);
+        state.update(Update::Accepted(0));
+        state.update(Update::Started("job-temp".into()));
+        state.editor.set("/temp off".into());
+        assert!(!state.submit(&mut tx));
+        let msg_active_temp = super::input_loop::exit_conversation_message("job-temp", &state);
+        assert_eq!(
+            msg_active_temp,
+            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb resume job-temp"
+        );
+
+        // 3. gRPC remote session with temporary mode includes the temporary note too.
+        state.update(Update::Status(json!({
+            "browser_connection": {"transport": "grpc", "connected": true}
+        })));
+        let msg_grpc_temp = super::input_loop::exit_conversation_message("job-temp", &state);
+        assert_eq!(
+            msg_grpc_temp,
+            "Session saved (temporary mode: not stored on provider server). Reconnect with `anticrumb connect`, then use `/resume job-temp`."
+        );
+    }
+
+    #[test]
+    fn resume_normal_job_and_finished_pending_fallback_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, rx) = mpsc::sync_channel(8);
+
+        let mut base_opts = PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        };
+        let normal_req = base_opts.agent_request("earlier normal task".into(), None);
+        let normal_job = json!({
+            "id": "job-normal",
+            "state": "completed",
+            "request": normal_req,
+            "result": {"final_response": "normal answer"}
+        });
+        base_opts.temporary = true;
+        let temp_req = base_opts.agent_request("earlier temp task".into(), None);
+        let temp_job = json!({
+            "id": "job-temp",
+            "state": "completed",
+            "request": temp_req,
+            "result": {"final_response": "temp answer"}
+        });
+
+        // 1. In-session `/temp on` (without restart) + resuming normal job preserves `temporary: true`
+        //    and logs the local-context explanation.
+        let mut live_state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        live_state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        live_state.editor.set("/temp on".into());
+        assert!(!live_state.submit(&mut tx));
+        live_state.update(Update::Loaded(normal_job.clone()));
+        assert!(live_state.options.temporary);
+        assert_eq!(live_state.conversation_temporary, Some(false));
+        assert!(live_state
+            .logs()
+            .contains("Temp chat remains ON: next turn starts a new temporary chat with local context instead of continuing the server chat"));
+
+        // 2. Post-restart (fresh State loading saved Preferences without `overrides`) + resuming the same
+        //    normal job behaves identically.
+        let mut restarted_state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        restarted_state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        restarted_state.load_model_preference();
+        assert!(restarted_state.options.temporary);
+        restarted_state.update(Update::Loaded(normal_job.clone()));
+        assert!(restarted_state.options.temporary);
+        assert_eq!(restarted_state.conversation_temporary, Some(false));
+
+        // 3. Running `/new` or deleting the active `[temp]` conversation while saved `/temp off`
+        //    restores the saved `false` default, and `[temp]` resume tags and explains the switch.
+        live_state.editor.set("/temp off".into());
+        assert!(!live_state.submit(&mut tx));
+        assert!(!live_state.preferences.as_ref().unwrap().temporary());
+        live_state.update(Update::Loaded(temp_job.clone()));
+        assert!(live_state.options.temporary);
+        assert!(live_state.logs().contains("Resumed job-temp [temp]"));
+        assert!(live_state
+            .logs()
+            .contains("Temp chat turned ON for this resumed temporary conversation"));
+        live_state.editor.set("/new".into());
+        assert!(!live_state.submit(&mut tx));
+        assert!(!live_state.options.temporary);
+
+        // Deleting the active `[temp]` parent restores saved `false`, whereas deleting another ID does not.
+        live_state.update(Update::Loaded(temp_job.clone()));
+        assert!(live_state.options.temporary);
+        live_state.update(Update::ConversationDeleted("other-job".into()));
+        assert!(live_state.options.temporary);
+        live_state.update(Update::ConversationDeleted("job-temp".into()));
+        assert!(!live_state.options.temporary);
+        assert_eq!(live_state.conversation_temporary, None);
+        assert_eq!(live_state.pending_temporary, None);
+
+        // 4. Starting TUI with `--temp`, interactively running `/temp off`, then resuming a `[temp]`
+        //    job clears the CLI override so `[temp]` inheritance still protects temporary chats.
+        let cli_temp_opts = PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            overrides: ["temporary".to_owned()].into_iter().collect(),
+            temporary: true,
+            ..Default::default()
+        };
+        let mut started_with_cli_temp = State::new(cli_temp_opts);
+        started_with_cli_temp.preferences = Some(Preferences::open(dir.path()).unwrap());
+        started_with_cli_temp.editor.set("/temp off".into());
+        assert!(!started_with_cli_temp.submit(&mut tx));
+        assert!(!started_with_cli_temp.options.temporary);
+        assert!(!started_with_cli_temp
+            .options
+            .overrides
+            .contains("temporary"));
+        started_with_cli_temp.update(Update::Loaded(temp_job));
+        assert!(started_with_cli_temp.options.temporary);
+
+        // 5. `Update::Finished` without preceding `Update::Started` or `request.temporary` falls back
+        //    to `pending_temporary` and clears it.
+        live_state.editor.set("/temp on".into());
+        assert!(!live_state.submit(&mut tx));
+        live_state.editor.set("turn without started update".into());
+        assert!(!live_state.submit(&mut tx));
+        let Command::Start(started_req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(started_req.temporary);
+        assert_eq!(live_state.pending_temporary, Some(true));
+        live_state.update(Update::Accepted(0));
+        live_state.update(Update::Finished(json!({
+            "id": "job-direct-finish",
+            "state": "completed",
+            "result": {"final_response": "done"}
+        })));
+        assert_eq!(live_state.conversation_temporary, Some(true));
+        assert_eq!(live_state.pending_temporary, None);
+    }
+
+    #[test]
+    fn consecutive_resume_temp_then_normal_does_not_sticky_temporary_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, _rx) = mpsc::sync_channel::<Command>(8);
+
+        // Create a normal job and a [temp] job.
+        let mut base_opts = PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        };
+        let normal_req = base_opts.agent_request("normal task".into(), None);
+        let normal_job = json!({
+            "id": "job-normal",
+            "state": "completed",
+            "request": normal_req,
+            "result": {"final_response": "normal answer"}
+        });
+        base_opts.temporary = true;
+        let temp_req = base_opts.agent_request("temp task".into(), None);
+        let temp_job = json!({
+            "id": "job-temp",
+            "state": "completed",
+            "request": temp_req,
+            "result": {"final_response": "temp answer"}
+        });
+
+        // Scenario: saved pref is `/temp off`, no `--temp` CLI flag.
+        // 1. /resume [temp] job → temporary turns ON (inheriting from job).
+        // 2. /resume normal job → temporary should revert to saved false (not sticky true).
+        let prefs = Preferences::open(dir.path()).unwrap();
+        prefs.set_temporary(false).unwrap();
+
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+        assert!(!state.options.temporary);
+
+        // Resume [temp] job.
+        state.update(Update::Loaded(temp_job.clone()));
+        assert!(
+            state.options.temporary,
+            "must inherit temporary from [temp] job"
+        );
+        assert_eq!(state.conversation_temporary, Some(true));
+
+        // Now resume normal job WITHOUT /new in between.
+        state.update(Update::Loaded(normal_job.clone()));
+        assert!(
+            !state.options.temporary,
+            "consecutive /resume of a normal job must not be sticky-temporary"
+        );
+        assert_eq!(state.conversation_temporary, Some(false));
+        assert!(
+            !state.logs().contains("Temp chat remains ON"),
+            "should not show temp-remains notice when pref is off and job is normal"
+        );
+
+        // Verify: saved `/temp on` + resume [temp] + resume normal → temporary stays ON (pref-based).
+        prefs.set_temporary(true).unwrap();
+        let mut state2 = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state2.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state2.load_model_preference();
+        assert!(state2.options.temporary);
+
+        state2.update(Update::Loaded(temp_job));
+        assert!(state2.options.temporary);
+
+        state2.update(Update::Loaded(normal_job));
+        assert!(
+            state2.options.temporary,
+            "saved /temp on must keep temporary true even when resuming normal job"
+        );
+        assert!(state2.logs().contains("Temp chat remains ON"));
+
+        // Verify: `--temp` CLI flag + resume normal → temporary stays ON (CLI override).
+        prefs.set_temporary(false).unwrap();
+        let mut state3 = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            temporary: true,
+            overrides: ["temporary".to_owned()].into_iter().collect(),
+            ..Default::default()
+        });
+        state3.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state3.load_model_preference();
+        // --temp override keeps temporary=true despite pref=false
+        assert!(state3.options.temporary);
+
+        let normal_req2 = PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            ..Default::default()
+        }
+        .agent_request("another normal".into(), None);
+        let normal_job2 = json!({
+            "id": "job-normal-2",
+            "state": "completed",
+            "request": normal_req2,
+            "result": {"final_response": "ok"}
+        });
+        state3.update(Update::Loaded(normal_job2));
+        assert!(
+            state3.options.temporary,
+            "--temp CLI flag must keep temporary true when resuming normal job"
+        );
+    }
 }

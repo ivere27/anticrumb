@@ -209,6 +209,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
   -m, --model ID      -C, --cd DIR          model and working directory
   --agent             --yolo                agent mode (respects /permissions) or yolo (all permissions)
+  --temp                                    anonymous temporary chat for this run
   -p, --print                              noninteractive final answer
   -c, --continue     -r, --resume ID        reopen a conversation
   --file PATH        -i, --image PATH       native Gemini attachment (repeatable)
@@ -218,7 +219,7 @@ pub fn run(args: &[String]) -> Result<()> {
   --connect https://HOST:PORT --token STRING [--tls-pin SHA256]
 
 Type @path or @"path with spaces" to upload a file, never inline its contents.
-Interactive: /help /mode /provider /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
+Interactive: /help /mode /temp /provider /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
 Enter sends; Esc interrupts; Tab completes; Alt+Enter inserts a newline.
 
 Service and integration commands:
@@ -519,6 +520,10 @@ impl PromptOptions {
                     o.yolo = false;
                     o.overrides.insert("agent".into());
                 }
+                "--temp" | "--temporary" => {
+                    o.temporary = true;
+                    o.overrides.insert("temporary".into());
+                }
                 "--no-shell" => {
                     o.no_shell = true;
                     o.permissions.shell = false;
@@ -638,9 +643,12 @@ impl PromptOptions {
         if !self.overrides.contains("no_shell") {
             self.no_shell = request.no_shell;
         }
-        if !self.overrides.contains("temporary") {
-            self.temporary = request.temporary;
-        }
+        // Always inherit [temp] from the resumed job: resuming a `[temp]` conversation must stay
+        // temporary regardless of the current `self.temporary` state or overrides.  There is no
+        // `--no-temp` flag, so the override can only mean `--temp` (which already sets `true`).
+        // The `||` preserves active/saved `/temp on` when resuming a normal job so server history
+        // is never silently written.
+        self.temporary = self.temporary || request.temporary;
         if !self.overrides.contains("mcp") {
             self.mcp = request.mcp_config.clone();
         }
@@ -745,6 +753,39 @@ impl PromptOptions {
         }
     }
 
+    pub(crate) fn load_saved_temporary(&mut self, root: &Path) {
+        if !self.overrides.contains("temporary") {
+            if let Ok(prefs) = crate::tui::preferences::Preferences::open(root) {
+                self.temporary = prefs.temporary();
+            }
+        }
+    }
+
+    /// Resolve `temporary` mode for low-level `chat`/`image` commands.
+    ///
+    /// Unlike `run_agent` (`--resume`), which can branch a normal parent conversation into a new
+    /// temporary turn using local context when saved `/temp on` is active, `chat --session <ID>`
+    /// targets a specific browser session whose `SessionMode` is fixed on the server
+    /// (`Service::submit` rejects mode mismatches). When `--session` is given without `--temp`, we
+    /// intentionally skip saved `/temp on` and adopt the target session's recorded mode instead.
+    pub(crate) fn resolve_chat_temporary(
+        &mut self,
+        root: &Path,
+        fetch_sessions: impl FnOnce() -> Result<Value>,
+    ) {
+        if let Some(sid) = self.session.as_deref() {
+            if !self.overrides.contains("temporary") {
+                if let Ok(sessions) = fetch_sessions() {
+                    if session_is_temporary(&sessions, sid) == Some(true) {
+                        self.temporary = true;
+                    }
+                }
+            }
+        } else {
+            self.load_saved_temporary(root);
+        }
+    }
+
     pub(crate) fn effective_permissions(&self) -> ToolPermissions {
         if self.yolo {
             ToolPermissions::all()
@@ -802,9 +843,38 @@ fn launch_resume(args: &[String], print: bool) -> Result<()> {
         crate::tui::run(options)
     }
 }
+fn with_temporary_unsupported_hint(
+    err: ServiceError,
+    temporary: bool,
+    cli_temp_override: bool,
+) -> ServiceError {
+    if temporary {
+        let lower = err.message.to_ascii_lowercase();
+        let is_temp_unsupported = lower.contains("temporary")
+            && (err.code == ErrorCode::UnsupportedCapability
+                || lower.contains("does not support temporary sessions")
+                || lower.contains("temporary chat control unavailable")
+                || lower.contains("unsupported capability"));
+        if is_temp_unsupported {
+            let mut enriched = err;
+            if cli_temp_override {
+                enriched.message.push_str(
+                    "\nHint: omit `--temp` or select a provider that supports temporary sessions.",
+                );
+            } else {
+                enriched.message.push_str(
+                    "\nHint: run `/temp off` in the TUI to disable saved temporary mode, or select a provider that supports temporary sessions.",
+                );
+            }
+            return enriched;
+        }
+    }
+    err
+}
 fn run_agent(mut o: PromptOptions) -> Result<()> {
     o.apply_worker_override();
     o.load_saved_permissions(&root());
+    o.load_saved_temporary(&root());
     let client = Client::connect()?;
     o.resolve_account(&client)?;
     let parent = if let Some(id) = &o.resume {
@@ -826,13 +896,16 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     if prepared.text.trim().is_empty() {
         return Err(ServiceError::invalid("provide a task or follow-up prompt"));
     }
+    let cli_temp_override = o.overrides.contains("temporary");
     let mut request = o.agent_request(prepared.text, parent);
     request.artifacts = client.upload_files(&o.account, &prepared.files, &prepared.temp_files)?;
-    let value = client.request(
-        "POST",
-        "/api/agents",
-        Some(&serde_json::to_value(request).map_err(ServiceError::storage)?),
-    )?;
+    let value = client
+        .request(
+            "POST",
+            "/api/agents",
+            Some(&serde_json::to_value(request).map_err(ServiceError::storage)?),
+        )
+        .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))?;
     let id = value["id"]
         .as_str()
         .ok_or_else(|| ServiceError::invalid("missing job id"))?;
@@ -846,8 +919,14 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
             o.effective_permissions().summary()
         )
     };
+    let mode_desc = if o.temporary {
+        format!("{mode_desc}, temporary")
+    } else {
+        mode_desc
+    };
     eprintln!("mode: {mode_desc} | agent: {id}");
     follow_agent(&client, id, o.json, o.print)
+        .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))
 }
 fn follow_agent(client: &Client, id: &str, json: bool, quiet: bool) -> Result<()> {
     let cancel = crate::agent::CancelToken::new();
@@ -909,10 +988,20 @@ fn follow_agent(client: &Client, id: &str, json: bool, quiet: bool) -> Result<()
         Ok(std::ops::ControlFlow::Continue(()))
     })
 }
+fn session_is_temporary(sessions: &Value, session_id: &str) -> Option<bool> {
+    sessions
+        .as_array()?
+        .iter()
+        .find(|s| s["id"].as_str() == Some(session_id))
+        .and_then(|s| s["mode"].as_str())
+        .map(|mode| mode == "temporary")
+}
 fn chat_command(args: &[String], image: bool) -> Result<()> {
     let mut o = PromptOptions::parse(args)?;
     let client = Client::connect()?;
     o.resolve_account(&client)?;
+    o.resolve_chat_temporary(&root(), || client.request("GET", "/api/sessions", None));
+    let cli_temp_override = o.overrides.contains("temporary");
     let prepared = crate::input::prepare(&o.words.join(" "), &o.workspace, &o.files)?;
     for warning in &prepared.warnings {
         eprintln!("warning: {warning}");
@@ -933,12 +1022,16 @@ fn chat_command(args: &[String], image: bool) -> Result<()> {
     for path in prepared.files {
         r.artifacts.push(client.upload(&r.account_id, &path)?);
     }
-    let id = client.submit(&r)?;
+    let id = client
+        .submit(&r)
+        .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))?;
     eprintln!("run: {id}");
     let cancel = crate::agent::CancelToken::new();
     let c = cancel.clone();
     let _ = ctrlc::set_handler(move || c.cancel());
-    let result = client.wait(&id, &cancel)?;
+    let result = client
+        .wait(&id, &cancel)
+        .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))?;
     print_json(&result);
     Ok(())
 }
@@ -2044,6 +2137,160 @@ mod tests {
         assert!(!yolo_req.chat_only);
         assert!(!yolo_req.no_shell);
         assert_eq!(yolo_req.permissions, Some(ToolPermissions::all()));
+    }
+
+    #[test]
+    fn temporary_flags_persistence_and_resume_overrides_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = crate::tui::preferences::Preferences::open(dir.path()).unwrap();
+
+        // Default is non-temporary when nothing is saved.
+        let mut default_opts = PromptOptions::parse(&["hello".into()]).unwrap();
+        default_opts.load_saved_temporary(dir.path());
+        assert!(!default_opts.temporary);
+
+        // Saved temporary preference applies automatically unless overridden.
+        prefs.set_temporary(true).unwrap();
+        let mut saved_opts = PromptOptions::parse(&["hello".into()]).unwrap();
+        saved_opts.load_saved_temporary(dir.path());
+        assert!(saved_opts.temporary);
+        assert!(saved_opts.agent_request("hello".into(), None).temporary);
+
+        // `--no-temp` has been removed; `--temp` explicitly enables temporary mode and marks override.
+        assert!(PromptOptions::parse(&["--no-temp".into(), "hello".into()]).is_err());
+
+        let temp_flag = PromptOptions::parse(&["--temp".into(), "hello".into()]).unwrap();
+        assert!(temp_flag.temporary);
+        assert!(temp_flag.overrides.contains("temporary"));
+
+        // Resuming a normal (`temporary: false`) job while saved `/temp on` is active preserves
+        // temporary mode so follow-ups never silently leak to server history.
+        let mut normal_job = default_opts.agent_request("normal earlier".into(), None);
+        normal_job.temporary = false;
+        let mut saved_resuming_normal = PromptOptions::parse(&[]).unwrap();
+        saved_resuming_normal.load_saved_temporary(dir.path());
+        saved_resuming_normal.inherit(&normal_job).unwrap();
+        assert!(saved_resuming_normal.temporary);
+
+        // Explicit `--temp` enables temporary mode when resuming a normal job even when saved pref is off.
+        prefs.set_temporary(false).unwrap();
+        let mut temp_job = saved_opts.agent_request("temp earlier".into(), None);
+        temp_job.temporary = true;
+        let mut forced_temp_on_normal = PromptOptions::parse(&["--temp".into()]).unwrap();
+        forced_temp_on_normal.load_saved_temporary(dir.path());
+        forced_temp_on_normal.inherit(&normal_job).unwrap();
+        assert!(forced_temp_on_normal.temporary);
+
+        // When saved preference is `/temp off`, resuming a `[temp]` job still keeps it temporary,
+        // even if `"temporary"` was somehow in `overrides` with `temporary == false`.
+        let mut off_resuming_temp = PromptOptions::parse(&[]).unwrap();
+        off_resuming_temp.load_saved_temporary(dir.path());
+        off_resuming_temp.inherit(&temp_job).unwrap();
+        assert!(off_resuming_temp.temporary);
+
+        let mut overridden_false_resuming_temp = PromptOptions::parse(&[]).unwrap();
+        overridden_false_resuming_temp
+            .overrides
+            .insert("temporary".into());
+        overridden_false_resuming_temp.temporary = false;
+        overridden_false_resuming_temp.inherit(&temp_job).unwrap();
+        assert!(overridden_false_resuming_temp.temporary);
+
+        // `--session` mode auto-detection distinguishes `temporary` vs `chat` sessions cleanly,
+        // and `resolve_chat_temporary` intentionally ignores saved `/temp on` when an explicit
+        // `--session` is provided (matching the target session's mode instead).
+        let sessions = json!([
+            {"id": "sess-chat", "mode": "chat"},
+            {"id": "sess-temp", "mode": "temporary"},
+        ]);
+        assert_eq!(session_is_temporary(&sessions, "sess-chat"), Some(false));
+        assert_eq!(session_is_temporary(&sessions, "sess-temp"), Some(true));
+        assert_eq!(session_is_temporary(&sessions, "missing"), None);
+
+        prefs.set_temporary(true).unwrap();
+        let mut chat_no_session = PromptOptions::parse(&["hello".into()]).unwrap();
+        chat_no_session.resolve_chat_temporary(dir.path(), || {
+            panic!("sessions endpoint must not be queried without --session")
+        });
+        assert!(chat_no_session.temporary);
+
+        let mut chat_explicit_normal_session =
+            PromptOptions::parse(&["--session".into(), "sess-chat".into(), "hello".into()])
+                .unwrap();
+        chat_explicit_normal_session.resolve_chat_temporary(dir.path(), || Ok(sessions.clone()));
+        assert!(
+            !chat_explicit_normal_session.temporary,
+            "explicit --session for a normal chat session must ignore saved /temp on"
+        );
+
+        prefs.set_temporary(false).unwrap();
+        let mut chat_explicit_temp_session =
+            PromptOptions::parse(&["--session".into(), "sess-temp".into(), "hello".into()])
+                .unwrap();
+        chat_explicit_temp_session.resolve_chat_temporary(dir.path(), || Ok(sessions.clone()));
+        assert!(
+            chat_explicit_temp_session.temporary,
+            "explicit --session for a temporary session must adopt temporary mode"
+        );
+
+        // Hints attach on temporary-capability errors (both sync UnsupportedCapability and wrapped
+        // agent Internal errors), distinguishing saved `/temp on` from explicit `--temp` CLI flag,
+        // and never fire on unrelated capability failures like image generation.
+        let err = ServiceError::new(
+            ErrorCode::Internal,
+            "agent",
+            "agent ended as failed: provider 'claude-web' does not support temporary sessions",
+        );
+        let hinted_saved = with_temporary_unsupported_hint(err.clone(), true, false);
+        assert!(hinted_saved.message.contains("/temp off"));
+        assert!(!hinted_saved.message.contains("omit `--temp`"));
+        let hinted_cli = with_temporary_unsupported_hint(err.clone(), true, true);
+        assert!(hinted_cli.message.contains("omit `--temp`"));
+        assert!(!hinted_cli.message.contains("disable saved temporary mode"));
+        let unhinted = with_temporary_unsupported_hint(err, false, false);
+        assert!(!unhinted.message.contains("Hint:"));
+
+        let sync_temp_err = ServiceError::new(
+            ErrorCode::UnsupportedCapability,
+            "prepare",
+            "provider 'claude-web' does not support temporary sessions",
+        );
+        assert!(
+            with_temporary_unsupported_hint(sync_temp_err.clone(), true, false)
+                .message
+                .contains("/temp off")
+        );
+        assert!(with_temporary_unsupported_hint(sync_temp_err, true, true)
+            .message
+            .contains("omit `--temp`"));
+
+        let control_err = ServiceError::new(
+            ErrorCode::UnsupportedCapability,
+            "backend",
+            "unsupported capability: temporary chat control unavailable",
+        );
+        assert!(with_temporary_unsupported_hint(control_err, true, false)
+            .message
+            .contains("/temp off"));
+
+        let unrelated_image_err = ServiceError::new(
+            ErrorCode::UnsupportedCapability,
+            "download",
+            "provider 'chatgpt-web' does not support image generation",
+        );
+        let untouched_image_err = with_temporary_unsupported_hint(unrelated_image_err, true, false);
+        assert!(!untouched_image_err.message.contains("Hint:"));
+
+        let unrelated_upload_err = ServiceError::new(
+            ErrorCode::UnsupportedCapability,
+            "upload",
+            "provider 'custom' does not support file uploads",
+        );
+        assert!(
+            !with_temporary_unsupported_hint(unrelated_upload_err, true, true)
+                .message
+                .contains("Hint:")
+        );
     }
 
     #[test]

@@ -691,14 +691,30 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     drop(updates);
     drop(worker_guard);
     loop_result?;
-    if let Some(id) = state.active.or(state.parent) {
-        if state.status["browser_connection"]["transport"] == "grpc" {
-            eprintln!(
-                "Session saved. Reconnect with `anticrumb connect`, then use `/resume {id}`."
-            );
-        } else {
-            eprintln!("Session saved. Continue with: anticrumb resume {id}");
-        }
+    if let Some(id) = state.active.clone().or_else(|| state.parent.clone()) {
+        eprintln!("{}", exit_conversation_message(&id, &state));
     }
     Ok(())
+}
+
+pub(super) fn exit_conversation_message(id: &str, state: &State) -> String {
+    let temporary = state
+        .conversation_temporary
+        .unwrap_or(state.options.temporary);
+    if state.status["browser_connection"]["transport"] == "grpc" {
+        let temp_note = if temporary {
+            " (temporary mode: not stored on provider server)"
+        } else {
+            ""
+        };
+        format!(
+            "Session saved{temp_note}. Reconnect with `anticrumb connect`, then use `/resume {id}`."
+        )
+    } else if temporary {
+        format!(
+            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb resume {id}"
+        )
+    } else {
+        format!("Session saved. Continue with: anticrumb resume {id}")
+    }
 }

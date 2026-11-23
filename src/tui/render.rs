@@ -183,6 +183,10 @@ impl State {
         } else {
             parts.push(("AGENT".into(), Face::HIGHLIGHT_BOLD));
         }
+        if self.options.temporary {
+            parts.push((" · ".into(), Face::MUTED));
+            parts.push(("TEMP".into(), Face::CODE_BOLD));
+        }
         if self.debug.level > 0 {
             parts.push((" · ".into(), Face::MUTED));
             parts.push((
