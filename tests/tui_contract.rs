@@ -85,6 +85,16 @@ mod unix_pty {
             workspace: &Path,
             extra_env: &[(&str, Option<&str>)],
         ) -> Self {
+            Self::spawn_with_args(binary, state, workspace, &[], extra_env)
+        }
+
+        fn spawn_with_args(
+            binary: &Path,
+            state: &Path,
+            workspace: &Path,
+            extra_args: &[&str],
+            extra_env: &[(&str, Option<&str>)],
+        ) -> Self {
             let mut master: libc::c_int = -1;
             let mut slave: libc::c_int = -1;
             let ws = libc::winsize {
@@ -128,7 +138,7 @@ mod unix_pty {
             }
 
             let mut cmd = Command::new(binary);
-            cmd.arg(state).args(["-C"]).arg(workspace);
+            cmd.arg(state).args(["-C"]).arg(workspace).args(extra_args);
             for (k, v) in extra_env {
                 match v {
                     Some(val) => {
@@ -1421,6 +1431,100 @@ mod unix_pty {
 
         pty.send("\x15/exit\r");
         assert_eq!(pty.wait_exit(), 0);
+    }
+
+    #[test]
+    fn temp_mode_updates_status_bar_sends_temporary_flag_and_persists_across_restarts() {
+        let binary = fixture_binary();
+        let _pty_guard = lock_pty_test();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+
+        let home_str = home.to_string_lossy().into_owned();
+        let env = [
+            ("HOME", Some(home_str.as_str())),
+            ("TERM", Some("xterm-256color")),
+            ("NO_COLOR", None),
+        ];
+
+        // Session 1: starts in non-temp CHAT mode, enables Temp via `/temp` menu, submits turn.
+        let mut pty1 = PtyHarness::spawn(&binary, &state, &workspace, &env);
+        let initial_out = pty1.wait_for("W:project");
+        let row26_initial = screen_row(&initial_out, 26);
+        assert!(row26_initial.contains("CHAT"));
+        assert!(!row26_initial.contains("TEMP"));
+
+        pty1.send("/temp\r");
+        pty1.wait_for("Temp (anonymous)");
+        pty1.send("\x1b[B\r");
+        let enabled_out = pty1.wait_for("TEMP");
+        assert!(frame(&enabled_out).contains("Temp chat: ON"));
+        assert!(screen_row(&enabled_out, 26).contains("CHAT · TEMP"));
+
+        pty1.send("first temporary prompt\r");
+        pty1.wait_for("Attachment turn 1 completed.");
+        pty1.send("/exit\r");
+        assert_eq!(pty1.wait_exit(), 0);
+        assert_eq!(observations_at(&state)["tasks"][0]["temporary"], true);
+
+        // Session 2: relaunched without CLI flags restores saved temporary mode, then `/temp off`
+        // persists normal mode back to disk.
+        let mut pty2 = PtyHarness::spawn(&binary, &state, &workspace, &env);
+        let relaunched_out = pty2.wait_for("TEMP");
+        let relaunched_out = if screen_row(&relaunched_out, 26).contains("W:project") {
+            relaunched_out
+        } else {
+            pty2.wait_for("W:project")
+        };
+        assert!(frame(&relaunched_out).contains("Temp (anonymous, no server history)"));
+        assert!(screen_row(&relaunched_out, 26).contains("CHAT · TEMP"));
+
+        pty2.send("second persisted temporary prompt\r");
+        pty2.wait_for("Attachment turn 2 completed.");
+        pty2.send("/temp off\r");
+        let disabled_out = pty2.wait_for("chats saved on provider server");
+        assert!(frame(&disabled_out).contains("Temp chat: OFF"));
+        let row26_disabled = screen_row(&disabled_out, 26);
+        assert!(row26_disabled.contains("CHAT"));
+        assert!(!row26_disabled.contains("TEMP"));
+        pty2.send("third persisted normal prompt\r");
+        pty2.wait_for("Attachment turn 3 completed.");
+        pty2.send("/exit\r");
+        assert_eq!(pty2.wait_exit(), 0);
+        assert_eq!(observations_at(&state)["tasks"][1]["temporary"], true);
+        assert_eq!(observations_at(&state)["tasks"][2]["temporary"], false);
+
+        // Session 3: relaunched without flags stays in persisted non-temp mode.
+        let mut pty3 = PtyHarness::spawn(&binary, &state, &workspace, &env);
+        let persisted_off_out = pty3.wait_for("W:project");
+        let row26_off = screen_row(&persisted_off_out, 26);
+        assert!(row26_off.contains("CHAT"));
+        assert!(!row26_off.contains("TEMP"));
+        pty3.send("fourth normal prompt\r");
+        pty3.wait_for("Attachment turn 4 completed.");
+        pty3.send("/exit\r");
+        assert_eq!(pty3.wait_exit(), 0);
+        assert_eq!(observations_at(&state)["tasks"][3]["temporary"], false);
+
+        // Session 4: relaunched with `--temp` enables temporary mode for this run over saved `/temp off`.
+        let mut pty4 = PtyHarness::spawn_with_args(&binary, &state, &workspace, &["--temp"], &env);
+        let override_out = pty4.wait_for("TEMP");
+        let override_out = if screen_row(&override_out, 26).contains("W:project") {
+            override_out
+        } else {
+            pty4.wait_for("W:project")
+        };
+        assert!(screen_row(&override_out, 26).contains("CHAT · TEMP"));
+        pty4.send("fifth cli temp override prompt\r");
+        pty4.wait_for("Attachment turn 5 completed.");
+        pty4.send("/exit\r");
+        assert_eq!(pty4.wait_exit(), 0);
+        assert_eq!(observations_at(&state)["tasks"][4]["temporary"], true);
     }
 
     fn observations_at(state: &Path) -> serde_json::Value {

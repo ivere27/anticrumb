@@ -20,6 +20,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
         "Switch between Chat mode (default) and Agent mode (--yolo)",
     ),
     (
+        "/temp",
+        "Toggle anonymous temporary chat (no history saved on server; persisted)",
+    ),
+    (
         "/copy",
         "Copy the last assistant response, including Markdown",
     ),
@@ -99,6 +103,7 @@ pub(super) enum Selection {
         agent: bool,
         yolo: bool,
     },
+    Temporary(bool),
     Permission {
         kind: PermissionKind,
         perms: crate::domain::ToolPermissions,
@@ -602,6 +607,9 @@ impl State {
         {
             self.options.thinking = pref.thinking;
         }
+        if !self.options.overrides.contains("temporary") {
+            self.options.temporary = data.temporary();
+        }
         if self.options.yolo {
             self.options.permissions = crate::domain::ToolPermissions::all();
             self.options.no_shell = false;
@@ -618,6 +626,18 @@ impl State {
                     self.options.permissions.shell = !no_shell;
                 }
             }
+        }
+    }
+
+    pub(super) fn saved_temporary_preference(&self) -> bool {
+        self.preferences
+            .as_ref()
+            .is_some_and(|prefs| prefs.temporary())
+    }
+
+    pub(super) fn reset_temporary_to_preference(&mut self) {
+        if !self.options.overrides.contains("temporary") {
+            self.options.temporary = self.saved_temporary_preference();
         }
     }
 
@@ -722,6 +742,22 @@ impl State {
                 Face::HIGHLIGHT_BOLD
             } else {
                 Face::ACCENT
+            },
+        );
+        let temp_text = if self.options.temporary {
+            "on (anonymous · no server chat history saved)".to_owned()
+        } else {
+            "off (normal · saved on provider server)".to_owned()
+        };
+        self.log_kv(
+            "· ",
+            Face::ACCENT,
+            "Temp chat",
+            &temp_text,
+            if self.options.temporary {
+                Face::CODE_BOLD
+            } else {
+                Face::MUTED
             },
         );
         self.log_kv("· ", Face::ACCENT, "Model", &model, Face::ACCENT_BOLD);
@@ -939,6 +975,64 @@ impl State {
         }
     }
 
+    pub(super) fn set_temporary(&mut self, temporary: bool) {
+        self.options.temporary = temporary;
+        let mut save_error = None;
+        let persisted = if let Some(data) = &self.preferences {
+            match data.set_temporary(temporary) {
+                Ok(()) => true,
+                Err(e) => {
+                    save_error = Some(e.to_string());
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if let Some(err) = save_error {
+            self.log_error(&format!("Temporary mode setting could not be saved: {err}"));
+        }
+        if persisted || self.preferences.is_none() || !temporary {
+            self.options.overrides.remove("temporary");
+        } else {
+            self.options.overrides.insert("temporary".into());
+        }
+        let persisted_suffix = if persisted {
+            "; persisted for future sessions"
+        } else {
+            ""
+        };
+        if temporary {
+            let detail = format!(" (anonymous · no server history saved{persisted_suffix})");
+            self.log_spans(
+                &format!("Temp chat: ON{detail}"),
+                vec![
+                    ("· ".into(), Face::ACCENT),
+                    ("Temp chat: ".into(), Face::MUTED),
+                    ("ON".into(), Face::CODE_BOLD),
+                    (detail, Face::MUTED),
+                ],
+            );
+            if (self.active.is_some() || self.parent.is_some())
+                && self.conversation_temporary != Some(true)
+            {
+                self.log("  Next turn opens a new temporary chat with local context instead of continuing the server chat.");
+            }
+            self.warn_if_temporary_unsupported();
+        } else {
+            let detail = format!(" (normal · chats saved on provider server{persisted_suffix})");
+            self.log_spans(
+                &format!("Temp chat: OFF{detail}"),
+                vec![
+                    ("· ".into(), Face::ACCENT),
+                    ("Temp chat: ".into(), Face::MUTED),
+                    ("OFF".into(), Face::HIGHLIGHT_BOLD),
+                    (detail, Face::MUTED),
+                ],
+            );
+        }
+    }
+
     pub(super) fn submit(&mut self, sink: &mut dyn EffectSink) -> bool {
         let draft = self.editor.draft();
         let input = draft.text.trim();
@@ -1015,6 +1109,36 @@ impl State {
                     "agent" | "on" => self.set_agent_mode(true, false),
                     "yolo" => self.set_agent_mode(true, true),
                     _ => self.log("Usage: /mode [chat|agent|yolo]"),
+                },
+                "/temp" => match arg {
+                    "" => {
+                        let current = if self.options.temporary {
+                            "on (anonymous)"
+                        } else {
+                            "off (normal)"
+                        };
+                        self.menu = Some(Menu {
+                            title: format!("Temp chat · current: {current}"),
+                            choices: vec![
+                                Choice {
+                                    label: "Normal · save conversations on provider server".into(),
+                                    value: Selection::Temporary(false),
+                                },
+                                Choice {
+                                    label:
+                                        "Temp (anonymous) · no history saved on server (persisted)"
+                                            .into(),
+                                    value: Selection::Temporary(true),
+                                },
+                            ],
+                            selected: usize::from(self.options.temporary),
+                        });
+                    }
+                    "on" | "temp" | "temporary" | "anon" | "anonymous" | "true" | "1" => {
+                        self.set_temporary(true)
+                    }
+                    "off" | "normal" | "saved" | "false" | "0" => self.set_temporary(false),
+                    _ => self.log("Usage: /temp [on|off]"),
                 },
                 "/copy" => {
                     if arg.is_empty() {
@@ -1180,6 +1304,9 @@ impl State {
                 }
                 "/new" | "/clear" if !self.busy() => {
                     self.parent = None;
+                    self.conversation_temporary = None;
+                    self.pending_temporary = None;
+                    self.reset_temporary_to_preference();
                     self.files.clear();
                     self.in_chars = 0;
                     self.out_chars = 0;
@@ -1482,12 +1609,11 @@ impl State {
             }
             .into();
             self.started = Instant::now();
-            Command::Start(
-                self.options
-                    .agent_request(prepared.text, self.parent.clone()),
-                prepared.files,
-                prepared.temp_files,
-            )
+            let request = self
+                .options
+                .agent_request(prepared.text, self.parent.clone());
+            self.pending_temporary = Some(request.temporary);
+            Command::Start(request, prepared.files, prepared.temp_files)
         };
         self.send(sink, command);
         false
@@ -1628,6 +1754,7 @@ impl State {
             }
             Selection::Theme(theme) => self.choose_theme(theme),
             Selection::Mode { agent, yolo } => self.set_agent_mode(agent, yolo),
+            Selection::Temporary(temporary) => self.set_temporary(temporary),
             Selection::Permission { perms, .. } => self.apply_permissions(perms),
             Selection::Shell(allow) => {
                 let mut perms = self.options.effective_permissions();

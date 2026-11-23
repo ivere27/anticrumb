@@ -6,11 +6,12 @@
 
 ```sh
 anticrumb          # Chat mode (default: direct chat, no tool overhead)
+anticrumb --temp   # Anonymous temporary chat for this run (no server history)
 anticrumb --agent  # Agent mode (coding tools, respects /permissions)
 anticrumb --yolo   # Agent mode with all permissions (file, shell & sub-agents)
 ```
 
-Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
+Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) and `/temp` (`/temp on` / `/temp off`, persisted across launches) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
 
 ## CLI & Non-Interactive Commands
 
@@ -22,7 +23,7 @@ anticrumb exec resume AGENT_ID 'Add a regression test'
 anticrumb agents list
 ```
 
-Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `-r/--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
+Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `--temp` (enable anonymous temporary chat for this run), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `-r/--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
 
 For browser commands, worker delegation, and external MCP setup, see [Tools](tools.md).
 
@@ -31,6 +32,7 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 | Command or key | Action |
 |---|---|
 | `/mode [chat\|agent\|yolo]` | Switch between Chat mode (default) and Agent (`--yolo`) mode |
+| `/temp [on\|off]` | Enable or disable anonymous temporary chat (no server history; saved across restarts) |
 | `/model` | Pick a cached model (Up/Down) and thinking level (Left/Right) |
 | `/model refresh` | Discover models through Chrome |
 | `/provider` | Select or set up a provider account |

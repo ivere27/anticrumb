@@ -42,6 +42,11 @@ impl Face {
         code: true,
         ..Self::TEXT
     };
+    pub const CODE_BOLD: Self = Self {
+        bold: true,
+        code: true,
+        ..Self::TEXT
+    };
     pub const HEADING: Self = Self {
         bold: true,
         heading: true,

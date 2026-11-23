@@ -1430,4 +1430,60 @@ mod tests {
         assert_eq!(reopened.remote_turns, 2);
         assert_eq!(reopened.target_id.as_deref(), Some("tab-turn-2"));
     }
+
+    #[test]
+    fn submit_rejects_explicit_session_with_mismatched_temporary_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put(
+                "local",
+                "account",
+                "default",
+                &Account {
+                    id: "default".into(),
+                    provider: default_provider(),
+                    profile: directory.path().join("profile"),
+                    subprofile: None,
+                    port: 9222,
+                    headless: true,
+                    state: "ready".into(),
+                },
+            )
+            .unwrap();
+        store
+            .put(
+                "local",
+                "session",
+                "chat-sess",
+                &Session {
+                    id: "chat-sess".into(),
+                    provider: default_provider(),
+                    account_id: "default".into(),
+                    mode: SessionMode::Chat,
+                    target_id: Some("tab-1".into()),
+                    remote_url: Some("https://gemini.google.com/app/c1".into()),
+                    remote_session_id: None,
+                    history: vec![],
+                    state: "ready".into(),
+                    model: None,
+                    thinking: None,
+                    tool_digest: String::new(),
+                    remote_turns: 1,
+                    last_used: 1,
+                    reuse_scope: None,
+                },
+            )
+            .unwrap();
+        let service =
+            Service::new(store, Arc::new(UnexpectedBackend(AtomicUsize::new(0)))).unwrap();
+        let mut req = TurnRequest::text("follow up with wrong mode");
+        req.session_id = Some("chat-sess".into());
+        req.mode = SessionMode::Temporary;
+        let err = service.submit(req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert!(err
+            .message
+            .contains("session ownership, provider, mode, or state mismatch"));
+    }
 }

@@ -86,6 +86,8 @@ pub(super) struct State {
     pub catalog: Value,
     pub parent: Option<String>,
     pub active: Option<String>,
+    pub conversation_temporary: Option<bool>,
+    pub pending_temporary: Option<bool>,
     pub phase: String,
     pub editor: Editor,
     pub transcript: Transcript,
@@ -170,6 +172,8 @@ impl State {
             editor,
             parent: None,
             active: None,
+            conversation_temporary: None,
+            pending_temporary: None,
             phase: "ready".into(),
             transcript: Transcript::default(),
             status: json!({}),
@@ -358,13 +362,22 @@ impl State {
             (workspace_label.clone(), Face::MUTED),
         ];
 
+        let temp_suffix = if self.options.temporary {
+            " · Temp (anonymous, no server history)"
+        } else {
+            ""
+        };
         let mode_summary = if !self.options.agent {
-            "Mode: Chat (use /mode or --agent / --yolo for Agent mode)".to_owned()
+            if self.options.temporary {
+                format!("Mode: Chat{temp_suffix} (use /temp off for normal or /mode for Agent)")
+            } else {
+                "Mode: Chat (use /mode or --agent / --yolo for Agent mode)".to_owned()
+            }
         } else if self.options.yolo {
-            "Mode: Agent (--yolo · all tools & sub-agents allowed)".to_owned()
+            format!("Mode: Agent (--yolo · all tools & sub-agents allowed){temp_suffix}")
         } else {
             format!(
-                "Mode: Agent (permissions: {})",
+                "Mode: Agent (permissions: {}){temp_suffix}",
                 self.options.effective_permissions().summary()
             )
         };
@@ -722,6 +735,23 @@ impl State {
             .any(|p| p["id"].as_str() == Some(provider_id))
     }
 
+    pub(super) fn provider_temporary_support(&self) -> Option<bool> {
+        let pid = self.provider_id();
+        let providers = self.status["providers"].as_array()?;
+        let provider = providers.iter().find(|p| p["id"].as_str() == Some(pid))?;
+        provider["capabilities"]["temporary_sessions"].as_bool()
+    }
+
+    pub(super) fn warn_if_temporary_unsupported(&mut self) {
+        if self.options.temporary && self.provider_temporary_support() == Some(false) {
+            let name = self.provider_name().to_owned();
+            let pid = self.provider_id().to_owned();
+            self.log_warning(&format!(
+                "{name} ({pid}) does not support temporary sessions; turns will fail instead of saving to server history. Use /temp off or /provider to switch."
+            ));
+        }
+    }
+
     pub(super) fn switch_provider(
         &mut self,
         account_id: &str,
@@ -758,6 +788,8 @@ impl State {
         self.load_model_preference();
 
         self.parent = None;
+        self.conversation_temporary = None;
+        self.pending_temporary = None;
         self.active_model = None;
         self.files.clear();
         self.clear_mention();
@@ -803,6 +835,7 @@ impl State {
                 .is_some_and(|account| account["state"] == "auth_required");
             self.log_human_action_guide(auth_required, None, false);
         }
+        self.warn_if_temporary_unsupported();
     }
 
     pub(super) fn copy_text(&mut self, text: &str, selected: bool, sink: &mut dyn EffectSink) {
@@ -1334,6 +1367,7 @@ impl State {
             self.files = files;
         }
         if self.active.is_none() {
+            self.pending_temporary = None;
             self.phase = "ready".into();
         }
     }
@@ -1574,11 +1608,23 @@ impl State {
         let Some(id) = job["id"].as_str() else {
             return;
         };
-        if let Err(e) = self.options.inherit_from_job(&job) {
+        // Clone options and reset `temporary` to the saved preference (unless overridden by
+        // `--temp` or an unpersisted `/temp on`) before inheriting from the resumed job.
+        // Applying only on success prevents partial mutation on error and avoids leaking
+        // temporary state when consecutively `/resume`-ing `[temp]` -> normal conversations.
+        let mut next_options = self.options.clone();
+        if !next_options.overrides.contains("temporary") {
+            next_options.temporary = self.saved_temporary_preference();
+        }
+        let was_temporary = next_options.temporary;
+        if let Err(e) = next_options.inherit_from_job(&job) {
             self.error(&e.to_string());
             return;
         }
+        self.options = next_options;
         self.parent = Some(id.into());
+        self.conversation_temporary = Some(job["request"]["temporary"] == true);
+        self.pending_temporary = None;
         self.active_model = None;
         self.clear_mention();
         self.in_chars = 0;
@@ -1594,16 +1640,24 @@ impl State {
             "failed" | "cancelled" | "outcome_unknown" | "awaiting_human" => Face::DANGER_BOLD,
             _ => Face::ACCENT,
         };
-        self.log_spans(
-            &format!("\nResumed {id} · {state_str}"),
-            vec![
-                ("\n".into(), Face::MUTED),
-                ("· ".into(), Face::ACCENT),
-                (format!("Resumed {id}"), Face::ACCENT_BOLD),
-                (" · ".into(), Face::MUTED),
-                (state_str.into(), state_face),
-            ],
-        );
+        let is_temp = self.conversation_temporary == Some(true);
+        let plain_resumed = if is_temp {
+            format!("\nResumed {id} [temp] · {state_str}")
+        } else {
+            format!("\nResumed {id} · {state_str}")
+        };
+        let mut resumed_spans = vec![
+            ("\n".into(), Face::MUTED),
+            ("· ".into(), Face::ACCENT),
+            (format!("Resumed {id}"), Face::ACCENT_BOLD),
+        ];
+        if is_temp {
+            resumed_spans.push((" ".into(), Face::MUTED));
+            resumed_spans.push(("[temp]".into(), Face::CODE_BOLD));
+        }
+        resumed_spans.push((" · ".into(), Face::MUTED));
+        resumed_spans.push((state_str.into(), state_face));
+        self.log_spans(&plain_resumed, resumed_spans);
         self.push_entry(
             &format!("› {}", job["request"]["task"].as_str().unwrap_or("")),
             Entry::Prompt(job["request"]["task"].as_str().unwrap_or("").into()),
@@ -1625,6 +1679,12 @@ impl State {
             }
             self.log("Send a follow-up to continue. Previous actions will not be replayed automatically.");
         }
+        if self.options.temporary && self.conversation_temporary == Some(false) {
+            self.log("  Temp chat remains ON: next turn starts a new temporary chat with local context instead of continuing the server chat (use /temp off to continue on server).");
+        } else if !was_temporary && self.options.temporary && is_temp {
+            self.log("  Temp chat turned ON for this resumed temporary conversation (local context only; /new returns to saved normal mode).");
+        }
+        self.warn_if_temporary_unsupported();
     }
 
     fn apply_status(&mut self, status: Value) -> bool {
@@ -1635,11 +1695,21 @@ impl State {
         self.status_disconnected = false;
         let was_blocked = self.human_required();
         let previous_connection = self.daemon_summary();
+        let prev_pid = self.provider_id().to_owned();
+        let prev_temp_support = self.provider_temporary_support();
         self.status = status;
         self.notice_chat_cleanup();
         let connection = self.daemon_summary();
         if connection != previous_connection {
             self.log_daemon_rows(&connection);
+        }
+        let next_pid = self.provider_id().to_owned();
+        let next_temp_support = self.provider_temporary_support();
+        if self.options.temporary
+            && next_temp_support == Some(false)
+            && (prev_pid != next_pid || prev_temp_support != Some(false))
+        {
+            self.warn_if_temporary_unsupported();
         }
         let login = self
             .account()
@@ -1765,6 +1835,9 @@ impl State {
                     self.log_debug("agent", &format!("started job {id}"));
                 }
                 self.active = Some(id);
+                if let Some(temp) = self.pending_temporary.take() {
+                    self.conversation_temporary = Some(temp);
+                }
                 self.phase = "running".into();
                 self.in_chars = 0;
                 self.out_chars = 0;
@@ -1822,10 +1895,16 @@ impl State {
                     .into_iter()
                     .take(30)
                     .filter_map(|j| {
+                        let temp = if j["request"]["temporary"] == true {
+                            " [temp]"
+                        } else {
+                            ""
+                        };
                         Some(Choice {
                             label: format!(
-                                "{} · {}",
+                                "{}{} · {}",
                                 j["state"].as_str().unwrap_or("saved"),
+                                temp,
                                 clip(j["request"]["task"].as_str().unwrap_or(""), 80)
                             ),
                             value: Selection::Resume(j["id"].as_str()?.into()),
@@ -1847,6 +1926,9 @@ impl State {
                 self.phase = "ready".into();
                 if self.parent.as_deref() == Some(&id) {
                     self.parent = None;
+                    self.conversation_temporary = None;
+                    self.pending_temporary = None;
+                    self.reset_temporary_to_preference();
                     self.active_model = None;
                     self.in_chars = 0;
                     self.out_chars = 0;
@@ -2043,6 +2125,11 @@ impl State {
 
     fn handle_finished(&mut self, job: Value) {
         self.parent = job["id"].as_str().map(str::to_owned);
+        let pending = self.pending_temporary.take();
+        self.conversation_temporary = job["request"]["temporary"]
+            .as_bool()
+            .or(pending)
+            .or(self.conversation_temporary);
         self.active = None;
         self.active_model = None;
         self.stream.clear();
