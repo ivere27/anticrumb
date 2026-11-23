@@ -104,12 +104,16 @@ L19: pub fn reserve_funds(account_id: u64, amount_cents: u64, timeout_ms: u64, i
 - **Layer 3-① (Same-File Unmodified Types & Constants):**
   - Reuses the already-parsed Tree-sitter AST (`0 ms` extra parse cost) to extract unmodified top-level/module-level `struct`, `enum`, `interface`, `type`, `record`, `class`, and `const` definitions referenced by changed hunks.
   - Excludes inline `#[cfg(test)]` test blocks and function-local inner constants.
-- **Layer 3-② (Snapshot-Safe 1-Hop Cross-File Types & Signatures):**
+- **Layer 3-② (Snapshot-Safe 1-Hop Forward Cross-File Types & Signatures):**
   - Resolves diff-referenced imports (`use`, `import`, `from ... import`, `#include`, `using`, `require_relative`) and same-package sibling files across the repository.
-  - **Snapshot accuracy:** Reads target blobs via a single batched `git cat-file --batch` pipe for `Commit(sha)` and `Staged` diffs (and bounded `fs::read` for `Unstaged`), guaranteeing historical and staged accuracy without touching dirty worktree files.
+  - **Snapshot accuracy:** Reads target blobs via a single batched `git cat-file --batch` pipe bounded by `8s` timeout for `Commit(sha)` and `Staged` diffs (and bounded `fs::read` for `Unstaged`), guaranteeing historical and staged accuracy without touching dirty worktree files.
   - **Body-stripped signatures + concise doc comments:** Emits function/method signatures with bodies stripped, plus up to `160 B` of leading doc comments (`///`, `/** ... */`, `//`, `#`) or Python first-statement docstrings (`"""..."""`) as `// doc: ...`.
-  - **Strict noise discipline:** Filters out untouched top-of-file imports, stdlib/external packages, test files, and ambiguous unpinned symbols (`> 2` candidate files). Capped at `24` candidate files and `400 ms` wall time.
-  - **Automatic budget shedding:** When a massive diff triggers production code compaction (Tier 3+) or leaves `< 2 KiB` of headroom on diffs `> 256 KiB`, cross-file resolution is skipped automatically (`0 ms` overhead) so Layer 3 never starves modified production code.
+- **Layer 3-③ (Snapshot-Safe 1-Hop Reverse Callers & Type Consumers):**
+  - Detects unmodified production callers across the repository whose calls, constructor sites, JSX usages, or type references target modified/deleted production functions or types (`git grep -n -z -F -I` + batched `git cat-file --batch` + Tree-sitter AST verification).
+  - Supports both ASCII identifiers (`-w`) and non-ASCII/UTF-8 identifiers (e.g., Korean symbols, Ruby `?`/`!` methods) while ignoring comments, string literals, imports, and test scopes (`tests/`, `#[test]`, inline `#[cfg(test)]` blocks).
+  - Prioritizes signature-changed / type targets and explicit import/same-package pinned callers within a strict 6-tier budget order.
+- **Strict noise discipline:** Filters out untouched top-of-file imports, stdlib/external packages, test files, and ambiguous unpinned symbols (`> 2` candidate files). Deterministic candidate cap (`24` files) and `2 MiB` total parse byte ceiling; file-scoped `(norm_path, symbol_name)` deduplication ensures modifying `a::sym` never suppresses external `b::sym`.
+- **Automatic budget shedding:** When a massive diff triggers production code compaction (Tier 3+) or leaves `< 2 KiB` of headroom on diffs `> 256 KiB`, cross-file forward & reverse resolution is skipped automatically (`0 ms` overhead) so Layer 3 never starves modified production code.
 
 ---
 
@@ -144,19 +148,19 @@ Total output is strictly bounded by `ANTICRUMB_PATCH_BUDGET_KIB` (default `512 K
 
 ---
 
-## 5. Pure-Rust A/B & 4-Arm Ablation Benchmark Suite
+## 5. Pure-Rust Multi-Arm Ablation & External Baseline Suite
 
-A zero-Python benchmark harness is built into `xtask` and `tools/test/ab-bench` for regression testing and ablation experiments (`A: off`, `B1: l1,l2`, `B2: l1,l2,l3_local`, `B3: all`):
+A zero-Python benchmark harness is built into `xtask` and `tools/test/ab-bench` for regression testing, external baseline comparisons (`P0`: `-U3`, `P1`: `-W`, `P2`: `-U3` + snapshot full files), and ablation experiments (`A: off`, `B1: l1,l2`, `B2: l1,l2,l3_local`, `B3: +l3_cross`, `B4: full` with reverse callers):
 
 ```sh
-# 1. Generate multi-language seeded-bug fixtures (Rust, TS, Python, Go, Java, C#, C++, Ruby)
+# 1. Generate multi-language seeded-bug fixtures (Rust, TS, Python, Go, Java, C#, C++, Ruby + UTF-8 reverse callers)
 ./tools/test/ab-bench fixtures --out /tmp/anticrumb_ab/fixtures
 
-# 2. Run 4-Arm offline ablation on real repository commits + fixtures
+# 2. Run Multi-Arm offline ablation on real repository commits + fixtures
 ./tools/test/ab-bench offline \
   --commits 575d269,b1bbdab,5aca67c,85c359b,86d4ef9@512,86d4ef9@128 \
   --fixtures-dir /tmp/anticrumb_ab/fixtures \
-  --arms A,B1,B2,B3 \
+  --arms P0,P1,P2,A,B1,B2,B3,B4 \
   --out /tmp/anticrumb_ab/run1
 
 # 3. Grade structured JSON code-review outputs against ground-truth rubrics

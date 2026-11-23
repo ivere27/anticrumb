@@ -1,8 +1,10 @@
 //! Tree-sitter AST-expanded git diff generation and language support.
 use crate::domain::{Result, ServiceError};
 use std::{
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "tree-sitter")]
@@ -218,13 +220,142 @@ fn git_cmd(repo_root: &Path) -> Command {
     cmd
 }
 
+pub(super) struct TimedCmdOutput {
+    pub(super) status: Option<std::process::ExitStatus>,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    pub(super) timed_out: bool,
+    pub(super) truncated: bool,
+}
+
+pub(super) fn read_stream_bounded<R: Read>(
+    mut reader: R,
+    max_bytes: Option<usize>,
+    truncated_signal: Option<&std::sync::atomic::AtomicBool>,
+) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let to_read = match max_bytes {
+            Some(cap) => {
+                if buf.len() >= cap {
+                    let mut probe = [0u8; 1];
+                    loop {
+                        match reader.read(&mut probe) {
+                            Ok(n) => {
+                                if n > 0 {
+                                    truncated = true;
+                                    if let Some(sig) = truncated_signal {
+                                        sig.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                }
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    break;
+                }
+                (cap - buf.len()).min(chunk.len())
+            }
+            None => chunk.len(),
+        };
+        match reader.read(&mut chunk[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (buf, truncated)
+}
+
+/// Runs `cmd` with a wall-clock timeout and optional stdout byte cap without pipe deadlocks.
+pub(super) fn run_cmd_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    max_stdout_bytes: Option<usize>,
+) -> std::io::Result<TimedCmdOutput> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let trunc_flag = Arc::new(AtomicBool::new(false));
+    let trunc_for_out = Arc::clone(&trunc_flag);
+    let out_handle = std::thread::spawn(move || {
+        read_stream_bounded(stdout, max_stdout_bytes, Some(&trunc_for_out))
+    });
+    let err_handle = std::thread::spawn(move || read_stream_bounded(stderr, Some(64 * 1024), None));
+
+    let deadline = Instant::now() + timeout;
+    let mut exit_status = None;
+    let mut timed_out = false;
+    let mut poll_ms = 1u64;
+
+    loop {
+        if let Some(st) = child.try_wait()? {
+            exit_status = Some(st);
+            break;
+        }
+        if trunc_flag.load(Ordering::Acquire) {
+            let _ = child.kill();
+            exit_status = child.wait().ok();
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        let sleep_dur = Duration::from_millis(poll_ms).min(deadline - now);
+        std::thread::sleep(sleep_dur);
+        poll_ms = (poll_ms * 2).min(15);
+    }
+
+    if timed_out {
+        return Ok(TimedCmdOutput {
+            status: exit_status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: true,
+            truncated: false,
+        });
+    }
+
+    let (stdout_bytes, truncated) = out_handle.join().unwrap_or_default();
+    let (stderr_bytes, _) = err_handle.join().unwrap_or_default();
+
+    Ok(TimedCmdOutput {
+        status: exit_status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        timed_out: false,
+        truncated,
+    })
+}
+
 fn get_repo_root(workspace: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .current_dir(workspace)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.current_dir(workspace)
+        .args(["rev-parse", "--show-toplevel"]);
+    let output = run_cmd_with_timeout(cmd, Duration::from_secs(5), Some(16 * 1024))
         .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
-    if !output.status.success() {
+    if output.timed_out {
+        return Err(ServiceError::invalid("git rev-parse timed out"));
+    }
+    if !output.status.is_some_and(|s| s.success()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.to_ascii_lowercase().contains("not a git repository") {
             return Err(ServiceError::invalid("not a git repository"));
@@ -840,9 +971,10 @@ struct EnclosingMatch {
     full_start: usize,
     full_end: usize,
     extra_defs: usize,
-    extra_names: Vec<String>,
+    extra_names: Vec<(String, bool)>,
     /// For single-function matches: `(body_start_line_1idx, body_start_col_bytes, body_end_line_1idx)`.
     func_body_span: Option<(usize, usize, usize)>,
+    is_type_def: bool,
 }
 
 /// Finds the enclosing definition AST node spanning `[start_line, end_line]` (1-indexed),
@@ -1020,6 +1152,7 @@ fn find_enclosing_definition_detail(
                 extra_defs: 0,
                 extra_names: Vec::new(),
                 func_body_span,
+                is_type_def: hybrid::is_type_or_const_def_node(lang, &matched),
             };
         }
 
@@ -1107,15 +1240,20 @@ fn find_enclosing_definition_detail(
                     let bare_name = sig_node
                         .as_ref()
                         .and_then(|sn| ast_compact::bare_def_name(lang, sn, &lines, source));
-                    let mut extra_names = Vec::new();
+                    let primary_is_type = sig_node.as_ref().is_some_and(|sn| {
+                        check_primary_definition(lang, sn)
+                            .is_some_and(|m| hybrid::is_type_or_const_def_node(lang, &m))
+                    });
+                    let mut extra_names: Vec<(String, bool)> = Vec::new();
                     if hybrid.layer2 && primary_defs.len() > 1 {
                         for def in &primary_defs {
                             if let Some(nm) = ast_compact::bare_def_name(lang, def, &lines, source)
                             {
+                                let is_type = hybrid::is_type_or_const_def_node(lang, def);
                                 if bare_name.as_deref() != Some(nm.as_str())
-                                    && !extra_names.contains(&nm)
+                                    && !extra_names.iter().any(|(existing, _)| existing == &nm)
                                 {
-                                    extra_names.push(nm);
+                                    extra_names.push((nm, is_type));
                                 }
                             }
                         }
@@ -1133,6 +1271,7 @@ fn find_enclosing_definition_detail(
                         extra_defs,
                         extra_names,
                         func_body_span: None,
+                        is_type_def: primary_is_type,
                     };
                 }
             }
@@ -1159,5 +1298,6 @@ fn find_enclosing_definition_detail(
         extra_defs: 0,
         extra_names: Vec::new(),
         func_body_span: None,
+        is_type_def: false,
     }
 }
