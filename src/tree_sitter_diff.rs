@@ -11,6 +11,7 @@ use std::{
 mod ast_compact;
 mod diff_expand;
 pub mod hybrid;
+mod language_registry;
 #[cfg(feature = "tree-sitter")]
 mod signature;
 #[cfg(feature = "tree-sitter")]
@@ -24,6 +25,7 @@ pub use diff_expand::{
     git_expanded_patch_file, is_lockfile_or_generated,
 };
 pub use hybrid::HybridConfig;
+pub use language_registry::{LanguageCandidates, LanguageRegistry};
 
 /// 1-based inclusive source line span `(start_line, end_line)` for a rendered diff line.
 type SourceLineSpan = (usize, usize);
@@ -56,8 +58,10 @@ const LOW_CHURN_MAX_CHANGE_LINES: usize = 3;
 #[cfg(feature = "tree-sitter")]
 const CLAMPED_CONTEXT_LINES: usize = 10;
 
-/// Soft byte budget for combined expanded diff output before progressive chunk compaction triggers.
-/// Tuned for 1M-context reasoning models (~140K-150K tokens) so large commits keep full production logic.
+/// Soft advisory size threshold for combined expanded diff output (512 KiB default).
+/// Default `@git:diff+` / `@git:staged+` / `@git:<commit>+` emits the full diff without budget
+/// truncation and logs a warning when the output exceeds this threshold (configurable via
+/// `ANTICRUMB_PATCH_BUDGET_KIB`).
 const DEFAULT_PATCH_BUDGET_BYTES: usize = 512 * 1024;
 const MIN_PATCH_BUDGET_BYTES: usize = 16 * 1024;
 const MAX_PATCH_BUDGET_BYTES: usize = 16 * 1024 * 1024;
@@ -74,7 +78,7 @@ fn parse_patch_budget_kib(raw: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_PATCH_BUDGET_BYTES)
 }
 
-/// Resolves the active soft patch budget from `ANTICRUMB_PATCH_BUDGET_KIB` or `DEFAULT_PATCH_BUDGET_BYTES`.
+/// Resolves the advisory patch size warning threshold from `ANTICRUMB_PATCH_BUDGET_KIB` or `DEFAULT_PATCH_BUDGET_BYTES`.
 fn resolve_patch_budget_bytes() -> usize {
     let val = std::env::var("ANTICRUMB_PATCH_BUDGET_KIB").ok();
     parse_patch_budget_kib(val.as_deref())
@@ -108,24 +112,61 @@ pub enum SupportedLanguage {
 }
 
 impl SupportedLanguage {
-    pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        match ext.as_str() {
-            "rs" => Some(Self::Rust),
-            "py" | "pyi" => Some(Self::Python),
-            "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
-            "ts" | "mts" | "cts" => Some(Self::TypeScript),
+    /// Parses a canonical language identifier from `extensions.json` (case-insensitive).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            "javascript" => Some(Self::JavaScript),
+            "typescript" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "go" => Some(Self::Go),
             "c" => Some(Self::C),
-            "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "cpp" | "c++" => Some(Self::Cpp),
             "java" => Some(Self::Java),
-            "cs" => Some(Self::CSharp),
-            "sh" | "bash" => Some(Self::Bash),
-            "rb" => Some(Self::Ruby),
+            "csharp" | "c#" | "cs" => Some(Self::CSharp),
+            "bash" | "sh" => Some(Self::Bash),
+            "ruby" => Some(Self::Ruby),
             "json" => Some(Self::Json),
             _ => None,
         }
+    }
+
+    /// Canonical lowercase identifier used in `extensions.json` and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::Go => "go",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Java => "java",
+            Self::CSharp => "csharp",
+            Self::Bash => "bash",
+            Self::Ruby => "ruby",
+            Self::Json => "json",
+        }
+    }
+
+    /// Resolves exact or priority-ordered candidate languages for `path` from the built-in
+    /// `extensions.json` registry.
+    pub fn candidates_for_path(path: &Path) -> Option<LanguageCandidates<'static>> {
+        LanguageRegistry::builtin().candidates_for_path(path)
+    }
+
+    /// Returns the primary language for `path` (exact match, or the highest-priority candidate
+    /// for ambiguous priority extensions).
+    pub fn from_path(path: &Path) -> Option<Self> {
+        Self::candidates_for_path(path).map(LanguageCandidates::primary)
+    }
+
+    /// Returns true if `path` is configured in `extensions.json` `"plain_diff"`
+    /// (documentation/config/plain-text files that attach as clean `-U3` diffs without warnings).
+    pub fn is_plain_diff_path(path: &Path) -> bool {
+        LanguageRegistry::builtin().is_plain_diff_path(path)
     }
 
     #[cfg(feature = "tree-sitter")]

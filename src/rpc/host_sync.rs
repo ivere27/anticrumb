@@ -246,11 +246,18 @@ async fn dispatch_clear_web_history(
         // Exact remote IDs avoid guessing a local clock cutoff
         // from an old terminal status on startup.
         let deleted = remote
-            .list_sessions(pb::Empty {})
+            .list_sessions(pb::ListSessionsRequest {
+                account_id: Some(status.account_id.clone()),
+                mode: pb::SessionMode::Unspecified as i32,
+                state: pb::SessionState::Deleted as i32,
+            })
             .await?
             .sessions
             .into_iter()
-            .filter(|session| session.account_id == status.account_id && session.state == "deleted")
+            .filter(|session| {
+                session.account_id == status.account_id
+                    && session.state == pb::SessionState::Deleted as i32
+            })
             .map(|session| session.id)
             .collect::<std::collections::HashSet<_>>();
         for mut session in host.service.store.list::<Session>("local", "session")? {
@@ -273,7 +280,7 @@ async fn dispatch_clear_web_history(
                     Err(error) => return Err(error),
                 };
             if record.server_id == info.server_id {
-                session.state = "deleted".into();
+                session.state = SessionState::Deleted;
                 host.service
                     .store
                     .put("local", "session", &session.id, &session)?;

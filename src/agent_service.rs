@@ -18,7 +18,8 @@ struct AgentRuntimeSpec {
     account_id: String,
     model: Option<String>,
     thinking: Option<String>,
-    temporary: bool,
+    session_mode: SessionMode,
+    session_retention: SessionRetention,
     allow_shell: bool,
     read_only: bool,
     allow_spawn_agent: bool,
@@ -44,10 +45,10 @@ fn build_coding_agent(
         spec.account_id.clone(),
         spec.model.clone(),
         spec.thinking.clone(),
-        spec.temporary,
+        spec.session_mode,
     );
     backend.set_chat_only(spec.chat_only);
-    backend.retain_session_after_run(!spec.temporary);
+    backend.set_session_retention(spec.session_retention);
     backend
         .add_artifacts(&spec.artifacts)
         .map_err(ServiceError::invalid)?;
@@ -219,8 +220,25 @@ impl Drop for SubagentFinishGuard {
     }
 }
 
-fn subagent_event_sink(parent_events: EventSink, id: String, label: String) -> EventSink {
+fn subagent_event_sink(
+    store: Store,
+    parent_job_id: String,
+    parent_events: EventSink,
+    id: String,
+    label: String,
+) -> EventSink {
     EventSink::new(move |ev| match ev {
+        AgentEvent::BrowserSession { session_id } => {
+            let _ = store.event(
+                &parent_job_id,
+                EVENT_SUBAGENT_BROWSER_SESSION,
+                json!({
+                    "id": id,
+                    "label": label,
+                    "session_id": session_id,
+                }),
+            );
+        }
         AgentEvent::StepStarted { step } => {
             parent_events.emit(AgentEvent::SubagentProgress {
                 id: id.clone(),
@@ -274,6 +292,7 @@ fn subagent_event_sink(parent_events: EventSink, id: String, label: String) -> E
 
 struct SubagentRunner {
     manager: Arc<AgentManager>,
+    parent_job_id: String,
     base_spec: AgentRuntimeSpec,
     parent_events: EventSink,
     browser_fetch: BrowserFetchFn,
@@ -321,7 +340,8 @@ impl SubagentRunner {
         let sub_client =
             Client::for_workspace(self.manager.store.root()).map_err(|e| e.to_string())?;
         let mut spec = self.base_spec.clone();
-        spec.temporary = true;
+        spec.session_mode = SessionMode::Temporary;
+        spec.session_retention = SessionRetention::Retain;
         spec.read_only = read_only;
         spec.allow_spawn_agent = false;
         spec.chat_only = false;
@@ -345,7 +365,13 @@ impl SubagentRunner {
         let sub_control = RunControl {
             cancel: cancel.clone(),
             inbox: SteerInbox::default(),
-            events: subagent_event_sink(self.parent_events.clone(), sub_id, label_str),
+            events: subagent_event_sink(
+                self.manager.store.clone(),
+                self.parent_job_id.clone(),
+                self.parent_events.clone(),
+                sub_id,
+                label_str,
+            ),
         };
         let subagent_instructions = crate::agent::load_subagent_instructions(None);
         let sub_prompt = format!("{subtask}\n\n[SUB-AGENT INSTRUCTIONS]\n{subagent_instructions}");
@@ -462,10 +488,15 @@ impl AgentManager {
     fn prepare_continuation(
         &self,
         request: &mut AgentRequest,
+        allow_session_continuation: bool,
     ) -> Result<(String, Option<String>, usize)> {
         let new_artifacts = request.artifacts.clone();
         let context = self.context(request)?;
-        let continued_session = self.continuable_parent_session(request);
+        let continued_session = if allow_session_continuation {
+            self.continuable_parent_session(request)
+        } else {
+            None
+        };
         let prior_artifact_count = if continued_session.is_some() {
             let mut prior = Vec::new();
             let mut current_only = Vec::new();
@@ -508,13 +539,16 @@ impl AgentManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_agent_job(
         self: &Arc<Self>,
+        job_id: &str,
         request: &AgentRequest,
         control: &RunControl,
         stale_workspace_sessions: &[String],
         context: &str,
         continuation: (Option<String>, usize),
+        session_retention: SessionRetention,
         worker_gate: Option<&Arc<tokio::sync::Semaphore>>,
     ) -> Result<AgentRunResult> {
         let (continued_session, prior_artifact_count) = continuation;
@@ -527,9 +561,7 @@ impl AgentManager {
             None
         };
         let client = Client::for_workspace(self.store.root())?;
-        for sid in stale_workspace_sessions {
-            let _ = client.close_session(sid);
-        }
+        let _ = client.close_sessions(stale_workspace_sessions);
         let mut task = request.task.clone();
         task.push_str(context);
         let mut excerpts_suffix = String::new();
@@ -541,8 +573,9 @@ impl AgentManager {
             );
             task.push_str(&excerpts_suffix);
         }
-        let has_tool_contract = !request.chat_only && self.session_has_tool_contract(request);
         let continued = continued_session.map(|session_id| {
+            let has_tool_contract =
+                !request.chat_only && self.session_has_tool_contract(request, &session_id);
             let compact = if request.chat_only {
                 Some(format!("{}{excerpts_suffix}", request.task))
             } else if has_tool_contract {
@@ -558,7 +591,7 @@ impl AgentManager {
         let browser_fetch = build_browser_fetch(self.store.root(), &request.account_id)?;
         let browser_control =
             build_browser_control(self.store.root(), &request.account_id, &request.workspace)?;
-        let allow_subagent = !request.temporary
+        let allow_subagent = !request.is_temporary()
             && !request.chat_only
             && request.permissions.is_none_or(|p| p.subagent);
         let spec = AgentRuntimeSpec {
@@ -567,7 +600,8 @@ impl AgentManager {
             account_id: request.account_id.clone(),
             model: request.model.clone(),
             thinking: request.thinking.clone(),
-            temporary: request.temporary,
+            session_mode: request.session_mode,
+            session_retention,
             allow_shell: !request.no_shell && request.permissions.is_none_or(|p| p.shell),
             read_only: false,
             allow_spawn_agent: allow_subagent,
@@ -587,6 +621,7 @@ impl AgentManager {
         if allow_subagent {
             let runner = Arc::new(SubagentRunner {
                 manager: self.clone(),
+                parent_job_id: job_id.to_owned(),
                 base_spec: spec,
                 parent_events: control.events.clone(),
                 browser_fetch,
@@ -615,6 +650,31 @@ impl AgentManager {
             .unwrap_or(u32::MAX))
     }
 
+    fn finish_agent_job(&self, job_id: &str, mut terminal: AgentRecord, lease: Option<fs::File>) {
+        let state = terminal.state.clone();
+        let error = terminal.error.clone();
+        // Hold `controls` across lease release, terminal event/state persistence,
+        // and control removal so a caller polling `GetAgent` cannot observe the
+        // terminal state and race ahead into `start()`/`delete()` while this
+        // job still owns the workspace lease or remains in `controls`.
+        let mut controls = self.controls.lock().unwrap_or_else(|e| e.into_inner());
+        drop(lease);
+        let _ = self.store.event(
+            job_id,
+            "agent_terminal",
+            json!({"state": state, "error": error}),
+        );
+        if let Err(e) = self.store.put("local", "agent", job_id, &terminal) {
+            terminal.state = "failed".into();
+            terminal.error = Some(e);
+            self.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(job_id.to_owned(), terminal);
+        }
+        controls.remove(job_id);
+    }
+
     pub fn start(self: &Arc<Self>, mut request: AgentRequest) -> Result<String> {
         self.ensure_accepting_jobs()?;
         if request.task.trim().is_empty() || request.task.len() > 48000 {
@@ -627,20 +687,17 @@ impl AgentManager {
         let mut controls = self.controls.lock().map_err(ServiceError::storage)?;
         // cancel_all sets stopping before taking this lock, so a job cannot
         // register after the shutdown cancellation pass has already completed.
-        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ServiceError::invalid(
-                "agent manager is stopping or requires storage repair",
-            ));
-        }
+        self.ensure_accepting_jobs()?;
         // Deletion takes the same lock: a parent cannot disappear between
         // collecting its context and registering the dependent turn.
         let artifact_lease = self.store.blob_lease()?;
-        let (context, continued_session, prior_artifact_count) =
-            self.prepare_continuation(&mut request)?;
         let lease = self.acquire_workspace_lease(&controls, &request.workspace)?;
-        if lease.is_none() {
-            request.temporary = true;
+        let has_workspace_lease = lease.is_some();
+        if !has_workspace_lease {
+            request.session_mode = SessionMode::Temporary;
         }
+        let (context, continued_session, prior_artifact_count) =
+            self.prepare_continuation(&mut request, has_workspace_lease)?;
         let id = id("agent");
         let control = self.new_run_control(&id);
         let created_at = now_ms();
@@ -661,29 +718,45 @@ impl AgentManager {
         controls.insert(id.clone(), control.clone());
         drop(artifact_lease);
         drop(controls);
-        let stale_workspace_sessions = if !request.temporary {
-            self.idle_workspace_sessions(&request.workspace, &request.account_id, &id)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|sid| continued_session.as_deref() != Some(sid.as_str()))
-                .collect()
+        let stale_workspace_sessions = if has_workspace_lease {
+            let keep_conversation_jobs = if continued_session.is_some() {
+                self.conversation_ancestors(&request)
+            } else {
+                std::collections::HashSet::new()
+            };
+            self.idle_workspace_sessions(
+                &request.workspace,
+                &request.account_id,
+                &id,
+                &keep_conversation_jobs,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|sid| continued_session.as_deref() != Some(sid.as_str()))
+            .collect()
         } else {
             Vec::new()
         };
+        let session_retention = SessionRetention::for_turn(
+            request
+                .session_retention
+                .should_retain_agent(has_workspace_lease),
+        );
         let manager = self.clone();
         let job_id = id.clone();
         let worker_gate = request
-            .temporary
+            .is_temporary()
             .then(|| self.worker_gate(&request.account_id));
         tokio::task::spawn_blocking(move || {
-            let _lease = lease;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 manager.run_agent_job(
+                    &job_id,
                     &request,
                     &control,
                     &stale_workspace_sessions,
                     &context,
                     (continued_session, prior_artifact_count),
+                    session_retention,
                     worker_gate.as_ref(),
                 )
             }))
@@ -707,30 +780,16 @@ impl AgentManager {
                 ),
                 Err(e) => ("failed".into(), None, Some(e)),
             };
-            let mut terminal = AgentRecord {
+            let terminal = AgentRecord {
                 id: job_id.clone(),
-                state: state.clone(),
+                state,
                 request,
                 result: value,
-                error: error.clone(),
+                error,
                 created_at,
                 updated_at: now_ms(),
             };
-            if let Err(e) = manager.store.put("local", "agent", &job_id, &terminal) {
-                terminal.state = "failed".into();
-                terminal.error = Some(e);
-                manager
-                    .failures
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(job_id.clone(), terminal);
-            }
-            let _ = manager.store.event(
-                &job_id,
-                "agent_terminal",
-                json!({"state":state,"error":error}),
-            );
-            manager.controls.lock().unwrap().remove(&job_id);
+            manager.finish_agent_job(&job_id, terminal, lease);
         });
         Ok(id)
     }
@@ -868,6 +927,10 @@ impl AgentManager {
     }
 
     fn browser_session_ids(&self, agent_id: &str) -> Result<Vec<String>> {
+        self.job_session_ids(agent_id, false)
+    }
+
+    fn job_session_ids(&self, agent_id: &str, include_subagents: bool) -> Result<Vec<String>> {
         let mut after = 0;
         let mut sessions = Vec::new();
         loop {
@@ -877,7 +940,9 @@ impl AgentManager {
             }
             for event in events {
                 after = event.sequence;
-                if event.kind == "browser_session" {
+                let matches_kind = event.kind == EVENT_BROWSER_SESSION
+                    || (include_subagents && event.kind == EVENT_SUBAGENT_BROWSER_SESSION);
+                if matches_kind {
                     if let Some(id) = event.data["session_id"].as_str() {
                         sessions.push(id.to_owned());
                     }
@@ -887,7 +952,32 @@ impl AgentManager {
         Ok(sessions)
     }
 
-    fn session_has_tool_contract(&self, request: &AgentRequest) -> bool {
+    fn conversation_ancestors(&self, request: &AgentRequest) -> std::collections::HashSet<String> {
+        const MAX_CONVERSATION_ANCESTORS: usize = 64;
+        let mut ancestors = std::collections::HashSet::new();
+        let mut current = request.parent_id.clone();
+        while ancestors.len() < MAX_CONVERSATION_ANCESTORS {
+            let Some(id) = current else {
+                break;
+            };
+            let Ok(job) = self.snapshot(&id) else {
+                break;
+            };
+            if job.request.workspace != request.workspace
+                || job.request.account_id != request.account_id
+                || job.request.session_mode != request.session_mode
+            {
+                break;
+            }
+            if !ancestors.insert(id) {
+                break;
+            }
+            current = job.request.parent_id;
+        }
+        ancestors
+    }
+
+    fn session_has_tool_contract(&self, request: &AgentRequest, session_id: &str) -> bool {
         let mut current = request.parent_id.clone();
         for _ in 0..8 {
             let Some(parent_id) = current else {
@@ -896,7 +986,19 @@ impl AgentManager {
             let Ok(job) = self.snapshot(&parent_id) else {
                 break;
             };
-            if job.state == "completed" && !job.request.chat_only {
+            if job.request.workspace != request.workspace
+                || job.request.account_id != request.account_id
+                || job.request.session_mode != request.session_mode
+            {
+                break;
+            }
+            if job.state == "completed"
+                && !job.request.chat_only
+                && self
+                    .browser_session_ids(&parent_id)
+                    .ok()
+                    .is_some_and(|sids| sids.last().map(String::as_str) == Some(session_id))
+            {
                 return true;
             }
             current = job.request.parent_id;
@@ -905,9 +1007,7 @@ impl AgentManager {
     }
 
     fn continuable_parent_session(&self, request: &AgentRequest) -> Option<String> {
-        if request.temporary {
-            return None;
-        }
+        let expected_mode = request.session_mode;
         let mut current = request.parent_id.clone();
         for _ in 0..8 {
             let parent_id = current?;
@@ -915,7 +1015,7 @@ impl AgentManager {
             let previous = job.request;
             if previous.workspace != request.workspace
                 || previous.account_id != request.account_id
-                || previous.temporary
+                || previous.session_mode != request.session_mode
             {
                 return None;
             }
@@ -928,8 +1028,8 @@ impl AgentManager {
                         .get::<Session>("local", "session", sid)
                         .ok()
                         .is_some_and(|s| {
-                            (s.remote_turns == 0 && s.state != "outcome_unknown")
-                                || (s.remote_turns > 0 && s.state == "ready")
+                            (s.remote_turns == 0 && s.state != SessionState::OutcomeUnknown)
+                                || (s.remote_turns > 0 && s.state == SessionState::Ready)
                         }),
                 };
                 if clean_unsubmitted_failure {
@@ -940,17 +1040,11 @@ impl AgentManager {
             }
             let sid = sid?;
             let session: Session = self.store.get("local", "session", &sid).ok()?;
-            let has_remote_handle = session.target_id.is_some()
-                || session.remote_url.is_some()
-                || session.remote_session_id.is_some();
-            let resumable_state = session.state == "ready"
-                || (session.state == "closed"
-                    && (session.remote_url.is_some() || session.remote_session_id.is_some()));
             if session.account_id == request.account_id
-                && resumable_state
-                && session.mode == SessionMode::Chat
+                && session.mode == expected_mode
+                && session.is_continuable()
                 && session.remote_turns > 0
-                && has_remote_handle
+                && session.has_remote_handle()
             {
                 return Some(sid);
             }
@@ -964,6 +1058,7 @@ impl AgentManager {
         workspace: &std::path::Path,
         account_id: &str,
         exclude_agent_id: &str,
+        keep_conversation_jobs: &std::collections::HashSet<String>,
     ) -> Result<Vec<String>> {
         let mut sids = std::collections::BTreeSet::new();
         for job in self.store.list::<AgentRecord>("local", "agent")? {
@@ -971,18 +1066,20 @@ impl AgentManager {
                 continue;
             }
             let req = &job.request;
-            if req.workspace != workspace || req.account_id != account_id || req.temporary {
+            if req.workspace != workspace || req.account_id != account_id {
                 continue;
             }
-            if let Ok(sessions) = self.browser_session_ids(&job.id) {
-                for sid in sessions {
-                    if let Ok(session) = self.store.get::<Session>("local", "session", &sid) {
-                        if session.account_id == account_id
-                            && session.state == "ready"
-                            && session.reuse_scope.is_none()
-                        {
-                            sids.insert(sid);
-                        }
+            let include_subagents = !keep_conversation_jobs.contains(&job.id);
+            for sid in self
+                .job_session_ids(&job.id, include_subagents)
+                .unwrap_or_default()
+            {
+                if let Ok(session) = self.store.get::<Session>("local", "session", &sid) {
+                    if session.account_id == account_id
+                        && session.state == SessionState::Ready
+                        && session.reuse_scope.is_none()
+                    {
+                        sids.insert(sid);
                     }
                 }
             }
@@ -1220,7 +1317,7 @@ mod tests {
                     account_id: "default".into(),
                     model: None,
                     thinking: None,
-                    temporary: false,
+                    session_mode: SessionMode::Chat,
                     no_shell: false,
                     max_steps: 0,
                     knowledge: None,
@@ -1229,6 +1326,7 @@ mod tests {
                     parent_id: None,
                     chat_only: false,
                     permissions: None,
+                    session_retention: SessionRetention::Unspecified,
                 },
                 result: None,
                 error: None,
@@ -1334,7 +1432,7 @@ mod tests {
                     remote_url: Some("https://gemini.google.com/app/chat123".into()),
                     remote_session_id: None,
                     history: vec![],
-                    state: "ready".into(),
+                    state: SessionState::Ready,
                     model: Some("pro".into()),
                     thinking: None,
                     tool_digest: String::new(),
@@ -1351,7 +1449,7 @@ mod tests {
                 "turn-1",
                 &json!({
                     "id":"turn-1","state":"completed",
-                    "request":{"task":"first","workspace":ws,"account_id":"default","parent_id":null,"temporary":false},
+                    "request":{"task":"first","workspace":ws,"account_id":"default","parent_id":null,"session_mode":"chat"},
                     "result":{"final_response":"ok"}
                 }),
             )
@@ -1359,7 +1457,7 @@ mod tests {
         store
             .event(
                 "turn-1",
-                "browser_session",
+                EVENT_BROWSER_SESSION,
                 json!({"session_id":"sess-ready"}),
             )
             .unwrap();
@@ -1373,12 +1471,13 @@ mod tests {
             Some("sess-ready")
         );
         let mut temp_followup = followup.clone();
-        temp_followup.temporary = true;
+        temp_followup.session_mode = SessionMode::Temporary;
         assert!(manager.continuable_parent_session(&temp_followup).is_none());
 
+        let empty_keep = std::collections::HashSet::new();
         assert_eq!(
             manager
-                .idle_workspace_sessions(&ws, "default", "turn-2")
+                .idle_workspace_sessions(&ws, "default", "turn-2", &empty_keep)
                 .unwrap(),
             vec!["sess-ready"]
         );
@@ -1387,7 +1486,7 @@ mod tests {
         // conversations, a saved remote_url allows continuable_parent_session to re-hydrate it.
         let mut evicted: Session = store.get("local", "session", "sess-ready").unwrap();
         evicted.target_id = None;
-        evicted.state = "closed".into();
+        evicted.state = SessionState::Closed;
         store
             .put("local", "session", "sess-ready", &evicted)
             .unwrap();
@@ -1401,7 +1500,7 @@ mod tests {
         // continue the session, including across an intermediate unsubmitted failed turn.
         evicted.remote_url = None;
         evicted.remote_session_id = Some("remote-browser-sess-1".into());
-        evicted.state = "ready".into();
+        evicted.state = SessionState::Ready;
         store
             .put("local", "session", "sess-ready", &evicted)
             .unwrap();
@@ -1416,7 +1515,7 @@ mod tests {
                 "turn-2-failed",
                 &json!({
                     "id":"turn-2-failed","state":"failed",
-                    "request":{"task":"failed step","workspace":ws,"account_id":"default","parent_id":"turn-1","temporary":false},
+                    "request":{"task":"failed step","workspace":ws,"account_id":"default","parent_id":"turn-1","session_mode":"chat"},
                     "error":{"code":"internal","message":"prepare failed"}
                 }),
             )
@@ -1429,6 +1528,197 @@ mod tests {
             manager.continuable_parent_session(&after_failed).as_deref(),
             Some("sess-ready")
         );
+
+        // Temporary conversations also continue their live temporary session across turns until
+        // `/new`, `/clear`, mode switch, or session closure/invalidation.
+        store
+            .put(
+                "local",
+                "session",
+                "sess-temp-ready",
+                &Session {
+                    id: "sess-temp-ready".into(),
+                    provider: default_provider(),
+                    account_id: "default".into(),
+                    mode: SessionMode::Temporary,
+                    target_id: Some("tab-temp".into()),
+                    remote_url: Some("https://gemini.google.com/app".into()),
+                    remote_session_id: None,
+                    history: vec![],
+                    state: SessionState::Ready,
+                    model: Some("pro".into()),
+                    thinking: None,
+                    tool_digest: String::new(),
+                    remote_turns: 1,
+                    last_used: 2,
+                    reuse_scope: None,
+                },
+            )
+            .unwrap();
+        store
+            .put(
+                "local",
+                "agent",
+                "temp-turn-1",
+                &json!({
+                    "id":"temp-turn-1","state":"completed",
+                    "request":{"task":"temp first","workspace":ws,"account_id":"default","parent_id":null,"session_mode":"temporary","chat_only":true},
+                    "result":{"final_response":"ok"}
+                }),
+            )
+            .unwrap();
+        store
+            .event(
+                "temp-turn-1",
+                EVENT_BROWSER_SESSION,
+                json!({"session_id":"sess-temp-ready"}),
+            )
+            .unwrap();
+
+        let temp_continue: AgentRequest = serde_json::from_value(json!({
+            "task":"temp second","workspace":ws,"account_id":"default","parent_id":"temp-turn-1","session_mode":"temporary"
+        }))
+        .unwrap();
+        assert_eq!(
+            manager
+                .continuable_parent_session(&temp_continue)
+                .as_deref(),
+            Some("sess-temp-ready")
+        );
+        // Switching back to normal mode mid-conversation must not reuse the temporary session.
+        let mut normal_after_temp = temp_continue.clone();
+        normal_after_temp.session_mode = SessionMode::Chat;
+        assert!(manager
+            .continuable_parent_session(&normal_after_temp)
+            .is_none());
+        // Sub-agent sessions recorded on a turn stay alive during follow-ups in the same
+        // conversation, never hijack `continuable_parent_session`, and are closed on `/new`.
+        store
+            .put(
+                "local",
+                "session",
+                "sess-subagent",
+                &Session {
+                    id: "sess-subagent".into(),
+                    provider: default_provider(),
+                    account_id: "default".into(),
+                    mode: SessionMode::Temporary,
+                    target_id: Some("tab-sub".into()),
+                    remote_url: Some("https://gemini.google.com/app".into()),
+                    remote_session_id: None,
+                    history: vec![],
+                    state: SessionState::Ready,
+                    model: None,
+                    thinking: None,
+                    tool_digest: String::new(),
+                    remote_turns: 1,
+                    last_used: 3,
+                    reuse_scope: None,
+                },
+            )
+            .unwrap();
+        store
+            .event(
+                "turn-1",
+                "subagent_browser_session",
+                json!({"id":"sub_1","label":"helper","session_id":"sess-subagent"}),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.continuable_parent_session(&followup).as_deref(),
+            Some("sess-ready")
+        );
+        let keep_turn1 = manager.conversation_ancestors(&followup);
+        assert_eq!(
+            manager
+                .idle_workspace_sessions(&ws, "default", "turn-next", &keep_turn1)
+                .unwrap(),
+            vec!["sess-ready", "sess-temp-ready"]
+        );
+        // Starting a fresh conversation (`/new` / `/clear`) clears `keep_conversation_jobs` and
+        // closes idle main, temporary, and sub-agent sessions in this workspace.
+        assert_eq!(
+            manager
+                .idle_workspace_sessions(&ws, "default", "turn-next", &empty_keep)
+                .unwrap(),
+            vec!["sess-ready", "sess-subagent", "sess-temp-ready"]
+        );
+
+        // Relay-mode temporary session (`target_id: None`, `remote_session_id: Some(...)`) continues while ready.
+        let mut relay_temp: Session = store.get("local", "session", "sess-temp-ready").unwrap();
+        relay_temp.target_id = None;
+        relay_temp.remote_url = None;
+        relay_temp.remote_session_id = Some("remote-temp-1".into());
+        store
+            .put("local", "session", "sess-temp-ready", &relay_temp)
+            .unwrap();
+        assert_eq!(
+            manager
+                .continuable_parent_session(&temp_continue)
+                .as_deref(),
+            Some("sess-temp-ready")
+        );
+
+        // Unsubmitted failed temp turn walks back to the previous live temporary session.
+        store
+            .put(
+                "local",
+                "agent",
+                "temp-turn-2-failed",
+                &json!({
+                    "id":"temp-turn-2-failed","state":"failed",
+                    "request":{"task":"temp failed","workspace":ws,"account_id":"default","parent_id":"temp-turn-1","session_mode":"temporary"},
+                    "error":{"code":"internal","message":"prepare failed"}
+                }),
+            )
+            .unwrap();
+        let retry_temp: AgentRequest = serde_json::from_value(json!({
+            "task":"temp retry","workspace":ws,"account_id":"default","parent_id":"temp-turn-2-failed","session_mode":"temporary"
+        }))
+        .unwrap();
+        assert_eq!(
+            manager.continuable_parent_session(&retry_temp).as_deref(),
+            Some("sess-temp-ready")
+        );
+
+        // Tool contract detection must be scoped to the continued session rather than crossing
+        // a normal->temp mode boundary.
+        store
+            .put(
+                "local",
+                "agent",
+                "temp-after-normal-agent",
+                &json!({
+                    "id":"temp-after-normal-agent","state":"completed",
+                    "request":{"task":"temp chat","workspace":ws,"account_id":"default","parent_id":"turn-1","session_mode":"temporary","chat_only":true},
+                    "result":{"final_response":"ok"}
+                }),
+            )
+            .unwrap();
+        store
+            .event(
+                "temp-after-normal-agent",
+                EVENT_BROWSER_SESSION,
+                json!({"session_id":"sess-temp-ready"}),
+            )
+            .unwrap();
+        let agent_in_temp: AgentRequest = serde_json::from_value(json!({
+            "task":"now use tools","workspace":ws,"account_id":"default","parent_id":"temp-after-normal-agent","session_mode":"temporary","chat_only":false
+        }))
+        .unwrap();
+        assert!(!manager.session_has_tool_contract(&agent_in_temp, "sess-temp-ready"));
+
+        // Closed or invalidated temporary sessions cannot be reopened from a URL.
+        for dead_state in [SessionState::Closed, SessionState::Invalidated] {
+            relay_temp.state = dead_state;
+            store
+                .put("local", "session", "sess-temp-ready", &relay_temp)
+                .unwrap();
+            assert!(
+                manager.continuable_parent_session(&temp_continue).is_none(),
+                "temporary session in state {dead_state} must not continue"
+            );
+        }
     }
 
     #[test]
@@ -1450,8 +1740,8 @@ mod tests {
             )
             .unwrap();
         for (id, state) in [
-            ("before-checkpoint", "closed"),
-            ("after-checkpoint", "ready"),
+            ("before-checkpoint", SessionState::Closed),
+            ("after-checkpoint", SessionState::Ready),
         ] {
             store
                 .put(
@@ -1467,7 +1757,7 @@ mod tests {
                         remote_url: Some(format!("https://gemini.google.com/app/{id}")),
                         remote_session_id: None,
                         history: vec![],
-                        state: state.into(),
+                        state,
                         model: None,
                         thinking: None,
                         tool_digest: String::new(),
@@ -1506,9 +1796,120 @@ mod tests {
         );
         assert_eq!(
             manager
-                .idle_workspace_sessions(&workspace, "default", "next-task")
+                .idle_workspace_sessions(
+                    &workspace,
+                    "default",
+                    "next-task",
+                    &std::collections::HashSet::new()
+                )
                 .unwrap(),
             vec!["after-checkpoint"]
         );
+    }
+
+    #[test]
+    fn finish_agent_job_releases_control_and_workspace_lease_before_followup_observes_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store.clone()).unwrap();
+        let workspace = fs::canonicalize(dir.path()).unwrap();
+
+        for iter in 0..32 {
+            let job_id = format!("agent-race-{iter}");
+            let request = AgentRequest {
+                environment: None,
+                task: format!("turn {iter}"),
+                workspace: workspace.clone(),
+                account_id: "default".into(),
+                model: None,
+                thinking: None,
+                session_mode: SessionMode::Temporary,
+                no_shell: true,
+                max_steps: 4,
+                knowledge: None,
+                mcp_config: None,
+                artifacts: vec![],
+                parent_id: None,
+                chat_only: false,
+                permissions: None,
+                session_retention: SessionRetention::Retain,
+            };
+            let lease = {
+                let mut controls = manager.controls.lock().unwrap();
+                let lease = manager
+                    .acquire_workspace_lease(&controls, &workspace)
+                    .unwrap();
+                assert!(lease.is_some());
+                store
+                    .put(
+                        "local",
+                        "agent",
+                        &job_id,
+                        &AgentRecord {
+                            id: job_id.clone(),
+                            state: "running".into(),
+                            request: request.clone(),
+                            result: None,
+                            error: None,
+                            created_at: 1,
+                            updated_at: 0,
+                        },
+                    )
+                    .unwrap();
+                controls.insert(job_id.clone(), manager.new_run_control(&job_id));
+                lease
+            };
+
+            let terminal = AgentRecord {
+                id: job_id.clone(),
+                state: "completed".into(),
+                request,
+                result: Some(AgentRunResult {
+                    status: AgentStatus::Completed,
+                    final_response: "ok".into(),
+                    ..Default::default()
+                }),
+                error: None,
+                created_at: 1,
+                updated_at: 2,
+            };
+            let finisher_mgr = manager.clone();
+            let finisher_id = job_id.clone();
+            let worker = std::thread::spawn(move || {
+                finisher_mgr.finish_agent_job(&finisher_id, terminal, lease);
+            });
+
+            loop {
+                if manager.snapshot(&job_id).unwrap().state == "completed" {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            // Immediately upon observing `completed`, a follow-up turn must be
+            // able to acquire the workspace lease (and see no stale control),
+            // read the terminal event, and delete the completed turn cleanly.
+            {
+                let controls = manager.controls.lock().unwrap();
+                assert!(
+                    !controls.contains_key(&job_id),
+                    "iter {iter}: control still registered after completed snapshot"
+                );
+                let next_lease = manager
+                    .acquire_workspace_lease(&controls, &workspace)
+                    .unwrap();
+                assert!(
+                    next_lease.is_some(),
+                    "iter {iter}: workspace lease still held after completed snapshot"
+                );
+            }
+            let events = store.events(&job_id, 0).unwrap();
+            assert!(
+                events.iter().any(|ev| ev.kind == "agent_terminal"),
+                "iter {iter}: agent_terminal missing after completed snapshot"
+            );
+            manager.delete(&job_id).unwrap();
+            worker.join().unwrap();
+        }
     }
 }

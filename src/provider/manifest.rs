@@ -344,7 +344,10 @@ impl ManifestWebProvider {
                         .map_err(|e| ServiceError::backend(e, false))?;
                         navigated = true;
                     } else {
-                        return Err(ServiceError::invalid(
+                        return Err(super::invalidate_unavailable_session(
+                            store,
+                            session,
+                            |_| Ok(()),
                             "owned tab navigated to another conversation; start a new session",
                         ));
                     }
@@ -379,17 +382,19 @@ impl ManifestWebProvider {
                     .map_err(|e| ServiceError::backend(e, false))?;
                     (target, ChatSessionMode::Continue, false)
                 } else {
-                    return Err(ServiceError::new(
-                        ErrorCode::SubmissionOutcomeUnknown,
-                        "resume",
-                        "owned browser tab is gone; create a new session from a checkpoint",
+                    return Err(super::invalidate_unavailable_session(
+                        store,
+                        session,
+                        |_| Ok(()),
+                        "owned browser tab is gone; start a new session",
                     ));
                 }
             } else {
-                return Err(ServiceError::new(
-                    ErrorCode::SubmissionOutcomeUnknown,
-                    "resume",
-                    "owned browser tab is gone; create a new session from a checkpoint",
+                return Err(super::invalidate_unavailable_session(
+                    store,
+                    session,
+                    |_| Ok(()),
+                    "owned browser tab is gone; start a new session",
                 ));
             }
         } else {
@@ -596,7 +601,7 @@ impl ManifestWebProvider {
             Ok(result) => result,
             Err(e) => {
                 let err = ServiceError::backend(e, true);
-                session.state = "outcome_unknown".into();
+                session.state = SessionState::OutcomeUnknown;
                 if matches!(
                     err.code,
                     ErrorCode::Cancelled
@@ -909,18 +914,14 @@ impl Provider for ManifestWebProvider {
             ));
         }
         if is_continue {
-            if let Some(count) = tab.initial_probe()["response_count"].as_u64() {
-                if count != session.remote_turns {
-                    return Err(ServiceError::backend(
-                        "UI contract changed: owned conversation was modified outside this service"
-                            .into(),
-                        false,
-                    ));
-                }
-            } else {
-                tab.verify_owned_turns(session.remote_turns)
-                    .map_err(|e| ServiceError::backend(e, false))?;
-            }
+            let probe_count = tab.initial_probe()["response_count"].as_u64();
+            super::verify_continued_session_turns(
+                store,
+                probe_count,
+                session,
+                |expected| tab.verify_owned_turns(expected),
+                |s| self.close_session(ctx, account, s),
+            )?;
         }
         self.prepare_tab(
             store,

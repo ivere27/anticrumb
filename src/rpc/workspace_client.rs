@@ -240,10 +240,51 @@ impl Client {
         self.runtime
             .block_on(presentation(&self.rpc, method, path, body))
     }
+    pub(crate) fn get_session(&self, id: &str) -> Result<pb::Session> {
+        self.runtime
+            .block_on(self.rpc.get_session(pb::SessionRef { id: id.into() }))
+    }
     pub(crate) fn close_session(&self, id: &str) -> Result<()> {
         self.runtime
             .block_on(self.rpc.close_session(pb::SessionRef { id: id.into() }))?;
         Ok(())
+    }
+    pub(crate) fn close_sessions(&self, ids: &[String]) -> Result<pb::CloseSessionsResult> {
+        if ids.is_empty() {
+            return Ok(pb::CloseSessionsResult::default());
+        }
+        self.runtime
+            .block_on(self.rpc.close_sessions(pb::CloseSessionsRequest {
+                session_ids: ids.to_vec(),
+            }))
+    }
+    pub(crate) fn create_turn(&self, request: &TurnRequest) -> Result<String> {
+        Ok(self
+            .runtime
+            .block_on(self.rpc.create_turn(codec::request_to(request.clone())))?
+            .id)
+    }
+    pub(crate) fn get_turn(&self, id: &str) -> Result<Run> {
+        codec::turn_from(
+            self.runtime
+                .block_on(self.rpc.get_turn(pb::TurnRef { id: id.into() }))?,
+        )
+    }
+    pub(crate) fn cancel_turn(&self, id: &str) -> Result<()> {
+        self.runtime
+            .block_on(self.rpc.cancel_turn(pb::TurnRef { id: id.into() }))?;
+        Ok(())
+    }
+    pub(crate) fn read_turn_events(&self, id: &str, after: i64) -> Result<Vec<Event>> {
+        self.runtime
+            .block_on(self.rpc.read_events(pb::EventCursor {
+                run_id: id.into(),
+                after,
+            }))?
+            .events
+            .into_iter()
+            .map(codec::event_from)
+            .collect()
     }
     pub fn put_file(&self, account: &str, path: &Path, mime: &str) -> Result<String> {
         // Reject oversized files before starting a streaming upload.
@@ -518,7 +559,16 @@ pub async fn presentation(
                 .map(codec::event_from)
                 .collect::<Result<Vec<_>>>()?))
         }
-        ("GET", ["api", "sessions"]) => Ok(json!(rpc.list_sessions(pb::Empty {}).await?.sessions)),
+        ("GET", ["api", "sessions"]) => Ok(json!(rpc
+            .list_sessions(pb::ListSessionsRequest::default())
+            .await?
+            .sessions
+            .into_iter()
+            .map(codec::session_json)
+            .collect::<Vec<_>>())),
+        ("GET", ["api", "sessions", id]) => Ok(codec::session_json(
+            rpc.get_session(pb::SessionRef { id: (*id).into() }).await?,
+        )),
         ("POST", ["api", "sessions", id, "close"]) => {
             rpc.close_session(pb::SessionRef { id: (*id).into() })
                 .await?;

@@ -7093,3 +7093,587 @@ fn test_decorators_csharp_compound_ts_methods_java_dedup_and_rust_must_use() {
         "Compound C# attribute must not duplicate HttpPost: {compound_raw_sig}"
     );
 }
+
+#[test]
+fn test_extensions_registry_bundled_and_validation() {
+    let reg = LanguageRegistry::builtin();
+
+    // Exact mappings
+    assert_eq!(
+        reg.candidates_for_path(Path::new("src/main.rs")),
+        Some(LanguageCandidates::Exact(SupportedLanguage::Rust))
+    );
+    assert_eq!(
+        reg.candidates_for_path(Path::new("include/header.H")),
+        Some(LanguageCandidates::Exact(SupportedLanguage::Cpp))
+    );
+    assert_eq!(
+        reg.candidates_for_path(Path::new("src/core.c")),
+        Some(LanguageCandidates::Exact(SupportedLanguage::C))
+    );
+
+    // Priority mappings (.inc -> [cpp] for now, extensible to [cpp, php, ...])
+    let inc = reg
+        .candidates_for_path(Path::new("native/src/runtime/fixed_partition_plan.inc"))
+        .expect(".inc must be registered as a priority extension");
+    assert_eq!(inc, LanguageCandidates::Priority(&[SupportedLanguage::Cpp]));
+    assert!(inc.requires_parse_validation());
+    assert_eq!(inc.primary(), SupportedLanguage::Cpp);
+    assert_eq!(inc.format_names(), "cpp");
+
+    // Unknown extensions stay None
+    assert_eq!(reg.candidates_for_path(Path::new("styles.css")), None);
+
+    // Custom multi-priority JSON validation
+    let custom = LanguageRegistry::from_json_str(
+        r#"{
+            "exact": { ".rs": "rust" },
+            "priority": { "inc": ["cpp", "python", "ruby"] }
+        }"#,
+    )
+    .expect("custom JSON should parse");
+    assert_eq!(
+        custom.candidates_for_path(Path::new("x.inc")),
+        Some(LanguageCandidates::Priority(&[
+            SupportedLanguage::Cpp,
+            SupportedLanguage::Python,
+            SupportedLanguage::Ruby,
+        ]))
+    );
+    assert_eq!(
+        custom
+            .candidates_for_path(Path::new("x.inc"))
+            .unwrap()
+            .format_names(),
+        "cpp, python, ruby"
+    );
+
+    // Invalid configs must be rejected with clear errors
+    assert!(LanguageRegistry::from_json_str(r#"{"exact":{"x":"bogus"}}"#).is_err());
+    assert!(LanguageRegistry::from_json_str(r#"{"priority":{"inc":[]}}"#).is_err());
+    assert!(LanguageRegistry::from_json_str(r#"{"priority":{"inc":["cpp","cpp"]}}"#).is_err());
+    assert!(
+        LanguageRegistry::from_json_str(r#"{"exact":{"inc":"c"},"priority":{"inc":["cpp"]}}"#)
+            .is_err()
+    );
+    assert!(
+        LanguageRegistry::from_json_str(r#"{"exact":{"md":"rust"},"plain_diff":["md"]}"#).is_err()
+    );
+    assert!(LanguageRegistry::from_json_str(
+        r#"{"priority":{"inc":["cpp"]},"plain_diff":["inc"]}"#
+    )
+    .is_err());
+    assert!(LanguageRegistry::from_json_str(r#"{"plain_diff":["md","MD"]}"#).is_err());
+
+    // CUDA .cu / .cuh exact mappings and plain_diff mappings
+    assert_eq!(
+        reg.candidates_for_path(Path::new("native/src/backends/cuda_kernels.cu")),
+        Some(LanguageCandidates::Exact(SupportedLanguage::Cpp))
+    );
+    assert_eq!(
+        reg.candidates_for_path(Path::new("native/src/backends/cuda_helpers.cuh")),
+        Some(LanguageCandidates::Exact(SupportedLanguage::Cpp))
+    );
+    assert!(reg.is_plain_diff_path(Path::new("ARCHITECTURE.md")));
+    assert!(reg.is_plain_diff_path(Path::new("native/CMakeLists.txt")));
+    assert!(reg.is_plain_diff_path(Path::new(".github/workflows/build.yml")));
+    assert!(!reg.is_plain_diff_path(Path::new("styles.css")));
+}
+
+#[test]
+fn test_priority_language_resolution_order_and_ast_error_gate() {
+    use super::language_registry::{
+        assess_priority_parse, parse_for_candidates, CandidateParseOutcome, ParseQuality,
+    };
+
+    let reg = LanguageRegistry::from_json_str(
+        r#"{
+            "exact": {},
+            "priority": {
+                "multi": ["json", "cpp", "python"]
+            }
+        }"#,
+    )
+    .unwrap();
+    let cands = reg.candidates_for_ext("multi").unwrap();
+
+    // 1. JSON matches priority #1
+    let json_src = "{\"key\": [1, 2, 3]}\n";
+    match parse_for_candidates(cands, json_src, &[]) {
+        CandidateParseOutcome::Parsed { lang, .. } => assert_eq!(lang, SupportedLanguage::Json),
+        _ => panic!("expected Json match"),
+    }
+
+    // 2. C++ skips Json and matches priority #2
+    let cpp_src = "template <typename T>\nstatic inline T add_one(T x) {\n    return x + 1;\n}\n";
+    match parse_for_candidates(cands, cpp_src, &[]) {
+        CandidateParseOutcome::Parsed { lang, .. } => assert_eq!(lang, SupportedLanguage::Cpp),
+        _ => panic!("expected Cpp match"),
+    }
+
+    // 3. Python skips Json & Cpp and matches priority #3
+    let py_src = "def compute_total(items):\n    total = 0\n    for item in items:\n        total += item\n    return total\n";
+    match parse_for_candidates(cands, py_src, &[]) {
+        CandidateParseOutcome::Parsed { lang, .. } => assert_eq!(lang, SupportedLanguage::Python),
+        _ => panic!("expected Python match"),
+    }
+
+    // 4. PHP fails all of [json, cpp, python] and rejects cleanly
+    let php_src = "<?php\nfunction render_page($ctx) {\n    $name = $ctx['name'];\n    return \"Hello \" . $name;\n}\n?>\n";
+    assert!(matches!(
+        parse_for_candidates(cands, php_src, &[]),
+        CandidateParseOutcome::NoMatchingCandidate
+    ));
+
+    // 5. Assembly and BitBake fail Cpp priority gate
+    let cpp_only = LanguageCandidates::Priority(&[SupportedLanguage::Cpp]);
+    let asm_src =
+        "%define BUF_SIZE 1024\nsection .text\nglobal _start\n_start:\n    mov rax, 1\n    ret\n";
+    assert!(matches!(
+        parse_for_candidates(cpp_only, asm_src, &[]),
+        CandidateParseOutcome::NoMatchingCandidate
+    ));
+    let bitbake_src = "SUMMARY = \"Example\"\nDEPENDS += \"openssl zlib\"\nSRC_URI = \"https://example.com/a.tar.gz\"\n";
+    assert!(matches!(
+        parse_for_candidates(cpp_only, bitbake_src, &[]),
+        CandidateParseOutcome::NoMatchingCandidate
+    ));
+
+    // 6. Hunk-level error check: an error overlapping a changed hunk rejects even a tiny error
+    let cpp_with_localized_error = "\
+static int helper_one(int a, int b) {
+    int sum = a + b;
+    int prod = a * b;
+    return sum + prod;
+}
+
+static int helper_two(int a, int b) {
+    int diff = a - b;
+    return diff * 2;
+}
+
+static int helper_three(int x) {
+    if (x < 0) return -x;
+    return x + 10;
+}
+
+static int broken_decl(int x) {
+    return @@@ x;
+}
+";
+    let tree = parse_with_timeout(SupportedLanguage::Cpp, cpp_with_localized_error).unwrap();
+    // Changing line 3 (inside clean helper_one) is tolerated
+    assert!(matches!(
+        assess_priority_parse(
+            SupportedLanguage::Cpp,
+            &tree,
+            cpp_with_localized_error,
+            &[(3, 3)]
+        ),
+        ParseQuality::Tolerated { .. }
+    ));
+    // Changing line 18 (the ERROR line itself) is rejected
+    assert_eq!(
+        assess_priority_parse(
+            SupportedLanguage::Cpp,
+            &tree,
+            cpp_with_localized_error,
+            &[(18, 18)]
+        ),
+        ParseQuality::Rejected
+    );
+
+    // ERROR node ending at column 0 of the next line (trailing newline) must NOT falsely
+    // overlap a clean hunk starting on that next line.
+    let cpp_newline_error = "\
+int clean_one(int x) { return x + 1; }
+int clean_two(int x) { return x + 2; }
+int clean_three(int x) { return x + 3; }
+int clean_four(int x) { return x + 4; }
+int clean_five(int x) { return x + 5; }
+@@@
+int after_error(int x) {
+    return x * 2;
+}
+";
+    let nl_tree = parse_with_timeout(SupportedLanguage::Cpp, cpp_newline_error).unwrap();
+    // Line 6 is `@@@`, line 7 is `int after_error(int x) {`
+    assert_eq!(
+        assess_priority_parse(
+            SupportedLanguage::Cpp,
+            &nl_tree,
+            cpp_newline_error,
+            &[(6, 6)]
+        ),
+        ParseQuality::Rejected
+    );
+    assert!(
+        matches!(
+            assess_priority_parse(
+                SupportedLanguage::Cpp,
+                &nl_tree,
+                cpp_newline_error,
+                &[(7, 7)]
+            ),
+            ParseQuality::Tolerated { .. }
+        ),
+        "clean line immediately after newline-terminated ERROR node should not be falsely rejected"
+    );
+}
+
+#[test]
+fn test_inc_file_diff_expand_cpp_cuda_non_c_fallback_and_layer3_include() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    // 1. Valid C .inc (like volvoxai's fixed_partition_plan.inc)
+    let c_inc_v1 = "\
+#include \"plan.h\"
+
+static int plan_check_op(int op) {
+    switch (op) {
+        case 1:
+        case 2:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int plan_prepare(int count) {
+    if (count <= 0) return -1;
+    int total = 0;
+    for (int i = 0; i < count; ++i) {
+        total += plan_check_op(i);
+    }
+    return total;
+}
+";
+    // 2. Valid CUDA C++ .inc (templates + reinterpret_cast)
+    let cuda_inc_v1 = "\
+template <typename T>
+static inline T* cuda_cast_ptr(const unsigned char* raw) {
+    return reinterpret_cast<T*>(const_cast<unsigned char*>(raw));
+}
+
+template <typename T>
+static inline T cuda_load_val(const unsigned char* storage) {
+    T val = *reinterpret_cast<const T*>(storage);
+    return val;
+}
+";
+    // 3. PHP .inc (must be rejected by Tree-sitter AST error gate and fall back to git diff -W)
+    let php_inc_v1 = "\
+<?php
+function format_greeting($user) {
+    $name = $user['name'];
+    return \"Hello \" . $name;
+}
+?>
+";
+    // 4. Function-body fragment .inc (bare #ifdef-split loop, no enclosing function)
+    let fragment_inc_v1 = "\
+#ifdef SINGLE_STEP
+    for (int i = 0; i < 1; i++) {
+#else
+    for (int i = count - 1; i >= 0; i--) {
+#endif
+        int x = items[i];
+        acc += x;
+    }
+";
+    // 5. Header + C caller that #includes plan.inc for Layer 3 verification
+    let header_v1 = "static const int PLAN_LIMIT = 64;\n";
+    let caller_v1 = "\
+#include \"plan.inc\"
+
+int run_plan(int n) {
+    return plan_prepare(n);
+}
+";
+
+    std::fs::write(repo.join("plan.h"), header_v1).unwrap();
+    std::fs::write(repo.join("plan.inc"), c_inc_v1).unwrap();
+    std::fs::write(repo.join("cuda_arg.inc"), cuda_inc_v1).unwrap();
+    std::fs::write(repo.join("view.inc"), php_inc_v1).unwrap();
+    std::fs::write(repo.join("loop_body.inc"), fragment_inc_v1).unwrap();
+    std::fs::write(repo.join("caller.c"), caller_v1).unwrap();
+
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+
+    // Modify all four .inc files
+    std::fs::write(
+        repo.join("plan.inc"),
+        c_inc_v1.replace(
+            "if (count <= 0) return -1;",
+            "if (count <= 0 || count > PLAN_LIMIT) return -1;",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("cuda_arg.inc"),
+        cuda_inc_v1.replace("return val;", "return val + static_cast<T>(1);"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("view.inc"),
+        php_inc_v1.replace("\"Hello \"", "\"Hi \""),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("loop_body.inc"),
+        fragment_inc_v1.replace("acc += x;", "acc += x * 2;"),
+    )
+    .unwrap();
+
+    let mut warnings = Vec::new();
+    let expanded = generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        DEFAULT_PATCH_BUDGET_BYTES,
+        HybridConfig::full(),
+        &mut warnings,
+    )
+    .expect("expanded diff should succeed");
+
+    // Valid C .inc and CUDA C++ .inc must NOT trigger fallback warnings
+    assert!(
+        !warnings.iter().any(|w| w.contains("plan.inc")),
+        "valid C .inc should not warn: {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("cuda_arg.inc")),
+        "valid CUDA C++ .inc should not warn: {warnings:?}"
+    );
+
+    // PHP .inc and bare #ifdef-split fragment .inc MUST be rejected and fall back cleanly (with size!)
+    assert!(
+        warnings.iter().any(|w| {
+            w.contains(
+                "no matching grammar for 'view.inc' (tried: cpp); falling back to git diff -W (",
+            ) && (w.ends_with(" B)") || w.ends_with(" KiB)") || w.ends_with(" MiB)"))
+        }),
+        "PHP .inc should trigger no-matching-grammar fallback warning with size: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| {
+            w.contains("no matching grammar for 'loop_body.inc' (tried: cpp); falling back to git diff -W (")
+                && (w.ends_with(" B)") || w.ends_with(" KiB)") || w.ends_with(" MiB)"))
+        }),
+        "fragment .inc should trigger no-matching-grammar fallback warning with size: {warnings:?}"
+    );
+
+    // AST signatures expanded for plan.inc and cuda_arg.inc
+    assert!(
+        expanded.contains("static int plan_prepare(int count)"),
+        "expected AST expansion for plan.inc:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("cuda_load_val"),
+        "expected AST expansion for cuda_arg.inc:\n{expanded}"
+    );
+    // Layer 3 cross-file forward (`PLAN_LIMIT` from plan.h) & reverse (`run_plan` in caller.c)
+    assert!(
+        expanded.contains("PLAN_LIMIT"),
+        "expected Layer 3 forward context from plan.h:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("run_plan"),
+        "expected Layer 3 reverse caller from caller.c:\n{expanded}"
+    );
+    // Fallback diffs still include view.inc and loop_body.inc changes
+    assert!(
+        expanded.contains("\"Hi \""),
+        "PHP .inc fallback diff missing"
+    );
+    assert!(
+        expanded.contains("acc += x * 2;"),
+        "fragment .inc fallback diff missing"
+    );
+}
+
+#[test]
+fn test_plain_diff_md_cuda_cu_and_advisory_size_warning_without_truncation() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    // 1. Markdown file with multiple paragraphs (should attach as clean -U3 with ZERO warnings)
+    let md_v1 = "\
+# Architecture
+
+Line 1 of intro
+Line 2 of intro
+Line 3 of intro
+Line 4 of intro
+Line 5 of intro
+Line 6 target paragraph
+Line 7 after target
+Line 8 after target
+Line 9 after target
+Line 10 far away
+Line 11 far away
+Line 12 far away
+";
+    // 2. CUDA .cu file (should parse cleanly via exact -> cpp with ZERO warnings)
+    let cu_v1 = "\
+#define VX_CUDA_DEVICE __device__
+
+static VX_CUDA_DEVICE float vx_min(float a, float b) {
+    return a < b ? a : b;
+}
+
+static VX_CUDA_DEVICE float vx_scale(float x, float gain) {
+    float base = vx_min(x, 1.0f);
+    return base * gain;
+}
+";
+    std::fs::write(repo.join("ARCHITECTURE.md"), md_v1).unwrap();
+    std::fs::write(repo.join("kernels.cu"), cu_v1).unwrap();
+    std::fs::write(
+        repo.join(".env"),
+        "API_URL=http://localhost:8000\nDEBUG=0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".env.local"),
+        "API_URL=http://localhost:9000\nDEBUG=0\n",
+    )
+    .unwrap();
+
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap();
+
+    std::fs::write(
+        repo.join("ARCHITECTURE.md"),
+        md_v1.replace("Line 6 target paragraph", "Line 6 updated paragraph"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("kernels.cu"),
+        cu_v1.replace("return base * gain;", "return base * gain + 0.5f;"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".env"),
+        "API_URL=http://localhost:8000\nDEBUG=1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".env.local"),
+        "API_URL=http://localhost:9000\nDEBUG=1\n",
+    )
+    .unwrap();
+
+    let mut warnings = Vec::new();
+    let expanded = generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        usize::MAX,
+        HybridConfig::full(),
+        &mut warnings,
+    )
+    .expect("expanded diff should succeed");
+
+    // Neither ARCHITECTURE.md, kernels.cu, .env, nor .env.local should emit any warning
+    assert!(
+        warnings.is_empty(),
+        "plain_diff .md/.env/.env.local and exact .cu must produce zero warnings, got: {warnings:?}"
+    );
+    assert!(SupportedLanguage::is_plain_diff_path(Path::new(".env")));
+    assert!(SupportedLanguage::is_plain_diff_path(Path::new(
+        "config/.env.local"
+    )));
+    assert!(!SupportedLanguage::is_plain_diff_path(Path::new(
+        ".env.json"
+    )));
+    assert!(expanded.contains("+DEBUG=1"));
+    // ARCHITECTURE.md uses -U3 context (includes nearby lines, excludes far-away lines)
+    assert!(expanded.contains("+Line 6 updated paragraph"));
+    assert!(expanded.contains(" Line 3 of intro"));
+    assert!(expanded.contains(" Line 9 after target"));
+    assert!(
+        !expanded.contains("Line 12 far away"),
+        "plain_diff .md should use -U3 rather than dumping distant lines:\n{expanded}"
+    );
+    // kernels.cu expands enclosing CUDA function via cpp grammar
+    assert!(
+        expanded.contains("vx_scale"),
+        "CUDA .cu function should expand via cpp grammar:\n{expanded}"
+    );
+
+    // 3. Default `generate_expanded_diff_for_source` does NOT truncate/compact diffs over 512 KiB
+    //    and instead emits an advisory size warning while keeping all lines intact.
+    let mut big_source = String::from("pub fn big_entry(x: i32) -> i32 {\n    let mut acc = x;\n");
+    for i in 0..10_000 {
+        big_source.push_str(&format!(
+            "    acc += {i}; // padding line for advisory threshold test {i:05}\n"
+        ));
+    }
+    big_source.push_str("    acc // SENTINEL_FINAL_LINE\n}\n");
+    std::fs::write(repo.join("big.rs"), &big_source).unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "big.rs"])
+        .status()
+        .unwrap();
+
+    let mut advisory_warnings = Vec::new();
+    let full_patch = diff_expand::generate_expanded_diff_for_source_with_threshold(
+        repo,
+        GitDiffSource::Staged,
+        DEFAULT_PATCH_BUDGET_BYTES,
+        &mut advisory_warnings,
+    )
+    .expect("full unbounded diff should succeed");
+
+    assert!(
+        full_patch.len() > DEFAULT_PATCH_BUDGET_BYTES,
+        "expected fixture patch > 512 KiB, got {} B",
+        full_patch.len()
+    );
+    assert!(
+        full_patch.contains("SENTINEL_FINAL_LINE"),
+        "default expanded diff must NOT truncate or skeletonize large diffs"
+    );
+    assert!(
+        !full_patch.contains("[patch-budget:"),
+        "default expanded diff must NOT emit compaction banner"
+    );
+    assert!(
+        advisory_warnings
+            .iter()
+            .any(|w| w.contains("exceeds") && w.contains("threshold")),
+        "expected advisory size warning, got: {advisory_warnings:?}"
+    );
+
+    // 4. Unbounded Layer 3 budget is capped at 128 KiB and format_human_size avoids "1024 KiB".
+    assert_eq!(
+        hybrid::compute_layer3_budget(usize::MAX, 2 * 1024 * 1024, usize::MAX, false),
+        hybrid::UNBOUNDED_LAYER3_MAX_BYTES
+    );
+    assert_eq!(
+        hybrid::compute_layer3_budget(usize::MAX, 40 * 1024, usize::MAX, false),
+        10 * 1024
+    );
+    assert_eq!(diff_expand::format_human_size(1024 * 1024 - 1), "1 MiB");
+    assert_eq!(diff_expand::format_human_size(1024 * 1023), "1023 KiB");
+}

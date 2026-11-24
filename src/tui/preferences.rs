@@ -2,10 +2,28 @@ use super::editor::Draft;
 use crate::{domain::*, store::Store};
 use std::path::Path;
 
+pub const MAX_PINNED_RECENT_MENTIONS: usize = 2;
+const MAX_STORED_RECENT_MENTIONS: usize = 8;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelPreference {
     pub model: Option<String>,
     pub thinking: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecentMentionKind {
+    File,
+    Git,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecentMention {
+    pub display: String,
+    pub kind: RecentMentionKind,
+    #[serde(default)]
+    pub detail: String,
 }
 
 pub struct Preferences {
@@ -23,6 +41,31 @@ impl Preferences {
                 .to_string()
                 .as_bytes(),
         )
+    }
+    fn workspace_key(workspace: &Path) -> String {
+        digest(serde_json::json!([workspace]).to_string().as_bytes())
+    }
+    pub(super) fn recent_mentions(&self, workspace: &Path) -> Result<Vec<RecentMention>> {
+        match self.store.get::<Vec<RecentMention>>(
+            "ui",
+            "recent_mentions",
+            &Self::workspace_key(workspace),
+        ) {
+            Ok(items) => Ok(items),
+            Err(error) if error.code == ErrorCode::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+    pub(super) fn record_recent_mention(
+        &self,
+        workspace: &Path,
+        mention: &RecentMention,
+    ) -> Result<Vec<RecentMention>> {
+        let key = Self::workspace_key(workspace);
+        self.store
+            .update_immediate("ui", "recent_mentions", &key, |items| {
+                push_recent_mention(items, mention)
+            })
     }
     pub(super) fn history(&self, account: &str, workspace: &Path) -> Result<Vec<Draft>> {
         match self
@@ -121,6 +164,17 @@ impl Preferences {
         )
     }
 }
+pub(super) fn push_recent_mention(items: &mut Vec<RecentMention>, mention: &RecentMention) {
+    if mention.display.is_empty() {
+        return;
+    }
+    items.retain(|existing| existing.display != mention.display);
+    items.insert(0, mention.clone());
+    if items.len() > MAX_STORED_RECENT_MENTIONS {
+        items.truncate(MAX_STORED_RECENT_MENTIONS);
+    }
+}
+
 pub(super) fn append(history: &mut Vec<Draft>, input: &Draft) {
     if input.text.is_empty() || history.last().is_some_and(|s| s == input) {
         return;
@@ -191,5 +245,28 @@ mod tests {
                 .last(),
             Some(&pasted)
         );
+
+        // Recent mentions persist per workspace and move duplicates to front
+        let m1 = RecentMention {
+            display: "src/a.rs".into(),
+            kind: RecentMentionKind::File,
+            detail: "/one/src/a.rs".into(),
+        };
+        let m2 = RecentMention {
+            display: "git:diff+".into(),
+            kind: RecentMentionKind::Git,
+            detail: "Unstaged git diff with tree-sitter AST context".into(),
+        };
+        a.record_recent_mention(Path::new("/one"), &m1).unwrap();
+        a.record_recent_mention(Path::new("/one"), &m2).unwrap();
+        a.record_recent_mention(Path::new("/one"), &m1).unwrap();
+        assert_eq!(
+            Preferences::open(dir.path())
+                .unwrap()
+                .recent_mentions(Path::new("/one"))
+                .unwrap(),
+            vec![m1, m2]
+        );
+        assert!(a.recent_mentions(Path::new("/two")).unwrap().is_empty());
     }
 }

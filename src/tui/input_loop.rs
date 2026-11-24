@@ -90,9 +90,10 @@ impl EffectSink for TerminalSink<'_> {
             id,
             workspace,
             query,
+            recent,
         } = command
         {
-            self.mentions.schedule(id, workspace, query);
+            self.mentions.schedule(id, workspace, query, recent);
             return Ok(());
         }
         self.commands.try_send(command).map_err(|e| {

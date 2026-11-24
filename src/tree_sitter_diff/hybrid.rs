@@ -7,7 +7,9 @@
 use super::{
     ast_compact, check_primary_definition,
     diff_expand::{has_generated_source_header, is_lockfile_or_generated, parse_with_timeout},
-    git_cmd, is_test_file_path, run_cmd_with_timeout, signature, test_scope, GitDiffSource,
+    git_cmd, is_test_file_path,
+    language_registry::{self, CandidateParseOutcome},
+    run_cmd_with_timeout, signature, test_scope, GitDiffSource, LanguageCandidates,
     SupportedLanguage, MAX_TREESITTER_FILE_BYTES,
 };
 #[cfg(feature = "tree-sitter")]
@@ -139,7 +141,7 @@ pub(super) struct Layer1FileEntry {
 
 /// Computes the dynamic byte budget for Layer 1: `min(3% of patch budget, 6 KiB)`.
 pub(super) fn layer1_budget_bytes(max_patch_bytes: usize) -> usize {
-    ((max_patch_bytes * 3) / 100).min(6 * 1024)
+    (max_patch_bytes.saturating_mul(3) / 100).min(6 * 1024)
 }
 
 /// Renders Layer 1 compact commit symbol index, bounded strictly to `max_bytes`.
@@ -2596,8 +2598,10 @@ fn is_eligible_repo_source_path(p: &Path) -> bool {
         && !s.contains("/target/")
         && !is_lockfile_or_generated(p)
         && !is_test_file_path(p)
-        && SupportedLanguage::from_path(p)
-            .is_some_and(|l| !matches!(l, SupportedLanguage::Json | SupportedLanguage::Bash))
+        && SupportedLanguage::candidates_for_path(p).is_some_and(|c| {
+            c.iter()
+                .any(|l| !matches!(l, SupportedLanguage::Json | SupportedLanguage::Bash))
+        })
 }
 
 /// Lists tracked repository source files for the exact `GitDiffSource` snapshot using `-z`
@@ -2638,7 +2642,7 @@ fn list_tracked_source_files(repo_root: &Path, source: GitDiffSource<'_>) -> Vec
 struct TrackedFileEntry {
     path: PathBuf,
     norm: String,
-    lang: Option<SupportedLanguage>,
+    candidates: Option<LanguageCandidates<'static>>,
     file_name: String,
     ext: Option<String>,
 }
@@ -2670,7 +2674,7 @@ impl TrackedRepoIndex {
         for p in tracked_files {
             let idx = entries.len();
             let norm = p.to_string_lossy().replace('\\', "/");
-            let lang = SupportedLanguage::from_path(p);
+            let candidates = SupportedLanguage::candidates_for_path(p);
             let file_name = p
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -2693,16 +2697,18 @@ impl TrackedRepoIndex {
                     .or_default()
                     .push(idx);
             }
-            if let Some(l) = lang {
+            if let Some(cands) = candidates {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                     let norm_stem = normalize_alnum_lower(stem);
                     if !norm_stem.is_empty() {
-                        lang_stem_to_indices
-                            .entry(l)
-                            .or_default()
-                            .entry(norm_stem)
-                            .or_default()
-                            .push(idx);
+                        for l in cands.iter() {
+                            lang_stem_to_indices
+                                .entry(l)
+                                .or_default()
+                                .entry(norm_stem.clone())
+                                .or_default()
+                                .push(idx);
+                        }
                     }
                 }
             }
@@ -2720,7 +2726,7 @@ impl TrackedRepoIndex {
             entries.push(TrackedFileEntry {
                 path: p.clone(),
                 norm,
-                lang,
+                candidates,
                 file_name,
                 ext,
             });
@@ -3165,12 +3171,16 @@ fn resolve_candidate_files_for_query(
         if let Some(dir_idxs) = index.dir_to_indices.get(&src_dir_norm) {
             for &idx in dir_idxs {
                 let entry = &index.entries[idx];
-                let same_lang_family = match (q.lang, entry.lang) {
-                    (a, Some(b)) if a == b => true,
-                    (SupportedLanguage::C, Some(SupportedLanguage::Cpp))
-                    | (SupportedLanguage::Cpp, Some(SupportedLanguage::C)) => true,
-                    _ => false,
-                };
+                let same_lang_family = entry.candidates.is_some_and(|cands| {
+                    cands.iter().any(|b| {
+                        q.lang == b
+                            || matches!(
+                                (q.lang, b),
+                                (SupportedLanguage::C, SupportedLanguage::Cpp)
+                                    | (SupportedLanguage::Cpp, SupportedLanguage::C)
+                            )
+                    })
+                });
                 if !same_lang_family {
                     continue;
                 }
@@ -3512,9 +3522,6 @@ pub(super) fn resolve_cross_file_context(
     let mut parsed_bytes = 0usize;
 
     for (cand_path, cw) in ranked_paths {
-        let Some(lang) = SupportedLanguage::from_path(&cand_path) else {
-            continue;
-        };
         let Some(content) = blobs.get(&cand_path) else {
             continue;
         };
@@ -3525,9 +3532,12 @@ pub(super) fn resolve_cross_file_context(
             continue;
         }
         parsed_bytes += content.len();
-        let Ok(tree) = parse_with_timeout(lang, content) else {
+        let Some((lang, tree)) = language_registry::parse_for_path(&cand_path, content) else {
             continue;
         };
+        if matches!(lang, SupportedLanguage::Json | SupportedLanguage::Bash) {
+            continue;
+        }
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             continue;
@@ -3830,10 +3840,14 @@ fn complete_deleted_header_syntax(reconstructed: &str, lang: SupportedLanguage) 
 #[cfg(feature = "tree-sitter")]
 fn extract_deleted_targets_with_fallbacks(
     reconstructed: &str,
+    initial_tree: Option<&tree_sitter::Tree>,
     path: &Path,
     lang: SupportedLanguage,
 ) -> Vec<ReverseTarget> {
-    let mut targets = extract_reverse_targets_from_source(reconstructed, path, lang);
+    let mut targets = match initial_tree {
+        Some(tree) => extract_reverse_targets_from_tree(reconstructed, tree, path, lang),
+        None => extract_reverse_targets_from_source(reconstructed, path, lang),
+    };
     if !targets.is_empty() {
         return targets;
     }
@@ -3870,9 +3884,12 @@ fn extract_deleted_targets_with_fallbacks(
 pub(super) fn collect_deleted_reverse_targets(
     chunk: &str,
     path: &Path,
-    lang: SupportedLanguage,
+    candidates: LanguageCandidates<'_>,
 ) -> Vec<ReverseTarget> {
-    if is_test_file_path(path) || matches!(lang, SupportedLanguage::Json | SupportedLanguage::Bash)
+    if is_test_file_path(path)
+        || !candidates
+            .iter()
+            .any(|l| !matches!(l, SupportedLanguage::Json | SupportedLanguage::Bash))
     {
         return Vec::new();
     }
@@ -3904,7 +3921,21 @@ pub(super) fn collect_deleted_reverse_targets(
             }
         }
     }
-    extract_deleted_targets_with_fallbacks(&reconstructed, path, lang)
+    match candidates {
+        LanguageCandidates::Exact(lang) => {
+            extract_deleted_targets_with_fallbacks(&reconstructed, None, path, lang)
+        }
+        LanguageCandidates::Priority(_) => {
+            match language_registry::parse_for_candidates(candidates, &reconstructed, &[]) {
+                CandidateParseOutcome::Parsed { lang, tree }
+                    if !matches!(lang, SupportedLanguage::Json | SupportedLanguage::Bash) =>
+                {
+                    extract_deleted_targets_with_fallbacks(&reconstructed, Some(&tree), path, lang)
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
 }
 
 /// Extracts non-test top-level/member definitions removed in a pure-deletion or renamed-header hunk
@@ -3939,7 +3970,7 @@ pub(super) fn collect_deleted_lines_reverse_targets(
             reconstructed.push('\n');
         }
     }
-    extract_deleted_targets_with_fallbacks(&reconstructed, path, lang)
+    extract_deleted_targets_with_fallbacks(&reconstructed, None, path, lang)
 }
 
 #[cfg(feature = "tree-sitter")]
@@ -3954,6 +3985,19 @@ fn extract_reverse_targets_from_source(
     let Ok(tree) = parse_with_timeout(lang, source) else {
         return Vec::new();
     };
+    extract_reverse_targets_from_tree(source, &tree, path, lang)
+}
+
+#[cfg(feature = "tree-sitter")]
+fn extract_reverse_targets_from_tree(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    path: &Path,
+    lang: SupportedLanguage,
+) -> Vec<ReverseTarget> {
+    if source.trim().is_empty() {
+        return Vec::new();
+    }
     let lines: Vec<&str> = source.lines().collect();
     if lines.is_empty() {
         return Vec::new();
@@ -4594,7 +4638,8 @@ fn run_git_grep_for_symbols(
                 continue;
             }
 
-            let is_ruby = SupportedLanguage::from_path(&path) == Some(SupportedLanguage::Ruby);
+            let is_ruby = SupportedLanguage::candidates_for_path(&path)
+                .is_some_and(|c| c.iter().any(|l| l == SupportedLanguage::Ruby));
             let line_text = String::from_utf8_lossy(text_b);
             let mut matched_syms = Vec::new();
             for sym in &owned_syms {
@@ -4875,9 +4920,6 @@ pub(super) fn resolve_reverse_callers_context(
     let mut parsed_bytes = 0usize;
 
     for cand in cand_list {
-        let Some(cand_lang) = SupportedLanguage::from_path(&cand.path) else {
-            continue;
-        };
         let Some(content) = blobs.get(&cand.path) else {
             continue;
         };
@@ -4888,9 +4930,12 @@ pub(super) fn resolve_reverse_callers_context(
             continue;
         }
         parsed_bytes += content.len();
-        let Ok(tree) = parse_with_timeout(cand_lang, content) else {
+        let Some((cand_lang, tree)) = language_registry::parse_for_path(&cand.path, content) else {
             continue;
         };
+        if matches!(cand_lang, SupportedLanguage::Json | SupportedLanguage::Bash) {
+            continue;
+        }
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             continue;
@@ -5771,8 +5816,13 @@ pub(super) fn resolve_reverse_callers_context(
     final_entries
 }
 
+/// Absolute Layer 3 byte ceiling when `max_patch_bytes` is unbounded (`usize::MAX`).
+#[cfg(feature = "tree-sitter")]
+pub(super) const UNBOUNDED_LAYER3_MAX_BYTES: usize = 128 * 1024;
+
 /// Computes Layer 3 dynamic budget:
-/// - Under normal conditions: `min(15% of max_bytes, max(4 KiB, 25% of layer2_bytes), remaining_bytes)`
+/// - Under normal finite budgets: `min(15% of max_bytes, max(4 KiB, 25% of layer2_bytes), remaining_bytes)`
+/// - Under unbounded mode (`max_patch_bytes == usize::MAX`): `min(128 KiB, max(4 KiB, 25% of layer2_bytes), remaining_bytes)`
 /// - Under production compaction pressure (when Layer 2 had to degrade/truncate):
 ///   shrinks to a tiny local-only floor so Layer 3 never starves modified production code.
 #[cfg(feature = "tree-sitter")]
@@ -5785,7 +5835,11 @@ pub(super) fn compute_layer3_budget(
     if remaining_bytes < 256 {
         return 0;
     }
-    let pct_cap = (max_patch_bytes * 15) / 100;
+    let pct_cap = if max_patch_bytes == usize::MAX {
+        UNBOUNDED_LAYER3_MAX_BYTES
+    } else {
+        max_patch_bytes.saturating_mul(15) / 100
+    };
     let rel_cap = (layer2_bytes / 4).max(4 * 1024);
     let cap = if prod_compacted {
         // Keep only a small floor for same-file types if production code was compacted

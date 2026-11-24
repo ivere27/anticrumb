@@ -59,10 +59,11 @@ fn clip_spans(parts: Vec<(String, Face)>, max_width: usize) -> Vec<(String, Face
     out
 }
 
+pub(super) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 impl State {
     fn spinner(&self) -> &'static str {
-        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-            [(self.started.elapsed().as_millis() / 120 % 10) as usize]
+        SPINNER_FRAMES[(self.started.elapsed().as_millis() / 120 % 10) as usize]
     }
 
     #[cfg(test)]
@@ -316,8 +317,7 @@ impl State {
         sub: &SubagentView,
         width: usize,
     ) -> Vec<(String, Face)> {
-        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-            [(sub.started.elapsed().as_millis() / 120 % 10) as usize];
+        let spinner = SPINNER_FRAMES[(sub.started.elapsed().as_millis() / 120 % 10) as usize];
         let label_limit = if width < 80 { 16 } else { 28 };
         let detail_limit = width.saturating_sub(42).max(12);
         let elapsed = format!("{:.1}s", sub.started.elapsed().as_secs_f64());
@@ -402,32 +402,42 @@ impl State {
         Ok(())
     }
 
-    fn render_transcript(
+    pub(super) fn render_transcript(
         &mut self,
         out: &mut impl Write,
         layout: FrameLayout,
         full_clear: bool,
     ) -> Result<()> {
+        if layout.transcript.len == 0 {
+            self.painted_transcript.clear();
+            self.painted_all_transcript.clear();
+            self.scroll_bottom_button = None;
+            self.painted_size = (layout.width, layout.height);
+            self.painted_layout = Some(layout);
+            return Ok(());
+        }
         let w = usize::from(layout.width);
         let viewport = usize::from(layout.transcript.len);
         let transcript_selection = self
             .selection
             .as_ref()
             .filter(|_| self.selection_target == SelectionTarget::Transcript);
-        let (start, effective_scroll, painted, all_snapshot) =
-            if let Some(selection) = transcript_selection {
-                let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
-                let eff = selection.lines.len().saturating_sub(end);
-                (start, eff, selection.lines[start..end].to_vec(), None)
-            } else {
-                // Release the previous snapshot first so the cache appends in place.
-                self.painted_all_transcript.clear();
-                let all = self.transcript.lines(&self.stream, w);
-                let (start, end) = self.selection_view_range(all.len(), viewport);
-                let eff = all.len().saturating_sub(end);
-                let painted = all.slice(start, end);
-                (start, eff, painted, Some(all))
-            };
+        let (start, effective_scroll, painted, all_snapshot) = if let Some(selection) =
+            transcript_selection
+        {
+            let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
+            let eff = selection.lines.len().saturating_sub(end);
+            (start, eff, selection.lines[start..end].to_vec(), None)
+        } else {
+            // Release the previous snapshot first so the cache appends in place.
+            self.painted_all_transcript.clear();
+            let all = self.transcript.lines(&self.stream, w);
+            self.sync_scroll_anchor(all.len(), all.evicted_lines(), w, all.visible_stream_len());
+            let (start, end) = self.selection_view_range(all.len(), viewport);
+            let eff = all.len().saturating_sub(end);
+            let painted = all.slice(start, end);
+            (start, eff, painted, Some(all))
+        };
         for (row, line) in painted.iter().enumerate() {
             let y = layout.transcript.start + row as u16;
             queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
@@ -466,15 +476,20 @@ impl State {
         if let Some(all) = all_snapshot {
             self.painted_all_transcript = all;
         }
-        self.painted_transcript_start = start;
+        self.scroll = effective_scroll;
         self.painted_effective_scroll = effective_scroll;
+        if effective_scroll == 0 && self.scroll_anchor_deficit.is_none() {
+            self.has_unread_below = false;
+        }
+        self.scroll_relative = false;
+        self.painted_transcript_start = start;
         self.painted_transcript = painted;
         self.painted_size = (layout.width, layout.height);
         self.painted_layout = Some(layout);
         Ok(())
     }
 
-    fn hint_line(&self, layout: FrameLayout) -> (markdown::Line, Option<(u16, u16, String)>) {
+    fn hint_line(&self, layout: FrameLayout) -> (markdown::Line, Option<(u16, u16)>) {
         let w = usize::from(layout.width);
         let resume_notice = self.resume_notice.as_ref().filter(|_| {
             self.menu.as_ref().is_some_and(|menu| {
@@ -501,22 +516,25 @@ impl State {
         };
         let safe_w = Self::safe_row_width(layout.hint.start, layout.width, layout.height);
 
-        if self.painted_effective_scroll > 0
+        if layout.transcript.len > 0
+            && self.painted_effective_scroll > 0
             && self.history_clear_confirmation.is_none()
             && self.selection.is_none()
             && resume_notice.is_none()
             && safe_w > 0
         {
+            let badge = self.scroll_bottom_badge();
+            let spinner = self.spinner();
             let raw_btn = if safe_w >= 22 {
-                "[ ↓ Jump to bottom ]"
+                badge.label(spinner)
             } else {
-                "[ ↓ Bottom ]"
+                badge.compact_label(spinner)
             };
-            let btn_text = clip(raw_btn, safe_w);
+            let btn_text = clip(&raw_btn, safe_w);
             let btn_w = btn_text.width();
             if !btn_text.is_empty() {
-                if let Some((badge, badge_face)) = right_badge.as_ref() {
-                    let badge_clipped = clip(badge, safe_w);
+                if let Some((right_text, badge_face)) = right_badge.as_ref() {
+                    let badge_clipped = clip(right_text, safe_w);
                     let badge_w = badge_clipped.width();
                     if btn_w + 2 + badge_w <= safe_w {
                         let center_start = safe_w.saturating_sub(btn_w) / 2;
@@ -534,7 +552,7 @@ impl State {
                             });
                         }
                         line.push(Span {
-                            text: btn_text.clone(),
+                            text: btn_text,
                             face: Face::ACCENT_BOLD,
                         });
                         if gap > 0 {
@@ -549,7 +567,7 @@ impl State {
                                 face: *badge_face,
                             });
                         }
-                        return (line, Some((start as u16, (start + btn_w) as u16, btn_text)));
+                        return (line, Some((start as u16, (start + btn_w) as u16)));
                     }
                 } else {
                     let start = safe_w.saturating_sub(btn_w) / 2;
@@ -561,10 +579,10 @@ impl State {
                         });
                     }
                     line.push(Span {
-                        text: btn_text.clone(),
+                        text: btn_text,
                         face: Face::ACCENT_BOLD,
                     });
-                    return (line, Some((start as u16, (start + btn_w) as u16, btn_text)));
+                    return (line, Some((start as u16, (start + btn_w) as u16)));
                 }
             }
         }
@@ -686,7 +704,7 @@ impl State {
         (line, None)
     }
 
-    fn render_hint(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+    pub(super) fn render_hint(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
         if layout.hint.len == 0 {
             self.scroll_bottom_button = None;
             if self.selection.is_none() {
@@ -713,28 +731,11 @@ impl State {
             }
             (line, button)
         };
-        self.scroll_bottom_button = button
-            .as_ref()
-            .map(|(start, end, _)| (layout.hint.start, *start, *end));
+        self.scroll_bottom_button = button.map(|(start, end)| (layout.hint.start, start, end));
         let rendered_width: usize = line.iter().map(|s| s.text.width()).sum();
         queue!(out, cursor::MoveTo(0, layout.hint.start)).map_err(ServiceError::storage)?;
         markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
         Self::pad_and_clear_row(out, layout.hint.start, rendered_width, layout, self.theme)?;
-        if let Some((start, _, btn_text)) = button {
-            queue!(
-                out,
-                cursor::MoveTo(start, layout.hint.start),
-                style::Print(
-                    btn_text
-                        .with(self.theme.selected_text)
-                        .on(self.theme.selected_background)
-                        .attribute(style::Attribute::Bold)
-                ),
-                style::SetBackgroundColor(self.theme.background),
-                style::SetForegroundColor(self.theme.text),
-            )
-            .map_err(ServiceError::storage)?;
-        }
         if hint_selected {
             if let Some((column, selected)) = self
                 .selection
@@ -860,8 +861,8 @@ impl State {
             let safe_w = Self::safe_row_width(status_row, layout.width, layout.height);
             queue!(out, cursor::MoveTo(0, status_row)).map_err(ServiceError::storage)?;
             if mention.loading {
-                let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-                    [(mention.started_at.elapsed().as_millis() / 120 % 10) as usize];
+                let spinner =
+                    SPINNER_FRAMES[(mention.started_at.elapsed().as_millis() / 120 % 10) as usize];
                 let msg = if mention.query.is_empty() {
                     " Fetching matches...".to_owned()
                 } else {
@@ -942,12 +943,23 @@ impl State {
 
             let prefix_w = 3 + display_text.width() + display_pad.len() + 2 + kind_label.width();
             let detail_budget = safe_w.saturating_sub(prefix_w + 2);
-            let detail_src =
+            let base_detail =
                 if matched.detail.is_empty() && matched.kind == super::mentions::MentionKind::Git {
                     "Git commit"
                 } else {
                     matched.detail.as_str()
                 };
+            let detail_owned;
+            let detail_src = if matched.recent {
+                detail_owned = if base_detail.is_empty() {
+                    "Recent".to_owned()
+                } else {
+                    format!("Recent · {base_detail}")
+                };
+                detail_owned.as_str()
+            } else {
+                base_detail
+            };
             let detail_text = if detail_budget >= 8 {
                 clip(detail_src, detail_budget)
             } else {

@@ -1,8 +1,10 @@
 #[cfg(feature = "tree-sitter")]
 use super::{
-    ast_compact, check_primary_definition, find_enclosing_definition_detail, signature,
+    ast_compact, check_primary_definition, find_enclosing_definition_detail,
+    language_registry::{self, CandidateParseOutcome},
+    signature,
     test_scope::{is_ast_node_attr_or_comment, is_attribute_or_comment_only},
-    SupportedLanguage, ATTR_ONLY_MAX_EXPANSION_LINES, CLAMPED_CONTEXT_LINES,
+    LanguageCandidates, SupportedLanguage, ATTR_ONLY_MAX_EXPANSION_LINES, CLAMPED_CONTEXT_LINES,
     MAX_TREESITTER_FILE_BYTES, TREESITTER_PARSE_TIMEOUT_MICROS,
 };
 use super::{
@@ -366,15 +368,10 @@ pub(super) fn is_container_definition_node(node: &tree_sitter::Node) -> bool {
 #[cfg(feature = "tree-sitter")]
 fn collect_primary_definition_hashes(
     lang: SupportedLanguage,
+    tree: &tree_sitter::Tree,
     source: &str,
     out: &mut Vec<PrimaryDefHash>,
 ) {
-    if source.len() > MAX_TREESITTER_FILE_BYTES {
-        return;
-    }
-    let Ok(tree) = parse_with_timeout(lang, source) else {
-        return;
-    };
     let lines: Vec<&str> = source.lines().collect();
     if lines.is_empty() {
         return;
@@ -449,7 +446,7 @@ fn has_potential_move_destinations(chunks: &[String]) -> bool {
         {
             continue;
         }
-        if SupportedLanguage::from_path(&target_path).is_none() {
+        if SupportedLanguage::candidates_for_path(&target_path).is_none() {
             continue;
         }
         if is_new {
@@ -491,31 +488,36 @@ fn collect_moved_deleted_blocks_for_chunk(chunk: &str) -> Vec<([u8; 32], MovedSo
         return Vec::new();
     }
     let src_path = old_path.unwrap_or(target_path);
-    let lang = SupportedLanguage::from_path(&src_path);
+    let has_lang_candidates = SupportedLanguage::candidates_for_path(&src_path).is_some();
 
     let mut entries: Vec<([u8; 32], MovedSource)> = Vec::new();
     let mut in_hunk = false;
     let mut current_deleted: Vec<&str> = Vec::new();
     let flush_run = |run: &mut Vec<&str>,
                      entries: &mut Vec<([u8; 32], MovedSource)>,
-                     lang: Option<SupportedLanguage>,
+                     has_lang_candidates: bool,
                      src_path: &Path| {
         if run.is_empty() {
             return;
         }
         if let Some((hash, _non_empty)) = normalize_block_hash(run.iter().copied()) {
-            if let Some(l) = lang {
+            if has_lang_candidates {
                 let dedented = dedent_lines(run);
-                let mut defs = Vec::new();
-                collect_primary_definition_hashes(l, &dedented, &mut defs);
-                for (def_hash, _s, _e, _def_lines, def_sig) in defs {
-                    entries.push((
-                        def_hash,
-                        MovedSource {
-                            path: src_path.to_path_buf(),
-                            signature: def_sig,
-                        },
-                    ));
+                if dedented.len() <= MAX_TREESITTER_FILE_BYTES {
+                    if let Some((l, tree)) = language_registry::parse_for_path(src_path, &dedented)
+                    {
+                        let mut defs = Vec::new();
+                        collect_primary_definition_hashes(l, &tree, &dedented, &mut defs);
+                        for (def_hash, _s, _e, _def_lines, def_sig) in defs {
+                            entries.push((
+                                def_hash,
+                                MovedSource {
+                                    path: src_path.to_path_buf(),
+                                    signature: def_sig,
+                                },
+                            ));
+                        }
+                    }
                 }
             }
             // Always index the full contiguous deleted run as well (e.g. a complete standalone
@@ -538,7 +540,12 @@ fn collect_moved_deleted_blocks_for_chunk(chunk: &str) -> Vec<([u8; 32], MovedSo
     for raw_line in chunk.split_inclusive('\n') {
         let trimmed = raw_line.trim_end_matches(['\r', '\n']);
         if trimmed.starts_with("@@") {
-            flush_run(&mut current_deleted, &mut entries, lang, &src_path);
+            flush_run(
+                &mut current_deleted,
+                &mut entries,
+                has_lang_candidates,
+                &src_path,
+            );
             in_hunk = true;
             continue;
         }
@@ -548,10 +555,20 @@ fn collect_moved_deleted_blocks_for_chunk(chunk: &str) -> Vec<([u8; 32], MovedSo
         if let Some(deleted_text) = trimmed.strip_prefix('-') {
             current_deleted.push(deleted_text);
         } else if !trimmed.starts_with('\\') {
-            flush_run(&mut current_deleted, &mut entries, lang, &src_path);
+            flush_run(
+                &mut current_deleted,
+                &mut entries,
+                has_lang_candidates,
+                &src_path,
+            );
         }
     }
-    flush_run(&mut current_deleted, &mut entries, lang, &src_path);
+    flush_run(
+        &mut current_deleted,
+        &mut entries,
+        has_lang_candidates,
+        &src_path,
+    );
     entries
 }
 
@@ -616,54 +633,52 @@ fn summarize_large_new_test_chunk(chunk: &str, path: &Path) -> Option<String> {
     let mut toc_lines = Vec::new();
     let mut total_defs = 0usize;
 
-    if let Some(lang) = SupportedLanguage::from_path(path) {
-        if added_source.len() <= MAX_TREESITTER_FILE_BYTES {
-            if let Ok(tree) = parse_with_timeout(lang, &added_source) {
-                let lines: Vec<&str> = added_source.lines().collect();
-                let mut collected = Vec::new();
-                fn collect_defs(
-                    lang: SupportedLanguage,
-                    node: tree_sitter::Node,
-                    lines: &[&str],
-                    source: &str,
-                    out: &mut Vec<(usize, usize, String)>,
-                ) {
-                    if let Some(matched) = check_primary_definition(lang, &node) {
-                        let s = matched.start_position().row + 1;
-                        let e = (matched.end_position().row + 1).min(lines.len().max(1));
-                        let raw_sig = signature::extract_signature(lang, &matched, lines, source);
-                        let parent =
-                            signature::extract_parent_scope_prefix(lang, &matched, lines, source);
-                        if let Some(sig) = signature::compact_definition_signature_with_ast(
-                            lang,
-                            &matched,
-                            parent.as_deref(),
-                            raw_sig.as_deref(),
-                            source,
-                            110,
-                        ) {
-                            out.push((s, e, sig));
-                            if !is_container_definition_node(&matched) {
-                                return;
-                            }
+    if added_source.len() <= MAX_TREESITTER_FILE_BYTES {
+        if let Some((lang, tree)) = language_registry::parse_for_path(path, &added_source) {
+            let lines: Vec<&str> = added_source.lines().collect();
+            let mut collected = Vec::new();
+            fn collect_defs(
+                lang: SupportedLanguage,
+                node: tree_sitter::Node,
+                lines: &[&str],
+                source: &str,
+                out: &mut Vec<(usize, usize, String)>,
+            ) {
+                if let Some(matched) = check_primary_definition(lang, &node) {
+                    let s = matched.start_position().row + 1;
+                    let e = (matched.end_position().row + 1).min(lines.len().max(1));
+                    let raw_sig = signature::extract_signature(lang, &matched, lines, source);
+                    let parent =
+                        signature::extract_parent_scope_prefix(lang, &matched, lines, source);
+                    if let Some(sig) = signature::compact_definition_signature_with_ast(
+                        lang,
+                        &matched,
+                        parent.as_deref(),
+                        raw_sig.as_deref(),
+                        source,
+                        110,
+                    ) {
+                        out.push((s, e, sig));
+                        if !is_container_definition_node(&matched) {
+                            return;
                         }
                     }
-                    let mut cursor = node.walk();
-                    for ch in node.named_children(&mut cursor) {
-                        collect_defs(lang, ch, lines, source, out);
-                    }
                 }
-                collect_defs(
-                    lang,
-                    tree.root_node(),
-                    &lines,
-                    &added_source,
-                    &mut collected,
-                );
-                total_defs = collected.len();
-                for (s, e, sig) in collected.into_iter().take(40) {
-                    toc_lines.push(format!("  - L{s}-L{e}: {sig}"));
+                let mut cursor = node.walk();
+                for ch in node.named_children(&mut cursor) {
+                    collect_defs(lang, ch, lines, source, out);
                 }
+            }
+            collect_defs(
+                lang,
+                tree.root_node(),
+                &lines,
+                &added_source,
+                &mut collected,
+            );
+            total_defs = collected.len();
+            for (s, e, sig) in collected.into_iter().take(40) {
+                toc_lines.push(format!("  - L{s}-L{e}: {sig}"));
             }
         }
     }
@@ -703,14 +718,17 @@ fn summarize_moved_new_file_chunk(
     if moved_map.is_empty() {
         return None;
     }
-    let lang = SupportedLanguage::from_path(path)?;
+    let _ = SupportedLanguage::candidates_for_path(path)?;
     let (header, added_source, added_count) = extract_chunk_header_and_added_source(chunk);
-    if added_count < MIN_MOVED_BLOCK_NON_EMPTY_LINES {
+    if added_count < MIN_MOVED_BLOCK_NON_EMPTY_LINES
+        || added_source.len() > MAX_TREESITTER_FILE_BYTES
+    {
         return None;
     }
 
+    let (lang, tree) = language_registry::parse_for_path(path, &added_source)?;
     let mut defs = Vec::new();
-    collect_primary_definition_hashes(lang, &added_source, &mut defs);
+    collect_primary_definition_hashes(lang, &tree, &added_source, &mut defs);
     if defs.is_empty() {
         return None;
     }
@@ -954,6 +972,7 @@ struct ExpandedChunkData {
 enum TreeSitterExpandResult {
     Expanded(Box<ExpandedChunkData>),
     Generated,
+    NoMatchingPriorityLanguage,
 }
 
 /// Checks whether a Rust `#[...]` attribute is purely non-semantic (`#[inline]`, `#[allow(...)]`,
@@ -1161,7 +1180,7 @@ fn expand_chunk_with_treesitter(
     path: &Path,
     chunk: &str,
     source: GitDiffSource<'_>,
-    lang: SupportedLanguage,
+    candidates: LanguageCandidates<'_>,
     moved_deleted_map: &HashMap<[u8; 32], MovedSource>,
     hybrid: HybridConfig,
 ) -> Result<Option<TreeSitterExpandResult>> {
@@ -1247,14 +1266,6 @@ fn expand_chunk_with_treesitter(
     }
     let plain_lines: Vec<&str> = new_content.lines().collect();
 
-    let tree = parse_with_timeout(lang, &new_content).map_err(ServiceError::invalid)?;
-    let root = tree.root_node();
-    let inline_test_blocks = if is_test_file_path(path) {
-        Vec::new()
-    } else {
-        ast_compact::find_inline_test_blocks(lang, &root, &new_content)
-    };
-
     // Parse header and hunks from git diff chunk, preserving original line endings for hunks
     let mut file_header = Vec::new();
     let mut hunks: Vec<ParsedHunk> = Vec::new();
@@ -1291,7 +1302,7 @@ fn expand_chunk_with_treesitter(
         return Ok(Some(TreeSitterExpandResult::Expanded(Box::new(
             ExpandedChunkData {
                 rendered: chunk.to_string(),
-                inline_test_blocks,
+                inline_test_blocks: Vec::new(),
                 changed_symbols: Vec::new(),
                 local_context: Vec::new(),
                 cross_query: None,
@@ -1300,6 +1311,37 @@ fn expand_chunk_with_treesitter(
             },
         ))));
     }
+
+    let changed_line_ranges: Vec<(usize, usize)> = hunks
+        .iter()
+        .map(|h| {
+            let s = h.new_start.max(1);
+            let e = if h.new_count == 0 {
+                s
+            } else {
+                (h.new_start + h.new_count - 1).max(s)
+            };
+            (s, e)
+        })
+        .collect();
+
+    let (lang, tree) = match language_registry::parse_for_candidates(
+        candidates,
+        &new_content,
+        &changed_line_ranges,
+    ) {
+        CandidateParseOutcome::Parsed { lang, tree } => (lang, tree),
+        CandidateParseOutcome::ExactParseFailed(e) => return Err(ServiceError::invalid(e)),
+        CandidateParseOutcome::NoMatchingCandidate => {
+            return Ok(Some(TreeSitterExpandResult::NoMatchingPriorityLanguage));
+        }
+    };
+    let root = tree.root_node();
+    let inline_test_blocks = if is_test_file_path(path) {
+        Vec::new()
+    } else {
+        ast_compact::find_inline_test_blocks(lang, &root, &new_content)
+    };
 
     struct ExpandedEntry {
         exp_start: usize,
@@ -2163,20 +2205,22 @@ fn git_diff_w_all(repo_root: &Path, source: GitDiffSource<'_>) -> Result<String>
     Ok(stdout)
 }
 
-/// Fallback helper to run `git diff -W` or `git show -W` for a single file, preserving rename information when applicable.
+/// Helper to run `git diff`/`git show` with an explicit context flag (e.g. `"-W"` or `"-U3"`)
+/// for a single file, preserving rename information when applicable.
 #[cfg(feature = "tree-sitter")]
-fn git_diff_w_for_file(
+fn git_diff_context_for_file(
     repo_root: &Path,
     path: &Path,
     old_path: Option<&Path>,
     source: GitDiffSource<'_>,
+    context_flag: &str,
 ) -> Result<String> {
     let mut cmd = git_cmd(repo_root);
     match source {
         GitDiffSource::Unstaged => {
             cmd.args([
                 "diff",
-                "-W",
+                context_flag,
                 "-M",
                 "--diff-algorithm=histogram",
                 "--no-color",
@@ -2186,7 +2230,7 @@ fn git_diff_w_for_file(
         GitDiffSource::Staged => {
             cmd.args([
                 "diff",
-                "-W",
+                context_flag,
                 "-M",
                 "--diff-algorithm=histogram",
                 "--no-color",
@@ -2197,7 +2241,7 @@ fn git_diff_w_for_file(
         GitDiffSource::Commit(sha) => {
             cmd.args([
                 "show",
-                "-W",
+                context_flag,
                 "-M",
                 "--diff-algorithm=histogram",
                 "--first-parent",
@@ -2217,12 +2261,14 @@ fn git_diff_w_for_file(
     let output = super::run_cmd_with_timeout(cmd, std::time::Duration::from_secs(15), None)
         .map_err(|e| ServiceError::invalid(format!("git command failed: {e}")))?;
     if output.timed_out {
-        return Err(ServiceError::invalid("git fallback diff -W timed out"));
+        return Err(ServiceError::invalid(format!(
+            "git fallback diff {context_flag} timed out"
+        )));
     }
     if !output.status.is_some_and(|s| s.success()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ServiceError::invalid(format!(
-            "git fallback diff -W failed: {stderr}"
+            "git fallback diff {context_flag} failed: {stderr}"
         )));
     }
     let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -2239,7 +2285,7 @@ fn git_diff_w_for_file(
         }
     }
 
-    // If old_path was passed, git diff -W might output chunks for both old_path and path when old_path
+    // If old_path was passed, git diff might output chunks for both old_path and path when old_path
     // was also recreated. In that case, keep only chunks whose destination matches path to avoid duplication.
     if old_path.is_some_and(|old| old != path) && stdout.matches("diff --git ").count() > 1 {
         let mut matching_chunks = String::new();
@@ -2267,6 +2313,29 @@ fn git_diff_w_for_file(
         }
     }
     Ok(stdout)
+}
+
+/// Fallback helper to run `git diff -W` or `git show -W` for a single file, preserving rename information when applicable.
+#[cfg(feature = "tree-sitter")]
+fn git_diff_w_for_file(
+    repo_root: &Path,
+    path: &Path,
+    old_path: Option<&Path>,
+    source: GitDiffSource<'_>,
+) -> Result<String> {
+    git_diff_context_for_file(repo_root, path, old_path, source, "-W")
+}
+
+/// Helper to run `git diff -U3` or `git show -U3` for `plain_diff` files (Markdown, docs, configs)
+/// without function-context bloat or unsupported-language warnings.
+#[cfg(feature = "tree-sitter")]
+fn git_diff_u3_for_file(
+    repo_root: &Path,
+    path: &Path,
+    old_path: Option<&Path>,
+    source: GitDiffSource<'_>,
+) -> Result<String> {
+    git_diff_context_for_file(repo_root, path, old_path, source, "-U3")
 }
 
 /// Determines if a path belongs to a package lockfile, minified bundle, or generated asset.
@@ -2371,6 +2440,8 @@ fn hash_comment_policy_for_path(path: Option<&Path>) -> HashCommentPolicy {
                 | "hh"
                 | "hpp"
                 | "hxx"
+                | "cu"
+                | "cuh"
                 | "m"
                 | "mm"
                 | "cs"
@@ -2901,7 +2972,9 @@ const COMPACT_CONTEXT_LINES: usize = 3;
 const BUDGET_BANNER_RESERVE_BYTES: usize = 256;
 
 fn format_budget_size(bytes: usize) -> String {
-    if bytes >= 1024 && bytes.is_multiple_of(1024) {
+    if bytes >= 1024 * 1024 && bytes.is_multiple_of(1024 * 1024) {
+        format!("{} MiB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
         format!("{} KiB", bytes / 1024)
     } else {
         format!("{bytes} B")
@@ -3367,13 +3440,13 @@ fn short_def_label(
 
 #[cfg(feature = "tree-sitter")]
 fn collect_ast_def_spans_for_new_chunk(raw_chunk: &str, path: &Path) -> Option<Vec<AstDefSpan>> {
-    let lang = SupportedLanguage::from_path(path)?;
+    let _ = SupportedLanguage::candidates_for_path(path)?;
     let (_hdr, added_source, added_count) = extract_chunk_header_and_added_source(raw_chunk);
     if added_count == 0 || added_source.len() > MAX_TREESITTER_FILE_BYTES {
         return None;
     }
 
-    let tree = parse_with_timeout(lang, &added_source).ok()?;
+    let (lang, tree) = language_registry::parse_for_path(path, &added_source)?;
     let src_lines: Vec<&str> = added_source.lines().collect();
     if src_lines.is_empty() {
         return None;
@@ -3888,6 +3961,25 @@ fn split_raw_diff_chunks(raw_diff: &str) -> (String, Vec<String>) {
         chunks.push(current_chunk);
     }
     (commit_header, chunks)
+}
+
+pub(super) fn format_human_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        if bytes.is_multiple_of(1024 * 1024) {
+            format!("{} MiB", bytes / (1024 * 1024))
+        } else {
+            format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    } else if bytes >= 1024 {
+        let kib = bytes.div_ceil(1024);
+        if kib >= 1024 {
+            "1 MiB".to_string()
+        } else {
+            format!("{kib} KiB")
+        }
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[cfg(test)]
@@ -4622,7 +4714,7 @@ fn apply_patch_budget_with_hybrid(
         }
 
         let msg = format!(
-            "diff output exceeded patch budget ({max_bytes} bytes); compacted {compacted_files} file chunk(s) ({})",
+            "diff output exceeded patch budget ({budget_label}); compacted {compacted_files} file chunk(s) ({})",
             detail_parts.join(", ")
         );
         if !warnings.contains(&msg) {
@@ -4704,18 +4796,46 @@ fn generate_diff_preamble(repo_root: &Path, source: GitDiffSource<'_>) -> String
 /// Generates the full combined diff for the workspace, expanding supported languages
 /// with Tree-Sitter AST context and falling back to `git diff -W` for unsupported ones.
 /// Uses a single `git diff -U0 -M` (or `git show -U0 -M`) execution to eliminate per-file subprocess overhead.
+/// Does not truncate production code by default; logs a warning if output exceeds the advisory
+/// threshold (`512 KiB` default, or `ANTICRUMB_PATCH_BUDGET_KIB`).
 pub fn generate_expanded_diff_for_source(
     workspace: &Path,
     source: GitDiffSource<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<String> {
-    generate_expanded_diff_with_config(
+    generate_expanded_diff_for_source_with_threshold(
         workspace,
         source,
         resolve_patch_budget_bytes(),
-        HybridConfig::full(),
         warnings,
     )
+}
+
+pub(super) fn generate_expanded_diff_for_source_with_threshold(
+    workspace: &Path,
+    source: GitDiffSource<'_>,
+    warn_threshold: usize,
+    warnings: &mut Vec<String>,
+) -> Result<String> {
+    let out = generate_expanded_diff_with_config(
+        workspace,
+        source,
+        usize::MAX,
+        HybridConfig::full(),
+        warnings,
+    )?;
+    if out.len() > warn_threshold {
+        let actual_label = format_human_size(out.len());
+        let limit_label = format_budget_size(warn_threshold);
+        let est_tokens_k = (out.len() / 4).div_ceil(1000);
+        let msg = format!(
+            "diff output ({actual_label}, ~{est_tokens_k}k tokens) exceeds {limit_label} threshold"
+        );
+        if !warnings.contains(&msg) {
+            warnings.push(msg);
+        }
+    }
+    Ok(out)
 }
 
 /// Generates an expanded diff with explicit byte budget and `HybridConfig` ablation flags
@@ -5055,11 +5175,13 @@ pub fn generate_expanded_diff_with_config(
                     let mut meta = base_meta();
                     meta.changed_symbols = new_file_symbols;
                     if is_deleted && !path_is_test && !is_special_mode && hybrid.layer3_callers {
-                        if let Some(lang) = SupportedLanguage::from_path(&target_path) {
+                        if let Some(candidates) =
+                            SupportedLanguage::candidates_for_path(&target_path)
+                        {
                             meta.reverse_targets = hybrid::collect_deleted_reverse_targets(
                                 chunk,
                                 &target_path,
-                                lang,
+                                candidates,
                             );
                         }
                     }
@@ -5081,14 +5203,14 @@ pub fn generate_expanded_diff_with_config(
                     ));
                 }
 
-                let expanded_data = match SupportedLanguage::from_path(&target_path) {
-                    Some(lang) => {
+                let expanded_data = match SupportedLanguage::candidates_for_path(&target_path) {
+                    Some(candidates) => {
                         match expand_chunk_with_treesitter(
                             &repo_root,
                             &target_path,
                             chunk,
                             source,
-                            lang,
+                            candidates,
                             &moved_deleted_map,
                             hybrid,
                         ) {
@@ -5111,23 +5233,48 @@ pub fn generate_expanded_diff_with_config(
                                     file_warnings,
                                 ));
                             }
+                            Ok(Some(TreeSitterExpandResult::NoMatchingPriorityLanguage)) => {
+                                let rendered = git_diff_w_for_file(
+                                    &repo_root,
+                                    &target_path,
+                                    old_path.as_deref(),
+                                    source,
+                                )?;
+                                file_warnings.push(format!(
+                                    "tree-sitter: no matching grammar for '{}' (tried: {}); falling back to git diff -W ({})",
+                                    target_path.display(),
+                                    candidates.format_names(),
+                                    format_human_size(rendered.len())
+                                ));
+                                ExpandedChunkData {
+                                    rendered,
+                                    inline_test_blocks: Vec::new(),
+                                    changed_symbols: Vec::new(),
+                                    local_context: Vec::new(),
+                                    cross_query: None,
+                                    exposed_defs: Vec::new(),
+                                    reverse_targets: Vec::new(),
+                                }
+                            }
                             Ok(Some(TreeSitterExpandResult::Expanded(data)))
                                 if !data.rendered.trim().is_empty() =>
                             {
                                 *data
                             }
                             Ok(Some(TreeSitterExpandResult::Expanded(_))) | Ok(None) => {
+                                let rendered = git_diff_w_for_file(
+                                    &repo_root,
+                                    &target_path,
+                                    old_path.as_deref(),
+                                    source,
+                                )?;
                                 file_warnings.push(format!(
-                                    "tree-sitter: could not expand '{}'; falling back to git diff -W",
-                                    target_path.display()
+                                    "tree-sitter: could not expand '{}'; falling back to git diff -W ({})",
+                                    target_path.display(),
+                                    format_human_size(rendered.len())
                                 ));
                                 ExpandedChunkData {
-                                    rendered: git_diff_w_for_file(
-                                        &repo_root,
-                                        &target_path,
-                                        old_path.as_deref(),
-                                        source,
-                                    )?,
+                                    rendered,
                                     inline_test_blocks: Vec::new(),
                                     changed_symbols: Vec::new(),
                                     local_context: Vec::new(),
@@ -5160,17 +5307,19 @@ pub fn generate_expanded_diff_with_config(
                                         file_warnings,
                                     ));
                                 }
+                                let rendered = git_diff_w_for_file(
+                                    &repo_root,
+                                    &target_path,
+                                    old_path.as_deref(),
+                                    source,
+                                )?;
                                 file_warnings.push(format!(
-                                    "tree-sitter: failed for '{}' ({e}); falling back to git diff -W",
-                                    target_path.display()
+                                    "tree-sitter: failed for '{}' ({e}); falling back to git diff -W ({})",
+                                    target_path.display(),
+                                    format_human_size(rendered.len())
                                 ));
                                 ExpandedChunkData {
-                                    rendered: git_diff_w_for_file(
-                                        &repo_root,
-                                        &target_path,
-                                        old_path.as_deref(),
-                                        source,
-                                    )?,
+                                    rendered,
                                     inline_test_blocks: Vec::new(),
                                     changed_symbols: Vec::new(),
                                     local_context: Vec::new(),
@@ -5201,23 +5350,47 @@ pub fn generate_expanded_diff_with_config(
                                 file_warnings,
                             ));
                         }
-                        file_warnings.push(format!(
-                            "tree-sitter: unsupported language for '{}'; falling back to git diff -W",
-                            target_path.display()
-                        ));
-                        ExpandedChunkData {
-                            rendered: git_diff_w_for_file(
+                        if SupportedLanguage::is_plain_diff_path(&target_path) {
+                            let u3 = git_diff_u3_for_file(
                                 &repo_root,
                                 &target_path,
                                 old_path.as_deref(),
                                 source,
-                            )?,
-                            inline_test_blocks: Vec::new(),
-                            changed_symbols: Vec::new(),
-                            local_context: Vec::new(),
-                            cross_query: None,
-                            exposed_defs: Vec::new(),
-                            reverse_targets: Vec::new(),
+                            )?;
+                            ExpandedChunkData {
+                                rendered: if u3.trim().is_empty() {
+                                    chunk.clone()
+                                } else {
+                                    u3
+                                },
+                                inline_test_blocks: Vec::new(),
+                                changed_symbols: Vec::new(),
+                                local_context: Vec::new(),
+                                cross_query: None,
+                                exposed_defs: Vec::new(),
+                                reverse_targets: Vec::new(),
+                            }
+                        } else {
+                            let rendered = git_diff_w_for_file(
+                                &repo_root,
+                                &target_path,
+                                old_path.as_deref(),
+                                source,
+                            )?;
+                            file_warnings.push(format!(
+                                "tree-sitter: unsupported language for '{}'; falling back to git diff -W ({})",
+                                target_path.display(),
+                                format_human_size(rendered.len())
+                            ));
+                            ExpandedChunkData {
+                                rendered,
+                                inline_test_blocks: Vec::new(),
+                                changed_symbols: Vec::new(),
+                                local_context: Vec::new(),
+                                cross_query: None,
+                                exposed_defs: Vec::new(),
+                                reverse_targets: Vec::new(),
+                            }
                         }
                     }
                 };

@@ -1314,6 +1314,9 @@ impl State {
                     self.phase = "ready".into();
                     self.copy_response.clear();
                     self.subagents.clear();
+                    self.reset_scroll();
+                    self.clear_selection();
+                    self.clear_painted_regions();
                     if command == "/clear" {
                         self.transcript.clear();
                     }
@@ -1587,8 +1590,16 @@ impl State {
         for warning in &prepared.warnings {
             self.log_warning(warning);
         }
+        for display in &prepared.resolved_mentions {
+            if let Some(recent) =
+                super::mentions::recent_mention_from_resolved(&self.options.workspace, display)
+            {
+                self.remember_mention(recent);
+            }
+        }
         self.remember_draft(&draft);
-        self.scroll = 0;
+        self.reset_scroll();
+        self.clear_selection();
         self.pending = Some((draft, std::mem::take(&mut self.files)));
         self.editor.set(String::new());
         self.completion = None;
@@ -1612,7 +1623,7 @@ impl State {
             let request = self
                 .options
                 .agent_request(prepared.text, self.parent.clone());
-            self.pending_temporary = Some(request.temporary);
+            self.pending_temporary = Some(request.is_temporary());
             Command::Start(request, prepared.files, prepared.temp_files)
         };
         self.send(sink, command);

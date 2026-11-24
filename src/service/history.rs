@@ -179,7 +179,7 @@ impl Service {
         url: Option<&str>,
         peer: Option<(&str, i64)>,
     ) -> Result<()> {
-        self.mark_web_history_sessions(account, url, peer, "deleted")
+        self.mark_web_history_sessions(account, url, peer, SessionState::Deleted)
     }
 
     pub(crate) fn invalidate_web_history_sessions(
@@ -188,7 +188,12 @@ impl Service {
         peer: &str,
         cutoff: i64,
     ) -> Result<()> {
-        self.mark_web_history_sessions(account, None, Some((peer, cutoff)), "invalidated")
+        self.mark_web_history_sessions(
+            account,
+            None,
+            Some((peer, cutoff)),
+            SessionState::Invalidated,
+        )
     }
 
     fn mark_web_history_sessions(
@@ -196,13 +201,13 @@ impl Service {
         account: &str,
         url: Option<&str>,
         peer: Option<(&str, i64)>,
-        state: &str,
+        state: SessionState,
     ) -> Result<()> {
         for mut session in self.store.list::<Session>("local", "session")? {
             if session.account_id != account || session.mode == SessionMode::Temporary {
                 continue;
             }
-            if state == "invalidated" && session.state == "deleted" {
+            if state == SessionState::Invalidated && session.state == SessionState::Deleted {
                 continue;
             }
             if let Some(url) = url {
@@ -225,7 +230,7 @@ impl Service {
                     continue;
                 }
             }
-            session.state = state.into();
+            session.state = state;
             self.store.put("local", "session", &session.id, &session)?;
         }
         Ok(())
@@ -338,14 +343,14 @@ mod tests {
                 .get::<Session>("local", "session", "owned")
                 .unwrap()
                 .state,
-            "deleted"
+            SessionState::Deleted
         );
         assert_eq!(
             store
                 .get::<Session>("local", "session", "other")
                 .unwrap()
                 .state,
-            "ready"
+            SessionState::Ready
         );
         let restarted =
             Service::new(Store::open(directory.path()).unwrap(), backend.clone()).unwrap();
@@ -360,14 +365,14 @@ mod tests {
                 .get::<Session>("local", "session", "other")
                 .unwrap()
                 .state,
-            "deleted"
+            SessionState::Deleted
         );
         assert_eq!(
             store
                 .get::<Session>("local", "session", "unrelated")
                 .unwrap()
                 .state,
-            "ready"
+            SessionState::Ready
         );
         assert!(
             store

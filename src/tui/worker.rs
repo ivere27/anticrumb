@@ -82,6 +82,7 @@ pub(super) enum Command {
         id: u64,
         workspace: PathBuf,
         query: String,
+        recent: Vec<super::preferences::RecentMention>,
     },
 }
 

@@ -34,6 +34,76 @@ impl Relay {
         self.runtime
             .block_on(download_artifact(&self.client, &self.store, account, id))
     }
+    fn verify_remote_session(
+        &self,
+        account: &Account,
+        session: &mut Session,
+        remote_id: &str,
+    ) -> Result<()> {
+        let recorded: RemoteTurnRef = self.store.get(&session.id, "remote", "turn")?;
+        if recorded.server_id != self.peer {
+            return Err(ServiceError::invalid(
+                "saved web conversation belongs to a different browser daemon; reconnect to its original host",
+            ));
+        }
+        let remote = match self
+            .runtime
+            .block_on(self.client.get_session(pb::SessionRef {
+                id: remote_id.to_owned(),
+            })) {
+            Ok(remote) => remote,
+            Err(err)
+                if err.code == ErrorCode::NotFound && session.mode == SessionMode::Temporary =>
+            {
+                session.state = SessionState::Invalidated;
+                return Err(ServiceError::session_unavailable(
+                    "resume",
+                    "session no longer available",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        if remote.account_id != account.id {
+            return Err(ServiceError::invalid(
+                "remote session belongs to a different account",
+            ));
+        }
+        let remote_mode = codec::session_mode_from(remote.mode)?;
+        if remote_mode != session.mode {
+            return Err(ServiceError::invalid("remote session mode mismatch"));
+        }
+        match codec::session_state_from(remote.state)? {
+            SessionState::Deleted => {
+                session.state = SessionState::Deleted;
+                Err(ServiceError::invalid(
+                    "this web conversation was deleted on the browser daemon; resume the saved conversation or start a new one to send its full context",
+                ))
+            }
+            SessionState::OutcomeUnknown => {
+                session.state = SessionState::OutcomeUnknown;
+                Err(ServiceError::new(
+                    ErrorCode::SubmissionOutcomeUnknown,
+                    "resume",
+                    "remote session outcome is unknown; reconcile before retrying",
+                ))
+            }
+            state
+                if session.mode == SessionMode::Temporary
+                    && state.is_unavailable_for_temporary_resume() =>
+            {
+                session.state = if state == SessionState::Closed {
+                    SessionState::Closed
+                } else {
+                    SessionState::Invalidated
+                };
+                Err(ServiceError::session_unavailable(
+                    "resume",
+                    "session no longer available",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 pub(super) async fn download_artifact(
@@ -83,30 +153,12 @@ impl Backend for Relay {
         cancel: CancelToken,
         emit: Emit<'_>,
     ) -> Result<TurnResult> {
-        if let Some(remote_id) = &session.remote_session_id {
-            let recorded: RemoteTurnRef = self.store.get(&session.id, "remote", "turn")?;
-            if recorded.server_id != self.peer {
-                return Err(ServiceError::invalid(
-                    "saved web conversation belongs to a different browser daemon; reconnect to its original host",
-                ));
-            }
-            let known = self
-                .runtime
-                .block_on(self.client.list_sessions(pb::Empty {}))?;
-            if known.sessions.iter().any(|remote| {
-                remote.id == *remote_id
-                    && remote.account_id == account.id
-                    && remote.state == "deleted"
-            }) {
-                session.state = "deleted".into();
-                return Err(ServiceError::invalid(
-                    "this web conversation was deleted on the browser daemon; resume the saved conversation or start a new one to send its full context",
-                ));
-            }
+        if let Some(remote_id) = session.remote_session_id.clone() {
+            self.verify_remote_session(account, session, &remote_id)?;
         }
         let mut remote = request.clone();
         remote.session_id = session.remote_session_id.clone(); // The remote identity is separate from Chrome URLs and workspace paths.
-        remote.keep_session = true;
+        remote.retention = SessionRetention::Retain;
         remote.reuse_scope = None;
         // A backend invocation is one logical local turn. Persist its unique key
         // below for reconciliation; a later turn must not reuse a failed turn's key.
@@ -295,7 +347,7 @@ pub(crate) async fn workspace_with_browser(
             )?;
         }
         for mut session in store.list::<Session>("local", "session")? {
-            session.state = "closed".into();
+            session.state = SessionState::Closed;
             store.put("local", "session", &session.id, &session)?;
         }
         store.put("local", "host", "browser_peer", &info.server_id)?;

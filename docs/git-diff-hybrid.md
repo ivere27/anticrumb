@@ -1,6 +1,6 @@
 # 3-Layer Hybrid Git+AST Diff (`@git:diff+`, `@git:staged+`, `@git:<commit>+`)
 
-`anticrumb` provides AST-expanded git patch attachments optimized for **1-turn LLM code review attention efficiency**. By combining `git diff` with LSP-free Tree-sitter AST analysis, `@git:diff+`, `@git:staged+`, and `@git:<commit>+` deliver self-contained patches within a bounded byte budget (`512 KiB` default, configurable via `ANTICRUMB_PATCH_BUDGET_KIB`).
+`anticrumb` provides AST-expanded git patch attachments optimized for **1-turn LLM code review attention efficiency**. By combining `git diff` with LSP-free Tree-sitter AST analysis, `@git:diff+`, `@git:staged+`, and `@git:<commit>+` deliver self-contained patches without truncating production code (logging an advisory warning when output exceeds `512 KiB`, configurable via `ANTICRUMB_PATCH_BUDGET_KIB`).
 
 ---
 
@@ -128,17 +128,22 @@ L19: pub fn reserve_funds(account_id: u64, amount_cents: u64, timeout_ms: u64, i
 | **Go** | `.go` | `func`, method receivers, `type struct/interface` | Same-directory package siblings + internal package imports, `//` docs |
 | **Java** | `.java` | `class`, `interface`, `enum`, `record`, methods, `@Annotation` | `import pkg.Type;` + same-package siblings, JavaDoc `/** */` |
 | **C#** | `.cs` | `class`, `struct`, `interface`, `enum`, `record`, methods, `[Attr]` | `using Namespace;` + same-directory siblings, `/// <summary>` docs |
-| **C / C++** | `.c`, `.h`, `.cc`, `.cpp`, `.hpp`, `.cxx`, `.hxx` | `fn`, `struct`, `class`, `enum`, `namespace`, templates | `#include "..."` + paired header/source siblings, `///`/`/** */` |
+| **C / C++ / CUDA** | `.c`, `.h`, `.cc`, `.cpp`, `.hpp`, `.cxx`, `.hxx`, `.cu`, `.cuh` (plus `.inc` via priority gate) | `fn`, `struct`, `class`, `enum`, `namespace`, templates | `#include "..."` + paired header/source siblings, `///`/`/** */` |
 | **Ruby** | `.rb` | `class`, `module`, `def`, `def self.foo` | `require_relative`, `require`, `#` docs |
 | **Bash / JSON** | `.sh`, `.bash`, `.json` | Enclosing function / key expansion (Layer 2) | Excluded from Layer 3 cross-file resolution |
 
-Unsupported file extensions automatically fall back to `git diff -W` (function context) with a non-fatal warning.
+Extension mappings are declared in `src/tree_sitter_diff/extensions.json`:
+- **`exact`**: unambiguous 1:1 extension-to-language mappings parsed directly (including `.cu`/`.cuh` mapped to `cpp`).
+- **`priority`**: ambiguous extensions mapped to an ordered list of candidate languages (e.g. `"inc": ["cpp"]`, extensible to `["cpp", "php", ...]`). Candidates are tried in priority order and validated via Tree-sitter's AST `ERROR`/`MISSING` nodes; if no candidate parses cleanly, the file falls back to `git diff -W` with a non-fatal warning.
+- **`plain_diff`**: non-code documentation, text, and config extensions (`.md`, `.txt`, `.yml`, `.yaml`, `.toml`, `.csv`, etc.) attached directly as clean `-U3` unified diffs with zero fallback warnings.
+
+Other unsupported file extensions automatically fall back to `git diff -W` (function context) with a non-fatal warning.
 
 ---
 
-## 4. Progressive Budget & Compaction Tiers
+## 4. Pre-Omission & Size Warning (Plus Explicit-Budget Compaction Engine)
 
-Total output is strictly bounded by `ANTICRUMB_PATCH_BUDGET_KIB` (default `512 KiB`, range `16`–`16384 KiB`). When a patch exceeds the budget, `apply_patch_budget_with_hybrid` degrades non-essential content in five progressive tiers before ever truncating modified production code:
+By default, `@git:diff+`, `@git:staged+`, and `@git:<commit>+` apply noise pre-omission (Tier 1 lockfiles/minified/generated files and large new test summaries) without truncating production code, and log a warning when the resulting patch exceeds `ANTICRUMB_PATCH_BUDGET_KIB` (default `512 KiB`, clamped `16`–`16384 KiB`). When an explicit byte budget is supplied via `generate_expanded_diff_with_config` (used by `diff_ab_bench` and compaction tests), `apply_patch_budget_with_hybrid` degrades non-essential content in five progressive tiers before truncating modified production code:
 
 1. **Tier 1 (Pre-Omission):** Lockfiles (`Cargo.lock`, `package-lock.json`, etc.), minified bundles (`*.min.js`, `*.map`), and generated code (`@generated`, protobuf/codegen outputs) are replaced with 1-line summaries.
 2. **Tier 2 (Test Compaction):** Large new test files are summarized with a symbol index; modified test files and inline `#[cfg(test)]` blocks degrade to `-U3` / `-U0` or fold before production files are touched.

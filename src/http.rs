@@ -30,7 +30,7 @@ impl IntoResponse for ServiceError {
             ErrorCode::AuthRequired | ErrorCode::VerificationRequired => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            ErrorCode::Cancelled => StatusCode::CONFLICT,
+            ErrorCode::Cancelled | ErrorCode::SessionUnavailable => StatusCode::CONFLICT,
             ErrorCode::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::BAD_GATEWAY,
         };

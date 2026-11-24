@@ -1470,7 +1470,10 @@ mod unix_pty {
         pty1.wait_for("Attachment turn 1 completed.");
         pty1.send("/exit\r");
         assert_eq!(pty1.wait_exit(), 0);
-        assert_eq!(observations_at(&state)["tasks"][0]["temporary"], true);
+        assert_eq!(
+            observations_at(&state)["tasks"][0]["session_mode"],
+            "temporary"
+        );
 
         // Session 2: relaunched without CLI flags restores saved temporary mode, then `/temp off`
         // persists normal mode back to disk.
@@ -1496,8 +1499,11 @@ mod unix_pty {
         pty2.wait_for("Attachment turn 3 completed.");
         pty2.send("/exit\r");
         assert_eq!(pty2.wait_exit(), 0);
-        assert_eq!(observations_at(&state)["tasks"][1]["temporary"], true);
-        assert_eq!(observations_at(&state)["tasks"][2]["temporary"], false);
+        assert_eq!(
+            observations_at(&state)["tasks"][1]["session_mode"],
+            "temporary"
+        );
+        assert_eq!(observations_at(&state)["tasks"][2]["session_mode"], "chat");
 
         // Session 3: relaunched without flags stays in persisted non-temp mode.
         let mut pty3 = PtyHarness::spawn(&binary, &state, &workspace, &env);
@@ -1509,7 +1515,7 @@ mod unix_pty {
         pty3.wait_for("Attachment turn 4 completed.");
         pty3.send("/exit\r");
         assert_eq!(pty3.wait_exit(), 0);
-        assert_eq!(observations_at(&state)["tasks"][3]["temporary"], false);
+        assert_eq!(observations_at(&state)["tasks"][3]["session_mode"], "chat");
 
         // Session 4: relaunched with `--temp` enables temporary mode for this run over saved `/temp off`.
         let mut pty4 = PtyHarness::spawn_with_args(&binary, &state, &workspace, &["--temp"], &env);
@@ -1524,7 +1530,10 @@ mod unix_pty {
         pty4.wait_for("Attachment turn 5 completed.");
         pty4.send("/exit\r");
         assert_eq!(pty4.wait_exit(), 0);
-        assert_eq!(observations_at(&state)["tasks"][4]["temporary"], true);
+        assert_eq!(
+            observations_at(&state)["tasks"][4]["session_mode"],
+            "temporary"
+        );
     }
 
     fn observations_at(state: &Path) -> serde_json::Value {

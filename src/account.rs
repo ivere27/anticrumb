@@ -129,7 +129,7 @@ pub fn browser_status(store: &Store, id: &str) -> Result<BrowserStatusRecord> {
     let owned = store
         .list::<Session>("local", "session")?
         .iter()
-        .filter(|s| s.account_id == id && s.state != "closed")
+        .filter(|s| s.account_id == id && s.state != SessionState::Closed)
         .count() as u64;
     Ok(BrowserStatusRecord {
         account_id: id.into(),
@@ -161,7 +161,7 @@ pub fn attach(store: &Store, id: &str, port: u16) -> Result<BrowserStatusRecord>
     if store
         .list::<Session>("local", "session")?
         .iter()
-        .any(|s| s.account_id == id && s.state != "closed")
+        .any(|s| s.account_id == id && s.state != SessionState::Closed)
     {
         return Err(ServiceError::invalid(
             "close owned sessions before attaching another browser",
@@ -208,17 +208,14 @@ pub(crate) fn invalidate_account_sessions(store: &Store, id: &str) -> Result<()>
         if session.account_id != id {
             continue;
         }
-        if !matches!(
-            session.state.as_str(),
-            "closed" | "deleted" | "invalidated" | "outcome_unknown"
-        ) {
-            let resumable_chat = session.state == "ready"
+        if !session.is_inactive() {
+            let resumable_chat = session.state == SessionState::Ready
                 && session.mode == SessionMode::Chat
                 && (session.remote_url.is_some() || session.remote_session_id.is_some());
             session.state = if resumable_chat {
-                "closed".into()
+                SessionState::Closed
             } else {
-                "invalidated".into()
+                SessionState::Invalidated
             };
             session.target_id = None;
             store.put("local", "session", &session.id, &session)?;
@@ -297,7 +294,7 @@ pub fn login(store: &Store, id: &str, provider: &dyn Provider) -> Result<()> {
     if store
         .list::<Session>("local", "session")?
         .iter()
-        .any(|s| s.account_id == id && s.state == "ready" && s.target_id.is_some())
+        .any(|s| s.account_id == id && s.state == SessionState::Ready && s.target_id.is_some())
     {
         return Err(ServiceError::invalid(
             "close active sessions before restarting the account browser for login",
@@ -339,7 +336,7 @@ mod tests {
         store.put("local", "account", &acct.id, &acct).unwrap();
 
         let make_session =
-            |sid: &str, account_id: &str, state: &str, target: Option<&str>| Session {
+            |sid: &str, account_id: &str, state: SessionState, target: Option<&str>| Session {
                 id: sid.into(),
                 provider: default_provider(),
                 account_id: account_id.into(),
@@ -348,7 +345,7 @@ mod tests {
                 remote_url: None,
                 remote_session_id: None,
                 history: vec![],
-                state: state.into(),
+                state,
                 model: None,
                 thinking: None,
                 tool_digest: String::new(),
@@ -361,7 +358,7 @@ mod tests {
                 "local",
                 "session",
                 "s-ready",
-                &make_session("s-ready", "default", "ready", Some("t1")),
+                &make_session("s-ready", "default", SessionState::Ready, Some("t1")),
             )
             .unwrap();
         store
@@ -369,7 +366,12 @@ mod tests {
                 "local",
                 "session",
                 "s-human",
-                &make_session("s-human", "default", "awaiting_human", Some("t2")),
+                &make_session(
+                    "s-human",
+                    "default",
+                    SessionState::AwaitingHuman,
+                    Some("t2"),
+                ),
             )
             .unwrap();
         store
@@ -377,7 +379,7 @@ mod tests {
                 "local",
                 "session",
                 "s-deleted",
-                &make_session("s-deleted", "default", "deleted", Some("t3")),
+                &make_session("s-deleted", "default", SessionState::Deleted, Some("t3")),
             )
             .unwrap();
         store
@@ -385,7 +387,12 @@ mod tests {
                 "local",
                 "session",
                 "s-unknown",
-                &make_session("s-unknown", "default", "outcome_unknown", Some("t4")),
+                &make_session(
+                    "s-unknown",
+                    "default",
+                    SessionState::OutcomeUnknown,
+                    Some("t4"),
+                ),
             )
             .unwrap();
         store
@@ -393,27 +400,36 @@ mod tests {
                 "local",
                 "session",
                 "s-other",
-                &make_session("s-other", "other", "ready", Some("t5")),
+                &make_session("s-other", "other", SessionState::Ready, Some("t5")),
             )
             .unwrap();
 
-        let mut resumable_chat =
-            make_session("s-chat-resumable", "default", "ready", Some("t-chat"));
+        let mut resumable_chat = make_session(
+            "s-chat-resumable",
+            "default",
+            SessionState::Ready,
+            Some("t-chat"),
+        );
         resumable_chat.remote_url = Some("https://claude.ai/chat/123".into());
         resumable_chat.remote_turns = 1;
         store
             .put("local", "session", "s-chat-resumable", &resumable_chat)
             .unwrap();
 
-        let mut temp_session = make_session("s-temp", "default", "ready", Some("t-temp"));
+        let mut temp_session =
+            make_session("s-temp", "default", SessionState::Ready, Some("t-temp"));
         temp_session.mode = SessionMode::Temporary;
         temp_session.remote_url = Some("https://gemini.google.com/app/temp".into());
         store
             .put("local", "session", "s-temp", &temp_session)
             .unwrap();
 
-        let mut human_with_url =
-            make_session("s-human-url", "default", "awaiting_human", Some("t-h"));
+        let mut human_with_url = make_session(
+            "s-human-url",
+            "default",
+            SessionState::AwaitingHuman,
+            Some("t-h"),
+        );
         human_with_url.remote_url = Some("https://claude.ai/chat/456".into());
         store
             .put("local", "session", "s-human-url", &human_with_url)
@@ -426,30 +442,30 @@ mod tests {
 
         invalidate_account_sessions(&store, "default").unwrap();
         let ready: Session = store.get("local", "session", "s-ready").unwrap();
-        assert_eq!(ready.state, "invalidated");
+        assert_eq!(ready.state, SessionState::Invalidated);
         assert!(ready.target_id.is_none());
         let chat_resumable: Session = store.get("local", "session", "s-chat-resumable").unwrap();
-        assert_eq!(chat_resumable.state, "closed");
+        assert_eq!(chat_resumable.state, SessionState::Closed);
         assert!(chat_resumable.target_id.is_none());
         assert_eq!(
             chat_resumable.remote_url.as_deref(),
             Some("https://claude.ai/chat/123")
         );
         let temp: Session = store.get("local", "session", "s-temp").unwrap();
-        assert_eq!(temp.state, "invalidated");
+        assert_eq!(temp.state, SessionState::Invalidated);
         assert!(temp.target_id.is_none());
         let human: Session = store.get("local", "session", "s-human").unwrap();
-        assert_eq!(human.state, "invalidated");
+        assert_eq!(human.state, SessionState::Invalidated);
         assert!(human.target_id.is_none());
         let human_url: Session = store.get("local", "session", "s-human-url").unwrap();
-        assert_eq!(human_url.state, "invalidated");
+        assert_eq!(human_url.state, SessionState::Invalidated);
         assert!(human_url.target_id.is_none());
         let deleted: Session = store.get("local", "session", "s-deleted").unwrap();
-        assert_eq!(deleted.state, "deleted");
+        assert_eq!(deleted.state, SessionState::Deleted);
         let unknown: Session = store.get("local", "session", "s-unknown").unwrap();
-        assert_eq!(unknown.state, "outcome_unknown");
+        assert_eq!(unknown.state, SessionState::OutcomeUnknown);
         let other: Session = store.get("local", "session", "s-other").unwrap();
-        assert_eq!(other.state, "ready");
+        assert_eq!(other.state, SessionState::Ready);
         assert_eq!(other.target_id.as_deref(), Some("t5"));
 
         // Active run check rejects mode switching while queued/running.

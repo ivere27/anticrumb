@@ -422,17 +422,16 @@ impl Service {
         // An explicit session is the sole continuation authority. Never infer it from a global last request.
         if let Some(id) = &request.session_id {
             let session: Session = self.store.get("local", "session", id)?;
-            let can_reopen_closed = session.state == "closed"
-                && session.mode == SessionMode::Chat
-                && (session.remote_url.is_some() || session.remote_session_id.is_some());
             if session.account_id != account.id
                 || session.provider != account.provider
                 || session.mode != request.mode
-                || (session.state != "ready" && !can_reopen_closed)
             {
                 return Err(ServiceError::invalid(
                     "session ownership, provider, mode, or state mismatch",
                 ));
+            }
+            if !session.is_continuable() {
+                return Err(uncontinuable_session_error(&session, "validate"));
             }
         }
         let admission = self.admission.clone().try_acquire_owned().map_err(|_| {
@@ -573,7 +572,7 @@ impl Service {
                 .filter(|s| {
                     s.account_id == account.id
                         && s.provider == account.provider
-                        && s.state == "ready"
+                        && s.state == SessionState::Ready
                         && s.reuse_scope == request.reuse_scope
                         && s.model == request.model
                         && s.thinking == request.thinking
@@ -599,7 +598,7 @@ impl Service {
                     )?;
                 }
             }
-            request.keep_session = true;
+            request.retention = SessionRetention::Retain;
             if request.session_id.is_none() {
                 // Keep at most two provider cache tabs per account; explicit user sessions are never evicted.
                 let count = known
@@ -615,7 +614,7 @@ impl Service {
                             s.account_id == account.id
                                 && s.reuse_scope.is_some()
                                 && !s.is_inactive()
-                                && s.state != "running"
+                                && s.state != SessionState::Running
                         })
                         .collect::<Vec<_>>();
                     idle.sort_by_key(|s| s.last_used);
@@ -627,28 +626,31 @@ impl Service {
                     });
                     if let Some((old, _permit)) = evictable {
                         self.backend.close(account, old)?;
-                        old.state = "closed".into();
+                        old.target_id = None;
+                        old.state = SessionState::Closed;
                         self.store.put("local", "session", &old.id, old)?;
                     } else {
                         // Both retained cache conversations are in use. Run this
                         // independent request without retaining a third cache entry.
                         reuse = false;
                         request.reuse_scope = None;
-                        request.keep_session = false;
+                        request.retention = SessionRetention::Ephemeral;
                     }
                 }
             }
         }
         let mut session = if let Some(id) = &request.session_id {
             let s: Session = self.store.get("local", "session", id)?;
-            let can_reopen_closed = s.state == "closed"
-                && s.mode == SessionMode::Chat
-                && (s.remote_url.is_some() || s.remote_session_id.is_some());
-            if (s.state != "ready" && !can_reopen_closed)
-                || s.account_id != account.id
+            if s.account_id != account.id
                 || s.provider != account.provider
+                || s.mode != request.mode
             {
-                return Err(ServiceError::invalid("session no longer available"));
+                return Err(ServiceError::invalid(
+                    "session ownership, provider, mode, or state mismatch",
+                ));
+            }
+            if !s.is_continuable() {
+                return Err(uncontinuable_session_error(&s, "prepare"));
             }
             s
         } else {
@@ -656,12 +658,12 @@ impl Service {
                 id: id("session"),
                 provider: account.provider.clone(),
                 account_id: account.id.clone(),
-                mode: worker_run.request.mode.clone(),
+                mode: worker_run.request.mode,
                 target_id: None,
                 remote_url: None,
                 remote_session_id: None,
                 history: vec![],
-                state: "ready".into(),
+                state: SessionState::Ready,
                 model: None,
                 thinking: None,
                 tool_digest: tools.clone(),
@@ -684,7 +686,7 @@ impl Service {
         }
         // Changing a tool contract is explicit in the next prompt, never silently cached.
         session.tool_digest = tools;
-        session.state = "running".into();
+        session.state = SessionState::Running;
         worker_run.state = "preparing".into();
         self.store.put("local", "run", &worker_run.id, worker_run)?;
         self.store.put("local", "session", &session.id, &session)?;
@@ -702,7 +704,7 @@ impl Service {
         let gate = self.account_gate(&account.id);
         let _preparation = gate.preparation.lock().map_err(ServiceError::storage)?;
         if let Ok(value) = result {
-            session.state = "ready".into();
+            session.state = SessionState::Ready;
             session.history.extend(request.messages.clone());
             let mut blocks = vec![Block::Text {
                 text: value.text.clone(),
@@ -720,18 +722,27 @@ impl Service {
             });
             session.model = request.model.clone();
             session.thinking = request.thinking.clone();
-        } else if session.state != "deleted" {
-            let unsubmitted_existing = session.remote_turns > 0
-                && worker_run.state != "submitted"
-                && result
-                    .as_ref()
-                    .err()
-                    .is_none_or(|e| e.code != ErrorCode::SubmissionOutcomeUnknown);
-            session.state = if unsubmitted_existing {
-                "ready".into()
+        } else if !session.state.is_terminated() {
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.code == ErrorCode::SessionUnavailable)
+            {
+                session.state = SessionState::Invalidated;
+                session.target_id = None;
             } else {
-                "outcome_unknown".into()
-            };
+                let unsubmitted_existing = session.remote_turns > 0
+                    && worker_run.state != "submitted"
+                    && result
+                        .as_ref()
+                        .err()
+                        .is_none_or(|e| e.code != ErrorCode::SubmissionOutcomeUnknown);
+                session.state = if unsubmitted_existing {
+                    SessionState::Ready
+                } else {
+                    SessionState::OutcomeUnknown
+                };
+            }
         }
         let human_required = result.as_ref().err().is_some_and(|error| {
             matches!(
@@ -740,7 +751,7 @@ impl Service {
             )
         });
         if human_required {
-            session.state = "awaiting_human".into();
+            session.state = SessionState::AwaitingHuman;
             self.record_run_event(
                 &worker_run.id,
                 "human_required",
@@ -758,17 +769,20 @@ impl Service {
         // Also release unsubmitted ephemeral sessions if prepare/upload failed
         // before sending anything, so they neither leak Chrome tabs nor fill
         // the retained session cap.
-        let keep_alive_session = request.keep_session
+        let keep_alive_session = request.retention.should_retain_turn()
             && (result.is_ok() || session.remote_url.is_some() || worker_run.state == "submitted");
         if !human_required
-            && session.state != "deleted"
+            && !session.state.is_terminated()
             && !keep_alive_session
             && request.session_id.is_none()
         {
             match self.backend.close(account, session) {
-                Ok(()) => session.state = "closed".into(),
+                Ok(()) => {
+                    session.target_id = None;
+                    session.state = SessionState::Closed;
+                }
                 Err(e) => {
-                    session.state = "cleanup_pending".into();
+                    session.state = SessionState::CleanupPending;
                     let _ = self.record_run_event(
                         &worker_run.id,
                         "cleanup_failed",
@@ -1000,13 +1014,68 @@ impl Service {
             let mut session: Session = store.get("local", "session", &session.id)?;
             let account: Account = store.get("local", "account", &session.account_id)?;
             backend.close(&account, &session)?;
-            if session.state != "deleted" {
-                session.state = "closed".into();
+            session.target_id = None;
+            if session.state != SessionState::Deleted {
+                session.state = SessionState::Closed;
             }
             store.put("local", "session", &session.id, &session)
         })
         .await
         .map_err(ServiceError::storage)?
+    }
+    pub async fn close_sessions(
+        self: &Arc<Self>,
+        ids: &[String],
+    ) -> (Vec<String>, Vec<String>, Vec<(String, ServiceError)>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut closed = Vec::new();
+        let mut skipped = Vec::new();
+        let mut errors = Vec::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let key = id.clone();
+            match self
+                .store
+                .blocking(move |store| store.get::<Session>("local", "session", &key))
+                .await
+            {
+                Ok(session) if session.is_inactive() => {
+                    skipped.push(id.clone());
+                    continue;
+                }
+                Err(err) if err.code == ErrorCode::NotFound => {
+                    skipped.push(id.clone());
+                    continue;
+                }
+                Err(err) => {
+                    errors.push((id.clone(), err));
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match self.close_session(id).await {
+                Ok(()) => closed.push(id.clone()),
+                Err(err) if err.code == ErrorCode::NotFound => skipped.push(id.clone()),
+                Err(err) => errors.push((id.clone(), err)),
+            }
+        }
+        (closed, skipped, errors)
+    }
+}
+
+fn uncontinuable_session_error(session: &Session, stage: &str) -> ServiceError {
+    match session.state {
+        SessionState::Closed | SessionState::Invalidated | SessionState::CleanupPending => {
+            ServiceError::session_unavailable(stage, "session no longer available")
+        }
+        SessionState::OutcomeUnknown => ServiceError::new(
+            ErrorCode::SubmissionOutcomeUnknown,
+            stage,
+            "session outcome is unknown; reconcile before retrying",
+        ),
+        _ => ServiceError::invalid("session ownership, provider, mode, or state mismatch"),
     }
 }
 
@@ -1090,7 +1159,7 @@ mod tests {
         let mut seed = TurnRequest::text("seed");
         seed.reuse_scope = Some("cache-scope".into());
         let (mut cached, _, _) = prepare(seed.clone());
-        cached.state = "ready".into();
+        cached.state = SessionState::Ready;
         cached.history = seed.messages.clone();
         cached.history.push(Message {
             role: Role::Assistant,
@@ -1119,7 +1188,7 @@ mod tests {
             "fallback must retain the complete history"
         );
         assert!(sent.session_id.is_none());
-        fresh.state = "ready".into();
+        fresh.state = SessionState::Ready;
         store.put("local", "session", &fresh.id, &fresh).unwrap();
         let second_explicit = service.session_gate(&fresh.id).try_acquire_owned().unwrap();
         let (uncached, sent, _) = prepare(TurnRequest {
@@ -1127,11 +1196,11 @@ mod tests {
             ..TurnRequest::text("independent")
         });
         assert!(uncached.reuse_scope.is_none());
-        assert!(!sent.keep_session);
+        assert!(!sent.retention.should_retain_turn());
         for sid in [&cached.id, &fresh.id] {
             assert_eq!(
                 store.get::<Session>("local", "session", sid).unwrap().state,
-                "ready"
+                SessionState::Ready
             );
         }
         drop(explicit);
@@ -1193,7 +1262,7 @@ mod tests {
         assert_eq!(backend.0.load(Ordering::SeqCst), 0);
         let sessions = store.sessions_for_account("default").unwrap();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].state, "closed");
+        assert_eq!(sessions[0].state, SessionState::Closed);
     }
 
     #[tokio::test]
@@ -1264,7 +1333,7 @@ mod tests {
                     remote_url: Some("https://gemini.google.com/app/chat_abc".into()),
                     remote_session_id: None,
                     history: vec![],
-                    state: "closed".into(),
+                    state: SessionState::Closed,
                     model: None,
                     thinking: None,
                     tool_digest: String::new(),
@@ -1378,7 +1447,7 @@ mod tests {
 
         let mut turn1 = TurnRequest::text("hi");
         turn1.account_id = "claude".into();
-        turn1.keep_session = true;
+        turn1.retention = SessionRetention::Retain;
         let run1_id = service.submit(turn1).unwrap();
         assert!(wait_until(|| {
             matches!(
@@ -1397,7 +1466,7 @@ mod tests {
         // Simulate `/browser hide` restarting Chrome and clearing live tabs.
         crate::account::invalidate_account_sessions(&store, "claude").unwrap();
         let after_hide: Session = store.get("local", "session", &session_id).unwrap();
-        assert_eq!(after_hide.state, "closed");
+        assert_eq!(after_hide.state, SessionState::Closed);
         assert!(after_hide.target_id.is_none());
         assert_eq!(
             after_hide.remote_url.as_deref(),
@@ -1407,7 +1476,7 @@ mod tests {
         let mut turn2 = TurnRequest::text("follow up");
         turn2.account_id = "claude".into();
         turn2.session_id = Some(session_id.clone());
-        turn2.keep_session = true;
+        turn2.retention = SessionRetention::Retain;
         let run2_id = service.submit(turn2).unwrap();
         assert!(wait_until(|| {
             matches!(
@@ -1426,7 +1495,7 @@ mod tests {
         assert_eq!(res2.text, "turn 2");
 
         let reopened: Session = store.get("local", "session", &session_id).unwrap();
-        assert_eq!(reopened.state, "ready");
+        assert_eq!(reopened.state, SessionState::Ready);
         assert_eq!(reopened.remote_turns, 2);
         assert_eq!(reopened.target_id.as_deref(), Some("tab-turn-2"));
     }
@@ -1465,7 +1534,7 @@ mod tests {
                     remote_url: Some("https://gemini.google.com/app/c1".into()),
                     remote_session_id: None,
                     history: vec![],
-                    state: "ready".into(),
+                    state: SessionState::Ready,
                     model: None,
                     thinking: None,
                     tool_digest: String::new(),

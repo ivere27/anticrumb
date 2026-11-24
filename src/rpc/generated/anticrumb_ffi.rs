@@ -947,9 +947,17 @@ pub fn register_turn_service<S: TurnServiceService>(instance: &mut Instance, ser
 
 pub trait SessionServiceService: synurang_call::Service + 'static {
 
+    fn get_session(&self, context: Context,
+
+        request: SessionRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Session>>;
+
+
     fn list_sessions(&self, context: Context,
 
-        request: Empty,
+        request: ListSessionsRequest,
 
 
     ) -> impl synurang_call::ServiceFuture<Result<SessionList>>;
@@ -961,6 +969,14 @@ pub trait SessionServiceService: synurang_call::Service + 'static {
 
 
     ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
+
+
+    fn close_sessions(&self, context: Context,
+
+        request: CloseSessionsRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<CloseSessionsResult>>;
 
 
     fn delete_conversation(&self, context: Context,
@@ -984,13 +1000,35 @@ pub fn register_session_service<S: SessionServiceService>(instance: &mut Instanc
 
     {
         let service = service.clone();
+        instance.register("/anticrumb.v1.SessionService/GetSession",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<SessionRef>();
+                    let responses = responses.typed::<Session>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.get_session(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
         instance.register("/anticrumb.v1.SessionService/ListSessions",
             false,
             false,
             move |context, requests, responses| {
                 let service = service.clone();
                 Box::pin(async move {
-                    let mut requests = requests.typed::<Empty>();
+                    let mut requests = requests.typed::<ListSessionsRequest>();
                     let responses = responses.typed::<SessionList>();
 
                     let request = requests.one().await?;
@@ -1019,6 +1057,28 @@ pub fn register_session_service<S: SessionServiceService>(instance: &mut Instanc
 
 
                     let response = service.close_session(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.SessionService/CloseSessions",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<CloseSessionsRequest>();
+                    let responses = responses.typed::<CloseSessionsResult>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.close_sessions(context,
                         request).await?;
                     responses.send(response).await
 

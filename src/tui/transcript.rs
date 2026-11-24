@@ -320,6 +320,8 @@ struct TranscriptItem {
 pub(super) struct TranscriptLines {
     items: Rc<Vec<markdown::Line>>,
     stream: Rc<Vec<markdown::Line>>,
+    visible_stream_len: usize,
+    evicted_lines: u64,
 }
 
 impl TranscriptLines {
@@ -329,6 +331,14 @@ impl TranscriptLines {
 
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub(super) fn visible_stream_len(&self) -> usize {
+        self.visible_stream_len
+    }
+
+    pub(super) fn evicted_lines(&self) -> u64 {
+        self.evicted_lines
     }
 
     pub(super) fn clear(&mut self) {
@@ -356,15 +366,20 @@ impl TranscriptLines {
 }
 
 /// Incremental wrap cache. Items are immutable after `push`, so only newly
-/// appended items are rendered; width changes, overflow trimming and `clear`
-/// invalidate. The streaming tail is re-wrapped only when its text changes.
+/// appended items are rendered; width changes and `clear` invalidate, while
+/// front overflow trimming drops only the evicted prefix and records the
+/// removed line count for scroll anchoring. The streaming tail is re-wrapped
+/// only when its text changes.
 #[derive(Default)]
 struct LineCache {
     width: usize,
     rendered_items: usize,
+    item_line_counts: Vec<usize>,
     items: Rc<Vec<markdown::Line>>,
+    evicted_lines: u64,
     stream_text: String,
     stream: Rc<Vec<markdown::Line>>,
+    visible_stream_len: usize,
 }
 
 impl LineCache {
@@ -408,9 +423,21 @@ impl Transcript {
             }
             if drained > 0 {
                 self.items.drain(..drained);
-                // Trimming is rare (only past `max_bytes`); re-wrap lazily.
-                let width = self.cache.get_mut().width;
-                self.cache.get_mut().reset(width);
+                let cache = self.cache.get_mut();
+                let drained_rendered = drained.min(cache.rendered_items);
+                if drained_rendered > 0 {
+                    let drained_lines: usize =
+                        cache.item_line_counts.drain(..drained_rendered).sum();
+                    cache.evicted_lines = cache.evicted_lines.saturating_add(drained_lines as u64);
+                    cache.rendered_items -= drained_rendered;
+                    if cache.rendered_items == 0 {
+                        cache.items = Rc::new(Vec::new());
+                    } else {
+                        let cached_items = Rc::make_mut(&mut cache.items);
+                        let drop_lines = drained_lines.min(cached_items.len());
+                        cached_items.drain(..drop_lines);
+                    }
+                }
             }
         }
     }
@@ -426,7 +453,8 @@ impl Transcript {
     /// Wrapped lines for `width`, reusing previously wrapped items.
     pub(super) fn lines(&self, stream: &str, width: usize) -> TranscriptLines {
         let w = width.saturating_sub(1);
-        let mut cache = self.cache.borrow_mut();
+        let mut cache_ref = self.cache.borrow_mut();
+        let cache = &mut *cache_ref;
         if cache.width != w {
             cache.reset(w);
         }
@@ -435,22 +463,29 @@ impl Transcript {
             // Copies only if a caller still holds the previous snapshot.
             let items = Rc::make_mut(&mut cache.items);
             for item in &self.items[start..] {
+                let before = items.len();
                 items.extend(item.entry.render(w));
+                cache.item_line_counts.push(items.len() - before);
             }
             cache.rendered_items = self.items.len();
         }
         if cache.stream_text != stream {
-            cache.stream = Rc::new(if stream.is_empty() {
-                Vec::new()
+            if stream.is_empty() {
+                cache.stream = Rc::new(Vec::new());
+                cache.visible_stream_len = 0;
             } else {
-                markdown::lines(&crate::tool_codec::visible_prose(stream), w)
-            });
+                let prose = crate::tool_codec::visible_prose(stream);
+                cache.visible_stream_len = prose.len();
+                cache.stream = Rc::new(markdown::lines(&prose, w));
+            }
             cache.stream_text.clear();
             cache.stream_text.push_str(stream);
         }
         TranscriptLines {
             items: Rc::clone(&cache.items),
             stream: Rc::clone(&cache.stream),
+            visible_stream_len: cache.visible_stream_len,
+            evicted_lines: cache.evicted_lines,
         }
     }
 
@@ -542,15 +577,29 @@ mod tests {
     fn cached_lines_follow_overflow_trimming() {
         let mut t = Transcript::default();
         let max = 200;
+        let mut total_pushed_lines = 0u64;
         for i in 0..40 {
-            push_md(&mut t, &format!("entry number {i:02} with some text"), max);
+            let text = format!("entry number {i:02} with some text");
+            total_pushed_lines += markdown::lines(&text, 29).len() as u64;
+            let held = t.lines("", 30);
+            let held_copy = held.to_vec();
+            push_md(&mut t, &text, max);
+            // Overflow trimming must not mutate an already-held snapshot.
+            assert_eq!(held.to_vec(), held_copy, "held snapshot after push {i}");
+            drop(held);
+            let lines = t.lines("", 30);
+            assert_eq!(lines.to_vec(), uncached(&t, "", 30), "after push {i}");
             assert_eq!(
-                t.render_lines("", 30),
-                uncached(&t, "", 30),
-                "after push {i}"
+                lines.evicted_lines() + lines.len() as u64,
+                total_pushed_lines,
+                "virtual line count conserved after push {i}"
             );
         }
         assert!(t.bytes <= max);
+        assert!(t.lines("", 30).evicted_lines() > 0);
+        // Width change resets evicted_lines cleanly for the new width.
+        assert_eq!(t.lines("", 50).evicted_lines(), 0);
+        assert_eq!(t.render_lines("", 50), uncached(&t, "", 50));
     }
 
     #[test]
@@ -572,5 +621,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn visible_stream_len_tracks_cached_stream_changes_and_resets() {
+        let mut t = Transcript::default();
+        assert_eq!(t.lines("", 80).visible_stream_len(), 0);
+        let prose = "Working\n";
+        let with_hidden_tool = "Working\n[TOOL_CALL]\n{\"tool\":\"read\"}";
+        assert_eq!(
+            t.lines(with_hidden_tool, 80).visible_stream_len(),
+            prose.len()
+        );
+        // Repeated lookup at same width reuses cached visible_stream_len.
+        assert_eq!(
+            t.lines(with_hidden_tool, 80).visible_stream_len(),
+            prose.len()
+        );
+        // Width change resets cache and recomputes visible_stream_len accurately.
+        assert_eq!(
+            t.lines(with_hidden_tool, 40).visible_stream_len(),
+            prose.len()
+        );
+        // Simultaneous width change + empty stream must reset visible_stream_len to 0.
+        assert_eq!(t.lines("", 60).visible_stream_len(), 0);
+        // Clear while a non-empty stream is cached must reset visible_stream_len to 0.
+        assert_eq!(t.lines(prose, 60).visible_stream_len(), prose.len());
+        t.clear();
+        assert_eq!(t.lines("", 60).visible_stream_len(), 0);
+        assert_eq!(t.lines("", 60).evicted_lines(), 0);
     }
 }

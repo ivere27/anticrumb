@@ -158,13 +158,9 @@ async fn turn(service: &Arc<Service>, request: TurnRequest, label: &str) -> Resu
 }
 fn req(prompt: &str, temporary: bool, image: bool) -> TurnRequest {
     let mut r = TurnRequest::text(prompt);
-    r.keep_session = true;
+    r.retention = SessionRetention::Retain;
     r.timeout_secs = if image { 180 } else { 120 };
-    r.mode = if temporary {
-        SessionMode::Temporary
-    } else {
-        SessionMode::Chat
-    };
+    r.mode = SessionMode::from_temporary(temporary);
     r.generate_image = image;
     r.model = std::env::var("ANTICRUMB_LIVE_MODEL").ok();
     r
@@ -341,7 +337,7 @@ async fn live_gemini_prompt_followup_workers_and_optional_media() {
                 remote_url: Some(t.url.clone()),
                 remote_session_id: None,
                 history: vec![],
-                state: "ready".into(),
+                state: SessionState::Ready,
                 model: None,
                 thinking: None,
                 tool_digest: String::new(),

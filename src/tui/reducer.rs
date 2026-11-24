@@ -22,6 +22,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn job_session_is_temporary(job: &Value) -> Option<bool> {
+    match job["request"]["session_mode"].as_str()? {
+        "temporary" => Some(true),
+        "chat" => Some(false),
+        _ => None,
+    }
+}
+
 pub(super) trait EffectSink {
     fn send_command(&mut self, command: Command) -> std::result::Result<(), String>;
     fn write_terminal(&mut self, sequence: &str) -> std::result::Result<(), String>;
@@ -78,6 +86,31 @@ pub(super) struct SubagentView {
     pub started: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScrollBottomBadge {
+    Idle,
+    NewOutput,
+    Streaming,
+}
+
+impl ScrollBottomBadge {
+    pub(super) fn label(self, spinner: &str) -> String {
+        match self {
+            Self::Idle => "[ ↓ Jump to bottom ]".into(),
+            Self::NewOutput => "[ ↓ New output ]".into(),
+            Self::Streaming => format!("[ {spinner} ↓ New output ]"),
+        }
+    }
+
+    pub(super) fn compact_label(self, spinner: &str) -> String {
+        match self {
+            Self::Idle => "[ ↓ Bottom ]".into(),
+            Self::NewOutput => "[ ↓ New ]".into(),
+            Self::Streaming => format!("[ {spinner} ↓ New ]"),
+        }
+    }
+}
+
 pub(super) struct State {
     pub options: PromptOptions,
     pub preferences: Option<Preferences>,
@@ -119,6 +152,7 @@ pub(super) struct State {
     pub completion: Option<Completion>,
     pub mention: Option<MentionPopup>,
     pub mention_dismissed: Option<(usize, String)>,
+    pub recent_mentions: Vec<preferences::RecentMention>,
     pub next_mention_id: u64,
     pub scroll: usize,
     pub last_response: String,
@@ -127,6 +161,14 @@ pub(super) struct State {
     pub painted_all_transcript: TranscriptLines,
     pub painted_transcript_start: usize,
     pub painted_effective_scroll: usize,
+    pub scroll_anchor_width: usize,
+    pub scroll_anchor_total_lines: usize,
+    pub scroll_anchor_evicted_lines: u64,
+    pub scroll_relative: bool,
+    pub scroll_anchor_deficit: Option<usize>,
+    pub scroll_anchor_stream_len: usize,
+    pub scroll_anchor_revision: u64,
+    pub has_unread_below: bool,
     pub painted_hint: Vec<markdown::Line>,
     pub painted_composer: Vec<markdown::Line>,
     pub painted_subagents: Vec<markdown::Line>,
@@ -203,6 +245,7 @@ impl State {
             completion: None,
             mention: None,
             mention_dismissed: None,
+            recent_mentions: Vec::new(),
             next_mention_id: 1,
             scroll: 0,
             last_response: String::new(),
@@ -211,6 +254,14 @@ impl State {
             painted_all_transcript: TranscriptLines::default(),
             painted_transcript_start: 0,
             painted_effective_scroll: 0,
+            scroll_anchor_width: 0,
+            scroll_anchor_total_lines: 0,
+            scroll_anchor_evicted_lines: 0,
+            scroll_relative: false,
+            scroll_anchor_deficit: None,
+            scroll_anchor_stream_len: 0,
+            scroll_anchor_revision: 0,
+            has_unread_below: false,
             painted_hint: Vec::new(),
             painted_composer: Vec::new(),
             painted_subagents: Vec::new(),
@@ -800,6 +851,9 @@ impl State {
         self.stream.clear();
         self.thinking_preview.clear();
         self.subagents.clear();
+        self.reset_scroll();
+        self.clear_selection();
+        self.clear_painted_regions();
         self.web_usage = None;
         self.web_usage_stale = false;
         self.web_history_status = Value::Null;
@@ -1374,13 +1428,30 @@ impl State {
 
     pub(super) fn load_history(&mut self) {
         if let Some(data) = &self.preferences {
-            match data.history(&self.options.account, &self.options.workspace) {
+            let history_res = data.history(&self.options.account, &self.options.workspace);
+            let recents_res = data.recent_mentions(&self.options.workspace);
+            match history_res {
                 Ok(items) => self.history = items,
                 Err(e) => self.log(&format!("History: {e}")),
+            }
+            if let Ok(recents) = recents_res {
+                self.recent_mentions = recents;
             }
         }
         self.history_index = self.history.len();
         self.saved_draft.clear();
+    }
+
+    pub(super) fn remember_mention(&mut self, mention: preferences::RecentMention) {
+        if mention.display.is_empty() || self.recent_mentions.first() == Some(&mention) {
+            return;
+        }
+        preferences::push_recent_mention(&mut self.recent_mentions, &mention);
+        if let Some(data) = &self.preferences {
+            if let Ok(items) = data.record_recent_mention(&self.options.workspace, &mention) {
+                self.recent_mentions = items;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1487,6 +1558,7 @@ impl State {
                 id: request_id,
                 workspace: self.options.workspace.clone(),
                 query: parsed.query,
+                recent: self.recent_mentions.clone(),
             },
         );
     }
@@ -1523,6 +1595,16 @@ impl State {
         if matched.kind == MentionKind::Dir {
             self.refresh_mention(sink);
         } else {
+            let recent_kind = match matched.kind {
+                MentionKind::File => preferences::RecentMentionKind::File,
+                MentionKind::Git => preferences::RecentMentionKind::Git,
+                MentionKind::Dir => unreachable!(),
+            };
+            self.remember_mention(preferences::RecentMention {
+                display: matched.display.clone(),
+                kind: recent_kind,
+                detail: matched.detail.clone(),
+            });
             self.mention = None;
         }
     }
@@ -1549,9 +1631,13 @@ impl State {
             return true;
         }
         if m.loading {
-            if let Some((matches, _)) =
-                mentions::search_mentions(&self.options.workspace, &m.query, None, m.request_id)
-            {
+            if let Some((matches, _)) = mentions::search_mentions_with_recent(
+                &self.options.workspace,
+                &m.query,
+                &self.recent_mentions,
+                None,
+                m.request_id,
+            ) {
                 if let Some(first) = matches.first() {
                     let (start, end, quoted) = (m.start, m.end, m.quoted);
                     self.apply_mention_match(start, end, quoted, first, sink);
@@ -1623,7 +1709,7 @@ impl State {
         }
         self.options = next_options;
         self.parent = Some(id.into());
-        self.conversation_temporary = Some(job["request"]["temporary"] == true);
+        self.conversation_temporary = Some(job_session_is_temporary(&job) == Some(true));
         self.pending_temporary = None;
         self.active_model = None;
         self.clear_mention();
@@ -1634,6 +1720,9 @@ impl State {
         self.stream.clear();
         self.thinking_preview.clear();
         self.subagents.clear();
+        self.reset_scroll();
+        self.clear_selection();
+        self.clear_painted_regions();
         let state_str = job["state"].as_str().unwrap_or("saved");
         let state_face = match state_str {
             "completed" | "ready" => Face::HIGHLIGHT_BOLD,
@@ -1682,7 +1771,7 @@ impl State {
         if self.options.temporary && self.conversation_temporary == Some(false) {
             self.log("  Temp chat remains ON: next turn starts a new temporary chat with local context instead of continuing the server chat (use /temp off to continue on server).");
         } else if !was_temporary && self.options.temporary && is_temp {
-            self.log("  Temp chat turned ON for this resumed temporary conversation (local context only; /new returns to saved normal mode).");
+            self.log("  Temp chat turned ON for this resumed temporary conversation (no server history; /new returns to saved normal mode).");
         }
         self.warn_if_temporary_unsupported();
     }
@@ -1895,7 +1984,7 @@ impl State {
                     .into_iter()
                     .take(30)
                     .filter_map(|j| {
-                        let temp = if j["request"]["temporary"] == true {
+                        let temp = if job_session_is_temporary(&j) == Some(true) {
                             " [temp]"
                         } else {
                             ""
@@ -2126,8 +2215,7 @@ impl State {
     fn handle_finished(&mut self, job: Value) {
         self.parent = job["id"].as_str().map(str::to_owned);
         let pending = self.pending_temporary.take();
-        self.conversation_temporary = job["request"]["temporary"]
-            .as_bool()
+        self.conversation_temporary = job_session_is_temporary(&job)
             .or(pending)
             .or(self.conversation_temporary);
         self.active = None;
@@ -2206,13 +2294,13 @@ impl State {
                     );
                 }
             }
-            "browser_turn" => {
+            crate::domain::EVENT_BROWSER_TURN => {
                 if self.debug.level >= 2 {
                     let run_id = event.data["run_id"].as_str().unwrap_or("");
                     self.log_debug("browser", &format!("turn submitted run_id={run_id}"));
                 }
             }
-            "browser_session" => {
+            crate::domain::EVENT_BROWSER_SESSION => {
                 if self.debug.level >= 1 {
                     let sid = event.data["session_id"].as_str().unwrap_or("");
                     self.log_debug("session", &format!("active session={sid}"));
@@ -2511,6 +2599,116 @@ impl State {
         self.transcript.render_lines(&self.stream, width)
     }
 
+    pub(super) fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.scroll_relative = false;
+        self.scroll_anchor_width = 0;
+        self.scroll_anchor_total_lines = 0;
+        self.scroll_anchor_evicted_lines = 0;
+        self.scroll_anchor_deficit = None;
+        self.scroll_anchor_stream_len = 0;
+        self.scroll_anchor_revision = 0;
+        self.has_unread_below = false;
+    }
+
+    pub(super) fn set_scroll_relative(&mut self, next: usize) {
+        self.scroll = next;
+        self.scroll_relative = next > 0;
+        self.scroll_anchor_deficit = None;
+        if next == 0 {
+            self.has_unread_below = false;
+        }
+    }
+
+    pub(super) fn scroll_bottom_badge(&self) -> ScrollBottomBadge {
+        if !self.has_unread_below {
+            ScrollBottomBadge::Idle
+        } else if self.active.is_some() {
+            ScrollBottomBadge::Streaming
+        } else {
+            ScrollBottomBadge::NewOutput
+        }
+    }
+
+    pub(super) fn sync_scroll_anchor(
+        &mut self,
+        current_lines: usize,
+        evicted_lines: u64,
+        wrap_width: usize,
+        visible_stream_len: usize,
+    ) {
+        let current_revision = self.transcript.revision();
+        let anchored = self.scroll > 0 || self.scroll_anchor_deficit.is_some();
+        let has_valid_anchor = anchored
+            && self.scroll_anchor_width > 0
+            && self.scroll_anchor_total_lines > 0
+            && (self.scroll == self.painted_effective_scroll || self.scroll_relative);
+        if has_valid_anchor {
+            if self.scroll_anchor_width == wrap_width {
+                let evicted_delta = evicted_lines.saturating_sub(self.scroll_anchor_evicted_lines);
+                let adjusted_lines = (current_lines as u64).saturating_add(evicted_delta);
+                let anchor_lines = self.scroll_anchor_total_lines as u64;
+                if adjusted_lines > anchor_lines {
+                    let delta =
+                        usize::try_from(adjusted_lines - anchor_lines).unwrap_or(usize::MAX);
+                    if let Some(deficit) = self.scroll_anchor_deficit {
+                        if delta > deficit {
+                            self.scroll = self.scroll.saturating_add(delta - deficit);
+                            self.scroll_anchor_deficit = None;
+                        } else {
+                            self.scroll_anchor_deficit = Some(deficit - delta);
+                        }
+                    } else {
+                        self.scroll = self.scroll.saturating_add(delta);
+                    }
+                    if visible_stream_len > 0 || current_revision != self.scroll_anchor_revision {
+                        self.has_unread_below = true;
+                    }
+                } else if adjusted_lines < anchor_lines {
+                    let delta =
+                        usize::try_from(anchor_lines - adjusted_lines).unwrap_or(usize::MAX);
+                    if let Some(deficit) = self.scroll_anchor_deficit {
+                        self.scroll_anchor_deficit = Some(deficit.saturating_add(delta));
+                    } else if delta >= self.scroll {
+                        self.scroll_anchor_deficit = Some(delta - self.scroll);
+                        self.scroll = 0;
+                    } else {
+                        self.scroll -= delta;
+                    }
+                    if current_revision != self.scroll_anchor_revision
+                        || visible_stream_len > self.scroll_anchor_stream_len
+                    {
+                        self.has_unread_below = true;
+                    }
+                } else if visible_stream_len > self.scroll_anchor_stream_len
+                    || current_revision != self.scroll_anchor_revision
+                {
+                    self.has_unread_below = true;
+                }
+            } else {
+                self.scroll_anchor_deficit = None;
+                if current_revision != self.scroll_anchor_revision
+                    || visible_stream_len > self.scroll_anchor_stream_len
+                {
+                    self.has_unread_below = true;
+                }
+            }
+        } else {
+            self.scroll_anchor_deficit = None;
+        }
+        if self.active.is_none() {
+            self.scroll_anchor_deficit = None;
+        }
+        if self.scroll == 0 && self.scroll_anchor_deficit.is_none() {
+            self.has_unread_below = false;
+        }
+        self.scroll_anchor_total_lines = current_lines;
+        self.scroll_anchor_evicted_lines = evicted_lines;
+        self.scroll_anchor_width = wrap_width;
+        self.scroll_anchor_stream_len = visible_stream_len;
+        self.scroll_anchor_revision = current_revision;
+    }
+
     pub(super) fn scroll_transcript(
         &mut self,
         up: bool,
@@ -2521,21 +2719,28 @@ impl State {
         let viewport = self
             .compute_layout(width as u16, height as u16)
             .map_or(1, |(layout, _)| usize::from(layout.transcript.len).max(1));
+        if self.selection.is_some() && self.selection_target == SelectionTarget::Transcript {
+            self.scroll_selection(up, lines, viewport);
+            return;
+        }
         // Release the previous frame's Rc snapshot so the cache can append new
         // items in-place (Rc refcount → 1) instead of deep-copying everything.
         self.painted_all_transcript.clear();
-        let maximum = self
-            .transcript
-            .lines(&self.stream, width)
-            .len()
-            .saturating_sub(viewport);
+        let all = self.transcript.lines(&self.stream, width);
+        let total_lines = all.len();
+        let evicted_lines = all.evicted_lines();
+        let visible_stream_len = all.visible_stream_len();
+        drop(all);
+        self.sync_scroll_anchor(total_lines, evicted_lines, width, visible_stream_len);
+        let maximum = total_lines.saturating_sub(viewport);
         let current = self.scroll.min(maximum);
-        self.scroll = if up {
+        let next = if up {
             current.saturating_add(lines)
         } else {
             current.saturating_sub(lines)
         }
         .min(maximum);
+        self.set_scroll_relative(next);
     }
 
     pub(super) fn clear_selection(&mut self) {
@@ -2544,6 +2749,11 @@ impl State {
     }
 
     pub(super) fn clear_painted_regions(&mut self) {
+        if (self.scroll > 0 || self.scroll_anchor_deficit.is_some())
+            && self.scroll == self.painted_effective_scroll
+        {
+            self.scroll_relative = true;
+        }
         self.painted_transcript.clear();
         self.painted_all_transcript.clear();
         self.painted_transcript_start = 0;
@@ -2635,7 +2845,7 @@ impl State {
         (start, end)
     }
 
-    fn scroll_selection(&mut self, up: bool, lines: usize, viewport: usize) -> bool {
+    pub(super) fn scroll_selection(&mut self, up: bool, lines: usize, viewport: usize) -> bool {
         let Some(selection) = self.selection.as_ref() else {
             return false;
         };
@@ -2654,7 +2864,7 @@ impl State {
             current.saturating_sub(lines)
         }
         .min(max_scroll);
-        self.scroll = next;
+        self.set_scroll_relative(next);
         next != current
     }
 
@@ -2805,7 +3015,7 @@ impl State {
                 if self.scroll_bottom_button.is_some_and(|(row, start, end)| {
                     mouse.row == row && mouse.column >= start && mouse.column < end
                 }) {
-                    self.scroll = 0;
+                    self.reset_scroll();
                     self.clear_selection();
                     self.last_click = None;
                     self.clipboard_notice = None;
@@ -2837,7 +3047,12 @@ impl State {
                                 let (_, _, viewport) = self.transcript_bounds();
                                 let max_scroll =
                                     self.painted_all_transcript.len().saturating_sub(viewport);
-                                self.scroll = self.scroll.min(max_scroll);
+                                let next = self.scroll.min(max_scroll);
+                                if next == 0 {
+                                    self.set_scroll_relative(0);
+                                } else {
+                                    self.scroll = next;
+                                }
                                 (
                                     self.painted_all_transcript.to_vec(),
                                     self.painted_transcript_start + viewport_row,
