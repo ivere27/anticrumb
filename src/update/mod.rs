@@ -113,7 +113,15 @@ fn plan_update<'a>(
         UpdateChannel::Stable => {
             let (version, asset_target, asset) = release.validate_with_target(target)?;
             let platform_label = format_target_label(target, &asset_target);
-            let newer = version.cmp_precedence(current).is_gt();
+            // Nightly and dev builds are SemVer pre-releases of `current`
+            // (e.g. `X.Y.Z-nightly < X.Y.Z`), so a published stable `current`
+            // graduates cleanly while older stables require `--force`.
+            let newer = match current_channel {
+                BuildChannel::Stable => version.cmp_precedence(current).is_gt(),
+                BuildChannel::Nightly | BuildChannel::Dev => {
+                    version.cmp_precedence(current).is_ge()
+                }
+            };
             if !newer && !options.force {
                 let message = match current_channel {
                     BuildChannel::Stable => format!(
@@ -979,29 +987,95 @@ mod tests {
             UpdatePlan::Install { .. }
         ));
 
-        // Stable update on nightly/dev does not downgrade on matching base version without --force
-        let stable = release("0.8.3", LINUX);
+        // Nightly/dev builds are SemVer pre-releases of `current` (e.g. 0.8.2 < 0.8.3-nightly < 0.8.3):
+        // an older stable release must not downgrade without --force, while matching stable graduates.
+        let older_stable = release("0.8.2", LINUX);
+        let matching_stable = release("0.8.3", LINUX);
         let stable_opts = UpdateOptions {
             check: false,
             channel: UpdateChannel::Stable,
             force: false,
+        };
+        let stable_check = UpdateOptions {
+            check: true,
+            ..stable_opts
         };
         match plan_update(
             stable_opts,
             &current,
             BuildChannel::Nightly,
             Some("9999999"),
-            &stable,
+            &older_stable,
             LINUX,
         )
         .unwrap()
         {
             UpdatePlan::UpToDate(msg) => {
                 assert!(msg.contains("0.8.3-nightly"), "{msg}");
+                assert!(msg.contains("0.8.2"), "{msg}");
                 assert!(msg.contains("--nightly"), "{msg}");
                 assert!(msg.contains("--force"), "{msg}");
             }
-            other => panic!("expected UpToDate hint for nightly -> stable, got {other:?}"),
+            other => panic!("expected UpToDate hint for nightly -> older stable, got {other:?}"),
+        }
+        match plan_update(
+            stable_opts,
+            &current,
+            BuildChannel::Dev,
+            Some("9999999"),
+            &older_stable,
+            LINUX,
+        )
+        .unwrap()
+        {
+            UpdatePlan::UpToDate(msg) => {
+                assert!(msg.contains("0.8.3-dev"), "{msg}");
+                assert!(msg.contains("0.8.2"), "{msg}");
+                assert!(msg.contains("--force"), "{msg}");
+            }
+            other => panic!("expected UpToDate hint for dev -> older stable, got {other:?}"),
+        }
+        for (channel, expected_from) in [
+            (BuildChannel::Nightly, "0.8.3-nightly"),
+            (BuildChannel::Dev, "0.8.3-dev"),
+        ] {
+            match plan_update(
+                stable_check,
+                &current,
+                channel,
+                Some("9999999"),
+                &matching_stable,
+                LINUX,
+            )
+            .unwrap()
+            {
+                UpdatePlan::CheckAvailable(msg) => {
+                    assert!(msg.contains(&format!("{expected_from} → 0.8.3")), "{msg}");
+                }
+                other => {
+                    panic!("expected CheckAvailable for {expected_from} -> 0.8.3, got {other:?}")
+                }
+            }
+            match plan_update(
+                stable_opts,
+                &current,
+                channel,
+                Some("9999999"),
+                &matching_stable,
+                LINUX,
+            )
+            .unwrap()
+            {
+                UpdatePlan::Install {
+                    updated_from,
+                    updated_to,
+                    ..
+                } => {
+                    assert_eq!(updated_from, expected_from);
+                    assert_eq!(updated_to, "0.8.3");
+                }
+                other => panic!("expected Install for {expected_from} -> 0.8.3, got {other:?}"),
+            }
         }
         assert!(matches!(
             plan_update(
@@ -1009,7 +1083,7 @@ mod tests {
                 &current,
                 BuildChannel::Stable,
                 Some("9999999"),
-                &stable,
+                &matching_stable,
                 LINUX,
             )
             .unwrap(),
@@ -1025,7 +1099,7 @@ mod tests {
                 &current,
                 BuildChannel::Nightly,
                 Some("9999999"),
-                &stable,
+                &older_stable,
                 LINUX,
             )
             .unwrap(),
