@@ -650,6 +650,31 @@ impl AgentManager {
             .unwrap_or(u32::MAX))
     }
 
+    fn finish_agent_job(&self, job_id: &str, mut terminal: AgentRecord, lease: Option<fs::File>) {
+        let state = terminal.state.clone();
+        let error = terminal.error.clone();
+        // Hold `controls` across lease release, terminal event/state persistence,
+        // and control removal so a caller polling `GetAgent` cannot observe the
+        // terminal state and race ahead into `start()`/`delete()` while this
+        // job still owns the workspace lease or remains in `controls`.
+        let mut controls = self.controls.lock().unwrap_or_else(|e| e.into_inner());
+        drop(lease);
+        let _ = self.store.event(
+            job_id,
+            "agent_terminal",
+            json!({"state": state, "error": error}),
+        );
+        if let Err(e) = self.store.put("local", "agent", job_id, &terminal) {
+            terminal.state = "failed".into();
+            terminal.error = Some(e);
+            self.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(job_id.to_owned(), terminal);
+        }
+        controls.remove(job_id);
+    }
+
     pub fn start(self: &Arc<Self>, mut request: AgentRequest) -> Result<String> {
         self.ensure_accepting_jobs()?;
         if request.task.trim().is_empty() || request.task.len() > 48000 {
@@ -662,11 +687,7 @@ impl AgentManager {
         let mut controls = self.controls.lock().map_err(ServiceError::storage)?;
         // cancel_all sets stopping before taking this lock, so a job cannot
         // register after the shutdown cancellation pass has already completed.
-        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ServiceError::invalid(
-                "agent manager is stopping or requires storage repair",
-            ));
-        }
+        self.ensure_accepting_jobs()?;
         // Deletion takes the same lock: a parent cannot disappear between
         // collecting its context and registering the dependent turn.
         let artifact_lease = self.store.blob_lease()?;
@@ -727,7 +748,6 @@ impl AgentManager {
             .is_temporary()
             .then(|| self.worker_gate(&request.account_id));
         tokio::task::spawn_blocking(move || {
-            let _lease = lease;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 manager.run_agent_job(
                     &job_id,
@@ -760,30 +780,16 @@ impl AgentManager {
                 ),
                 Err(e) => ("failed".into(), None, Some(e)),
             };
-            let mut terminal = AgentRecord {
+            let terminal = AgentRecord {
                 id: job_id.clone(),
-                state: state.clone(),
+                state,
                 request,
                 result: value,
-                error: error.clone(),
+                error,
                 created_at,
                 updated_at: now_ms(),
             };
-            if let Err(e) = manager.store.put("local", "agent", &job_id, &terminal) {
-                terminal.state = "failed".into();
-                terminal.error = Some(e);
-                manager
-                    .failures
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(job_id.clone(), terminal);
-            }
-            let _ = manager.store.event(
-                &job_id,
-                "agent_terminal",
-                json!({"state":state,"error":error}),
-            );
-            manager.controls.lock().unwrap().remove(&job_id);
+            manager.finish_agent_job(&job_id, terminal, lease);
         });
         Ok(id)
     }
@@ -1799,5 +1805,111 @@ mod tests {
                 .unwrap(),
             vec!["after-checkpoint"]
         );
+    }
+
+    #[test]
+    fn finish_agent_job_releases_control_and_workspace_lease_before_followup_observes_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store.clone()).unwrap();
+        let workspace = fs::canonicalize(dir.path()).unwrap();
+
+        for iter in 0..32 {
+            let job_id = format!("agent-race-{iter}");
+            let request = AgentRequest {
+                environment: None,
+                task: format!("turn {iter}"),
+                workspace: workspace.clone(),
+                account_id: "default".into(),
+                model: None,
+                thinking: None,
+                session_mode: SessionMode::Temporary,
+                no_shell: true,
+                max_steps: 4,
+                knowledge: None,
+                mcp_config: None,
+                artifacts: vec![],
+                parent_id: None,
+                chat_only: false,
+                permissions: None,
+                session_retention: SessionRetention::Retain,
+            };
+            let lease = {
+                let mut controls = manager.controls.lock().unwrap();
+                let lease = manager
+                    .acquire_workspace_lease(&controls, &workspace)
+                    .unwrap();
+                assert!(lease.is_some());
+                store
+                    .put(
+                        "local",
+                        "agent",
+                        &job_id,
+                        &AgentRecord {
+                            id: job_id.clone(),
+                            state: "running".into(),
+                            request: request.clone(),
+                            result: None,
+                            error: None,
+                            created_at: 1,
+                            updated_at: 0,
+                        },
+                    )
+                    .unwrap();
+                controls.insert(job_id.clone(), manager.new_run_control(&job_id));
+                lease
+            };
+
+            let terminal = AgentRecord {
+                id: job_id.clone(),
+                state: "completed".into(),
+                request,
+                result: Some(AgentRunResult {
+                    status: AgentStatus::Completed,
+                    final_response: "ok".into(),
+                    ..Default::default()
+                }),
+                error: None,
+                created_at: 1,
+                updated_at: 2,
+            };
+            let finisher_mgr = manager.clone();
+            let finisher_id = job_id.clone();
+            let worker = std::thread::spawn(move || {
+                finisher_mgr.finish_agent_job(&finisher_id, terminal, lease);
+            });
+
+            loop {
+                if manager.snapshot(&job_id).unwrap().state == "completed" {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            // Immediately upon observing `completed`, a follow-up turn must be
+            // able to acquire the workspace lease (and see no stale control),
+            // read the terminal event, and delete the completed turn cleanly.
+            {
+                let controls = manager.controls.lock().unwrap();
+                assert!(
+                    !controls.contains_key(&job_id),
+                    "iter {iter}: control still registered after completed snapshot"
+                );
+                let next_lease = manager
+                    .acquire_workspace_lease(&controls, &workspace)
+                    .unwrap();
+                assert!(
+                    next_lease.is_some(),
+                    "iter {iter}: workspace lease still held after completed snapshot"
+                );
+            }
+            let events = store.events(&job_id, 0).unwrap();
+            assert!(
+                events.iter().any(|ev| ev.kind == "agent_terminal"),
+                "iter {iter}: agent_terminal missing after completed snapshot"
+            );
+            manager.delete(&job_id).unwrap();
+            worker.join().unwrap();
+        }
     }
 }
