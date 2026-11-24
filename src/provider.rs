@@ -310,7 +310,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let mut session = make_session("temp-1", SessionMode::Temporary);
-        store.put("local", "session", &session.id, &session).unwrap();
+        store
+            .put("local", "session", &session.id, &session)
+            .unwrap();
 
         let released: RefCell<Vec<Option<String>>> = RefCell::new(Vec::new());
         let err = verify_continued_session_turns(
@@ -341,7 +343,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let mut session = make_session("chat-1", SessionMode::Chat);
-        store.put("local", "session", &session.id, &session).unwrap();
+        store
+            .put("local", "session", &session.id, &session)
+            .unwrap();
 
         let mut released = false;
         let err = verify_continued_session_turns(

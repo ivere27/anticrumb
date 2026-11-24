@@ -253,11 +253,10 @@ impl Client {
         if ids.is_empty() {
             return Ok(pb::CloseSessionsResult::default());
         }
-        self.runtime.block_on(self.rpc.close_sessions(
-            pb::CloseSessionsRequest {
+        self.runtime
+            .block_on(self.rpc.close_sessions(pb::CloseSessionsRequest {
                 session_ids: ids.to_vec(),
-            },
-        ))
+            }))
     }
     pub(crate) fn create_turn(&self, request: &TurnRequest) -> Result<String> {
         Ok(self

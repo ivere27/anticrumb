@@ -422,21 +422,22 @@ impl State {
             .selection
             .as_ref()
             .filter(|_| self.selection_target == SelectionTarget::Transcript);
-        let (start, effective_scroll, painted, all_snapshot) =
-            if let Some(selection) = transcript_selection {
-                let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
-                let eff = selection.lines.len().saturating_sub(end);
-                (start, eff, selection.lines[start..end].to_vec(), None)
-            } else {
-                // Release the previous snapshot first so the cache appends in place.
-                self.painted_all_transcript.clear();
-                let all = self.transcript.lines(&self.stream, w);
-                self.sync_scroll_anchor(all.len(), all.evicted_lines(), w, all.visible_stream_len());
-                let (start, end) = self.selection_view_range(all.len(), viewport);
-                let eff = all.len().saturating_sub(end);
-                let painted = all.slice(start, end);
-                (start, eff, painted, Some(all))
-            };
+        let (start, effective_scroll, painted, all_snapshot) = if let Some(selection) =
+            transcript_selection
+        {
+            let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
+            let eff = selection.lines.len().saturating_sub(end);
+            (start, eff, selection.lines[start..end].to_vec(), None)
+        } else {
+            // Release the previous snapshot first so the cache appends in place.
+            self.painted_all_transcript.clear();
+            let all = self.transcript.lines(&self.stream, w);
+            self.sync_scroll_anchor(all.len(), all.evicted_lines(), w, all.visible_stream_len());
+            let (start, end) = self.selection_view_range(all.len(), viewport);
+            let eff = all.len().saturating_sub(end);
+            let painted = all.slice(start, end);
+            (start, eff, painted, Some(all))
+        };
         for (row, line) in painted.iter().enumerate() {
             let y = layout.transcript.start + row as u16;
             queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
@@ -942,12 +943,23 @@ impl State {
 
             let prefix_w = 3 + display_text.width() + display_pad.len() + 2 + kind_label.width();
             let detail_budget = safe_w.saturating_sub(prefix_w + 2);
-            let detail_src =
+            let base_detail =
                 if matched.detail.is_empty() && matched.kind == super::mentions::MentionKind::Git {
                     "Git commit"
                 } else {
                     matched.detail.as_str()
                 };
+            let detail_owned;
+            let detail_src = if matched.recent {
+                detail_owned = if base_detail.is_empty() {
+                    "Recent".to_owned()
+                } else {
+                    format!("Recent · {base_detail}")
+                };
+                detail_owned.as_str()
+            } else {
+                base_detail
+            };
             let detail_text = if detail_budget >= 8 {
                 clip(detail_src, detail_budget)
             } else {

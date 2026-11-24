@@ -81,23 +81,45 @@ pub fn prompt(request: &TurnRequest) -> Result<String> {
             serde_json::to_string(&request.tools).map_err(ServiceError::storage)?
         ));
     }
-    for message in &request.messages {
-        output.push_str(&format!("\n[{:?}]\n", message.role));
-        for block in &message.blocks {
+    let plain_single_user = output.is_empty()
+        && request.messages.len() == 1
+        && matches!(request.messages[0].role, Role::User)
+        && request.messages[0]
+            .blocks
+            .iter()
+            .all(|block| matches!(block, Block::Text { .. } | Block::Artifact { .. }));
+    if plain_single_user {
+        for (idx, block) in request.messages[0].blocks.iter().enumerate() {
+            if idx > 0 {
+                output.push('\n');
+            }
             match block {
                 Block::Text { text } => output.push_str(text),
-                Block::ToolCall { call } => output.push_str(&format!(
-                    "[previous tool call] {}",
-                    serde_json::to_string(call).map_err(ServiceError::storage)?
-                )),
-                Block::ToolResult { call_id, content } => {
-                    output.push_str(&format!("[TOOL_RESULT id={call_id}]\n{content}"))
-                }
                 Block::Artifact { artifact_id } => {
                     output.push_str(&format!("[attachment {artifact_id}]"))
                 }
+                Block::ToolCall { .. } | Block::ToolResult { .. } => unreachable!(),
             }
-            output.push('\n');
+        }
+    } else {
+        for message in &request.messages {
+            output.push_str(&format!("\n[{:?}]\n", message.role));
+            for block in &message.blocks {
+                match block {
+                    Block::Text { text } => output.push_str(text),
+                    Block::ToolCall { call } => output.push_str(&format!(
+                        "[previous tool call] {}",
+                        serde_json::to_string(call).map_err(ServiceError::storage)?
+                    )),
+                    Block::ToolResult { call_id, content } => {
+                        output.push_str(&format!("[TOOL_RESULT id={call_id}]\n{content}"))
+                    }
+                    Block::Artifact { artifact_id } => {
+                        output.push_str(&format!("[attachment {artifact_id}]"))
+                    }
+                }
+                output.push('\n');
+            }
         }
     }
     if output.chars().count() > 100_000 {
@@ -172,4 +194,87 @@ pub fn openai_result(run_id: &str, result: &TurnResult) -> serde_json::Value {
     serde_json::json!({"id":run_id,"object":"chat.completion","created":now_ms()/1000,
         "model":result.model.as_deref().unwrap_or("gemini-web-default"),"choices":[{"index":0,"message":message,
         "finish_reason":if calls.is_empty(){"stop"}else{"tool_calls"}}],"usage":null})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn plain_single_user_prompt_omits_role_header() {
+        let req = TurnRequest::text("안녕\n리뷰 부탁해");
+        let rendered = prompt(&req).unwrap();
+        assert_eq!(rendered, "안녕\n리뷰 부탁해");
+        assert!(!rendered.contains("[User]"));
+    }
+
+    #[test]
+    fn plain_single_user_with_multiple_blocks_omits_role_header() {
+        let mut req = TurnRequest::text("이 파일 봐줘");
+        req.messages[0].blocks.push(Block::Artifact {
+            artifact_id: "art-1".into(),
+        });
+        let rendered = prompt(&req).unwrap();
+        assert_eq!(rendered, "이 파일 봐줘\n[attachment art-1]");
+        assert!(!rendered.contains("[User]"));
+    }
+
+    #[test]
+    fn multi_message_prompt_preserves_role_headers() {
+        let mut req = TurnRequest::text("hello");
+        req.messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                blocks: vec![Block::Text {
+                    text: "be concise".into(),
+                }],
+            },
+        );
+        let rendered = prompt(&req).unwrap();
+        assert_eq!(rendered, "\n[System]\nbe concise\n\n[User]\nhello\n");
+    }
+
+    #[test]
+    fn preamble_or_tools_preserve_user_role_header() {
+        let mut img_req = TurnRequest::text("a cat");
+        img_req.generate_image = true;
+        let rendered_img = prompt(&img_req).unwrap();
+        assert!(rendered_img.contains("\n[User]\na cat\n"));
+
+        let mut tool_req = TurnRequest::text("read main.rs");
+        tool_req.tools.push(ToolDefinition {
+            kind: ToolKind::Function,
+            name: "read".into(),
+            description: "read a file".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        });
+        let rendered_tool = prompt(&tool_req).unwrap();
+        assert!(rendered_tool.contains("\n[User]\nread main.rs\n"));
+
+        // When tool contract is omitted on a resumed turn with a single user delta, omit [User].
+        tool_req.omit_tool_contract = true;
+        assert_eq!(prompt(&tool_req).unwrap(), "read main.rs");
+    }
+
+    #[test]
+    fn non_user_or_tool_result_single_message_preserves_role_header() {
+        let mut req = TurnRequest::text("");
+        req.messages = vec![Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                call_id: "c1".into(),
+                content: "ok".into(),
+            }],
+        }];
+        let rendered = prompt(&req).unwrap();
+        assert_eq!(rendered, "\n[Tool]\n[TOOL_RESULT id=c1]\nok\n");
+    }
+
+    #[test]
+    fn plain_single_user_still_enforces_context_budget() {
+        let req = TurnRequest::text("x".repeat(100_001));
+        assert!(prompt(&req).is_err());
+    }
 }

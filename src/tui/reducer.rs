@@ -152,6 +152,7 @@ pub(super) struct State {
     pub completion: Option<Completion>,
     pub mention: Option<MentionPopup>,
     pub mention_dismissed: Option<(usize, String)>,
+    pub recent_mentions: Vec<preferences::RecentMention>,
     pub next_mention_id: u64,
     pub scroll: usize,
     pub last_response: String,
@@ -244,6 +245,7 @@ impl State {
             completion: None,
             mention: None,
             mention_dismissed: None,
+            recent_mentions: Vec::new(),
             next_mention_id: 1,
             scroll: 0,
             last_response: String::new(),
@@ -1426,13 +1428,30 @@ impl State {
 
     pub(super) fn load_history(&mut self) {
         if let Some(data) = &self.preferences {
-            match data.history(&self.options.account, &self.options.workspace) {
+            let history_res = data.history(&self.options.account, &self.options.workspace);
+            let recents_res = data.recent_mentions(&self.options.workspace);
+            match history_res {
                 Ok(items) => self.history = items,
                 Err(e) => self.log(&format!("History: {e}")),
+            }
+            if let Ok(recents) = recents_res {
+                self.recent_mentions = recents;
             }
         }
         self.history_index = self.history.len();
         self.saved_draft.clear();
+    }
+
+    pub(super) fn remember_mention(&mut self, mention: preferences::RecentMention) {
+        if mention.display.is_empty() || self.recent_mentions.first() == Some(&mention) {
+            return;
+        }
+        preferences::push_recent_mention(&mut self.recent_mentions, &mention);
+        if let Some(data) = &self.preferences {
+            if let Ok(items) = data.record_recent_mention(&self.options.workspace, &mention) {
+                self.recent_mentions = items;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1539,6 +1558,7 @@ impl State {
                 id: request_id,
                 workspace: self.options.workspace.clone(),
                 query: parsed.query,
+                recent: self.recent_mentions.clone(),
             },
         );
     }
@@ -1575,6 +1595,16 @@ impl State {
         if matched.kind == MentionKind::Dir {
             self.refresh_mention(sink);
         } else {
+            let recent_kind = match matched.kind {
+                MentionKind::File => preferences::RecentMentionKind::File,
+                MentionKind::Git => preferences::RecentMentionKind::Git,
+                MentionKind::Dir => unreachable!(),
+            };
+            self.remember_mention(preferences::RecentMention {
+                display: matched.display.clone(),
+                kind: recent_kind,
+                detail: matched.detail.clone(),
+            });
             self.mention = None;
         }
     }
@@ -1601,9 +1631,13 @@ impl State {
             return true;
         }
         if m.loading {
-            if let Some((matches, _)) =
-                mentions::search_mentions(&self.options.workspace, &m.query, None, m.request_id)
-            {
+            if let Some((matches, _)) = mentions::search_mentions_with_recent(
+                &self.options.workspace,
+                &m.query,
+                &self.recent_mentions,
+                None,
+                m.request_id,
+            ) {
                 if let Some(first) = matches.first() {
                     let (start, end, quoted) = (m.start, m.end, m.quoted);
                     self.apply_mention_match(start, end, quoted, first, sink);
@@ -2611,8 +2645,7 @@ impl State {
             && (self.scroll == self.painted_effective_scroll || self.scroll_relative);
         if has_valid_anchor {
             if self.scroll_anchor_width == wrap_width {
-                let evicted_delta =
-                    evicted_lines.saturating_sub(self.scroll_anchor_evicted_lines);
+                let evicted_delta = evicted_lines.saturating_sub(self.scroll_anchor_evicted_lines);
                 let adjusted_lines = (current_lines as u64).saturating_add(evicted_delta);
                 let anchor_lines = self.scroll_anchor_total_lines as u64;
                 if adjusted_lines > anchor_lines {

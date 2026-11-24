@@ -16,6 +16,7 @@ pub struct PreparedInput {
     pub files: Vec<PathBuf>,
     pub temp_files: Vec<PathBuf>,
     pub warnings: Vec<String>,
+    pub resolved_mentions: Vec<String>,
 }
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -360,6 +361,14 @@ pub fn prepare(text: &str, workspace: &Path, explicit: &[PathBuf]) -> Result<Pre
     prepare_with_literals(text, workspace, explicit, &[])
 }
 
+#[derive(Debug)]
+struct PreparedBody {
+    text: String,
+    files: Vec<PathBuf>,
+    warnings: Vec<String>,
+    resolved_mentions: Vec<String>,
+}
+
 /// Pasted text is literal, so examples containing @ are not file uploads.
 pub fn prepare_with_literals(
     text: &str,
@@ -369,17 +378,65 @@ pub fn prepare_with_literals(
 ) -> Result<PreparedInput> {
     let mut temp_files = Vec::new();
     match prepare_internal(text, workspace, explicit, literals, &mut temp_files) {
-        Ok((text, files, warnings)) => Ok(PreparedInput {
-            text,
-            files,
+        Ok(body) => Ok(PreparedInput {
+            text: body.text,
+            files: body.files,
             temp_files,
-            warnings,
+            warnings: body.warnings,
+            resolved_mentions: body.resolved_mentions,
         }),
         Err(e) => {
             cleanup_temp_files(&temp_files);
             Err(e)
         }
     }
+}
+
+fn format_rel_mention_path(rel: &Path) -> String {
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(seg) => parts.push(seg.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => parts.push("..".to_owned()),
+            _ => return rel.display().to_string(),
+        }
+    }
+    parts.join("/")
+}
+
+fn normalize_resolved_file_mention(
+    workspace: &Path,
+    raw_path: &str,
+    canonical_file: &Path,
+) -> String {
+    if raw_path.starts_with("~/") {
+        if let Some(canon_home) = home_dir().and_then(|h| h.canonicalize().ok()) {
+            if let Ok(rel) = canonical_file.strip_prefix(&canon_home) {
+                let rel_str = format_rel_mention_path(rel);
+                if !rel_str.is_empty() {
+                    return format!("~/{rel_str}");
+                }
+            }
+        }
+        return raw_path.to_owned();
+    }
+    if let Ok(canon_ws) = workspace.canonicalize() {
+        if let Ok(rel) = canonical_file.strip_prefix(&canon_ws) {
+            let rel_str = format_rel_mention_path(rel);
+            if !rel_str.is_empty() {
+                return rel_str;
+            }
+        }
+    }
+    let raw = Path::new(raw_path);
+    if raw.is_relative() {
+        let cleaned = format_rel_mention_path(raw);
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    canonical_file.display().to_string()
 }
 
 fn push_warning(warnings: &mut Vec<String>, warning: String) {
@@ -394,10 +451,11 @@ fn prepare_internal(
     explicit: &[PathBuf],
     literals: &[Range<usize>],
     temp_files: &mut Vec<PathBuf>,
-) -> Result<(String, Vec<PathBuf>, Vec<String>)> {
+) -> Result<PreparedBody> {
     let is_literal = |position| literals.iter().any(|range| range.contains(&position));
     let mut files = Vec::new();
     let mut warnings = Vec::new();
+    let mut resolved_mentions = Vec::new();
     for path in explicit {
         add(&mut files, file(workspace, path)?)?;
     }
@@ -454,6 +512,7 @@ fn prepare_internal(
                 continue;
             }
             let raw_mention = &line[pos..pos + end_rel];
+            let is_git_mention = path.starts_with("git:");
             let resolved = if let Some(spec) = path.strip_prefix("git:") {
                 resolve_git_mention(workspace, spec, &mut git_cache, temp_files, &mut warnings)
             } else {
@@ -461,6 +520,11 @@ fn prepare_internal(
             };
             match resolved {
                 Ok(resolved_path) => {
+                    let mention_display = if is_git_mention {
+                        path.to_owned()
+                    } else {
+                        normalize_resolved_file_mention(workspace, path, &resolved_path)
+                    };
                     output.push_str(&format!(
                         "[Attached file: {}]",
                         resolved_path
@@ -469,6 +533,7 @@ fn prepare_internal(
                             .to_string_lossy()
                     ));
                     add(&mut files, resolved_path)?;
+                    resolved_mentions.push(mention_display);
                 }
                 Err(e) => {
                     push_warning(
@@ -481,7 +546,12 @@ fn prepare_internal(
             pos += end_rel;
         }
     }
-    Ok((output, files, warnings))
+    Ok(PreparedBody {
+        text: output,
+        files,
+        warnings,
+        resolved_mentions,
+    })
 }
 
 fn add(files: &mut Vec<PathBuf>, path: PathBuf) -> Result<()> {
@@ -1303,5 +1373,22 @@ fn other() -> i32 {
         let prep_plus = prepare("@git:+", dir.path(), &[]).unwrap();
         assert!(prep_plus.files.is_empty());
         assert!(prep_plus.warnings[0].contains("unknown git commit"));
+    }
+
+    #[test]
+    fn resolved_file_mentions_normalize_dot_prefix_and_workspace_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let file_path = dir.path().join("src/foo.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let abs_str = file_path.display().to_string();
+        let prompt = format!("check @./src/foo.rs and @\"{abs_str}\" and @src/./foo.rs");
+        let prepared = prepare(&prompt, dir.path(), &[]).unwrap();
+        assert_eq!(prepared.files.len(), 1);
+        assert_eq!(
+            prepared.resolved_mentions,
+            vec!["src/foo.rs", "src/foo.rs", "src/foo.rs"]
+        );
     }
 }

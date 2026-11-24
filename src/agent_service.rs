@@ -1574,7 +1574,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            manager.continuable_parent_session(&temp_continue).as_deref(),
+            manager
+                .continuable_parent_session(&temp_continue)
+                .as_deref(),
             Some("sess-temp-ready")
         );
         // Switching back to normal mode mid-conversation must not reuse the temporary session.
@@ -1645,7 +1647,9 @@ mod tests {
             .put("local", "session", "sess-temp-ready", &relay_temp)
             .unwrap();
         assert_eq!(
-            manager.continuable_parent_session(&temp_continue).as_deref(),
+            manager
+                .continuable_parent_session(&temp_continue)
+                .as_deref(),
             Some("sess-temp-ready")
         );
 

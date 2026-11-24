@@ -467,18 +467,12 @@ pub fn error_to(e: ServiceError) -> pb::ErrorDetail {
             pb::ErrorCode::UnsupportedCapability,
             tonic::Code::Unimplemented,
         ),
-        AuthRequired => (
-            pb::ErrorCode::AuthRequired,
-            tonic::Code::FailedPrecondition,
-        ),
+        AuthRequired => (pb::ErrorCode::AuthRequired, tonic::Code::FailedPrecondition),
         VerificationRequired => (
             pb::ErrorCode::VerificationRequired,
             tonic::Code::FailedPrecondition,
         ),
-        RateLimited => (
-            pb::ErrorCode::RateLimited,
-            tonic::Code::ResourceExhausted,
-        ),
+        RateLimited => (pb::ErrorCode::RateLimited, tonic::Code::ResourceExhausted),
         UiContractChanged => (
             pb::ErrorCode::UiContractChanged,
             tonic::Code::FailedPrecondition,

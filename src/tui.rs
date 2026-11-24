@@ -1454,7 +1454,7 @@ mod tests {
             kind: "request_payload".into(),
             data: json!({
                 "request": {"account_id": "default", "mode": "chat", "model": "gemini-3-pro", "thinking": "high"},
-                "prompt": "[User]\nInspect src/main.rs\nLine 2 of full prompt"
+                "prompt": "Inspect src/main.rs\nLine 2 of full prompt"
             }),
             at: 0,
         }));
@@ -2073,7 +2073,9 @@ mod tests {
         assert!(!copied.contains("row-36-live-arrival"));
         // Render after drag copy to flush post-drag state: absorbs the live lines that arrived during drag
         // into the scroll anchor and resets `scroll_relative` before the next test reassigns `state.scroll = 4`.
-        state.render_frame(&mut out, 80, 16).expect("render_frame after drag");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame after drag");
 
         // Default layout (show_header = false): horizontal drag along row 0 does not scroll;
         // dwelling or repeating identical Drag(col, 0) scrolls up across earlier history.
@@ -2465,6 +2467,7 @@ mod tests {
                     .display()
                     .to_string(),
                 score: 100 - i as i64,
+                recent: false,
             })
             .collect();
         state.update(Update::MentionMatches {
@@ -2531,12 +2534,14 @@ mod tests {
                     kind: MentionKind::File,
                     detail: dir.path().join("first.rs").display().to_string(),
                     score: 100,
+                    recent: false,
                 },
                 MentionMatch {
                     display: "second.rs".into(),
                     kind: MentionKind::File,
                     detail: dir.path().join("second.rs").display().to_string(),
                     score: 90,
+                    recent: false,
                 },
             ],
             total: 2,
@@ -2584,6 +2589,7 @@ mod tests {
                 kind: MentionKind::Git,
                 detail: String::new(),
                 score: 100_000,
+                recent: false,
             }],
             total: 1,
         });
@@ -2592,6 +2598,75 @@ mod tests {
         let git_rendered = String::from_utf8_lossy(&out);
         assert!(git_rendered.contains("git:abc1234"));
         assert!(git_rendered.contains("Git commit"));
+
+        // Recent mentions: selecting a file records it, persists across restart, and renders `Recent ·`.
+        let prefs_dir = tempfile::tempdir().unwrap();
+        let mut s1 = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        s1.preferences = Some(Preferences::open(prefs_dir.path()).unwrap());
+        s1.editor.set("@".into());
+        s1.refresh_mention(&mut tx);
+        let Command::SearchMentions { id: rid1, .. } = rx.try_recv().unwrap() else {
+            panic!("expected SearchMentions");
+        };
+        s1.update(Update::MentionMatches {
+            id: rid1,
+            query: "".into(),
+            matches: vec![MentionMatch {
+                display: "a b.txt".into(),
+                kind: MentionKind::File,
+                detail: dir.path().join("a b.txt").display().to_string(),
+                score: 100,
+                recent: false,
+            }],
+            total: 1,
+        });
+        assert!(s1.select_mention(&mut tx));
+        assert_eq!(s1.recent_mentions.len(), 1);
+        assert_eq!(s1.recent_mentions[0].display, "a b.txt");
+
+        let mut s2 = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        s2.preferences = Some(Preferences::open(prefs_dir.path()).unwrap());
+        s2.load_history();
+        assert_eq!(s2.recent_mentions.len(), 1);
+        assert_eq!(s2.recent_mentions[0].display, "a b.txt");
+
+        s2.editor.set("@".into());
+        s2.refresh_mention(&mut tx);
+        let Command::SearchMentions {
+            id: rid2,
+            recent: sent_recent,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected SearchMentions with recent");
+        };
+        assert_eq!(sent_recent.len(), 1);
+        assert_eq!(sent_recent[0].display, "a b.txt");
+        s2.update(Update::MentionMatches {
+            id: rid2,
+            query: "".into(),
+            matches: vec![MentionMatch {
+                display: "a b.txt".into(),
+                kind: MentionKind::File,
+                detail: dir.path().join("a b.txt").display().to_string(),
+                score: 500_000,
+                recent: true,
+            }],
+            total: 1,
+        });
+        out.clear();
+        s2.render_frame(&mut out, 100, 26).unwrap();
+        let recent_rendered = String::from_utf8_lossy(&out);
+        assert!(
+            recent_rendered.contains("Recent ·"),
+            "expected Recent · marker in mention popup render: {recent_rendered}"
+        );
     }
 
     #[test]
@@ -3534,7 +3609,10 @@ mod tests {
         state.render_frame(&mut out, 80, 16).expect("render_frame");
 
         // The user's intended 2-line upward scroll must be honored, NOT pushed down by the 5 new lines.
-        assert_eq!(state.painted_transcript_start, start_before.saturating_sub(2));
+        assert_eq!(
+            state.painted_transcript_start,
+            start_before.saturating_sub(2)
+        );
 
         // 2. User scrolls UP by 3 lines FIRST, then 4 new stream lines arrive before render.
         let start_before_2 = state.painted_transcript_start;
@@ -3543,7 +3621,10 @@ mod tests {
         state.render_frame(&mut out, 80, 16).expect("render_frame");
 
         // Viewport moves up by exactly 3 lines; stream arriving after scroll does not push it down.
-        assert_eq!(state.painted_transcript_start, start_before_2.saturating_sub(3));
+        assert_eq!(
+            state.painted_transcript_start,
+            start_before_2.saturating_sub(3)
+        );
 
         // 3. New entries arrive BOTH before and after scroll_transcript in the same unrendered frame:
         // 3 entries arrive before, user scrolls DOWN 2 lines, then stream grows by 2 more lines.
@@ -3636,7 +3717,9 @@ mod tests {
         // Terminal width changes to 120: width guard MUST skip delta adjustment so
         // wrapping differences (60 -> 30) do not corrupt state.scroll.
         out.clear();
-        state.render_frame(&mut out, 120, 16).expect("render_frame at width 120");
+        state
+            .render_frame(&mut out, 120, 16)
+            .expect("render_frame at width 120");
         assert_eq!(state.painted_size.0, 120);
         // Scroll should remain clamped to valid range at width 120, not distorted by delta = -30.
         let viewport_120 = usize::from(state.painted_layout.unwrap().transcript.len);
@@ -3646,7 +3729,9 @@ mod tests {
         // Scrolling immediately after resize at new width (120) applies cleanly.
         let prev_start = state.painted_transcript_start;
         state.scroll_transcript(true, 2, 120, 16);
-        state.render_frame(&mut out, 120, 16).expect("render_frame after scroll");
+        state
+            .render_frame(&mut out, 120, 16)
+            .expect("render_frame after scroll");
         assert_eq!(state.painted_transcript_start, prev_start.saturating_sub(2));
     }
 
@@ -3659,13 +3744,17 @@ mod tests {
         for i in 1..=30 {
             state.log(&format!("resize-entry-{i:02}-{}", "x".repeat(85)));
         }
-        state.render_frame(&mut out, 80, 16).expect("render_frame at width 80");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame at width 80");
         assert_eq!(state.scroll_anchor_width, 80);
         assert_eq!(state.scroll_anchor_total_lines, 60);
 
         // User scrolls up 10 lines at width 80.
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("render_frame at width 80");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame at width 80");
         assert_eq!(state.scroll, 10);
         assert_eq!(state.scroll_anchor_width, 80);
         assert_eq!(state.scroll_anchor_total_lines, 60);
@@ -3689,7 +3778,9 @@ mod tests {
 
         // Now render_frame is called at width 120.
         out.clear();
-        state.render_frame(&mut out, 120, 16).expect("render_frame at width 120");
+        state
+            .render_frame(&mut out, 120, 16)
+            .expect("render_frame at width 120");
 
         // The 5 new lines must adjust scroll by +5 (12 + 5 = 17).
         assert_eq!(state.scroll, 17);
@@ -3707,7 +3798,9 @@ mod tests {
         // Render at width 80: anchor width (120) != wrap width (80),
         // so wrapping difference must NOT be falsely added as a delta.
         out.clear();
-        state.render_frame(&mut out, 80, 16).expect("render_frame at reverted width 80");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame at reverted width 80");
         assert_eq!(state.scroll_anchor_width, 80);
         // Lines at width 80: 30 * 2 (60) + 5 * 1 (5) = 65 lines.
         assert_eq!(state.scroll_anchor_total_lines, 65);
@@ -3757,7 +3850,9 @@ mod tests {
         state.selection = super::selection::Selection::new(all_lines, 0, 30);
         state.selection_target = SelectionTarget::Transcript;
         state.scroll = 5;
-        state.render_frame(&mut out, 80, 16).expect("render_frame with selection");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame with selection");
         assert_eq!(state.scroll, 5);
 
         // Scroll selection within frozen snapshot
@@ -3772,7 +3867,9 @@ mod tests {
         }
 
         // Mid-selection render must remain isolated on frozen selection lines
-        state.render_frame(&mut out, 80, 16).expect("render_frame mid-selection");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame mid-selection");
         assert_eq!(state.scroll, 8);
         assert_eq!(state.painted_effective_scroll, 8);
         assert!(!state.scroll_relative);
@@ -3781,7 +3878,9 @@ mod tests {
         state.clear_selection();
 
         // Render next frame: full transcript is rendered with anchor delta (+5) preserving viewed line
-        state.render_frame(&mut out, 80, 16).expect("render_frame after selection ends");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame after selection ends");
         assert_eq!(state.scroll, 13);
         assert_eq!(state.painted_effective_scroll, 13);
         assert!(!state.scroll_relative);
@@ -3799,7 +3898,9 @@ mod tests {
         state.selection = super::selection::Selection::new(all_lines, 0, 30);
         state.selection_target = SelectionTarget::Transcript;
         state.scroll = 5;
-        state.render_frame(&mut out, 80, 16).expect("render_frame with selection");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame with selection");
         assert_eq!(state.scroll, 5);
         assert_eq!(state.painted_effective_scroll, 5);
 
@@ -3818,7 +3919,9 @@ mod tests {
         }
 
         // Render frame: anchor delta (+5) must be applied because scroll_relative was true!
-        state.render_frame(&mut out, 80, 16).expect("render_frame after clear_selection without mid-render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame after clear_selection without mid-render");
         assert_eq!(state.scroll, 13);
         assert_eq!(state.painted_effective_scroll, 13);
         assert!(!state.scroll_relative);
@@ -3836,7 +3939,9 @@ mod tests {
 
         let mut collapsed = state.painted_layout.unwrap();
         collapsed.transcript.len = 0;
-        state.render_transcript(&mut out, collapsed, false).expect("collapsed render");
+        state
+            .render_transcript(&mut out, collapsed, false)
+            .expect("collapsed render");
         // painted_all_transcript must be cleared so Rc refcount drops
         assert!(state.painted_all_transcript.is_empty());
     }
@@ -3892,14 +3997,18 @@ mod tests {
             state.log(&format!("entry-{i:02}"));
         }
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("render_frame at normal height");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame at normal height");
         assert_eq!(state.scroll, 10);
         let anchored_start = state.painted_transcript_start;
 
         // Artificially render with layout where transcript.len == 0
         let mut collapsed_layout = state.painted_layout.unwrap();
         collapsed_layout.transcript.len = 0;
-        state.render_transcript(&mut out, collapsed_layout, false).expect("render_transcript collapsed");
+        state
+            .render_transcript(&mut out, collapsed_layout, false)
+            .expect("render_transcript collapsed");
 
         // Scroll position must be preserved, not wiped to 0
         assert_eq!(state.scroll, 10);
@@ -3908,12 +4017,16 @@ mod tests {
         for i in 41..=45 {
             state.log(&format!("entry-{i:02}-while-collapsed"));
         }
-        state.render_transcript(&mut out, collapsed_layout, false).expect("render_transcript collapsed with new entries");
+        state
+            .render_transcript(&mut out, collapsed_layout, false)
+            .expect("render_transcript collapsed with new entries");
         assert_eq!(state.scroll, 10);
 
         // Restoring normal height preserves scroll anchor:
         // scroll offset increases by the 5 new lines, and painted_transcript_start remains fixed.
-        state.render_frame(&mut out, 80, 16).expect("render_frame after height restored");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame after height restored");
         assert_eq!(state.scroll, 15);
         assert_eq!(state.painted_effective_scroll, 15);
         assert_eq!(
@@ -3934,7 +4047,9 @@ mod tests {
         // 1. Partial clamp scenario:
         // User scrolls up 10 lines at height 16.
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("render_frame at height 16");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame at height 16");
         assert_eq!(state.scroll, 10);
         assert_eq!(state.painted_effective_scroll, 10);
 
@@ -3950,7 +4065,9 @@ mod tests {
         assert_eq!(state.selection_target, SelectionTarget::Transcript);
 
         // Viewport height increases partially (e.g. height 35, where transcript len is 32, max_scroll = 40 - 32 = 8).
-        state.render_frame(&mut out, 80, 35).expect("render_frame at taller height 35");
+        state
+            .render_frame(&mut out, 80, 35)
+            .expect("render_frame at taller height 35");
         let layout35 = state.painted_layout.unwrap();
         let expected_clamped_scroll = 40_usize.saturating_sub(usize::from(layout35.transcript.len));
         assert!(expected_clamped_scroll < 10);
@@ -3968,7 +4085,9 @@ mod tests {
 
         // Render at height 35 without user scrolling:
         // Anchor delta (+3) must be added cleanly, and painted_transcript_start must remain fixed!
-        state.render_frame(&mut out, 80, 35).expect("render_frame after logs with cleared selection");
+        state
+            .render_frame(&mut out, 80, 35)
+            .expect("render_frame after logs with cleared selection");
         assert_eq!(state.scroll, expected_clamped_scroll + 3);
         assert_eq!(state.painted_effective_scroll, expected_clamped_scroll + 3);
         assert_eq!(
@@ -3985,7 +4104,9 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::empty(),
         });
         assert!(state.selection.is_some());
-        state.render_frame(&mut out, 80, 46).expect("render_frame at height 46");
+        state
+            .render_frame(&mut out, 80, 46)
+            .expect("render_frame at height 46");
         assert_eq!(state.scroll, 0);
         assert_eq!(state.painted_effective_scroll, 0);
 
@@ -3996,7 +4117,9 @@ mod tests {
         }
 
         // Render back at height 16: must stay at bottom (scroll == 0), without jumping to old scroll!
-        state.render_frame(&mut out, 80, 16).expect("render_frame at height 16 after full clamp");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame at height 16 after full clamp");
         assert_eq!(state.scroll, 0);
         assert_eq!(state.painted_effective_scroll, 0);
     }
@@ -4028,9 +4151,15 @@ mod tests {
         let (mut tx, _rx) = std::sync::mpsc::sync_channel(4);
         state.editor.set("hello steer".into());
         state.submit(&mut tx);
-        assert!(state.selection.is_none(), "selection must be cleared on steer submit");
+        assert!(
+            state.selection.is_none(),
+            "selection must be cleared on steer submit"
+        );
         assert_eq!(state.scroll, 0, "scroll must be reset to 0 on steer submit");
-        assert!(!state.scroll_relative, "scroll_relative must be false on steer submit");
+        assert!(
+            !state.scroll_relative,
+            "scroll_relative must be false on steer submit"
+        );
 
         // 2. Test initial/idle submission (state.active.is_none()) while scrolled up with active selection
         state.pending = None;
@@ -4049,9 +4178,18 @@ mod tests {
 
         state.editor.set("hello initial".into());
         state.submit(&mut tx);
-        assert!(state.selection.is_none(), "selection must be cleared on initial submit");
-        assert_eq!(state.scroll, 0, "scroll must be reset to 0 on initial submit");
-        assert!(!state.scroll_relative, "scroll_relative must be false on initial submit");
+        assert!(
+            state.selection.is_none(),
+            "selection must be cleared on initial submit"
+        );
+        assert_eq!(
+            state.scroll, 0,
+            "scroll must be reset to 0 on initial submit"
+        );
+        assert!(
+            !state.scroll_relative,
+            "scroll_relative must be false on initial submit"
+        );
     }
 
     #[test]
@@ -4077,7 +4215,9 @@ mod tests {
         for i in 41..=45 {
             state.log(&format!("entry-{i:02}-new"));
         }
-        state.render_frame(&mut out, 80, 16).expect("render_frame after clear_painted_regions");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame after clear_painted_regions");
         assert_eq!(state.scroll, 15);
         assert_eq!(state.painted_effective_scroll, 15);
         assert_eq!(state.painted_transcript_start, anchored_start);
@@ -4092,17 +4232,23 @@ mod tests {
         }
         state.active = Some("run-transient".into());
         state.stream = "stream-1\nstream-2\nstream-3\nstream-4".into();
-        state.render_frame(&mut out, 80, 16).expect("initial render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("initial render");
 
         // User scrolls up 3 lines (< 4 stream lines).
         state.scroll_transcript(true, 3, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled render");
         let anchored_start = state.painted_transcript_start;
         assert_eq!(state.scroll, 3);
 
         // Stream is transiently cleared while the run is still active.
         state.stream.clear();
-        state.render_frame(&mut out, 80, 16).expect("transient render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("transient render");
         assert_eq!(state.scroll, 0);
         assert_eq!(state.scroll_anchor_deficit, Some(1));
 
@@ -4111,7 +4257,9 @@ mod tests {
         for i in 1..=6 {
             state.log(&format!("final-response-{i:02}"));
         }
-        state.render_frame(&mut out, 80, 16).expect("post-commit render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("post-commit render");
         assert_eq!(state.scroll, 5);
         assert_eq!(state.painted_effective_scroll, 5);
         assert_eq!(state.scroll_anchor_deficit, None);
@@ -4130,7 +4278,9 @@ mod tests {
         state.selection = super::selection::Selection::new(all_lines, 0, 30);
         state.selection_target = SelectionTarget::Transcript;
         state.scroll = 5;
-        state.render_frame(&mut out, 80, 16).expect("render_frame with selection");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame with selection");
 
         // Live output arrives while selection is active.
         for i in 41..=45 {
@@ -4144,12 +4294,16 @@ mod tests {
         assert!(state.scroll_relative);
         assert_eq!(state.scroll_anchor_total_lines, 40);
 
-        state.render_frame(&mut out, 80, 16).expect("render_frame mid-selection");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame mid-selection");
         assert_eq!(state.scroll, 8);
         assert_eq!(state.painted_effective_scroll, 8);
 
         state.clear_selection();
-        state.render_frame(&mut out, 80, 16).expect("render_frame after selection");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame after selection");
         assert_eq!(state.scroll, 13);
         assert_eq!(state.painted_effective_scroll, 13);
     }
@@ -4202,7 +4356,9 @@ mod tests {
         // Scrolled up with no new output -> Idle calm accent label without highlight pill or duplicate paint.
         state.scroll_transcript(true, 10, 80, 16);
         out.clear();
-        state.render_frame(&mut out, 80, 16).expect("render_frame idle badge");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame idle badge");
         assert!(!state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Idle);
         let idle_rendered = String::from_utf8(out.clone()).unwrap();
@@ -4226,7 +4382,9 @@ mod tests {
             at: 0,
         }));
         out.clear();
-        state.render_frame(&mut out, 80, 16).expect("render_frame streaming badge");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame streaming badge");
         assert!(state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
         let streaming_rendered = String::from_utf8(out.clone()).unwrap();
@@ -4259,7 +4417,9 @@ mod tests {
             .find(|s| {
                 next_streaming_rendered.contains(&format!("{badge_style}[ {s} ↓ New output ]"))
             })
-            .expect("rotated streaming badge must render braille spinner with Jump to bottom colors");
+            .expect(
+                "rotated streaming badge must render braille spinner with Jump to bottom colors",
+            );
         assert_ne!(next_spinner, initial_spinner);
 
         // Run finishes while still scrolled up -> transitions to NewOutput without spinner, keeping Jump to bottom colors.
@@ -4269,7 +4429,9 @@ mod tests {
             "result": { "final_response": "live-1\nlive-2\n", "files_changed": [] }
         })));
         out.clear();
-        state.render_frame(&mut out, 80, 16).expect("render_frame finished badge");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame finished badge");
         assert!(state.active.is_none());
         assert!(state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::NewOutput);
@@ -4300,13 +4462,17 @@ mod tests {
             data: json!({"text": "word-1"}),
             at: 0,
         }));
-        state.render_frame(&mut out, 80, 16).expect("render_frame first word");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame first word");
         assert!(state.has_unread_below);
         // Reset to bottom and scroll up again to establish a clean baseline with the active stream.
         state.reset_scroll();
         assert!(!state.has_unread_below);
         state.scroll_transcript(true, 8, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("render_frame clean baseline with stream");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame clean baseline with stream");
         assert!(!state.has_unread_below);
         // Append on the exact same line (line count unchanged, visible stream length increases).
         state.update(Update::Event(crate::domain::Event {
@@ -4316,7 +4482,9 @@ mod tests {
             data: json!({"text": " word-2"}),
             at: 0,
         }));
-        state.render_frame(&mut out, 80, 16).expect("render_frame same line append");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render_frame same line append");
         assert!(state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
 
@@ -4337,15 +4505,21 @@ mod tests {
         for i in 1..=35 {
             state.log(&format!("long-wrap-row-{i:02}-{}", "x".repeat(55)));
         }
-        state.render_frame(&mut out, 80, 16).expect("initial render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("initial render");
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled render");
         assert!(!state.has_unread_below);
 
         // 1. Width shrink (80 -> 40) + clear_painted_regions() (like Input::Resize) increases wrapped
         // lines from 35 to 70, but must NOT falsely mark unread output when nothing new arrived.
         state.clear_painted_regions();
-        state.render_frame(&mut out, 40, 16).expect("resized narrow render");
+        state
+            .render_frame(&mut out, 40, 16)
+            .expect("resized narrow render");
         assert!(!state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Idle);
 
@@ -4358,7 +4532,9 @@ mod tests {
             data: json!({"text": "[TOOL_CALL]\n```json\n{\"tool\":\"read\""}),
             at: 0,
         }));
-        state.render_frame(&mut out, 40, 16).expect("hidden tool stream render");
+        state
+            .render_frame(&mut out, 40, 16)
+            .expect("hidden tool stream render");
         assert!(!state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Idle);
 
@@ -4371,20 +4547,28 @@ mod tests {
             data: json!({"tool": "read", "args": {"path": "src/main.rs"}}),
             at: 0,
         }));
-        state.render_frame(&mut out, 40, 16).expect("tool started render");
+        state
+            .render_frame(&mut out, 40, 16)
+            .expect("tool started render");
         assert!(state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
         state.clear_painted_regions();
         assert!(state.has_unread_below);
-        state.render_frame(&mut out, 80, 16).expect("resized wide preserves unread");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("resized wide preserves unread");
         assert!(state.has_unread_below);
 
         // 4. Stream->commit replacement where total line count stays equal still marks unread via revision.
         state.reset_scroll();
         state.stream = "draft-1\ndraft-2".into();
-        state.render_frame(&mut out, 80, 16).expect("stream draft render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("stream draft render");
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled with draft");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled with draft");
         assert!(!state.has_unread_below);
         let lines_before = state.scroll_anchor_total_lines;
         // Replace 2-line stream with 2-line committed markdown (`\nfinal` produces leading blank + line).
@@ -4397,23 +4581,31 @@ mod tests {
         }));
         let lines_after = state.transcript.lines(&state.stream, 80).len();
         assert_eq!(lines_after, lines_before);
-        state.render_frame(&mut out, 80, 16).expect("equal-line commit render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("equal-line commit render");
         assert!(state.has_unread_below);
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
 
         // 5. Same-frame width resize + committed log also marks unread even though width changed.
         state.reset_scroll();
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("clean scrolled baseline");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("clean scrolled baseline");
         assert!(!state.has_unread_below);
         state.clear_painted_regions();
         state.log("committed-on-resize-frame");
-        state.render_frame(&mut out, 60, 16).expect("resize with new log");
+        state
+            .render_frame(&mut out, 60, 16)
+            .expect("resize with new log");
         assert!(state.has_unread_below);
 
         // 6. Narrow terminal (< 22 cols) uses compact streaming spinner `[ ⠋ ↓ New ]` and finished `[ ↓ New ]`.
         out.clear();
-        state.render_frame(&mut out, 20, 16).expect("narrow highlighted streaming");
+        state
+            .render_frame(&mut out, 20, 16)
+            .expect("narrow highlighted streaming");
         let narrow_streaming = String::from_utf8_lossy(&out);
         assert!(
             SPINNER_FRAMES
@@ -4423,7 +4615,9 @@ mod tests {
         );
         state.active = None;
         out.clear();
-        state.render_frame(&mut out, 20, 16).expect("narrow highlighted finished");
+        state
+            .render_frame(&mut out, 20, 16)
+            .expect("narrow highlighted finished");
         assert!(String::from_utf8_lossy(&out).contains("[ ↓ New ]"));
     }
 
@@ -4434,7 +4628,9 @@ mod tests {
         for i in 1..=40 {
             state.log(&format!("entry-{i:02}"));
         }
-        state.render_frame(&mut out, 80, 16).expect("initial render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("initial render");
         assert_eq!(state.scroll, 0);
         assert_eq!(state.scroll_anchor_width, 80);
         assert_eq!(state.scroll_anchor_total_lines, 40);
@@ -4470,7 +4666,9 @@ mod tests {
         assert!(state.selection.is_none());
 
         // Rendering must apply the +5 delta to the dragged scroll offset and mark unread output.
-        state.render_frame(&mut out, 80, 16).expect("post-drag render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("post-drag render");
         assert_eq!(state.scroll, 9);
         assert_eq!(state.painted_effective_scroll, 9);
         assert!(state.has_unread_below);
@@ -4500,7 +4698,9 @@ mod tests {
 
         // User scrolls up slightly (< stream length).
         state.scroll_transcript(true, 2, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled render");
         assert_eq!(state.scroll, 2);
 
         // Run is cancelled with no final_response: stream clears and only short status lines remain.
@@ -4509,7 +4709,9 @@ mod tests {
             "state": "cancelled",
             "result": { "files_changed": [] }
         })));
-        state.render_frame(&mut out, 80, 16).expect("cancelled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("cancelled render");
         assert_eq!(state.scroll, 0);
         assert_eq!(state.painted_effective_scroll, 0);
         assert_eq!(state.scroll_anchor_deficit, None);
@@ -4536,9 +4738,13 @@ mod tests {
         for i in 1..=40 {
             state.log(&format!("entry-{i:02}"));
         }
-        state.render_frame(&mut out, 80, 16).expect("initial render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("initial render");
         state.scroll_transcript(true, 10, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled render");
 
         let bg_fill = format!("{}", SetBackgroundColor(state.theme.background));
         let accent_fg = format!("{}", SetForegroundColor(state.theme.accent));
@@ -4547,7 +4753,9 @@ mod tests {
 
         state.log("new-output-below");
         out.clear();
-        state.render_frame(&mut out, 80, 16).expect("latte new output badge");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("latte new output badge");
         let rendered = String::from_utf8(out.clone()).unwrap();
         assert!(
             rendered.contains(&format!("{bg_fill}{accent_fg}{bold_attr}[ ↓ New output ]")),
@@ -4557,7 +4765,9 @@ mod tests {
 
         state.update(Update::Started("run-latte".into()));
         out.clear();
-        state.render_frame(&mut out, 80, 16).expect("latte streaming badge");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("latte streaming badge");
         let streaming_rendered = String::from_utf8(out).unwrap();
         assert!(
             SPINNER_FRAMES.iter().any(|s| {
@@ -4588,7 +4798,9 @@ mod tests {
             state.log(&format!("entry-{i:02}"));
         }
         state.scroll_transcript(true, 8, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled render");
         let layout = state.painted_layout.unwrap();
         state.transcript_mouse(event::MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -4618,13 +4830,17 @@ mod tests {
         for i in 1..=120 {
             state.log(&format!("entry-{i:04}-{filler}"));
         }
-        state.render_frame(&mut out, 80, 16).expect("initial render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("initial render");
         assert_eq!(state.scroll_anchor_evicted_lines, 0);
 
         // Scroll up while an active run is underway and snapshot the visible transcript lines.
         state.update(Update::Started("run-evict".into()));
         state.scroll_transcript(true, 30, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("scrolled render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("scrolled render");
         let scroll_before = state.scroll;
         assert_eq!(scroll_before, 30);
         let visible_before = state.painted_transcript.clone();
@@ -4640,7 +4856,9 @@ mod tests {
         }
 
         // Rendering after front eviction must keep the exact same visible lines and never produce a deficit.
-        state.render_frame(&mut out, 80, 16).expect("post-eviction render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("post-eviction render");
         assert!(
             state.scroll_anchor_evicted_lines > 0,
             "test must exercise front eviction past 128 KiB"
@@ -4655,7 +4873,9 @@ mod tests {
         let extra_text = "post-eviction-tail-line";
         let extra_added = Entry::Notice(extra_text.into()).render(79).len();
         state.log(extra_text);
-        state.render_frame(&mut out, 80, 16).expect("second render after eviction");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("second render after eviction");
         assert_eq!(state.painted_transcript, visible_before);
         assert_eq!(state.scroll, scroll_before + added_lines + extra_added);
         assert_eq!(state.scroll_anchor_deficit, None);
@@ -4669,10 +4889,14 @@ mod tests {
         for i in 1..=120 {
             state.log(&format!("oldest-{i:04}-{filler}"));
         }
-        state.render_frame(&mut out, 80, 16).expect("initial render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("initial render");
         // Scroll all the way to the oldest entry at the very top.
         state.scroll_transcript(true, 100_000, 80, 16);
-        state.render_frame(&mut out, 80, 16).expect("top-anchored render");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("top-anchored render");
         assert_eq!(state.painted_transcript_start, 0);
 
         // Trigger front eviction so the currently viewed top entries are dropped.
@@ -4680,7 +4904,9 @@ mod tests {
             state.log(&format!("newer-{i:04}-{filler}"));
         }
         assert!(state.transcript.lines(&state.stream, 80).evicted_lines() > 0);
-        state.render_frame(&mut out, 80, 16).expect("render after top evicted");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render after top evicted");
         // Viewport must clamp cleanly to the new top of the surviving transcript without jumping to bottom.
         assert_eq!(state.painted_transcript_start, 0);
         assert!(state.scroll > 0);
@@ -4690,7 +4916,9 @@ mod tests {
 
         // Further bottom appends keep the viewport pinned on the surviving top lines.
         state.log("another-bottom-entry");
-        state.render_frame(&mut out, 80, 16).expect("render after bottom append");
+        state
+            .render_frame(&mut out, 80, 16)
+            .expect("render after bottom append");
         assert_eq!(state.painted_transcript, surviving_top);
         assert_eq!(state.painted_transcript_start, 0);
     }

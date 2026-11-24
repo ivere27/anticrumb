@@ -2140,7 +2140,9 @@ mod tests {
         let mut saved_opts = PromptOptions::parse(&["hello".into()]).unwrap();
         saved_opts.load_saved_temporary(dir.path());
         assert!(saved_opts.temporary);
-        assert!(saved_opts.agent_request("hello".into(), None).is_temporary());
+        assert!(saved_opts
+            .agent_request("hello".into(), None)
+            .is_temporary());
 
         // `--no-temp` has been removed; `--temp` explicitly enables temporary mode and marks override.
         assert!(PromptOptions::parse(&["--no-temp".into(), "hello".into()]).is_err());
@@ -2197,7 +2199,10 @@ mod tests {
         };
         assert_eq!(session_is_temporary(&chat_session), Some(false));
         assert_eq!(session_is_temporary(&temp_session), Some(true));
-        assert_eq!(session_is_temporary(&crate::rpc::pb::Session::default()), None);
+        assert_eq!(
+            session_is_temporary(&crate::rpc::pb::Session::default()),
+            None
+        );
 
         let fetch_session = |sid: &str| match sid {
             "sess-chat" => Ok(chat_session.clone()),

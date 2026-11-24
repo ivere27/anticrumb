@@ -3857,11 +3857,7 @@ async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_gr
     // Batch CloseSessions closes live sessions, skips missing/duplicate IDs, and updates state.
     let batch = browser_ffi
         .close_sessions(pb::CloseSessionsRequest {
-            session_ids: vec![
-                temp_sid.clone(),
-                temp_sid.clone(),
-                "does-not-exist".into(),
-            ],
+            session_ids: vec![temp_sid.clone(), temp_sid.clone(), "does-not-exist".into()],
         })
         .await
         .unwrap();
@@ -3925,8 +3921,7 @@ async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_gr
     )
     .await
     .unwrap();
-    let ws_ffi =
-        RpcClient::embedded(workspace.clone(), tokio::runtime::Handle::current()).unwrap();
+    let ws_ffi = RpcClient::embedded(workspace.clone(), tokio::runtime::Handle::current()).unwrap();
     let job = ws_ffi
         .start_agent(pb::AgentRequest {
             task: "ephemeral temp agent".into(),

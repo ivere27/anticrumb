@@ -629,12 +629,8 @@ async fn sdk_mcp_negotiates_lists_and_calls_the_same_service() {
         .to_owned();
     let inspected = client
         .call_tool(
-            CallToolRequestParams::new("gemini_session_get").with_arguments(
-                json!({"session_id": sid})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            CallToolRequestParams::new("gemini_session_get")
+                .with_arguments(json!({"session_id": sid}).as_object().unwrap().clone()),
         )
         .await
         .unwrap();

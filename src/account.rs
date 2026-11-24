@@ -404,8 +404,12 @@ mod tests {
             )
             .unwrap();
 
-        let mut resumable_chat =
-            make_session("s-chat-resumable", "default", SessionState::Ready, Some("t-chat"));
+        let mut resumable_chat = make_session(
+            "s-chat-resumable",
+            "default",
+            SessionState::Ready,
+            Some("t-chat"),
+        );
         resumable_chat.remote_url = Some("https://claude.ai/chat/123".into());
         resumable_chat.remote_turns = 1;
         store

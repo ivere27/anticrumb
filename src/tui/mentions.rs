@@ -1,5 +1,8 @@
 //! Asynchronous workspace `@` mention search, fuzzy ranking, and popup state.
-use super::editor::Editor;
+use super::{
+    editor::Editor,
+    preferences::{RecentMention, RecentMentionKind, MAX_PINNED_RECENT_MENTIONS},
+};
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -57,6 +60,8 @@ pub(super) struct MentionMatch {
     /// Absolute disk path or short description displayed on the right.
     pub detail: String,
     pub score: i64,
+    /// True when pinned at the top of the popup from recently used `@` mentions.
+    pub recent: bool,
 }
 
 impl MentionMatch {
@@ -136,7 +141,11 @@ impl MentionPopup {
                                         suffix.starts_with(low_git)
                                     };
                                     if matches {
-                                        Some(m.clone())
+                                        let mut updated = m.clone();
+                                        if !low_git.is_empty() {
+                                            updated.recent = false;
+                                        }
+                                        Some(updated)
                                     } else {
                                         None
                                     }
@@ -153,11 +162,18 @@ impl MentionPopup {
                                     };
                                     if matches {
                                         let mut updated = m.clone();
-                                        updated.display = if has_plus {
-                                            format!("git:{sha_core}+")
-                                        } else {
-                                            format!("git:{sha_core}")
-                                        };
+                                        if !low_git.is_empty() {
+                                            updated.recent = false;
+                                        }
+                                        // Preserve pinned recent commit `+` suffix while loading `@git:`
+                                        // without blocking `@git:+` -> `@git:` backspace on non-recent commits.
+                                        if !(low_git.is_empty() && m.recent) {
+                                            updated.display = if has_plus {
+                                                format!("git:{sha_core}+")
+                                            } else {
+                                                format!("git:{sha_core}")
+                                            };
+                                        }
                                         Some(updated)
                                     } else {
                                         None
@@ -165,18 +181,22 @@ impl MentionPopup {
                                 }
                             }
                         } else {
-                            if m.kind == MentionKind::Git
-                                && !matches!(
-                                    m.display.as_str(),
-                                    "git:diff" | "git:diff+" | "git:staged" | "git:staged+"
-                                )
-                            {
+                            let is_builtin_git = matches!(
+                                m.display.as_str(),
+                                "git:diff" | "git:diff+" | "git:staged" | "git:staged+"
+                            );
+                            if m.kind == MentionKind::Git && !is_builtin_git {
+                                if parsed.query.is_empty() && m.recent {
+                                    return Some(m.clone());
+                                }
                                 return None;
                             }
-                            if parsed.query.is_empty()
-                                || fuzzy_score(&parsed.query, &m.display).is_some()
-                            {
+                            if parsed.query.is_empty() {
                                 Some(m.clone())
+                            } else if fuzzy_score(&parsed.query, &m.display).is_some() {
+                                let mut updated = m.clone();
+                                updated.recent = false;
+                                Some(updated)
                             } else {
                                 None
                             }
@@ -442,8 +462,8 @@ pub(super) fn recent_git_commits(workspace: &Path, limit: usize) -> Vec<(String,
         .collect()
 }
 
-pub(super) fn resolve_git_commit_entry(workspace: &Path, rev: &str) -> Option<(String, String)> {
-    if rev.len() < 4 || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
+fn resolve_git_ref_entry(workspace: &Path, rev: &str) -> Option<(String, String)> {
+    if rev.is_empty() || rev.starts_with('-') || rev.chars().any(char::is_control) {
         return None;
     }
     let verified = std::process::Command::new("git")
@@ -476,9 +496,166 @@ pub(super) fn resolve_git_commit_entry(workspace: &Path, rev: &str) -> Option<(S
         .find_map(parse_git_commit_line)
 }
 
+pub(super) fn resolve_git_commit_entry(workspace: &Path, rev: &str) -> Option<(String, String)> {
+    if rev.len() < 4 || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    resolve_git_ref_entry(workspace, rev)
+}
+
+fn resolve_git_mention_spec_entry(workspace: &Path, spec: &str) -> Option<(String, String)> {
+    if let Some(rev) = spec.strip_suffix('+') {
+        if !rev.is_empty() {
+            if let Some(entry) = resolve_git_ref_entry(workspace, rev) {
+                return Some(entry);
+            }
+        }
+    }
+    resolve_git_ref_entry(workspace, spec)
+}
+
+pub(super) fn builtin_git_mention_detail(display: &str) -> Option<&'static str> {
+    match display {
+        "git:diff" => Some("Unstaged git diff"),
+        "git:diff+" => Some("Unstaged git diff with tree-sitter AST context"),
+        "git:staged" => Some("Staged git diff"),
+        "git:staged+" => Some("Staged git diff with tree-sitter AST context"),
+        _ => None,
+    }
+}
+
+pub(super) fn recent_mention_from_resolved(
+    workspace: &Path,
+    display: &str,
+) -> Option<RecentMention> {
+    if display.is_empty() {
+        return None;
+    }
+    if let Some(spec) = display.strip_prefix("git:") {
+        let detail = if let Some(desc) = builtin_git_mention_detail(display) {
+            desc.to_owned()
+        } else {
+            resolve_git_mention_spec_entry(workspace, spec)
+                .map(|(_, subject)| subject)
+                .unwrap_or_default()
+        };
+        return Some(RecentMention {
+            display: display.to_owned(),
+            kind: RecentMentionKind::Git,
+            detail,
+        });
+    }
+    let abs = crate::input::expand_home_path(display).unwrap_or_else(|| workspace.join(display));
+    Some(RecentMention {
+        display: display.to_owned(),
+        kind: RecentMentionKind::File,
+        detail: abs.display().to_string(),
+    })
+}
+
+fn resolve_valid_recent_matches(
+    workspace: &Path,
+    recent: &[RecentMention],
+    git_only: bool,
+    limit: usize,
+) -> Vec<MentionMatch> {
+    let mut out = Vec::with_capacity(limit);
+    for item in recent {
+        if out.len() >= limit {
+            break;
+        }
+        if item.display.is_empty() {
+            continue;
+        }
+        match item.kind {
+            RecentMentionKind::File => {
+                if git_only {
+                    continue;
+                }
+                let abs = crate::input::expand_home_path(&item.display)
+                    .unwrap_or_else(|| workspace.join(&item.display));
+                if !abs.is_file() {
+                    continue;
+                }
+                let detail = if item.detail.is_empty() {
+                    abs.display().to_string()
+                } else {
+                    item.detail.clone()
+                };
+                out.push(MentionMatch {
+                    display: item.display.clone(),
+                    kind: MentionKind::File,
+                    detail,
+                    score: 500_000 - out.len() as i64,
+                    recent: true,
+                });
+            }
+            RecentMentionKind::Git => {
+                let detail = if let Some(desc) = builtin_git_mention_detail(&item.display) {
+                    desc.to_owned()
+                } else {
+                    let Some(spec) = item.display.strip_prefix("git:") else {
+                        continue;
+                    };
+                    if spec.is_empty() {
+                        continue;
+                    }
+                    let Some((_, subject)) = resolve_git_mention_spec_entry(workspace, spec) else {
+                        continue;
+                    };
+                    if subject.is_empty() {
+                        item.detail.clone()
+                    } else {
+                        subject
+                    }
+                };
+                out.push(MentionMatch {
+                    display: item.display.clone(),
+                    kind: MentionKind::Git,
+                    detail,
+                    score: 500_000 - out.len() as i64,
+                    recent: true,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn prepend_pinned_recents(
+    results: &mut Vec<MentionMatch>,
+    total: &mut usize,
+    pinned: Vec<MentionMatch>,
+) {
+    if pinned.is_empty() {
+        return;
+    }
+    let before = results.len();
+    results.retain(|m| !pinned.iter().any(|p| p.display == m.display));
+    let removed = before - results.len();
+    let added_new = pinned.len().saturating_sub(removed);
+    *total += added_new;
+    let mut merged = Vec::with_capacity(pinned.len() + results.len());
+    merged.extend(pinned);
+    merged.append(results);
+    merged.truncate(MAX_STORED_MATCHES);
+    *results = merged;
+}
+
+#[cfg(test)]
 pub(super) fn search_mentions(
     workspace: &Path,
     query: &str,
+    cancel_counter: Option<&AtomicU64>,
+    request_id: u64,
+) -> Option<(Vec<MentionMatch>, usize)> {
+    search_mentions_with_recent(workspace, query, &[], cancel_counter, request_id)
+}
+
+pub(super) fn search_mentions_with_recent(
+    workspace: &Path,
+    query: &str,
+    recent: &[RecentMention],
     cancel_counter: Option<&AtomicU64>,
     request_id: u64,
 ) -> Option<(Vec<MentionMatch>, usize)> {
@@ -524,6 +701,7 @@ pub(super) fn search_mentions(
                     kind: MentionKind::Git,
                     detail: desc.to_owned(),
                     score: 200_000 - idx as i64,
+                    recent: false,
                 });
             }
         }
@@ -558,6 +736,7 @@ pub(super) fn search_mentions(
                     kind: MentionKind::Git,
                     detail: subject,
                     score,
+                    recent: false,
                 });
             }
         }
@@ -575,6 +754,7 @@ pub(super) fn search_mentions(
                         kind: MentionKind::Git,
                         detail: old_subject,
                         score: 100_000,
+                        recent: false,
                     });
                 }
             }
@@ -586,7 +766,12 @@ pub(super) fn search_mentions(
                 .then_with(|| a.display.len().cmp(&b.display.len()))
                 .then_with(|| a.display.cmp(&b.display))
         });
-        let total = results.len();
+        let mut total = results.len();
+        if git_prefix.is_empty() && !recent.is_empty() {
+            let pinned =
+                resolve_valid_recent_matches(workspace, recent, true, MAX_PINNED_RECENT_MENTIONS);
+            prepend_pinned_recents(&mut results, &mut total, pinned);
+        }
         results.truncate(MAX_STORED_MATCHES);
         return Some((results, total));
     }
@@ -610,6 +795,7 @@ pub(super) fn search_mentions(
                     kind: MentionKind::Git,
                     detail: desc.to_owned(),
                     score: score - if query.is_empty() { 40 } else { 0 },
+                    recent: false,
                 });
             }
         }
@@ -721,6 +907,7 @@ pub(super) fn search_mentions(
                     } else {
                         score
                     },
+                    recent: false,
                 });
             }
 
@@ -740,7 +927,12 @@ pub(super) fn search_mentions(
             .then_with(|| a.display.len().cmp(&b.display.len()))
             .then_with(|| a.display.cmp(&b.display))
     });
-    let total = results.len();
+    let mut total = results.len();
+    if query.is_empty() && !recent.is_empty() {
+        let pinned =
+            resolve_valid_recent_matches(workspace, recent, false, MAX_PINNED_RECENT_MENTIONS);
+        prepend_pinned_recents(&mut results, &mut total, pinned);
+    }
     results.truncate(MAX_STORED_MATCHES);
     Some((results, total))
 }
@@ -750,6 +942,7 @@ struct SearchJob {
     id: u64,
     workspace: PathBuf,
     query: String,
+    recent: Vec<RecentMention>,
 }
 
 /// Coalesced background `@` mention searcher so stale queries abort immediately
@@ -795,9 +988,13 @@ impl MentionSearchHandle {
             if latest_worker.load(Ordering::Relaxed) != job.id {
                 continue;
             }
-            if let Some((matches, total)) =
-                search_mentions(&job.workspace, &job.query, Some(&latest_worker), job.id)
-            {
+            if let Some((matches, total)) = search_mentions_with_recent(
+                &job.workspace,
+                &job.query,
+                &job.recent,
+                Some(&latest_worker),
+                job.id,
+            ) {
                 if latest_worker.load(Ordering::Relaxed) == job.id {
                     let _ = updates.try_send(super::worker::Update::MentionMatches {
                         id: job.id,
@@ -817,7 +1014,13 @@ impl MentionSearchHandle {
         }
     }
 
-    pub(super) fn schedule(&self, id: u64, workspace: PathBuf, query: String) {
+    pub(super) fn schedule(
+        &self,
+        id: u64,
+        workspace: PathBuf,
+        query: String,
+        recent: Vec<RecentMention>,
+    ) {
         self.latest_id.store(id, Ordering::Relaxed);
         let (lock, cv) = &*self.pending;
         if let Ok(mut guard) = lock.lock() {
@@ -825,6 +1028,7 @@ impl MentionSearchHandle {
                 id,
                 workspace,
                 query,
+                recent,
             });
             cv.notify_one();
         }
@@ -950,7 +1154,7 @@ mod tests {
         fs::write(root.join("beta_file.rs"), "").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let handle = MentionSearchHandle::spawn(tx);
-        handle.schedule(1, root.clone(), "beta".into());
+        handle.schedule(1, root.clone(), "beta".into(), Vec::new());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -1213,6 +1417,258 @@ mod tests {
         assert_eq!(old_matches.len(), 1);
         assert_eq!(old_matches[0].display, format!("git:{old_short}"));
         assert_eq!(old_matches[0].detail, "very old ancestor");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_mentions_pins_top_two_recent_items_deduped_and_skips_stale() {
+        let root = temp_workspace("recent-pins");
+        fs::write(root.join("alpha.rs"), "fn a() {}\n").unwrap();
+        fs::write(root.join("beta.rs"), "fn b() {}\n").unwrap();
+        fs::write(root.join("gamma.rs"), "fn g() {}\n").unwrap();
+        fs::write(root.join("zeta.rs"), "fn z() {}\n").unwrap();
+
+        let recents = vec![
+            // Stale deleted file must be skipped automatically
+            RecentMention {
+                display: "deleted.rs".into(),
+                kind: RecentMentionKind::File,
+                detail: root.join("deleted.rs").display().to_string(),
+            },
+            // Valid #1 recent -> pinned at index 0
+            RecentMention {
+                display: "zeta.rs".into(),
+                kind: RecentMentionKind::File,
+                detail: root.join("zeta.rs").display().to_string(),
+            },
+            // Valid #2 recent -> pinned at index 1
+            RecentMention {
+                display: "git:diff+".into(),
+                kind: RecentMentionKind::Git,
+                detail: "Unstaged git diff with tree-sitter AST context".into(),
+            },
+            // Valid #3 recent -> beyond top-2 pin limit, stays in normal order
+            RecentMention {
+                display: "gamma.rs".into(),
+                kind: RecentMentionKind::File,
+                detail: root.join("gamma.rs").display().to_string(),
+            },
+        ];
+
+        let (matches, total) = search_mentions_with_recent(&root, "", &recents, None, 1).unwrap();
+        assert_eq!(matches[0].display, "zeta.rs");
+        assert!(matches[0].recent);
+        assert_eq!(matches[1].display, "git:diff+");
+        assert!(matches[1].recent);
+        // Must not duplicate pinned items lower in the list, and 3rd recent is not pinned
+        assert_eq!(matches.iter().filter(|m| m.display == "zeta.rs").count(), 1);
+        assert_eq!(
+            matches.iter().filter(|m| m.display == "git:diff+").count(),
+            1
+        );
+        assert!(!matches.iter().any(|m| m.display == "deleted.rs"));
+        assert_eq!(matches.iter().filter(|m| m.recent).count(), 2);
+        assert_eq!(total, matches.len());
+
+        // Under `@git:`, only recent Git items (up to 2) pin at the top
+        let (git_matches, _) =
+            search_mentions_with_recent(&root, "git:", &recents, None, 2).unwrap();
+        assert_eq!(git_matches[0].display, "git:diff+");
+        assert!(git_matches[0].recent);
+        assert_eq!(
+            git_matches
+                .iter()
+                .filter(|m| m.display == "git:diff+")
+                .count(),
+            1
+        );
+
+        // Under non-empty filter query, normal fuzzy search applies without unrelated pins
+        let (alpha_matches, _) =
+            search_mentions_with_recent(&root, "alpha", &recents, None, 3).unwrap();
+        assert_eq!(alpha_matches.len(), 1);
+        assert_eq!(alpha_matches[0].display, "alpha.rs");
+        assert!(!alpha_matches[0].recent);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_mentions_total_not_overcounted_when_pinned_file_ranks_past_cap() {
+        let root = temp_workspace("recent-total-cap");
+        // Create 110 files so zzz_last.rs sorts after MAX_STORED_MATCHES (100).
+        for i in 0..109 {
+            fs::write(root.join(format!("f_{i:03}.rs")), "fn f() {}\n").unwrap();
+        }
+        fs::write(root.join("zzz_last.rs"), "fn z() {}\n").unwrap();
+
+        let (_, baseline_total) = search_mentions_with_recent(&root, "", &[], None, 1).unwrap();
+        assert_eq!(baseline_total, 110 + 4); // 110 files + 4 builtin git:* entries
+
+        let recents = vec![RecentMention {
+            display: "zzz_last.rs".into(),
+            kind: RecentMentionKind::File,
+            detail: root.join("zzz_last.rs").display().to_string(),
+        }];
+        let (matches, pinned_total) =
+            search_mentions_with_recent(&root, "", &recents, None, 2).unwrap();
+        assert_eq!(matches.len(), MAX_STORED_MATCHES);
+        assert_eq!(matches[0].display, "zzz_last.rs");
+        assert!(matches[0].recent);
+        assert_eq!(
+            pinned_total, baseline_total,
+            "pinning a file ranked beyond MAX_STORED_MATCHES must not overcount total"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mention_popup_optimistic_filtering_avoids_recent_commit_flicker() {
+        let mut base = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 1,
+                query: String::new(),
+                quoted: false,
+            },
+            1,
+            None,
+        );
+        base.apply_results(
+            1,
+            "",
+            vec![
+                MentionMatch {
+                    display: "git:abc1234+".into(),
+                    kind: MentionKind::Git,
+                    detail: "fix parser".into(),
+                    score: 500_000,
+                    recent: true,
+                },
+                MentionMatch {
+                    display: "alpha.rs".into(),
+                    kind: MentionKind::File,
+                    detail: "/ws/alpha.rs".into(),
+                    score: 990,
+                    recent: false,
+                },
+                MentionMatch {
+                    display: "git:diff+".into(),
+                    kind: MentionKind::Git,
+                    detail: "Unstaged git diff with tree-sitter AST context".into(),
+                    score: 950,
+                    recent: false,
+                },
+            ],
+            3,
+        );
+
+        // 1. Typing `@a` drops pinned recent commit immediately (non-`git:` searches don't return commits).
+        let typed_a = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 2,
+                query: "a".into(),
+                quoted: false,
+            },
+            2,
+            Some(&base),
+        );
+        assert!(!typed_a
+            .matches
+            .iter()
+            .any(|m| m.display.starts_with("git:abc1234")));
+        assert!(typed_a.matches.iter().any(|m| m.display == "alpha.rs"));
+
+        // 2. Typing `@git:` preserves `+` on pinned recent `git:abc1234+` while loading.
+        let typed_git = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 5,
+                query: "git:".into(),
+                quoted: false,
+            },
+            3,
+            Some(&base),
+        );
+        let pinned = typed_git
+            .matches
+            .iter()
+            .find(|m| m.display == "git:abc1234+")
+            .expect("pinned git:abc1234+ should retain + while loading @git:");
+        assert!(pinned.recent);
+
+        // 3. Backspacing from `@git:+` to `@git:` still strips `+` on non-recent commits.
+        let mut plus_popup = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 6,
+                query: "git:+".into(),
+                quoted: false,
+            },
+            4,
+            None,
+        );
+        plus_popup.apply_results(
+            4,
+            "git:+",
+            vec![MentionMatch {
+                display: "git:def5678+".into(),
+                kind: MentionKind::Git,
+                detail: "other commit".into(),
+                score: 100_000,
+                recent: false,
+            }],
+            1,
+        );
+        let backspaced_git = MentionPopup::new(
+            &MentionQuery {
+                start: 0,
+                end: 5,
+                query: "git:".into(),
+                quoted: false,
+            },
+            5,
+            Some(&plus_popup),
+        );
+        assert_eq!(backspaced_git.matches[0].display, "git:def5678");
+    }
+
+    #[test]
+    fn recent_git_mentions_support_literal_plus_branches_and_symbolic_refs() {
+        let root = temp_workspace("recent-git-refs");
+        let run_out = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_out(&["init"]);
+        run_out(&["config", "user.name", "test"]);
+        run_out(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+        run_out(&["add", "code.rs"]);
+        run_out(&["commit", "-m", "plus branch commit"]);
+        run_out(&["branch", "c++"]);
+
+        let m_plus_branch = recent_mention_from_resolved(&root, "git:c++").unwrap();
+        assert_eq!(m_plus_branch.detail, "plus branch commit");
+        let m_head_plus = recent_mention_from_resolved(&root, "git:HEAD+").unwrap();
+        assert_eq!(m_head_plus.detail, "plus branch commit");
+
+        let recents = vec![m_plus_branch, m_head_plus];
+        let (matches, _) = search_mentions_with_recent(&root, "git:", &recents, None, 1).unwrap();
+        assert_eq!(matches[0].display, "git:c++");
+        assert!(matches[0].recent);
+        assert_eq!(matches[0].detail, "plus branch commit");
+        assert_eq!(matches[1].display, "git:HEAD+");
+        assert!(matches[1].recent);
+        assert_eq!(matches[1].detail, "plus branch commit");
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -588,11 +588,7 @@ mod tests {
             assert_eq!(held.to_vec(), held_copy, "held snapshot after push {i}");
             drop(held);
             let lines = t.lines("", 30);
-            assert_eq!(
-                lines.to_vec(),
-                uncached(&t, "", 30),
-                "after push {i}"
-            );
+            assert_eq!(lines.to_vec(), uncached(&t, "", 30), "after push {i}");
             assert_eq!(
                 lines.evicted_lines() + lines.len() as u64,
                 total_pushed_lines,

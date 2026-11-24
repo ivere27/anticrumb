@@ -209,7 +209,10 @@ impl SessionState {
     }
 
     pub const fn is_unavailable_for_temporary_resume(self) -> bool {
-        matches!(self, Self::Closed | Self::Invalidated | Self::CleanupPending)
+        matches!(
+            self,
+            Self::Closed | Self::Invalidated | Self::CleanupPending
+        )
     }
 }
 
@@ -578,9 +581,7 @@ impl Session {
 
     pub fn has_remote_handle(&self) -> bool {
         match self.mode {
-            SessionMode::Temporary => {
-                self.target_id.is_some() || self.remote_session_id.is_some()
-            }
+            SessionMode::Temporary => self.target_id.is_some() || self.remote_session_id.is_some(),
             SessionMode::Chat => {
                 self.target_id.is_some()
                     || self.remote_url.is_some()

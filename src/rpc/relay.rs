@@ -46,11 +46,15 @@ impl Relay {
                 "saved web conversation belongs to a different browser daemon; reconnect to its original host",
             ));
         }
-        let remote = match self.runtime.block_on(self.client.get_session(pb::SessionRef {
-            id: remote_id.to_owned(),
-        })) {
+        let remote = match self
+            .runtime
+            .block_on(self.client.get_session(pb::SessionRef {
+                id: remote_id.to_owned(),
+            })) {
             Ok(remote) => remote,
-            Err(err) if err.code == ErrorCode::NotFound && session.mode == SessionMode::Temporary => {
+            Err(err)
+                if err.code == ErrorCode::NotFound && session.mode == SessionMode::Temporary =>
+            {
                 session.state = SessionState::Invalidated;
                 return Err(ServiceError::session_unavailable(
                     "resume",
@@ -66,9 +70,7 @@ impl Relay {
         }
         let remote_mode = codec::session_mode_from(remote.mode)?;
         if remote_mode != session.mode {
-            return Err(ServiceError::invalid(
-                "remote session mode mismatch",
-            ));
+            return Err(ServiceError::invalid("remote session mode mismatch"));
         }
         match codec::session_state_from(remote.state)? {
             SessionState::Deleted => {

@@ -1590,6 +1590,13 @@ impl State {
         for warning in &prepared.warnings {
             self.log_warning(warning);
         }
+        for display in &prepared.resolved_mentions {
+            if let Some(recent) =
+                super::mentions::recent_mention_from_resolved(&self.options.workspace, display)
+            {
+                self.remember_mention(recent);
+            }
+        }
         self.remember_draft(&draft);
         self.reset_scroll();
         self.clear_selection();

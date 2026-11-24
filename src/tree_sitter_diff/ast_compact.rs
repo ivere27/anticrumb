@@ -7,9 +7,9 @@ use super::{
     check_primary_definition,
     diff_expand::{
         compute_diff_line_numbers, extract_chunk_header_and_added_source,
-        is_container_definition_node, parse_hunk_header, parse_with_timeout, strip_clamped_suffix,
+        is_container_definition_node, parse_hunk_header, strip_clamped_suffix,
     },
-    get_node_text_same_line, signature,
+    get_node_text_same_line, language_registry, signature,
     test_scope::{
         collect_node_lines_text, extract_c_cpp_function_name, has_ast_java_csharp_test_attr,
         has_ast_rust_attr, is_cfg_test_attribute, is_rust_test_attr,
@@ -1163,12 +1163,12 @@ pub(super) fn fold_inline_tests_in_new_chunk(
     orig_line_map: Option<&[Option<super::SourceLineSpan>]>,
     path: &Path,
 ) -> Option<FoldedChunkResult> {
-    let lang = SupportedLanguage::from_path(path)?;
+    let _ = SupportedLanguage::candidates_for_path(path)?;
     let (_hdr, added_source, added_count) = extract_chunk_header_and_added_source(raw_chunk);
     if added_count < MIN_INLINE_TEST_FOLD_LINES || added_source.len() > MAX_TREESITTER_FILE_BYTES {
         return None;
     }
-    let tree = parse_with_timeout(lang, &added_source).ok()?;
+    let (lang, tree) = language_registry::parse_for_path(path, &added_source)?;
     let blocks: Vec<InlineTestBlock> =
         find_inline_test_blocks(lang, &tree.root_node(), &added_source)
             .into_iter()
@@ -1756,15 +1756,21 @@ pub(super) fn skeletonize_new_chunk_progressive(
     path: &Path,
     target_budget: usize,
 ) -> Option<ProgressiveSkeletonResult> {
-    let lang = SupportedLanguage::from_path(path)?;
-    if lang == SupportedLanguage::Json {
+    let candidates = SupportedLanguage::candidates_for_path(path)?;
+    if matches!(
+        candidates,
+        super::LanguageCandidates::Exact(SupportedLanguage::Json)
+    ) {
         return None;
     }
     let (_hdr, orig_source, added_count) = extract_chunk_header_and_added_source(raw_chunk);
     if added_count < MIN_SKELETON_BODY_LINES || orig_source.len() > MAX_TREESITTER_FILE_BYTES {
         return None;
     }
-    let tree = parse_with_timeout(lang, &orig_source).ok()?;
+    let (lang, tree) = language_registry::parse_for_path(path, &orig_source)?;
+    if lang == SupportedLanguage::Json {
+        return None;
+    }
     let orig_lines: Vec<&str> = orig_source.lines().collect();
     if orig_lines.is_empty() {
         return None;
@@ -1952,7 +1958,7 @@ pub(super) fn build_budget_omitted_toc(
 
     // 1. New or deleted files: parse full added (`+`) or deleted (`-`) source via tree-sitter
     if is_new || is_deleted {
-        let lang = SupportedLanguage::from_path(path)?;
+        let _ = SupportedLanguage::candidates_for_path(path)?;
         let mut source = String::new();
         let mut in_hunk = false;
         let prefix_ch = if is_deleted { '-' } else { '+' };
@@ -1973,7 +1979,7 @@ pub(super) fn build_budget_omitted_toc(
         if source.is_empty() || source.len() > MAX_TREESITTER_FILE_BYTES {
             return None;
         }
-        let tree = parse_with_timeout(lang, &source).ok()?;
+        let (lang, tree) = language_registry::parse_for_path(path, &source)?;
         let lines: Vec<&str> = source.lines().collect();
         if lines.is_empty() {
             return None;
