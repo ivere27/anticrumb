@@ -1314,6 +1314,9 @@ impl State {
                     self.phase = "ready".into();
                     self.copy_response.clear();
                     self.subagents.clear();
+                    self.reset_scroll();
+                    self.clear_selection();
+                    self.clear_painted_regions();
                     if command == "/clear" {
                         self.transcript.clear();
                     }
@@ -1588,7 +1591,8 @@ impl State {
             self.log_warning(warning);
         }
         self.remember_draft(&draft);
-        self.scroll = 0;
+        self.reset_scroll();
+        self.clear_selection();
         self.pending = Some((draft, std::mem::take(&mut self.files)));
         self.editor.set(String::new());
         self.completion = None;
