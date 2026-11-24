@@ -255,6 +255,11 @@ fn wrap(spans: Line, width: usize, lines: &mut Vec<Line>) {
     let mut used = 0;
     for span in spans {
         for ch in span.text.chars() {
+            if ch == '\n' {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+                continue;
+            }
             let repeat = if ch == '\t' { 4 - used % 4 } else { 1 };
             let ch = if ch == '\t' { ' ' } else { ch };
             let cells = ch.width().unwrap_or(0);
@@ -722,5 +727,23 @@ mod tests {
                 b: 91
             })
         )));
+    }
+
+    #[test]
+    fn spans_splits_embedded_newlines_into_distinct_rows_without_raw_lf() {
+        let result = spans(
+            &[("first\nsecond", Face::BOLD), ("\n\nthird", Face::ACCENT)],
+            80,
+        );
+        assert_eq!(result.len(), 4);
+        assert_eq!(plain(&result), "first\nsecond\n\nthird");
+        assert!(result
+            .iter()
+            .flatten()
+            .all(|span| !span.text.contains('\n')));
+        assert!(result[0][0].face.bold);
+        assert!(result[1][0].face.bold);
+        assert!(result[2].is_empty());
+        assert!(result[3][0].face.accent);
     }
 }

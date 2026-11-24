@@ -5,8 +5,8 @@
 [Build, test, and release](../.github/workflows/build.yml) builds, tests, and packages Linux (`x86_64`, `aarch64` on Ubuntu 22.04 for glibc 2.35+ compatibility, plus native `ubuntu-24.04-arm` verification), Windows (`x86_64` MSVC), and macOS (`aarch64`, `x86_64`):
 
 - **Pull requests & non-master branches**: built as `X.Y.Z-dev` (`ANTICRUMB_BUILD_CHANNEL=dev`); run checks, tests, and package validation only.
-- **`master` push**: built as `X.Y.Z-nightly` (`ANTICRUMB_BUILD_CHANNEL=nightly`) and updates the rolling `nightly` pre-release (`tag: nightly`, `prerelease: true`), replacing platform archives with the latest verified build without changing `latest`.
-- **Version tag push (`vX.Y.Z`)**: set `[package].version` in `Cargo.toml` to `X.Y.Z`, commit to `master`, then push only that tag (built as clean `X.Y.Z` with `ANTICRUMB_BUILD_CHANNEL=stable`):
+- **`master` push**: built as `X.Y.Z-nightly` (`ANTICRUMB_BUILD_CHANNEL=nightly`) and updates the rolling `nightly` pre-release (`tag: nightly`, `prerelease: true`), replacing platform archives with the latest verified build without changing `latest`. Right after cutting a stable tag, bump `[package].version` in `Cargo.toml` and `xtask/Cargo.toml` to the next target version so `master` nightlies sort as pre-releases ahead of the last stable (`X.Y.Z-nightly < X.Y.Z`).
+- **Version tag push (`vX.Y.Z`)**: verify `[package].version` in `Cargo.toml` (and `xtask/Cargo.toml`) matches `X.Y.Z` on `master`, then push only that tag (built as clean `X.Y.Z` with `ANTICRUMB_BUILD_CHANNEL=stable`):
 
 ```sh
 git tag v1.0.0 && git push origin v1.0.0

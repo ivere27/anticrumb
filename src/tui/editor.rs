@@ -149,7 +149,7 @@ impl Editor {
         }
     }
     fn clean(text: &str) -> String {
-        let normalized = text.replace("\r\n", "\n");
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         super::markdown::strip_controls(&normalized, true).collect()
     }
     pub fn insert(&mut self, text: &str) -> bool {
@@ -732,5 +732,16 @@ mod tests {
         assert_eq!(editor.text, "prefix ");
         editor.delete_block_backward();
         assert_eq!(editor.text, "");
+    }
+    #[test]
+    fn paste_preserves_bare_carriage_return_newlines() {
+        let mut editor = Editor::default();
+        let payload = "line1\rline2\r\nline3\n\rline4";
+        assert!(editor.paste(payload));
+        assert_eq!(editor.text, "line1\nline2\nline3\n\nline4");
+        assert_eq!(
+            editor.layout(80).0,
+            ["line1", "line2", "line3", "", "line4"]
+        );
     }
 }

@@ -1644,6 +1644,72 @@ mod tests {
     }
 
     #[test]
+    fn multiline_prompt_renders_every_line_verbatim_and_survives_subsequent_output() {
+        let mut state = State::new(PromptOptions::default());
+        let (mut tx, _rx) = mpsc::sync_channel(4);
+
+        // Simulate Alt+Enter multi-line entry with blank line, mention on line 3, and long wrapped line.
+        let prompt = "첫 번째 줄\n두 번째 줄\n\n세 번째 줄 @src/tui.rs 참고\nabcdefghijklmnopqrstuvwxyz1234567890";
+        state.editor.set(prompt.into());
+        assert!(!state.submit(&mut tx));
+
+        // Render at width 32 (transcript wrap width = 31, body width = 29).
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 32, 20).expect("render_frame");
+        let rendered_ansi = String::from_utf8(out.clone()).unwrap();
+        assert!(
+            !rendered_ansi.contains('\n'),
+            "raw-mode frame output must never contain literal LF characters"
+        );
+
+        let row_texts: Vec<String> = state
+            .painted_transcript
+            .iter()
+            .map(|line| line.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        // Blank separator + divider + 5 logical lines (last line wraps into 2 visual rows) = 8 rows.
+        assert_eq!(row_texts.len(), 8, "unexpected rows: {row_texts:?}");
+        assert_eq!(row_texts[0], "");
+        assert_eq!(row_texts[1], "─".repeat(31));
+        assert_eq!(row_texts[2], "> 첫 번째 줄");
+        assert_eq!(row_texts[3], "  두 번째 줄");
+        assert_eq!(row_texts[4], "");
+        assert_eq!(row_texts[5], "  세 번째 줄 @src/tui.rs 참고");
+        assert_eq!(row_texts[6], "  abcdefghijklmnopqrstuvwxyz123");
+        assert_eq!(row_texts[7], "  4567890");
+        assert!(
+            state.painted_transcript[5]
+                .iter()
+                .any(|span| span.text == "@src/tui.rs" && span.face.accent),
+            "mention on later prompt line must stay accented"
+        );
+        assert!(state
+            .painted_transcript
+            .iter()
+            .flatten()
+            .all(|span| !span.text.contains('\n')));
+
+        // Subsequent output must append below all prompt lines without overwriting or truncating them.
+        state.log_markdown("assistant reply");
+        out.clear();
+        state
+            .render_frame(&mut out, 32, 20)
+            .expect("render_frame after reply");
+        let after_rows: Vec<String> = state
+            .painted_transcript
+            .iter()
+            .map(|line| line.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(after_rows[2], "> 첫 번째 줄");
+        assert_eq!(after_rows[3], "  두 번째 줄");
+        assert_eq!(after_rows[4], "");
+        assert_eq!(after_rows[5], "  세 번째 줄 @src/tui.rs 참고");
+        assert_eq!(after_rows[6], "  abcdefghijklmnopqrstuvwxyz123");
+        assert_eq!(after_rows[7], "  4567890");
+        assert_eq!(after_rows[8], "assistant reply");
+    }
+
+    #[test]
     fn theme_menu_previews_on_move_and_restores_on_cancel_or_saves_on_enter() {
         let dir = tempfile::tempdir().unwrap();
         let (mut tx, _) = mpsc::sync_channel(4);
