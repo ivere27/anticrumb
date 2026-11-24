@@ -168,42 +168,74 @@ impl Entry {
             Entry::Markdown(text) => markdown::lines(text, width),
             Entry::Prompt(text) => {
                 let mut lines = Vec::new();
-                let mut trimmed = text.as_str();
-                while let Some(rest) = trimmed.strip_prefix('\n') {
+                let body = if let Some(rest) = text.strip_prefix('\n') {
                     lines.push(Vec::new());
-                    trimmed = rest;
-                }
+                    rest
+                } else {
+                    text.as_str()
+                };
                 if width > 0 {
                     lines.extend(markdown::literal(&"─".repeat(width), Face::SUBTLE, width));
                 }
-                let mut parts = vec![("> ".to_owned(), Face::ACCENT_BOLD)];
-                let mut plain_start = 0;
-                let mut i = 0;
-                while i < trimmed.len() {
-                    let rest = &trimmed[i..];
-                    if rest.starts_with('@')
-                        && crate::input::is_mention_boundary(trimmed[..i].chars().next_back())
-                    {
-                        if let Ok(Some((_, len))) = crate::input::parse_mention(rest) {
-                            if len > 1 {
-                                if i > plain_start {
-                                    parts.push((trimmed[plain_start..i].into(), Face::BOLD));
+                let mut is_first_visual_row = true;
+                for raw_line in body.split('\n') {
+                    let raw_line = raw_line.trim_end_matches('\r');
+                    let mut parts: Vec<(&str, Face)> = Vec::new();
+                    let mut plain_start = 0;
+                    let mut i = 0;
+                    while i < raw_line.len() {
+                        let rest = &raw_line[i..];
+                        if rest.starts_with('@')
+                            && crate::input::is_mention_boundary(raw_line[..i].chars().next_back())
+                        {
+                            if let Ok(Some((_, len))) = crate::input::parse_mention(rest) {
+                                if len > 1 {
+                                    if i > plain_start {
+                                        parts.push((&raw_line[plain_start..i], Face::BOLD));
+                                    }
+                                    parts.push((&raw_line[i..i + len], Face::ACCENT));
+                                    i += len;
+                                    plain_start = i;
+                                    continue;
                                 }
-                                parts.push((trimmed[i..i + len].into(), Face::ACCENT));
-                                i += len;
-                                plain_start = i;
-                                continue;
                             }
                         }
+                        i += rest.chars().next().map_or(1, char::len_utf8);
                     }
-                    i += rest.chars().next().map_or(1, char::len_utf8);
+                    if plain_start < raw_line.len() {
+                        parts.push((&raw_line[plain_start..], Face::BOLD));
+                    }
+                    if width <= 2 {
+                        if is_first_visual_row {
+                            parts.insert(0, ("> ", Face::ACCENT_BOLD));
+                        }
+                        lines.extend(markdown::spans(&parts, width));
+                        is_first_visual_row = false;
+                        continue;
+                    }
+                    let body_width = width - 2;
+                    for mut wrapped_line in markdown::spans(&parts, body_width) {
+                        if is_first_visual_row {
+                            wrapped_line.insert(
+                                0,
+                                markdown::Span {
+                                    text: "> ".into(),
+                                    face: Face::ACCENT_BOLD,
+                                },
+                            );
+                            is_first_visual_row = false;
+                        } else if !wrapped_line.is_empty() {
+                            wrapped_line.insert(
+                                0,
+                                markdown::Span {
+                                    text: "  ".into(),
+                                    face: Face::TEXT,
+                                },
+                            );
+                        }
+                        lines.push(wrapped_line);
+                    }
                 }
-                if plain_start < trimmed.len() {
-                    parts.push((trimmed[plain_start..].into(), Face::BOLD));
-                }
-                let borrowed: Vec<(&str, Face)> =
-                    parts.iter().map(|(s, f)| (s.as_str(), *f)).collect();
-                lines.extend(markdown::spans(&borrowed, width));
                 lines
             }
             Entry::Heading(text) => {
