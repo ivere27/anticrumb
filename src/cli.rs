@@ -84,26 +84,16 @@ impl Client {
             .block_on(self.web_history_cleanup_async(account))
     }
     pub fn submit(&self, request: &TurnRequest) -> Result<String> {
-        let value = self.request(
-            "POST",
-            "/api/runs",
-            Some(&serde_json::to_value(request).map_err(ServiceError::storage)?),
-        )?;
-        value["id"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| ServiceError::invalid("missing run ID"))
+        self.create_turn(request)
     }
     pub fn wait(&self, id: &str, cancel: &crate::agent::CancelToken) -> Result<TurnResult> {
         let mut cancellation_sent = false;
         poll_until(Duration::from_millis(100), Some(cancel), || {
             if cancel.is_cancelled() && !cancellation_sent {
-                self.request("POST", &format!("/api/runs/{id}/cancel"), Some(&json!({})))?;
+                self.cancel_turn(id)?;
                 cancellation_sent = true;
             }
-            let run: Run =
-                serde_json::from_value(self.request("GET", &format!("/api/runs/{id}"), None)?)
-                    .map_err(ServiceError::storage)?;
+            let run = self.get_turn(id)?;
             if let Some(error) = run.error {
                 return Err(error);
             }
@@ -230,7 +220,7 @@ Service and integration commands:
   chat [--session ID] [--file PATH] PROMPT
   image [--file PATH] PROMPT
   agents list|show|cancel|steer|resume|follow ID
-  runs list|show|cancel ID     sessions list|close|media ID
+  runs list|show|cancel ID     sessions list|show|close|media ID
   login [ACCOUNT|PROVIDER] [--provider ID] sign in (auto-creates account & port if needed)
   providers list|show ID|add DIR_OR_FILE [--replace] [--login]|remove ID
   accounts list|add [ID] [PORT] [--provider ID] [--login]|attach ID PORT|show|hide|login|resolve|pause ID
@@ -648,7 +638,7 @@ impl PromptOptions {
         // `--no-temp` flag, so the override can only mean `--temp` (which already sets `true`).
         // The `||` preserves active/saved `/temp on` when resuming a normal job so server history
         // is never silently written.
-        self.temporary = self.temporary || request.temporary;
+        self.temporary = self.temporary || request.is_temporary();
         if !self.overrides.contains("mcp") {
             self.mcp = request.mcp_config.clone();
         }
@@ -771,12 +761,12 @@ impl PromptOptions {
     pub(crate) fn resolve_chat_temporary(
         &mut self,
         root: &Path,
-        fetch_sessions: impl FnOnce() -> Result<Value>,
+        fetch_session: impl FnOnce(&str) -> Result<crate::rpc::pb::Session>,
     ) {
         if let Some(sid) = self.session.as_deref() {
             if !self.overrides.contains("temporary") {
-                if let Ok(sessions) = fetch_sessions() {
-                    if session_is_temporary(&sessions, sid) == Some(true) {
+                if let Ok(session) = fetch_session(sid) {
+                    if session_is_temporary(&session) == Some(true) {
                         self.temporary = true;
                     }
                 }
@@ -811,7 +801,7 @@ impl PromptOptions {
             account_id: self.account.clone(),
             model: self.model.clone(),
             thinking: self.thinking.clone(),
-            temporary: self.temporary,
+            session_mode: SessionMode::from_temporary(self.temporary),
             no_shell: !perms.shell,
             max_steps: 0,
             knowledge: self.knowledge.clone(),
@@ -820,6 +810,7 @@ impl PromptOptions {
             parent_id,
             chat_only: !self.agent,
             permissions: Some(perms),
+            session_retention: SessionRetention::Unspecified,
         }
     }
 }
@@ -988,19 +979,18 @@ fn follow_agent(client: &Client, id: &str, json: bool, quiet: bool) -> Result<()
         Ok(std::ops::ControlFlow::Continue(()))
     })
 }
-fn session_is_temporary(sessions: &Value, session_id: &str) -> Option<bool> {
-    sessions
-        .as_array()?
-        .iter()
-        .find(|s| s["id"].as_str() == Some(session_id))
-        .and_then(|s| s["mode"].as_str())
-        .map(|mode| mode == "temporary")
+fn session_is_temporary(session: &crate::rpc::pb::Session) -> Option<bool> {
+    match crate::rpc::pb::SessionMode::try_from(session.mode).ok()? {
+        crate::rpc::pb::SessionMode::Temporary => Some(true),
+        crate::rpc::pb::SessionMode::Chat => Some(false),
+        crate::rpc::pb::SessionMode::Unspecified => None,
+    }
 }
 fn chat_command(args: &[String], image: bool) -> Result<()> {
     let mut o = PromptOptions::parse(args)?;
     let client = Client::connect()?;
     o.resolve_account(&client)?;
-    o.resolve_chat_temporary(&root(), || client.request("GET", "/api/sessions", None));
+    o.resolve_chat_temporary(&root(), |sid| client.get_session(sid));
     let cli_temp_override = o.overrides.contains("temporary");
     let prepared = crate::input::prepare(&o.words.join(" "), &o.workspace, &o.files)?;
     for warning in &prepared.warnings {
@@ -1010,13 +1000,9 @@ fn chat_command(args: &[String], image: bool) -> Result<()> {
     r.account_id = o.account;
     r.model = o.model;
     r.thinking = o.thinking;
-    r.mode = if o.temporary {
-        SessionMode::Temporary
-    } else {
-        SessionMode::Chat
-    };
+    r.mode = SessionMode::from_temporary(o.temporary);
     r.session_id = o.session;
-    r.keep_session = o.keep;
+    r.retention = SessionRetention::for_turn(o.keep);
     r.timeout_secs = o.timeout;
     r.generate_image = image;
     for path in prepared.files {
@@ -2154,7 +2140,7 @@ mod tests {
         let mut saved_opts = PromptOptions::parse(&["hello".into()]).unwrap();
         saved_opts.load_saved_temporary(dir.path());
         assert!(saved_opts.temporary);
-        assert!(saved_opts.agent_request("hello".into(), None).temporary);
+        assert!(saved_opts.agent_request("hello".into(), None).is_temporary());
 
         // `--no-temp` has been removed; `--temp` explicitly enables temporary mode and marks override.
         assert!(PromptOptions::parse(&["--no-temp".into(), "hello".into()]).is_err());
@@ -2163,10 +2149,10 @@ mod tests {
         assert!(temp_flag.temporary);
         assert!(temp_flag.overrides.contains("temporary"));
 
-        // Resuming a normal (`temporary: false`) job while saved `/temp on` is active preserves
+        // Resuming a normal (`SessionMode::Chat`) job while saved `/temp on` is active preserves
         // temporary mode so follow-ups never silently leak to server history.
         let mut normal_job = default_opts.agent_request("normal earlier".into(), None);
-        normal_job.temporary = false;
+        normal_job.session_mode = SessionMode::Chat;
         let mut saved_resuming_normal = PromptOptions::parse(&[]).unwrap();
         saved_resuming_normal.load_saved_temporary(dir.path());
         saved_resuming_normal.inherit(&normal_job).unwrap();
@@ -2175,7 +2161,7 @@ mod tests {
         // Explicit `--temp` enables temporary mode when resuming a normal job even when saved pref is off.
         prefs.set_temporary(false).unwrap();
         let mut temp_job = saved_opts.agent_request("temp earlier".into(), None);
-        temp_job.temporary = true;
+        temp_job.session_mode = SessionMode::Temporary;
         let mut forced_temp_on_normal = PromptOptions::parse(&["--temp".into()]).unwrap();
         forced_temp_on_normal.load_saved_temporary(dir.path());
         forced_temp_on_normal.inherit(&normal_job).unwrap();
@@ -2196,20 +2182,36 @@ mod tests {
         overridden_false_resuming_temp.inherit(&temp_job).unwrap();
         assert!(overridden_false_resuming_temp.temporary);
 
-        // `--session` mode auto-detection distinguishes `temporary` vs `chat` sessions cleanly,
-        // and `resolve_chat_temporary` intentionally ignores saved `/temp on` when an explicit
-        // `--session` is provided (matching the target session's mode instead).
-        let sessions = json!([
-            {"id": "sess-chat", "mode": "chat"},
-            {"id": "sess-temp", "mode": "temporary"},
-        ]);
-        assert_eq!(session_is_temporary(&sessions, "sess-chat"), Some(false));
-        assert_eq!(session_is_temporary(&sessions, "sess-temp"), Some(true));
-        assert_eq!(session_is_temporary(&sessions, "missing"), None);
+        // `--session` mode auto-detection distinguishes `temporary` vs `chat` sessions cleanly
+        // via `SessionService.GetSession` (`pb::SessionMode`), and `resolve_chat_temporary`
+        // intentionally ignores saved `/temp on` when an explicit `--session` is provided.
+        let chat_session = crate::rpc::pb::Session {
+            id: "sess-chat".into(),
+            mode: crate::rpc::pb::SessionMode::Chat as i32,
+            ..Default::default()
+        };
+        let temp_session = crate::rpc::pb::Session {
+            id: "sess-temp".into(),
+            mode: crate::rpc::pb::SessionMode::Temporary as i32,
+            ..Default::default()
+        };
+        assert_eq!(session_is_temporary(&chat_session), Some(false));
+        assert_eq!(session_is_temporary(&temp_session), Some(true));
+        assert_eq!(session_is_temporary(&crate::rpc::pb::Session::default()), None);
+
+        let fetch_session = |sid: &str| match sid {
+            "sess-chat" => Ok(chat_session.clone()),
+            "sess-temp" => Ok(temp_session.clone()),
+            _ => Err(ServiceError::new(
+                ErrorCode::NotFound,
+                "store",
+                "session not found",
+            )),
+        };
 
         prefs.set_temporary(true).unwrap();
         let mut chat_no_session = PromptOptions::parse(&["hello".into()]).unwrap();
-        chat_no_session.resolve_chat_temporary(dir.path(), || {
+        chat_no_session.resolve_chat_temporary(dir.path(), |_| {
             panic!("sessions endpoint must not be queried without --session")
         });
         assert!(chat_no_session.temporary);
@@ -2217,7 +2219,7 @@ mod tests {
         let mut chat_explicit_normal_session =
             PromptOptions::parse(&["--session".into(), "sess-chat".into(), "hello".into()])
                 .unwrap();
-        chat_explicit_normal_session.resolve_chat_temporary(dir.path(), || Ok(sessions.clone()));
+        chat_explicit_normal_session.resolve_chat_temporary(dir.path(), fetch_session);
         assert!(
             !chat_explicit_normal_session.temporary,
             "explicit --session for a normal chat session must ignore saved /temp on"
@@ -2227,7 +2229,7 @@ mod tests {
         let mut chat_explicit_temp_session =
             PromptOptions::parse(&["--session".into(), "sess-temp".into(), "hello".into()])
                 .unwrap();
-        chat_explicit_temp_session.resolve_chat_temporary(dir.path(), || Ok(sessions.clone()));
+        chat_explicit_temp_session.resolve_chat_temporary(dir.path(), fetch_session);
         assert!(
             chat_explicit_temp_session.temporary,
             "explicit --session for a temporary session must adopt temporary mode"

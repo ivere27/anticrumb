@@ -850,8 +850,8 @@ impl Store {
             }
         }
         for mut session in self.list::<Session>("local", "session")? {
-            if session.state == "running" {
-                session.state = "outcome_unknown".into();
+            if session.state == SessionState::Running {
+                session.state = SessionState::OutcomeUnknown;
                 self.put("local", "session", &session.id, &session)?;
             }
         }
@@ -1269,7 +1269,7 @@ impl Store {
         }
         let ownership_events: Vec<(String, Value)> = {
             let mut statement = tx
-                .prepare("SELECT kind,data FROM events WHERE run_id=?1 AND kind IN ('browser_turn','browser_session')")
+                .prepare("SELECT kind,data FROM events WHERE run_id=?1 AND kind IN ('browser_turn','browser_session','subagent_browser_session')")
                 .map_err(ServiceError::storage)?;
             let rows = statement
                 .query_map([id], |r| {
@@ -1311,7 +1311,7 @@ impl Store {
     ) -> Result<bool> {
         let conn = self.conn.lock().map_err(ServiceError::storage)?;
         let mut stmt = conn
-            .prepare("SELECT e.kind,e.data FROM events e JOIN objects a ON a.scope='local' AND a.kind='agent' AND a.id=e.run_id WHERE e.kind IN ('browser_turn','browser_session')")
+            .prepare("SELECT e.kind,e.data FROM events e JOIN objects a ON a.scope='local' AND a.kind='agent' AND a.id=e.run_id WHERE e.kind IN ('browser_turn','browser_session','subagent_browser_session')")
             .map_err(ServiceError::storage)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -1319,8 +1319,11 @@ impl Store {
         for row in rows {
             let (kind, raw) = row.map_err(ServiceError::storage)?;
             let data: Value = serde_json::from_str(&raw).map_err(ServiceError::storage)?;
-            if kind == "browser_session" && data["session_id"] == session
-                || kind == "browser_turn"
+            if matches!(
+                kind.as_str(),
+                EVENT_BROWSER_SESSION | EVENT_SUBAGENT_BROWSER_SESSION
+            ) && data["session_id"] == session
+                || kind == EVENT_BROWSER_TURN
                     && data["run_id"]
                         .as_str()
                         .is_some_and(|id| runs.iter().any(|r| r == id))
@@ -2014,7 +2017,7 @@ mod tests {
             remote_url: None,
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: Some("claude-sonnet-4".into()),
             thinking: None,
             tool_digest: String::new(),
@@ -2031,7 +2034,7 @@ mod tests {
             remote_url: None,
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: Some("gpt-4o".into()),
             thinking: None,
             tool_digest: String::new(),

@@ -1,6 +1,6 @@
 //! Standards negotiation, framing, cancellation and notifications belong to rmcp.
 use crate::{
-    domain::{Result, ServiceError, SessionMode, TurnRequest},
+    domain::{Result, ServiceError, SessionMode, SessionRetention, TurnRequest},
     rpc::{codec, pb},
 };
 use futures_util::StreamExt;
@@ -47,13 +47,16 @@ impl Server {
                 );
                 return Ok(json!({"object":"list","data":data}));
             }
-            "gemini_session_close" | "gemini_media_download" => {
+            "gemini_session_get" | "gemini_session_close" | "gemini_media_download" => {
                 let id = args["session_id"]
                     .as_str()
                     .ok_or_else(|| ServiceError::invalid("missing session_id"))?;
                 validate_id(id)?;
                 let session = pb::SessionRef { id: id.into() };
-                if name == "gemini_media_download" {
+                if name == "gemini_session_get" {
+                    let info = self.rpc.get_session(session).await?;
+                    return Ok(codec::session_json(info));
+                } else if name == "gemini_media_download" {
                     let list = self.rpc.recover_media(session).await?;
                     let artifacts: Vec<_> = list.artifacts.into_iter().map(|a| a.id).collect();
                     return Ok(json!({"artifacts": artifacts}));
@@ -83,13 +86,25 @@ impl Server {
         );
         request.session_id = args["session_id"].as_str().map(str::to_owned);
         request.account_id = args["account_id"].as_str().unwrap_or("default").into();
-        request.keep_session = args["keep_session"].as_bool().unwrap_or(false);
+        request.retention = match args["session_retention"].as_str() {
+            None | Some("ephemeral") => SessionRetention::Ephemeral,
+            Some("retain") => SessionRetention::Retain,
+            Some(other) => {
+                return Err(ServiceError::invalid(format!(
+                    "invalid session_retention '{other}': expected 'ephemeral' or 'retain'"
+                )));
+            }
+        };
         request.model = args["model"].as_str().map(str::to_owned);
         request.thinking = args["thinking"].as_str().map(str::to_owned);
-        request.mode = if args["temporary"].as_bool().unwrap_or(false) {
-            SessionMode::Temporary
-        } else {
-            SessionMode::Chat
+        request.mode = match args["session_mode"].as_str() {
+            None | Some("chat") => SessionMode::Chat,
+            Some("temporary") => SessionMode::Temporary,
+            Some(other) => {
+                return Err(ServiceError::invalid(format!(
+                    "invalid session_mode '{other}': expected 'chat' or 'temporary'"
+                )));
+            }
         };
         request.timeout_secs = args["timeout_secs"].as_u64().unwrap_or(120);
         request.artifacts =
@@ -181,11 +196,27 @@ fn validate_id(id: &str) -> Result<()> {
     }
 }
 fn definitions() -> Vec<Tool> {
-    let query = json!({"type":"object","properties":{"prompt":{"type":"string"},"account_id":{"type":"string"},"session_id":{"type":"string"},"keep_session":{"type":"boolean"},"temporary":{"type":"boolean"},"model":{"type":"string"},"thinking":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1,"maximum":900},"artifacts":{"type":"array","items":{"type":"string"}}},"required":["prompt"],"additionalProperties":false});
+    let query = json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "account_id": {"type": "string"},
+            "session_id": {"type": "string"},
+            "session_mode": {"type": "string", "enum": ["chat", "temporary"]},
+            "session_retention": {"type": "string", "enum": ["ephemeral", "retain"]},
+            "model": {"type": "string"},
+            "thinking": {"type": "string"},
+            "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 900},
+            "artifacts": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+    });
     vec![
         Tool::new("gemini_ask","Ask Gemini Web; optional explicitly owned conversation. Does not execute coding tools.",query.as_object().unwrap().clone()),
         Tool::new("gemini_image_generate","Generate/edit images; attach input image artifact IDs; returns artifact IDs.",query.as_object().unwrap().clone()),
         Tool::new("gemini_models","Read locally cached model capabilities without opening a browser.",json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone()),
+        Tool::new("gemini_session_get","Inspect the typed mode, state, and continuability of an owned browser session.",json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}).as_object().unwrap().clone()),
         Tool::new("gemini_session_close","Close an owned browser conversation tab.",json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}).as_object().unwrap().clone()),
         Tool::new("gemini_media_download","Download images already generated in an owned session; never resubmits a prompt.",json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}).as_object().unwrap().clone()),
         Tool::new("gemini_knowledge_query","Retrieve local source excerpts with citations; no model call.",json!({"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),

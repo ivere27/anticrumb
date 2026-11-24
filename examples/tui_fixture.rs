@@ -368,11 +368,13 @@ impl WorkspaceService for Fixture {
         self.api.authorize(r.metadata())?;
         let mut request = r.into_inner();
         request.environment.clear();
+        let observed_request =
+            codec::agent_request_from(request.clone()).map_err(codec::status)?;
         let mut state = self.state.lock().unwrap();
         state.observations["tasks"]
             .as_array_mut()
             .unwrap()
-            .push(json!(&request));
+            .push(json!(&observed_request));
         let n = state.observations["tasks"].as_array().unwrap().len();
         let id = if n == 1 {
             "agent_fixture".to_owned()

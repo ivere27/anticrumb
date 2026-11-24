@@ -123,8 +123,15 @@ service TurnService {
 }
 
 service SessionService {
-  rpc ListSessions(Empty) returns (SessionList);
+  // Fetch the latest typed state and continuability of a single browser session.
+  rpc GetSession(SessionRef) returns (Session);
+  // List sessions with optional account, mode, and state filters.
+  rpc ListSessions(ListSessionsRequest) returns (SessionList);
+  // Close a single browser session tab and mark it SESSION_STATE_CLOSED.
   rpc CloseSession(SessionRef) returns (Empty);
+  // Best-effort batch close for idle or stale sessions. Missing or already
+  // closed sessions are reported in `skipped` rather than failing the batch.
+  rpc CloseSessions(CloseSessionsRequest) returns (CloseSessionsResult);
   // Permanently delete only this recorded session's web conversation.
   rpc DeleteConversation(SessionRef) returns (Empty);
   rpc RecoverMedia(SessionRef) returns (ArtifactList);
@@ -530,6 +537,27 @@ message ContentBlock {
   }
 }
 message Message { string role = 1; repeated ContentBlock blocks = 2; }
+enum SessionMode {
+  SESSION_MODE_UNSPECIFIED = 0;
+  SESSION_MODE_CHAT = 1;
+  SESSION_MODE_TEMPORARY = 2; // Not anonymous guest mode; avoids server chat history.
+}
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_READY = 1;
+  SESSION_STATE_RUNNING = 2;
+  SESSION_STATE_CLOSED = 3;
+  SESSION_STATE_DELETED = 4;
+  SESSION_STATE_INVALIDATED = 5;
+  SESSION_STATE_OUTCOME_UNKNOWN = 6;
+  SESSION_STATE_AWAITING_HUMAN = 7;
+  SESSION_STATE_CLEANUP_PENDING = 8;
+}
+enum SessionRetention {
+  SESSION_RETENTION_UNSPECIFIED = 0;
+  SESSION_RETENTION_EPHEMERAL = 1; // Close the browser session after this turn or agent run ends.
+  SESSION_RETENTION_RETAIN = 2; // Keep the browser session open for follow-ups until closed or invalidated.
+}
 message TurnRequest {
   string account_id = 1;
   optional string session_id = 2;
@@ -540,12 +568,12 @@ message TurnRequest {
   optional uint64 output_token_hint = 7;
   optional string model = 8;
   optional string thinking = 9;
-  string mode = 10; // chat or temporary; temporary is not anonymous guest mode.
+  SessionMode mode = 10; // Defaults to SESSION_MODE_CHAT when unspecified.
   repeated string artifacts = 11;
   uint64 timeout_secs = 12;
   optional string idempotency_key = 13;
   bool generate_image = 14;
-  bool keep_session = 15;
+  SessionRetention retention = 15; // Defaults to SESSION_RETENTION_EPHEMERAL when unspecified.
   optional string reuse_scope = 16;
 }
 message TurnResult {
@@ -587,14 +615,30 @@ message EventPage { repeated Event events = 1; }
 message Session {
   string id = 1;
   string account_id = 2;
-  string mode = 3;
-  string state = 4;
+  SessionMode mode = 3;
+  SessionState state = 4;
   optional string model = 5;
   optional string thinking = 6;
   int64 last_used = 7;
   uint64 remote_turns = 8;
+  string provider = 9;
+  optional string reuse_scope = 10;
+  bool continuable = 11;
+}
+message ListSessionsRequest {
+  optional string account_id = 1;
+  SessionMode mode = 2; // SESSION_MODE_UNSPECIFIED matches all modes.
+  SessionState state = 3; // SESSION_STATE_UNSPECIFIED matches all states.
 }
 message SessionList { repeated Session sessions = 1; }
+message CloseSessionsRequest {
+  repeated string session_ids = 1;
+}
+message CloseSessionsResult {
+  repeated string closed = 1;
+  repeated string skipped = 2;
+  map<string, ErrorDetail> errors = 3;
+}
 message ArtifactRef { string account_id = 1; string id = 2; }
 message PutArtifactMeta {
   string account_id = 1;
@@ -657,17 +701,28 @@ enum ErrorCode {
   NOT_FOUND = 16;
   STORAGE_FAILURE = 17;
   INTERNAL = 18;
+  // Pre-submit session loss (tab closed, reset, navigated away, evicted, or
+  // invalidated). Safe for callers with local context to start a fresh session,
+  // unlike SUBMISSION_OUTCOME_UNKNOWN.
+  SESSION_UNAVAILABLE = 19;
 }
 
+message ToolPermissions {
+  bool read = 1;
+  bool edit = 2;
+  bool shell = 3;
+  bool browser = 4;
+  bool subagent = 5;
+}
 message AgentRequest {
   string task = 1;
   string workspace = 2; // Local workspace host path, never a browser host path.
   string account_id = 3;
   optional string model = 4;
   optional string thinking = 5;
-  bool temporary = 6;
+  SessionMode session_mode = 6; // Defaults to SESSION_MODE_CHAT when unspecified.
   bool no_shell = 7;
-  uint32 max_steps = 8;
+  uint32 max_steps = 8; // Zero selects the agent engine's default step budget.
   optional string knowledge = 9;
   optional string mcp_config = 10;
   repeated string artifacts = 11;
@@ -675,6 +730,13 @@ message AgentRequest {
   // Transient client environment for local shell/MCP execution. Never persisted
   // or included in Agent responses. Browser hosts do not expose WorkspaceService.
   map<string, string> environment = 13;
+  // Controls whether the agent's browser session is retained after the run.
+  // SESSION_RETENTION_UNSPECIFIED retains while holding the workspace lease.
+  SessionRetention session_retention = 14;
+  // Single-turn conversational mode without coding tools or workspace instructions.
+  bool chat_only = 15;
+  // Explicit per-capability tool policy; omitted falls back to workspace defaults.
+  optional ToolPermissions permissions = 16;
 }
 message Agent {
   string id = 1;

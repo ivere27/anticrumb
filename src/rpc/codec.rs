@@ -48,21 +48,98 @@ fn role_str(role: d::Role) -> String {
     }
     .into()
 }
-fn parse_mode(raw: &str) -> Result<d::SessionMode> {
-    match raw {
-        "chat" => Ok(d::SessionMode::Chat),
-        "temporary" => Ok(d::SessionMode::Temporary),
-        _ => Err(ServiceError::invalid(format!(
+pub fn session_mode_from(raw: i32) -> Result<d::SessionMode> {
+    match pb::SessionMode::try_from(raw) {
+        Ok(pb::SessionMode::Unspecified | pb::SessionMode::Chat) => Ok(d::SessionMode::Chat),
+        Ok(pb::SessionMode::Temporary) => Ok(d::SessionMode::Temporary),
+        Err(_) => Err(ServiceError::invalid(format!(
             "invalid session mode: {raw}"
         ))),
     }
 }
-fn mode_str(mode: d::SessionMode) -> String {
-    match mode {
-        d::SessionMode::Chat => "chat",
-        d::SessionMode::Temporary => "temporary",
+pub fn session_mode_filter(raw: i32) -> Result<Option<d::SessionMode>> {
+    match pb::SessionMode::try_from(raw) {
+        Ok(pb::SessionMode::Unspecified) => Ok(None),
+        Ok(pb::SessionMode::Chat) => Ok(Some(d::SessionMode::Chat)),
+        Ok(pb::SessionMode::Temporary) => Ok(Some(d::SessionMode::Temporary)),
+        Err(_) => Err(ServiceError::invalid(format!(
+            "invalid session mode: {raw}"
+        ))),
     }
-    .into()
+}
+pub fn session_mode_to(mode: d::SessionMode) -> i32 {
+    match mode {
+        d::SessionMode::Chat => pb::SessionMode::Chat as i32,
+        d::SessionMode::Temporary => pb::SessionMode::Temporary as i32,
+    }
+}
+pub fn session_state_from(raw: i32) -> Result<d::SessionState> {
+    match pb::SessionState::try_from(raw) {
+        Ok(pb::SessionState::Ready) => Ok(d::SessionState::Ready),
+        Ok(pb::SessionState::Running) => Ok(d::SessionState::Running),
+        Ok(pb::SessionState::Closed) => Ok(d::SessionState::Closed),
+        Ok(pb::SessionState::Deleted) => Ok(d::SessionState::Deleted),
+        Ok(pb::SessionState::Invalidated) => Ok(d::SessionState::Invalidated),
+        Ok(pb::SessionState::OutcomeUnknown) => Ok(d::SessionState::OutcomeUnknown),
+        Ok(pb::SessionState::AwaitingHuman) => Ok(d::SessionState::AwaitingHuman),
+        Ok(pb::SessionState::CleanupPending) => Ok(d::SessionState::CleanupPending),
+        Ok(pb::SessionState::Unspecified) | Err(_) => Err(ServiceError::invalid(format!(
+            "invalid session state: {raw}"
+        ))),
+    }
+}
+pub fn session_state_filter(raw: i32) -> Result<Option<d::SessionState>> {
+    match pb::SessionState::try_from(raw) {
+        Ok(pb::SessionState::Unspecified) => Ok(None),
+        _ => session_state_from(raw).map(Some),
+    }
+}
+pub fn session_state_to(state: d::SessionState) -> i32 {
+    match state {
+        d::SessionState::Ready => pb::SessionState::Ready as i32,
+        d::SessionState::Running => pb::SessionState::Running as i32,
+        d::SessionState::Closed => pb::SessionState::Closed as i32,
+        d::SessionState::Deleted => pb::SessionState::Deleted as i32,
+        d::SessionState::Invalidated => pb::SessionState::Invalidated as i32,
+        d::SessionState::OutcomeUnknown => pb::SessionState::OutcomeUnknown as i32,
+        d::SessionState::AwaitingHuman => pb::SessionState::AwaitingHuman as i32,
+        d::SessionState::CleanupPending => pb::SessionState::CleanupPending as i32,
+    }
+}
+pub fn session_retention_from(raw: i32) -> Result<d::SessionRetention> {
+    match pb::SessionRetention::try_from(raw) {
+        Ok(pb::SessionRetention::Unspecified) => Ok(d::SessionRetention::Unspecified),
+        Ok(pb::SessionRetention::Ephemeral) => Ok(d::SessionRetention::Ephemeral),
+        Ok(pb::SessionRetention::Retain) => Ok(d::SessionRetention::Retain),
+        Err(_) => Err(ServiceError::invalid(format!(
+            "invalid session retention: {raw}"
+        ))),
+    }
+}
+pub fn session_retention_to(retention: d::SessionRetention) -> i32 {
+    match retention {
+        d::SessionRetention::Unspecified => pb::SessionRetention::Unspecified as i32,
+        d::SessionRetention::Ephemeral => pb::SessionRetention::Ephemeral as i32,
+        d::SessionRetention::Retain => pb::SessionRetention::Retain as i32,
+    }
+}
+pub fn tool_permissions_to(p: d::ToolPermissions) -> pb::ToolPermissions {
+    pb::ToolPermissions {
+        read: p.read,
+        edit: p.edit,
+        shell: p.shell,
+        browser: p.browser,
+        subagent: p.subagent,
+    }
+}
+pub fn tool_permissions_from(p: pb::ToolPermissions) -> d::ToolPermissions {
+    d::ToolPermissions {
+        read: p.read,
+        edit: p.edit,
+        shell: p.shell,
+        browser: p.browser,
+        subagent: p.subagent,
+    }
 }
 fn agent_status_str(status: AgentStatus) -> String {
     match status {
@@ -154,12 +231,12 @@ pub fn request_from(value: pb::TurnRequest) -> Result<d::TurnRequest> {
         output_token_hint: value.output_token_hint,
         model: value.model,
         thinking: value.thinking,
-        mode: parse_mode(&value.mode)?,
+        mode: session_mode_from(value.mode)?,
         artifacts: value.artifacts,
         timeout_secs: value.timeout_secs,
         idempotency_key: value.idempotency_key,
         generate_image: value.generate_image,
-        keep_session: value.keep_session,
+        retention: session_retention_from(value.retention)?,
         reuse_scope: value.reuse_scope,
         omit_tool_contract: false,
     })
@@ -211,12 +288,12 @@ pub fn request_to(value: d::TurnRequest) -> pb::TurnRequest {
         output_token_hint: value.output_token_hint,
         model: value.model,
         thinking: value.thinking,
-        mode: mode_str(value.mode),
+        mode: session_mode_to(value.mode),
         artifacts: value.artifacts,
         timeout_secs: value.timeout_secs,
         idempotency_key: value.idempotency_key,
         generate_image: value.generate_image,
-        keep_session: value.keep_session,
+        retention: session_retention_to(value.retention),
         reuse_scope: value.reuse_scope,
     }
 }
@@ -385,54 +462,89 @@ pub fn catalog_from(c: pb::ModelCatalog) -> d::ModelCatalogRecord {
 pub fn error_to(e: ServiceError) -> pb::ErrorDetail {
     use d::ErrorCode::*;
     let (code, grpc_code) = match e.code {
-        InvalidRequest => (1, 3),
-        UnsupportedCapability => (2, 12),
-        AuthRequired => (3, 9),
-        VerificationRequired => (4, 9),
-        RateLimited => (5, 8),
-        UiContractChanged => (6, 9),
-        TransportDisconnected => (7, 14),
-        SubmissionOutcomeUnknown => (8, 10),
-        UploadFailed => (9, 13),
-        MediaDownloadFailed => (10, 13),
-        ToolProtocolInvalid => (11, 3),
-        WorkspaceConflict => (12, 9),
-        Cancelled => (13, 1),
-        DeadlineExceeded => (14, 4),
-        QueueFull => (15, 8),
-        NotFound => (16, 5),
-        StorageFailure => (17, 13),
-        Internal => (18, 13),
+        InvalidRequest => (pb::ErrorCode::InvalidRequest, tonic::Code::InvalidArgument),
+        UnsupportedCapability => (
+            pb::ErrorCode::UnsupportedCapability,
+            tonic::Code::Unimplemented,
+        ),
+        AuthRequired => (
+            pb::ErrorCode::AuthRequired,
+            tonic::Code::FailedPrecondition,
+        ),
+        VerificationRequired => (
+            pb::ErrorCode::VerificationRequired,
+            tonic::Code::FailedPrecondition,
+        ),
+        RateLimited => (
+            pb::ErrorCode::RateLimited,
+            tonic::Code::ResourceExhausted,
+        ),
+        UiContractChanged => (
+            pb::ErrorCode::UiContractChanged,
+            tonic::Code::FailedPrecondition,
+        ),
+        TransportDisconnected => (
+            pb::ErrorCode::TransportDisconnected,
+            tonic::Code::Unavailable,
+        ),
+        SubmissionOutcomeUnknown => (
+            pb::ErrorCode::SubmissionOutcomeUnknown,
+            tonic::Code::Aborted,
+        ),
+        UploadFailed => (pb::ErrorCode::UploadFailed, tonic::Code::Internal),
+        MediaDownloadFailed => (pb::ErrorCode::MediaDownloadFailed, tonic::Code::Internal),
+        ToolProtocolInvalid => (
+            pb::ErrorCode::ToolProtocolInvalid,
+            tonic::Code::InvalidArgument,
+        ),
+        WorkspaceConflict => (
+            pb::ErrorCode::WorkspaceConflict,
+            tonic::Code::FailedPrecondition,
+        ),
+        Cancelled => (pb::ErrorCode::Cancelled, tonic::Code::Cancelled),
+        DeadlineExceeded => (
+            pb::ErrorCode::DeadlineExceeded,
+            tonic::Code::DeadlineExceeded,
+        ),
+        QueueFull => (pb::ErrorCode::QueueFull, tonic::Code::ResourceExhausted),
+        NotFound => (pb::ErrorCode::NotFound, tonic::Code::NotFound),
+        StorageFailure => (pb::ErrorCode::StorageFailure, tonic::Code::Internal),
+        Internal => (pb::ErrorCode::Internal, tonic::Code::Internal),
+        SessionUnavailable => (
+            pb::ErrorCode::SessionUnavailable,
+            tonic::Code::FailedPrecondition,
+        ),
     };
     pb::ErrorDetail {
-        code,
+        code: code as i32,
         message: e.message,
-        grpc_code,
+        grpc_code: grpc_code as i32,
         stage: e.stage,
         retry: e.retry,
     }
 }
 pub fn error_from(e: pb::ErrorDetail) -> ServiceError {
     use d::ErrorCode::*;
-    let code = match e.code {
-        1 => InvalidRequest,
-        2 => UnsupportedCapability,
-        3 => AuthRequired,
-        4 => VerificationRequired,
-        5 => RateLimited,
-        6 => UiContractChanged,
-        7 => TransportDisconnected,
-        8 => SubmissionOutcomeUnknown,
-        9 => UploadFailed,
-        10 => MediaDownloadFailed,
-        11 => ToolProtocolInvalid,
-        12 => WorkspaceConflict,
-        13 => Cancelled,
-        14 => DeadlineExceeded,
-        15 => QueueFull,
-        16 => NotFound,
-        17 => StorageFailure,
-        _ => Internal,
+    let code = match pb::ErrorCode::try_from(e.code) {
+        Ok(pb::ErrorCode::InvalidRequest) => InvalidRequest,
+        Ok(pb::ErrorCode::UnsupportedCapability) => UnsupportedCapability,
+        Ok(pb::ErrorCode::AuthRequired) => AuthRequired,
+        Ok(pb::ErrorCode::VerificationRequired) => VerificationRequired,
+        Ok(pb::ErrorCode::RateLimited) => RateLimited,
+        Ok(pb::ErrorCode::UiContractChanged) => UiContractChanged,
+        Ok(pb::ErrorCode::TransportDisconnected) => TransportDisconnected,
+        Ok(pb::ErrorCode::SubmissionOutcomeUnknown) => SubmissionOutcomeUnknown,
+        Ok(pb::ErrorCode::UploadFailed) => UploadFailed,
+        Ok(pb::ErrorCode::MediaDownloadFailed) => MediaDownloadFailed,
+        Ok(pb::ErrorCode::ToolProtocolInvalid) => ToolProtocolInvalid,
+        Ok(pb::ErrorCode::WorkspaceConflict) => WorkspaceConflict,
+        Ok(pb::ErrorCode::Cancelled) => Cancelled,
+        Ok(pb::ErrorCode::DeadlineExceeded) => DeadlineExceeded,
+        Ok(pb::ErrorCode::QueueFull) => QueueFull,
+        Ok(pb::ErrorCode::NotFound) => NotFound,
+        Ok(pb::ErrorCode::StorageFailure) => StorageFailure,
+        Ok(pb::ErrorCode::SessionUnavailable) => SessionUnavailable,
+        Ok(pb::ErrorCode::Internal | pb::ErrorCode::Unspecified) | Err(_) => Internal,
     };
     ServiceError {
         code,
@@ -614,16 +726,41 @@ pub fn provider_manifest_from(r: pb::RegisterProviderRequest) -> ProviderManifes
     }
 }
 pub fn session_to(s: d::Session) -> pb::Session {
+    let continuable = s.is_continuable();
     pb::Session {
         id: s.id,
         account_id: s.account_id,
-        mode: mode_str(s.mode),
-        state: s.state,
+        mode: session_mode_to(s.mode),
+        state: session_state_to(s.state),
         model: s.model,
         thinking: s.thinking,
         last_used: s.last_used,
         remote_turns: s.remote_turns,
+        provider: s.provider,
+        reuse_scope: s.reuse_scope,
+        continuable,
     }
+}
+pub fn session_json(s: pb::Session) -> Value {
+    let mode = match pb::SessionMode::try_from(s.mode) {
+        Ok(pb::SessionMode::Chat) => "chat",
+        Ok(pb::SessionMode::Temporary) => "temporary",
+        _ => "unspecified",
+    };
+    let state = session_state_from(s.state).map_or("unspecified", d::SessionState::as_str);
+    json!({
+        "id": s.id,
+        "account_id": s.account_id,
+        "provider": s.provider,
+        "mode": mode,
+        "state": state,
+        "model": s.model,
+        "thinking": s.thinking,
+        "last_used": s.last_used,
+        "remote_turns": s.remote_turns,
+        "reuse_scope": s.reuse_scope,
+        "continuable": s.continuable,
+    })
 }
 pub fn artifact_to(a: d::Artifact) -> pb::Artifact {
     pb::Artifact {
@@ -761,38 +898,7 @@ pub fn knowledge_excerpt_to(e: crate::knowledge::Excerpt) -> pb::KnowledgeExcerp
         citation: e.citation,
     }
 }
-const CHAT_ONLY_STEP_FLAG: u32 = 1 << 31;
-const PERMS_PRESENT_FLAG: u32 = 1 << 30;
-const PERM_READ_FLAG: u32 = 1 << 29;
-const PERM_EDIT_FLAG: u32 = 1 << 28;
-const PERM_SHELL_FLAG: u32 = 1 << 27;
-const PERM_BROWSER_FLAG: u32 = 1 << 26;
-const PERM_SUBAGENT_FLAG: u32 = 1 << 25;
-const STEP_COUNT_MASK: u32 = (1 << 25) - 1;
-
 pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
-    let mut max_steps = u32::try_from(r.max_steps).unwrap_or(STEP_COUNT_MASK) & STEP_COUNT_MASK;
-    if r.chat_only {
-        max_steps |= CHAT_ONLY_STEP_FLAG;
-    }
-    if let Some(perms) = r.permissions {
-        max_steps |= PERMS_PRESENT_FLAG;
-        if perms.read {
-            max_steps |= PERM_READ_FLAG;
-        }
-        if perms.edit {
-            max_steps |= PERM_EDIT_FLAG;
-        }
-        if perms.shell {
-            max_steps |= PERM_SHELL_FLAG;
-        }
-        if perms.browser {
-            max_steps |= PERM_BROWSER_FLAG;
-        }
-        if perms.subagent {
-            max_steps |= PERM_SUBAGENT_FLAG;
-        }
-    }
     pb::AgentRequest {
         environment: r.environment.unwrap_or_default().into_iter().collect(),
         task: r.task,
@@ -800,42 +906,37 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
         account_id: r.account_id,
         model: r.model,
         thinking: r.thinking,
-        temporary: r.temporary,
+        session_mode: session_mode_to(r.session_mode),
         no_shell: r.no_shell,
-        max_steps,
+        max_steps: u32::try_from(r.max_steps).unwrap_or(u32::MAX),
         knowledge: r.knowledge,
         mcp_config: r.mcp_config.map(|p| p.to_string_lossy().into_owned()),
         artifacts: r.artifacts,
         parent_id: r.parent_id,
+        session_retention: session_retention_to(r.session_retention),
+        chat_only: r.chat_only,
+        permissions: r.permissions.map(tool_permissions_to),
     }
 }
-pub fn agent_request_from(r: pb::AgentRequest) -> d::AgentRequest {
-    let chat_only = (r.max_steps & CHAT_ONLY_STEP_FLAG) != 0;
-    let permissions = ((r.max_steps & PERMS_PRESENT_FLAG) != 0).then_some(d::ToolPermissions {
-        read: (r.max_steps & PERM_READ_FLAG) != 0,
-        edit: (r.max_steps & PERM_EDIT_FLAG) != 0,
-        shell: (r.max_steps & PERM_SHELL_FLAG) != 0,
-        browser: (r.max_steps & PERM_BROWSER_FLAG) != 0,
-        subagent: (r.max_steps & PERM_SUBAGENT_FLAG) != 0,
-    });
-    let max_steps = (r.max_steps & STEP_COUNT_MASK) as usize;
-    d::AgentRequest {
+pub fn agent_request_from(r: pb::AgentRequest) -> Result<d::AgentRequest> {
+    Ok(d::AgentRequest {
         environment: (!r.environment.is_empty()).then(|| r.environment.into_iter().collect()),
         task: r.task,
         workspace: PathBuf::from(r.workspace),
         account_id: r.account_id,
         model: r.model,
         thinking: r.thinking,
-        temporary: r.temporary,
+        session_mode: session_mode_from(r.session_mode)?,
         no_shell: r.no_shell,
-        max_steps,
+        max_steps: r.max_steps as usize,
         knowledge: r.knowledge,
         mcp_config: r.mcp_config.map(PathBuf::from),
         artifacts: r.artifacts,
         parent_id: r.parent_id,
-        chat_only,
-        permissions,
-    }
+        chat_only: r.chat_only,
+        permissions: r.permissions.map(tool_permissions_from),
+        session_retention: session_retention_from(r.session_retention)?,
+    })
 }
 pub fn agent_to(record: d::AgentRecord) -> pb::Agent {
     let mut request = record.request;
@@ -890,7 +991,7 @@ pub fn agent_from(value: pb::Agent) -> Result<d::AgentRecord> {
         value
             .request
             .ok_or_else(|| ServiceError::invalid("missing agent request"))?,
-    );
+    )?;
     let result = value
         .result
         .map(|res| {
@@ -1004,7 +1105,7 @@ mod tests {
             wire.environment["PROJECT_SECRET"],
             "transient-fixture-value"
         );
-        let request = agent_request_from(wire);
+        let request = agent_request_from(wire).unwrap();
         assert!(!serde_json::to_string(&request)
             .unwrap()
             .contains("transient-fixture-value"));
@@ -1075,5 +1176,135 @@ mod tests {
         let result = roundtrip.result.unwrap();
         assert_eq!(result.steps[0].tool_calls[0].args["path"], "file.txt");
         assert_eq!(result.steps[0].observations[0].output, "written");
+    }
+
+    #[test]
+    fn session_enums_retention_and_error_codes_roundtrip_cleanly() {
+        for mode in [d::SessionMode::Chat, d::SessionMode::Temporary] {
+            let wire = session_mode_to(mode);
+            assert_eq!(session_mode_from(wire).unwrap(), mode);
+            assert_eq!(session_mode_filter(wire).unwrap(), Some(mode));
+        }
+        assert_eq!(
+            session_mode_from(pb::SessionMode::Unspecified as i32).unwrap(),
+            d::SessionMode::Chat
+        );
+        assert_eq!(
+            session_mode_filter(pb::SessionMode::Unspecified as i32).unwrap(),
+            None
+        );
+        assert!(session_mode_from(999).is_err());
+
+        for state in [
+            d::SessionState::Ready,
+            d::SessionState::Running,
+            d::SessionState::Closed,
+            d::SessionState::Deleted,
+            d::SessionState::Invalidated,
+            d::SessionState::OutcomeUnknown,
+            d::SessionState::AwaitingHuman,
+            d::SessionState::CleanupPending,
+        ] {
+            let wire = session_state_to(state);
+            assert_eq!(session_state_from(wire).unwrap(), state);
+            assert_eq!(session_state_filter(wire).unwrap(), Some(state));
+        }
+        assert!(session_state_from(pb::SessionState::Unspecified as i32).is_err());
+        assert_eq!(
+            session_state_filter(pb::SessionState::Unspecified as i32).unwrap(),
+            None
+        );
+
+        for retention in [
+            d::SessionRetention::Unspecified,
+            d::SessionRetention::Ephemeral,
+            d::SessionRetention::Retain,
+        ] {
+            let wire = session_retention_to(retention);
+            assert_eq!(session_retention_from(wire).unwrap(), retention);
+        }
+        assert!(session_retention_from(999).is_err());
+
+        let mut req = d::TurnRequest::text("hi");
+        req.mode = d::SessionMode::Temporary;
+        req.retention = d::SessionRetention::Retain;
+        let wire_req = request_to(req);
+        assert_eq!(wire_req.mode, pb::SessionMode::Temporary as i32);
+        assert_eq!(wire_req.retention, pb::SessionRetention::Retain as i32);
+        let back_req = request_from(wire_req).unwrap();
+        assert_eq!(back_req.mode, d::SessionMode::Temporary);
+        assert_eq!(back_req.retention, d::SessionRetention::Retain);
+
+        let agent_req = d::AgentRequest {
+            environment: None,
+            task: "typed agent".into(),
+            workspace: PathBuf::from("/tmp/ws"),
+            account_id: "default".into(),
+            model: None,
+            thinking: None,
+            session_mode: d::SessionMode::Temporary,
+            no_shell: false,
+            max_steps: 42,
+            knowledge: None,
+            mcp_config: None,
+            artifacts: vec![],
+            parent_id: None,
+            chat_only: true,
+            permissions: Some(d::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: true,
+                subagent: false,
+            }),
+            session_retention: d::SessionRetention::Ephemeral,
+        };
+        let wire_agent = agent_request_to(agent_req.clone());
+        assert_eq!(wire_agent.session_mode, pb::SessionMode::Temporary as i32);
+        assert_eq!(
+            wire_agent.session_retention,
+            pb::SessionRetention::Ephemeral as i32
+        );
+        assert_eq!(wire_agent.max_steps, 42);
+        assert!(wire_agent.chat_only);
+        let back_agent = agent_request_from(wire_agent).unwrap();
+        assert_eq!(back_agent.session_mode, d::SessionMode::Temporary);
+        assert_eq!(back_agent.session_retention, d::SessionRetention::Ephemeral);
+        assert_eq!(back_agent.max_steps, 42);
+        assert!(back_agent.chat_only);
+        assert_eq!(back_agent.permissions, agent_req.permissions);
+
+        let err = ServiceError::session_unavailable("resume", "tab gone");
+        let wire_err = error_to(err);
+        assert_eq!(wire_err.code, pb::ErrorCode::SessionUnavailable as i32);
+        assert_eq!(wire_err.grpc_code, tonic::Code::FailedPrecondition as i32);
+        let back_err = error_from(wire_err);
+        assert_eq!(back_err.code, d::ErrorCode::SessionUnavailable);
+        assert_eq!(back_err.stage, "resume");
+
+        let wire_session = session_to(d::Session {
+            id: "sess_1".into(),
+            provider: d::default_provider(),
+            account_id: "default".into(),
+            mode: d::SessionMode::Temporary,
+            target_id: Some("tab-1".into()),
+            remote_url: None,
+            remote_session_id: None,
+            history: vec![],
+            state: d::SessionState::Ready,
+            model: Some("pro".into()),
+            thinking: None,
+            tool_digest: String::new(),
+            remote_turns: 2,
+            last_used: 42,
+            reuse_scope: None,
+        });
+        assert_eq!(wire_session.mode, pb::SessionMode::Temporary as i32);
+        assert_eq!(wire_session.state, pb::SessionState::Ready as i32);
+        assert!(wire_session.continuable);
+        let rendered = session_json(wire_session);
+        assert_eq!(rendered["mode"], "temporary");
+        assert_eq!(rendered["state"], "ready");
+        assert_eq!(rendered["continuable"], true);
     }
 }

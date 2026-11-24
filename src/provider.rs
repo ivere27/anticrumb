@@ -223,3 +223,144 @@ pub trait Provider: Send + Sync + 'static {
 
     fn on_unregister(&self) {}
 }
+
+/// Mark a pre-submit unavailable session as `SessionState::Invalidated`, detach its tab handle,
+/// optionally release the tab back to the pool, and return `ErrorCode::SessionUnavailable`.
+pub(crate) fn invalidate_unavailable_session(
+    store: &Store,
+    session: &mut Session,
+    release_tab: impl FnOnce(&Session) -> Result<()>,
+    reason: impl Into<String>,
+) -> ServiceError {
+    session.state = SessionState::Invalidated;
+    let _ = store.put("local", "session", &session.id, session);
+    let _ = release_tab(session);
+    session.target_id = None;
+    let _ = store.put("local", "session", &session.id, session);
+    ServiceError::session_unavailable("resume", reason)
+}
+
+/// Verify that a continued browser tab still has the exact expected number of prior responses.
+///
+/// For `SessionMode::Temporary`, a mismatch indicates the tab was reset or externally modified
+/// (e.g. Chrome Memory Saver reload) before submission: release the tab back to the pool, mark
+/// the session `SessionState::Invalidated`, and return `ErrorCode::SessionUnavailable` so callers
+/// can fall back cleanly without poisoning account health (`adapter_error`) or falsely signaling
+/// unknown submission outcome.
+pub(crate) fn verify_continued_session_turns(
+    store: &Store,
+    probe_response_count: Option<u64>,
+    session: &mut Session,
+    verify_fallback: impl FnOnce(u64) -> std::result::Result<(), String>,
+    release_temp_tab: impl FnOnce(&Session) -> Result<()>,
+) -> Result<()> {
+    let count_mismatch = if let Some(count) = probe_response_count {
+        count != session.remote_turns
+    } else {
+        match verify_fallback(session.remote_turns) {
+            Ok(()) => false,
+            Err(e) if e.contains("owned conversation was modified outside this service") => true,
+            Err(e) => return Err(ServiceError::backend(e, false)),
+        }
+    };
+    if !count_mismatch {
+        return Ok(());
+    }
+    if session.mode == SessionMode::Temporary {
+        return Err(invalidate_unavailable_session(
+            store,
+            session,
+            release_temp_tab,
+            "session no longer available: temporary browser tab was reset",
+        ));
+    }
+    Err(ServiceError::backend(
+        "UI contract changed: owned conversation was modified outside this service".into(),
+        false,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn make_session(id: &str, mode: SessionMode) -> Session {
+        Session {
+            id: id.into(),
+            provider: default_provider(),
+            account_id: "default".into(),
+            mode,
+            target_id: Some("tab-1".into()),
+            remote_url: Some("https://gemini.google.com/app".into()),
+            remote_session_id: None,
+            history: vec![],
+            state: SessionState::Ready,
+            model: None,
+            thinking: None,
+            tool_digest: String::new(),
+            remote_turns: 2,
+            last_used: 1,
+            reuse_scope: None,
+        }
+    }
+
+    #[test]
+    fn verify_continued_session_turns_releases_and_invalidates_temporary_tab_on_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut session = make_session("temp-1", SessionMode::Temporary);
+        store.put("local", "session", &session.id, &session).unwrap();
+
+        let released: RefCell<Vec<Option<String>>> = RefCell::new(Vec::new());
+        let err = verify_continued_session_turns(
+            &store,
+            Some(0),
+            &mut session,
+            |_| unreachable!("probe count was provided"),
+            |s| {
+                released.borrow_mut().push(s.target_id.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::SessionUnavailable);
+        assert_eq!(err.stage, "resume");
+        assert!(err.message.contains("session no longer available"));
+        assert_eq!(released.borrow().as_slice(), &[Some("tab-1".to_string())]);
+        assert_eq!(session.state, SessionState::Invalidated);
+        assert!(session.target_id.is_none());
+        let persisted: Session = store.get("local", "session", "temp-1").unwrap();
+        assert_eq!(persisted.state, SessionState::Invalidated);
+        assert!(persisted.target_id.is_none());
+    }
+
+    #[test]
+    fn verify_continued_session_turns_preserves_chat_contract_error_without_releasing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut session = make_session("chat-1", SessionMode::Chat);
+        store.put("local", "session", &session.id, &session).unwrap();
+
+        let mut released = false;
+        let err = verify_continued_session_turns(
+            &store,
+            None,
+            &mut session,
+            |_| Err("owned conversation was modified outside this service".into()),
+            |_| {
+                released = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!released);
+        assert_eq!(session.state, SessionState::Ready);
+        assert_eq!(session.target_id.as_deref(), Some("tab-1"));
+        assert!(err
+            .message
+            .contains("owned conversation was modified outside this service"));
+    }
+}

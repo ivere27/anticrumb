@@ -2,7 +2,7 @@ use crate::{
     agent::CancelToken,
     browser_host as browser,
     cdp::CdpClient,
-    domain::{Account, ErrorCode, Result, ServiceError, Session, SessionMode},
+    domain::{Account, ErrorCode, Result, ServiceError, Session, SessionMode, SessionState},
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -94,7 +94,7 @@ pub fn clear_web_history_with_store(
             remote_url: Some(url.clone()),
             remote_session_id: None,
             history: Vec::new(),
-            state: "closed".into(),
+            state: SessionState::Closed,
             model: None,
             thinking: None,
             tool_digest: String::new(),

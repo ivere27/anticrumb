@@ -1616,7 +1616,7 @@ impl State {
             let request = self
                 .options
                 .agent_request(prepared.text, self.parent.clone());
-            self.pending_temporary = Some(request.temporary);
+            self.pending_temporary = Some(request.is_temporary());
             Command::Start(request, prepared.files, prepared.temp_files)
         };
         self.send(sink, command);

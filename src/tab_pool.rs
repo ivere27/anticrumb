@@ -16,7 +16,7 @@
 
 use crate::{
     browser_host::{self as browser, TargetInfo},
-    domain::{now_ms, Account, Result, ServiceError, Session, SessionMode},
+    domain::{now_ms, Account, Result, ServiceError, Session, SessionMode, SessionState},
     gemini,
     store::Store,
 };
@@ -419,7 +419,7 @@ pub(crate) fn reconcile(store: &Store, account_id: &str, targets: &[TargetInfo])
                 // Acquisition reserves a slot before the provider saves target_id.
                 // Keep that reservation while preparation is still running.
                 if sess.target_id.as_deref() != Some(slot.target_id.as_str())
-                    && sess.state != "running"
+                    && sess.state != SessionState::Running
                 {
                     slot.session_id = None;
                 }
@@ -703,7 +703,7 @@ pub(crate) fn acquire_session_tab_for(
         .list::<Session>("local", "session")
         .unwrap_or_default()
         .into_iter()
-        .filter(|s| matches!(s.state.as_str(), "running" | "awaiting_human"))
+        .filter(|s| matches!(s.state, SessionState::Running | SessionState::AwaitingHuman))
         .map(|s| s.id)
         .collect();
 
@@ -726,6 +726,11 @@ pub(crate) fn acquire_session_tab_for(
             if let Ok(mut old_session) = store.get::<Session>("local", "session", &old_sid) {
                 if old_session.target_id.as_deref() == Some(&state.slots[evict_idx].target_id) {
                     old_session.target_id = None;
+                    if old_session.mode == SessionMode::Temporary
+                        && old_session.state == SessionState::Ready
+                    {
+                        old_session.state = SessionState::Invalidated;
+                    }
                     let _ = store.put("local", "session", &old_session.id, &old_session);
                 }
             }
@@ -856,7 +861,7 @@ mod tests {
             remote_url: Some("https://gemini.google.com/app/chat-a".into()),
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: None,
             thinking: None,
             tool_digest: String::new(),
@@ -895,9 +900,9 @@ mod tests {
         assert!(owned_media_target(&store, &session, vec![target.clone()])
             .unwrap()
             .is_none());
-        other.state = "closed".into();
+        other.state = SessionState::Closed;
         store.put("local", "session", &other.id, &other).unwrap();
-        session.state = "closed".into();
+        session.state = SessionState::Closed;
         assert!(owned_media_target(&store, &session, vec![target])
             .unwrap()
             .is_none());
@@ -909,7 +914,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let mut session = media_session();
         session.mode = SessionMode::Temporary;
-        session.state = "running".into();
+        session.state = SessionState::Running;
         session.target_id = None;
         store
             .put("local", "session", &session.id, &session)
@@ -1039,7 +1044,7 @@ mod tests {
             remote_url: Some("https://gemini.google.com/app/chat_one".into()),
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: None,
             thinking: None,
             tool_digest: String::new(),
@@ -1066,7 +1071,7 @@ mod tests {
             remote_url: Some("https://gemini.google.com/app/chat_two".into()),
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: None,
             thinking: None,
             tool_digest: String::new(),
@@ -1098,7 +1103,7 @@ mod tests {
             remote_url: Some("https://gemini.google.com/app".into()),
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: None,
             thinking: None,
             tool_digest: String::new(),
@@ -1143,7 +1148,7 @@ mod tests {
             remote_url: Some("https://gemini.google.com/app".into()),
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: None,
             thinking: None,
             tool_digest: String::new(),
@@ -1177,7 +1182,7 @@ mod tests {
         // 8. Release both Worker sessions -> keeps both Worker tabs in pool WITHOUT closing Chrome tabs,
         //    and the next System task immediately preempts idle Worker `tab-sys`!
         for w in [&mut s_worker1, &mut s_worker2] {
-            w.state = "closed".into();
+            w.state = SessionState::Closed;
             store.put("local", "session", &w.id, w).unwrap();
             release_session_tab(&store, &account, w).unwrap();
         }

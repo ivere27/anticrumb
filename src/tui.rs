@@ -2915,13 +2915,13 @@ mod tests {
             .logs()
             .contains("on (anonymous · no server chat history saved)"));
 
-        // 4. Submitting a turn propagates `temporary: true` in `AgentRequest`.
+        // 4. Submitting a turn propagates `SessionMode::Temporary` in `AgentRequest`.
         state.editor.set("anonymous prompt".into());
         assert!(!state.submit(&mut tx));
         let Command::Start(req, _, _) = rx.try_recv().unwrap() else {
             panic!("expected Start command");
         };
-        assert!(req.temporary);
+        assert!(req.is_temporary());
         assert!(req.chat_only);
         state.active = None;
         state.pending = None;
@@ -3126,12 +3126,12 @@ mod tests {
             json!({
                 "id": "job-temp",
                 "state": "completed",
-                "request": {"task": "ephemeral question", "temporary": true}
+                "request": {"task": "ephemeral question", "session_mode": "temporary"}
             }),
             json!({
                 "id": "job-saved",
                 "state": "completed",
-                "request": {"task": "normal question", "temporary": false}
+                "request": {"task": "normal question", "session_mode": "chat"}
             }),
         ]));
         let menu = state.menu.as_ref().expect("/resume menu opened");
@@ -3153,13 +3153,13 @@ mod tests {
         let Command::Start(req, _, _) = rx.try_recv().unwrap() else {
             panic!("expected Start");
         };
-        assert!(!req.temporary);
+        assert!(!req.is_temporary());
         state.update(Update::Accepted(0));
         state.update(Update::Started("job-normal".into()));
         state.update(Update::Finished(json!({
             "id": "job-normal",
             "state": "completed",
-            "request": {"temporary": false},
+            "request": {"session_mode": "chat"},
             "result": {"final_response": "ok"}
         })));
         state.editor.set("/temp on".into());
@@ -3183,7 +3183,7 @@ mod tests {
         let Command::Start(req2, _, _) = rx.try_recv().unwrap() else {
             panic!("expected Start");
         };
-        assert!(req2.temporary);
+        assert!(req2.is_temporary());
         state.update(Update::Accepted(0));
         state.update(Update::Started("job-temp".into()));
         state.editor.set("/temp off".into());
@@ -3317,7 +3317,7 @@ mod tests {
         let Command::Start(started_req, _, _) = rx.try_recv().unwrap() else {
             panic!("expected Start");
         };
-        assert!(started_req.temporary);
+        assert!(started_req.is_temporary());
         assert_eq!(live_state.pending_temporary, Some(true));
         live_state.update(Update::Accepted(0));
         live_state.update(Update::Finished(json!({

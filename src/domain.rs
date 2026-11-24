@@ -4,6 +4,9 @@ use std::{fmt, path::PathBuf};
 
 pub const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_ARTIFACT_LABEL: &str = "100 MiB";
+pub const EVENT_BROWSER_SESSION: &str = "browser_session";
+pub const EVENT_SUBAGENT_BROWSER_SESSION: &str = "subagent_browser_session";
+pub const EVENT_BROWSER_TURN: &str = "browser_turn";
 
 pub fn is_valid_sha256_hex(value: &str) -> bool {
     value.len() == 64
@@ -56,6 +59,7 @@ pub enum ErrorCode {
     NotFound,
     StorageFailure,
     Internal,
+    SessionUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -87,6 +91,9 @@ impl ServiceError {
     }
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidRequest, "validate", message)
+    }
+    pub fn session_unavailable(stage: &str, message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::SessionUnavailable, stage, message)
     }
     pub fn storage(error: impl std::fmt::Display) -> Self {
         Self::new(ErrorCode::StorageFailure, "store", error.to_string())
@@ -127,12 +134,134 @@ impl ServiceError {
 }
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     #[default]
     Chat,
     Temporary,
+}
+
+impl SessionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Temporary => "temporary",
+        }
+    }
+
+    pub const fn is_temporary(self) -> bool {
+        matches!(self, Self::Temporary)
+    }
+
+    pub const fn from_temporary(temporary: bool) -> Self {
+        if temporary {
+            Self::Temporary
+        } else {
+            Self::Chat
+        }
+    }
+}
+
+impl fmt::Display for SessionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    #[default]
+    Ready,
+    Running,
+    Closed,
+    Deleted,
+    Invalidated,
+    OutcomeUnknown,
+    AwaitingHuman,
+    CleanupPending,
+}
+
+impl SessionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Closed => "closed",
+            Self::Deleted => "deleted",
+            Self::Invalidated => "invalidated",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::AwaitingHuman => "awaiting_human",
+            Self::CleanupPending => "cleanup_pending",
+        }
+    }
+
+    pub const fn is_inactive(self) -> bool {
+        matches!(
+            self,
+            Self::Closed | Self::Deleted | Self::Invalidated | Self::OutcomeUnknown
+        )
+    }
+
+    pub const fn is_terminated(self) -> bool {
+        matches!(self, Self::Closed | Self::Deleted | Self::Invalidated)
+    }
+
+    pub const fn is_unavailable_for_temporary_resume(self) -> bool {
+        matches!(self, Self::Closed | Self::Invalidated | Self::CleanupPending)
+    }
+}
+
+impl fmt::Display for SessionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRetention {
+    #[default]
+    Unspecified,
+    Ephemeral,
+    Retain,
+}
+
+impl SessionRetention {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Ephemeral => "ephemeral",
+            Self::Retain => "retain",
+        }
+    }
+
+    pub const fn is_unspecified(&self) -> bool {
+        matches!(self, Self::Unspecified)
+    }
+
+    pub const fn should_retain_turn(self) -> bool {
+        matches!(self, Self::Retain)
+    }
+
+    pub const fn should_retain_agent(self, has_workspace_lease: bool) -> bool {
+        has_workspace_lease && !matches!(self, Self::Ephemeral)
+    }
+
+    pub const fn for_turn(retain: bool) -> Self {
+        if retain {
+            Self::Retain
+        } else {
+            Self::Ephemeral
+        }
+    }
+}
+
+impl fmt::Display for SessionRetention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -336,7 +465,7 @@ pub struct TurnRequest {
     #[serde(default)]
     pub generate_image: bool,
     #[serde(default)]
-    pub keep_session: bool,
+    pub retention: SessionRetention,
     #[serde(default)]
     pub reuse_scope: Option<String>,
     #[serde(skip)]
@@ -364,7 +493,7 @@ impl TurnRequest {
             timeout_secs: 120,
             idempotency_key: None,
             generate_image: false,
-            keep_session: false,
+            retention: SessionRetention::Ephemeral,
             reuse_scope: None,
             omit_tool_contract: false,
         }
@@ -407,7 +536,8 @@ pub struct Session {
     #[serde(default)]
     pub remote_session_id: Option<String>,
     pub history: Vec<Message>,
-    pub state: String,
+    #[serde(default)]
+    pub state: SessionState,
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub tool_digest: String,
@@ -433,10 +563,30 @@ pub struct Run {
 
 impl Session {
     pub fn is_inactive(&self) -> bool {
-        matches!(
-            self.state.as_str(),
-            "closed" | "deleted" | "invalidated" | "outcome_unknown"
-        )
+        self.state.is_inactive()
+    }
+
+    pub fn can_reopen_closed(&self) -> bool {
+        self.state == SessionState::Closed
+            && self.mode == SessionMode::Chat
+            && (self.remote_url.is_some() || self.remote_session_id.is_some())
+    }
+
+    pub fn is_continuable(&self) -> bool {
+        self.state == SessionState::Ready || self.can_reopen_closed()
+    }
+
+    pub fn has_remote_handle(&self) -> bool {
+        match self.mode {
+            SessionMode::Temporary => {
+                self.target_id.is_some() || self.remote_session_id.is_some()
+            }
+            SessionMode::Chat => {
+                self.target_id.is_some()
+                    || self.remote_url.is_some()
+                    || self.remote_session_id.is_some()
+            }
+        }
     }
 }
 
@@ -558,7 +708,7 @@ pub struct AgentRequest {
     #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
-    pub temporary: bool,
+    pub session_mode: SessionMode,
     #[serde(default)]
     pub no_shell: bool,
     #[serde(default)]
@@ -575,6 +725,14 @@ pub struct AgentRequest {
     pub chat_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<ToolPermissions>,
+    #[serde(default, skip_serializing_if = "SessionRetention::is_unspecified")]
+    pub session_retention: SessionRetention,
+}
+
+impl AgentRequest {
+    pub const fn is_temporary(&self) -> bool {
+        self.session_mode.is_temporary()
+    }
 }
 
 fn deserialize_optional_agent_error<'de, D>(

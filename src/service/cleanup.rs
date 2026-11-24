@@ -30,7 +30,7 @@ pub(crate) fn build_job(id: &str, account: &str, ownership_events: Vec<(String, 
     let mut sessions = BTreeSet::new();
     let mut runs = BTreeSet::new();
     for (kind, data) in ownership_events {
-        if kind == "browser_turn" {
+        if kind == EVENT_BROWSER_TURN {
             if let Some(id) = data["run_id"].as_str() {
                 runs.insert(id.to_owned());
             }
@@ -241,7 +241,7 @@ impl Service {
                         "web cleanup session account mismatch",
                     ));
                 }
-                if session.state != "deleted" && self.shared_session(&id, &job.runs)? {
+                if session.state != SessionState::Deleted && self.shared_session(&id, &job.runs)? {
                     return Err(ServiceError::invalid(
                         "web chat is referenced by another saved entry; cleanup retained it",
                     ));
@@ -293,7 +293,7 @@ impl Service {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut session: Session = service.store.get("local", "session", &session.id)?;
-            if session.state == "deleted" {
+            if session.state == SessionState::Deleted {
                 return Ok(());
             }
             // Recheck after acquiring the account gate: another saved turn
@@ -303,7 +303,7 @@ impl Service {
                     "web chat is referenced by another saved entry; cleanup retained it",
                 ));
             }
-            if matches!(session.state.as_str(), "running" | "queued") {
+            if session.state == SessionState::Running {
                 return Err(ServiceError::invalid("web conversation is still running"));
             }
             let account: Account = service.store.get("local", "account", &session.account_id)?;
@@ -318,8 +318,15 @@ impl Service {
                     &session,
                     service.cleanup_cancel.clone(),
                 )?;
+            } else if !session.is_inactive() {
+                if let Err(err) = service.backend.close(&account, &session) {
+                    if err.code != ErrorCode::NotFound {
+                        return Err(err);
+                    }
+                }
+                session.target_id = None;
             }
-            session.state = "deleted".into();
+            session.state = SessionState::Deleted;
             service.store.put("local", "session", &session.id, &session)
         })
         .await
@@ -346,6 +353,7 @@ mod tests {
         calls: AtomicUsize,
         fail: AtomicBool,
         identities: Mutex<Vec<(String, String)>>,
+        closed: Mutex<Vec<String>>,
     }
     impl Backend for DeleteBackend {
         fn generate(
@@ -358,7 +366,8 @@ mod tests {
         ) -> Result<TurnResult> {
             Err(ServiceError::invalid("fixture does not generate"))
         }
-        fn close(&self, _: &Account, _: &Session) -> Result<()> {
+        fn close(&self, _: &Account, session: &Session) -> Result<()> {
+            self.closed.lock().unwrap().push(session.id.clone());
             Ok(())
         }
         fn delete_conversation(
@@ -425,7 +434,7 @@ mod tests {
                 .get::<Session>("local", "session", "owned")
                 .unwrap()
                 .state,
-            "closed"
+            SessionState::Closed
         );
         service.run_chat_cleanup(retry).await.unwrap();
         assert_eq!(status(&store).unwrap().completed, 1);
@@ -435,7 +444,7 @@ mod tests {
                 .get::<Session>("local", "session", "owned")
                 .unwrap()
                 .state,
-            "deleted"
+            SessionState::Deleted
         );
         service.delete_conversation("owned").await.unwrap();
         assert_eq!(
@@ -485,7 +494,7 @@ mod tests {
         // Explicit account-wide cleanup can delete the web chat while keeping
         // local entries. A previously queued job must then complete quietly.
         let mut session: Session = store.get("local", "session", "owned").unwrap();
-        session.state = "deleted".into();
+        session.state = SessionState::Deleted;
         store.put("local", "session", "owned", &session).unwrap();
         service.run_chat_cleanup(blocked).await.unwrap();
         let completed: Job = store.get("local", "chat_cleanup", "deleted").unwrap();
@@ -590,5 +599,92 @@ mod tests {
         assert_eq!(saved.state, "unmapped");
         assert!(saved.error.contains("was not deleted"));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn deleting_saved_conversation_closes_live_temporary_and_subagent_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put(
+                "local",
+                "account",
+                "default",
+                &json!({"id":"default","provider":"gemini-web","profile":"fixture/profile","port":0,"headless":true,"state":"ready"}),
+            )
+            .unwrap();
+        for (sid, tab) in [("temp-main", "tab-main"), ("temp-sub", "tab-sub")] {
+            store
+                .put(
+                    "local",
+                    "session",
+                    sid,
+                    &json!({"id":sid,"provider":"gemini-web","account_id":"default","mode":"temporary","target_id":tab,"remote_url":"https://gemini.google.com/app","history":[],"state":"ready","model":null,"thinking":null,"tool_digest":""}),
+                )
+                .unwrap();
+        }
+        let backend = Arc::new(DeleteBackend::default());
+        let service = Service::new(store.clone(), backend.clone()).unwrap();
+
+        // Shared subagent session referenced by a surviving conversation is retained while shared.
+        agent(&store, "conv-deleted");
+        store
+            .event(
+                "conv-deleted",
+                "browser_session",
+                json!({"session_id":"temp-main"}),
+            )
+            .unwrap();
+        store
+            .event(
+                "conv-deleted",
+                "subagent_browser_session",
+                json!({"session_id":"temp-sub"}),
+            )
+            .unwrap();
+        agent(&store, "conv-surviving");
+        store
+            .event(
+                "conv-surviving",
+                "subagent_browser_session",
+                json!({"session_id":"temp-sub"}),
+            )
+            .unwrap();
+
+        AgentManager::new(store.clone())
+            .unwrap()
+            .delete("conv-deleted")
+            .unwrap();
+        let job: Job = store.get("local", "chat_cleanup", "conv-deleted").unwrap();
+        assert_eq!(job.sessions, ["temp-main", "temp-sub"]);
+        service.run_chat_cleanup(job).await.unwrap();
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.closed.lock().unwrap().as_slice(), &["temp-main"]);
+        let main_sess: Session = store.get("local", "session", "temp-main").unwrap();
+        assert_eq!(main_sess.state, SessionState::Deleted);
+        assert!(main_sess.target_id.is_none());
+        let sub_sess: Session = store.get("local", "session", "temp-sub").unwrap();
+        assert_eq!(sub_sess.state, SessionState::Ready);
+        assert_eq!(sub_sess.target_id.as_deref(), Some("tab-sub"));
+
+        // Once the surviving conversation is deleted too, the retained subagent session closes cleanly.
+        AgentManager::new(store.clone())
+            .unwrap()
+            .delete("conv-surviving")
+            .unwrap();
+        let job2: Job = store
+            .get("local", "chat_cleanup", "conv-surviving")
+            .unwrap();
+        assert_eq!(job2.sessions, ["temp-sub"]);
+        service.run_chat_cleanup(job2).await.unwrap();
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            backend.closed.lock().unwrap().as_slice(),
+            &["temp-main", "temp-sub"]
+        );
+        let sub_sess: Session = store.get("local", "session", "temp-sub").unwrap();
+        assert_eq!(sub_sess.state, SessionState::Deleted);
+        assert!(sub_sess.target_id.is_none());
     }
 }

@@ -196,7 +196,7 @@ async fn network(
     (endpoint, task)
 }
 fn request() -> TurnRequest {
-    serde_json::from_value(json!({"messages":[{"role":"user","blocks":[{"type":"text","text":"Use the native attachment"}]}],"keep_session":true})).unwrap()
+    serde_json::from_value(json!({"messages":[{"role":"user","blocks":[{"type":"text","text":"Use the native attachment"}]}],"retention":"retain"})).unwrap()
 }
 
 type RecordedBrowserFetch = (String, String, u32, u32, String);
@@ -1231,7 +1231,7 @@ async fn every_network_method_authenticates_before_work() {
             count += 1;
         }
     }
-    assert_eq!(count, 36);
+    assert_eq!(count, 38);
     let client = RpcClient::network(&endpoint, TOKEN, None, None)
         .await
         .unwrap();
@@ -1737,7 +1737,7 @@ async fn human_challenge_retains_the_tab_session_and_pauses_only_its_account() {
         .unwrap();
     let mut input = request();
     input.messages = vec![Message::user("challenge")];
-    input.keep_session = false;
+    input.retention = SessionRetention::Ephemeral;
     let id = host.service.submit_async(input).await.unwrap();
     let run = host.service.wait(&id).await.unwrap();
     assert_eq!(run.state, "awaiting_human");
@@ -1748,7 +1748,7 @@ async fn human_challenge_retains_the_tab_session_and_pauses_only_its_account() {
         .list::<Session>("local", "session")
         .unwrap();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].state, "awaiting_human");
+    assert_eq!(sessions[0].state, SessionState::AwaitingHuman);
     let account: Account = host
         .service
         .store
@@ -1829,7 +1829,7 @@ async fn relay_allocates_a_new_key_after_a_known_failed_turn() {
     });
     let workspace = Service::new(store, backend).unwrap();
     let mut request = TurnRequest::text("first");
-    request.keep_session = true;
+    request.retention = SessionRetention::Retain;
     let run = workspace
         .wait(&workspace.submit(request).unwrap())
         .await
@@ -1837,7 +1837,7 @@ async fn relay_allocates_a_new_key_after_a_known_failed_turn() {
     let session = run.result.unwrap().session_id;
     for prompt in ["fail before submit", "fail before submit", "new prompt"] {
         let mut request = TurnRequest::text(prompt);
-        request.keep_session = true;
+        request.retention = SessionRetention::Retain;
         request.session_id = Some(session.clone());
         let run = workspace
             .wait(&workspace.submit(request).unwrap())
@@ -1986,7 +1986,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
             local.remote_session_id.as_ref().unwrap(),
         )
         .unwrap();
-    assert_eq!(remote.state, "closed");
+    assert_eq!(remote.state, SessionState::Closed);
     let original_peer: serde_json::Value = workspace
         .service
         .store
@@ -2028,7 +2028,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
             .get::<Session>("local", "session", &local.id)
             .unwrap()
             .state,
-        "deleted"
+        SessionState::Deleted
     );
     assert_eq!(
         browser
@@ -2037,7 +2037,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
             .get::<Session>("local", "session", &remote.id)
             .unwrap()
             .state,
-        "deleted"
+        SessionState::Deleted
     );
     let request = pb::AccountRef {
         account_id: "default".into(),
@@ -2083,7 +2083,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
     // remote continuation before submitting a delta as a fresh conversation.
     let mut stale = local.clone();
     stale.id = "stale-continuation".into();
-    stale.state = "ready".into();
+    stale.state = SessionState::Ready;
     workspace
         .service
         .store
@@ -2096,7 +2096,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
         .unwrap();
     let mut continuation = TurnRequest::text("only the new delta");
     continuation.session_id = Some(stale.id.clone());
-    continuation.keep_session = true;
+    continuation.retention = SessionRetention::Retain;
     let stale_run = workspace.service.submit_async(continuation).await.unwrap();
     let error = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -2116,7 +2116,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
             .get::<Session>("local", "session", &stale.id)
             .unwrap()
             .state,
-        "deleted"
+        SessionState::Deleted
     );
     assert_eq!(
         echo.requests.lock().unwrap().len(),
@@ -2127,7 +2127,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
     // Partial failure invalidates only this workspace's old batch scope.
     let mut old = local.clone();
     old.id = "partial-old".into();
-    old.state = "ready".into();
+    old.state = SessionState::Ready;
     old.last_used = 0;
     old.remote_session_id = Some("remote-still-ready".into());
     let mut newer = old.clone();
@@ -2147,7 +2147,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
     }
     let mut still_ready = remote.clone();
     still_ready.id = "remote-still-ready".into();
-    still_ready.state = "ready".into();
+    still_ready.state = SessionState::Ready;
     browser
         .service
         .store
@@ -2175,7 +2175,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
             .get::<Session>("local", "session", &old.id)
             .unwrap()
             .state,
-        "invalidated"
+        SessionState::Invalidated
     );
     assert_eq!(
         workspace
@@ -2184,7 +2184,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
             .get::<Session>("local", "session", &newer.id)
             .unwrap()
             .state,
-        "ready"
+        SessionState::Ready
     );
 
     // Another workspace has no local cutoff. Synchronize exact remote deleted
@@ -2200,7 +2200,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
     .unwrap();
     let mut seen_deleted = local.clone();
     seen_deleted.id = "observer-deleted".into();
-    seen_deleted.state = "ready".into();
+    seen_deleted.state = SessionState::Ready;
     let mut seen_ready = newer.clone();
     seen_ready.id = "observer-ready".into();
     let mut other_host = seen_deleted.clone();
@@ -2243,7 +2243,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
                 .get::<Session>("local", "session", &seen_deleted.id)
                 .unwrap()
                 .state,
-            "deleted"
+            SessionState::Deleted
         );
         assert_eq!(
             observer
@@ -2252,7 +2252,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
                 .get::<Session>("local", "session", &seen_ready.id)
                 .unwrap()
                 .state,
-            "ready"
+            SessionState::Ready
         );
         assert_eq!(
             observer
@@ -2261,7 +2261,7 @@ async fn separate_hosts_transfer_bytes_and_keep_session_identities_distinct() {
                 .get::<Session>("local", "session", &other_host.id)
                 .unwrap()
                 .state,
-            "ready"
+            SessionState::Ready
         );
     }
     // Conservative invalidation must not suppress later actual deletion.
@@ -3340,4 +3340,657 @@ async fn download_stream_rejects_invalid_name_and_empty_data_chunk() {
     drop(client);
     stop.send(()).unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_recover_when_invalidated(
+) {
+    let browser_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+    let project = local_dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let (browser, echo) = fixture(browser_dir.path());
+    let options = Options {
+        root: browser_dir.path().into(),
+        listen: "127.0.0.1:0".into(),
+        self_signed: true,
+        ..Default::default()
+    };
+    let identity = options.identity().unwrap();
+    let pin = certificate_fingerprint(
+        &std::fs::read(browser_dir.path().join("tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+    let (endpoint, task) = network(browser.clone(), identity).await;
+    let workspace = relay::workspace(
+        local_dir.path(),
+        Connection::Grpc {
+            endpoint,
+            token: TOKEN.into(),
+            ca_file: None,
+            server_name: None,
+            tls_pin: Some(pin),
+        },
+    )
+    .await
+    .unwrap();
+    let client = RpcClient::embedded(workspace.clone(), tokio::runtime::Handle::current()).unwrap();
+
+    let run_turn = |client: RpcClient,
+                    project: std::path::PathBuf,
+                    task_text: String,
+                    parent_id: Option<String>,
+                    temporary: bool| async move {
+        let job = client
+            .start_agent(pb::AgentRequest {
+                task: task_text,
+                workspace: project.to_string_lossy().into_owned(),
+                account_id: "default".into(),
+                session_mode: codec::session_mode_to(SessionMode::from_temporary(temporary)),
+                no_shell: true,
+                parent_id,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let value = client.get_agent(job.clone()).await.unwrap();
+                if value.state != "running" {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(finished.state, "completed", "{finished:?}");
+        finished.id
+    };
+
+    let read_full_prompt = |req: &TurnRequest| -> String {
+        let mut combined = anticrumb::protocol::prompt(req).unwrap();
+        for art_id in &req.artifacts {
+            if let Ok((meta, bytes)) = echo.store.artifact_bytes(&req.account_id, art_id) {
+                if meta.name.starts_with("anticrumb-prompt-") {
+                    combined.push('\n');
+                    combined.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        combined
+    };
+
+    // Turn 1 (/temp on, new conversation): creates browser temporary session S1 and retains it.
+    let turn1 = run_turn(
+        client.clone(),
+        project.clone(),
+        "remember secret ALPHA".into(),
+        None,
+        true,
+    )
+    .await;
+    let s1_id = {
+        let sessions = browser
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].mode, SessionMode::Temporary);
+        assert_eq!(sessions[0].state, SessionState::Ready);
+        assert_eq!(sessions[0].remote_turns, 1);
+        sessions[0].id.clone()
+    };
+
+    // Turn 2 (follow-up without /new or /clear): continues S1 in-place without previous-context dump.
+    let _turn2 = run_turn(
+        client.clone(),
+        project.clone(),
+        "what was the secret?".into(),
+        Some(turn1),
+        true,
+    )
+    .await;
+    {
+        let requests = echo.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].session_id.is_none());
+        assert_eq!(requests[0].mode, SessionMode::Temporary);
+        assert_eq!(requests[1].session_id.as_deref(), Some(s1_id.as_str()));
+        assert_eq!(requests[1].mode, SessionMode::Temporary);
+        let turn2_prompt = read_full_prompt(&requests[1]);
+        assert!(turn2_prompt.contains("what was the secret?"));
+        assert!(!turn2_prompt.contains("[PREVIOUS CONVERSATION"));
+
+        let s1: Session = browser
+            .service
+            .store
+            .get("local", "session", &s1_id)
+            .unwrap();
+        assert_eq!(s1.state, SessionState::Ready);
+        assert_eq!(s1.remote_turns, 2);
+    }
+
+    // Turn 3 (after /new or /clear -> parent_id is None): closes S1 and creates a fresh temp session S2.
+    let turn3 = run_turn(
+        client.clone(),
+        project.clone(),
+        "fresh temporary topic".into(),
+        None,
+        true,
+    )
+    .await;
+    let s2_id = {
+        let requests = echo.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].session_id.is_none());
+        assert_eq!(requests[2].mode, SessionMode::Temporary);
+
+        let s1: Session = browser
+            .service
+            .store
+            .get("local", "session", &s1_id)
+            .unwrap();
+        assert_eq!(s1.state, SessionState::Closed);
+
+        let sessions = browser
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap();
+        let s2 = sessions
+            .into_iter()
+            .find(|s| s.id != s1_id)
+            .expect("second temporary session created");
+        assert_eq!(s2.mode, SessionMode::Temporary);
+        assert_eq!(s2.state, SessionState::Ready);
+        assert_eq!(s2.remote_turns, 1);
+        s2.id
+    };
+
+    // Simulate Chrome restart invalidating S2 on the browser daemon: Turn 4 falls back cleanly
+    // to a new temporary session S3 with full local previous-conversation context.
+    let mut invalidated_s2: Session = browser
+        .service
+        .store
+        .get("local", "session", &s2_id)
+        .unwrap();
+    invalidated_s2.state = SessionState::Invalidated;
+    browser
+        .service
+        .store
+        .put("local", "session", &s2_id, &invalidated_s2)
+        .unwrap();
+    let turn4 = run_turn(
+        client.clone(),
+        project.clone(),
+        "continue after chrome restart".into(),
+        Some(turn3),
+        true,
+    )
+    .await;
+    let s3_id = {
+        let requests = echo.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].session_id.is_none());
+        assert_eq!(requests[3].mode, SessionMode::Temporary);
+        let turn4_prompt = read_full_prompt(&requests[3]);
+        assert!(turn4_prompt.contains("[PREVIOUS CONVERSATION"));
+        assert!(turn4_prompt.contains("fresh temporary topic"));
+
+        let sessions = browser
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap();
+        let s3 = sessions
+            .into_iter()
+            .find(|s| s.id != s1_id && s.id != s2_id)
+            .expect("fallback temporary session created");
+        assert_eq!(s3.mode, SessionMode::Temporary);
+        assert_eq!(s3.state, SessionState::Ready);
+        // Local workspace session mapped to invalidated S2 must have synced its state.
+        let local_s2 = workspace
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.remote_session_id.as_deref() == Some(s2_id.as_str()))
+            .expect("local session mapping for S2");
+        assert_eq!(local_s2.state, SessionState::Invalidated);
+        s3.id
+    };
+
+    // Simulate S3 completely vanishing from browser daemon store (`GetSession` -> `NotFound`):
+    // Relay must mark the local session invalidated and fall back cleanly to S3b.
+    assert!(browser
+        .service
+        .store
+        .delete("local", "session", &s3_id)
+        .unwrap());
+    let turn4b = run_turn(
+        client.clone(),
+        project.clone(),
+        "continue after missing remote session".into(),
+        Some(turn4),
+        true,
+    )
+    .await;
+    let s3b_id = {
+        let requests = echo.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[4].session_id.is_none());
+        assert_eq!(requests[4].mode, SessionMode::Temporary);
+        let turn4b_prompt = read_full_prompt(&requests[4]);
+        assert!(turn4b_prompt.contains("[PREVIOUS CONVERSATION"));
+        assert!(turn4b_prompt.contains("continue after chrome restart"));
+
+        let local_s3 = workspace
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.remote_session_id.as_deref() == Some(s3_id.as_str()))
+            .expect("local session mapping for deleted S3");
+        assert_eq!(local_s3.state, SessionState::Invalidated);
+
+        let sessions = browser
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap();
+        let s3b = sessions
+            .into_iter()
+            .find(|s| s.id != s1_id && s.id != s2_id && s.id != s3_id)
+            .expect("fallback session S3b after missing remote session");
+        assert_eq!(s3b.mode, SessionMode::Temporary);
+        assert_eq!(s3b.state, SessionState::Ready);
+        s3b.id
+    };
+
+    // Remote state `SessionState::OutcomeUnknown` must NOT trigger silent session_fallback.
+    let mut unknown_s3b: Session = browser
+        .service
+        .store
+        .get("local", "session", &s3b_id)
+        .unwrap();
+    unknown_s3b.state = SessionState::OutcomeUnknown;
+    browser
+        .service
+        .store
+        .put("local", "session", &s3b_id, &unknown_s3b)
+        .unwrap();
+    let failed_job = client
+        .start_agent(pb::AgentRequest {
+            task: "must not silently fork outcome_unknown".into(),
+            workspace: project.to_string_lossy().into_owned(),
+            account_id: "default".into(),
+            session_mode: pb::SessionMode::Temporary as i32,
+            no_shell: true,
+            parent_id: Some(turn4b.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let value = client.get_agent(failed_job.clone()).await.unwrap();
+            if value.state != "running" {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed.state, "failed", "{failed:?}");
+    assert_eq!(
+        echo.requests.lock().unwrap().len(),
+        5,
+        "must not submit a new fallback turn while remote session is outcome_unknown"
+    );
+    // Restore S3b (and its synced local mapping) to ready for the mode-switch test.
+    unknown_s3b.state = SessionState::Ready;
+    browser
+        .service
+        .store
+        .put("local", "session", &s3b_id, &unknown_s3b)
+        .unwrap();
+    let mut local_s3b = workspace
+        .service
+        .store
+        .list::<Session>("local", "session")
+        .unwrap()
+        .into_iter()
+        .find(|s| s.remote_session_id.as_deref() == Some(s3b_id.as_str()))
+        .expect("local session mapping for S3b");
+    assert_eq!(local_s3b.state, SessionState::OutcomeUnknown);
+    local_s3b.state = SessionState::Ready;
+    workspace
+        .service
+        .store
+        .put("local", "session", &local_s3b.id, &local_s3b)
+        .unwrap();
+
+    // Turn 5 (switching `/temp off` mid-conversation): closes S3b and starts a normal Chat session S4.
+    let turn5 = run_turn(
+        client.clone(),
+        project.clone(),
+        "switch to normal server chat".into(),
+        Some(turn4b),
+        false,
+    )
+    .await;
+    {
+        let requests = echo.requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[5].session_id.is_none());
+        assert_eq!(requests[5].mode, SessionMode::Chat);
+
+        let s3b: Session = browser
+            .service
+            .store
+            .get("local", "session", &s3b_id)
+            .unwrap();
+        assert_eq!(s3b.state, SessionState::Closed);
+    }
+
+    // Deleting a conversation closes any retained `subagent_browser_session` on the browser host.
+    let sub_turn = run_turn(
+        client.clone(),
+        project.clone(),
+        "retained subagent temporary session".into(),
+        None,
+        true,
+    )
+    .await;
+    let (local_sub_id, remote_sub_id) = {
+        let local_sub = workspace
+            .service
+            .store
+            .list::<Session>("local", "session")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.mode == SessionMode::Temporary && s.state == SessionState::Ready)
+            .expect("live relayed temporary session for subagent");
+        let remote_id = local_sub
+            .remote_session_id
+            .clone()
+            .expect("remote session id");
+        (local_sub.id, remote_id)
+    };
+    // Detach synthetic helper agent row so only `turn5` owns `local_sub_id` via `subagent_browser_session`.
+    workspace
+        .service
+        .store
+        .delete("local", "agent", &sub_turn)
+        .unwrap();
+    workspace
+        .service
+        .store
+        .event(
+            &turn5,
+            "subagent_browser_session",
+            serde_json::json!({"session_id": local_sub_id}),
+        )
+        .unwrap();
+    client
+        .delete_agent(pb::AgentRef { id: turn5 })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let remote_sub: Session = browser
+                .service
+                .store
+                .get("local", "session", &remote_sub_id)
+                .unwrap();
+            let local_sub: Session = workspace
+                .service
+                .store
+                .get("local", "session", &local_sub_id)
+                .unwrap();
+            if remote_sub.state == SessionState::Closed && local_sub.state == SessionState::Deleted
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("deleting conversation should close retained subagent session on browser daemon");
+
+    drop(client);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_grpc() {
+    let browser_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+    let project = local_dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let (browser, _echo) = fixture(browser_dir.path());
+    let browser_ffi =
+        RpcClient::embedded(browser.clone(), tokio::runtime::Handle::current()).unwrap();
+
+    // Create one retained temporary turn and one retained chat turn over Synurang FFI.
+    let mut temp_req = TurnRequest::text("ffi temp");
+    temp_req.mode = SessionMode::Temporary;
+    temp_req.retention = SessionRetention::Retain;
+    let temp_run = browser_ffi
+        .create_turn(codec::request_to(temp_req))
+        .await
+        .unwrap();
+    let temp_done = browser.service.wait(&temp_run.id).await.unwrap();
+    let temp_sid = temp_done.result.unwrap().session_id;
+
+    let mut chat_req = TurnRequest::text("ffi chat");
+    chat_req.mode = SessionMode::Chat;
+    chat_req.retention = SessionRetention::Retain;
+    let chat_run = browser_ffi
+        .create_turn(codec::request_to(chat_req))
+        .await
+        .unwrap();
+    let chat_done = browser.service.wait(&chat_run.id).await.unwrap();
+    let chat_sid = chat_done.result.unwrap().session_id;
+
+    // GetSession over Synurang FFI returns typed proto enums and continuable flag.
+    let fetched = browser_ffi
+        .get_session(pb::SessionRef {
+            id: temp_sid.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(fetched.id, temp_sid);
+    assert_eq!(fetched.mode, pb::SessionMode::Temporary as i32);
+    assert_eq!(fetched.state, pb::SessionState::Ready as i32);
+    assert_eq!(fetched.provider, default_provider());
+    assert!(fetched.continuable);
+
+    let missing_err = browser_ffi
+        .get_session(pb::SessionRef {
+            id: "missing-session".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing_err.code, ErrorCode::NotFound);
+
+    // Filtered ListSessions over Synurang FFI matches mode/state/account enums.
+    let only_temp = browser_ffi
+        .list_sessions(pb::ListSessionsRequest {
+            account_id: Some("default".into()),
+            mode: pb::SessionMode::Temporary as i32,
+            state: pb::SessionState::Ready as i32,
+        })
+        .await
+        .unwrap();
+    assert_eq!(only_temp.sessions.len(), 1);
+    assert_eq!(only_temp.sessions[0].id, temp_sid);
+
+    let none_closed = browser_ffi
+        .list_sessions(pb::ListSessionsRequest {
+            account_id: None,
+            mode: pb::SessionMode::Unspecified as i32,
+            state: pb::SessionState::Closed as i32,
+        })
+        .await
+        .unwrap();
+    assert!(none_closed.sessions.is_empty());
+
+    // Presentation JSON exposes readable string mode/state for both list and single show.
+    let single_json = anticrumb::rpc::workspace_client::presentation(
+        &browser_ffi,
+        "GET",
+        &format!("/api/sessions/{temp_sid}"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(single_json["mode"], "temporary");
+    assert_eq!(single_json["state"], "ready");
+    assert_eq!(single_json["continuable"], true);
+
+    // Batch CloseSessions closes live sessions, skips missing/duplicate IDs, and updates state.
+    let batch = browser_ffi
+        .close_sessions(pb::CloseSessionsRequest {
+            session_ids: vec![
+                temp_sid.clone(),
+                temp_sid.clone(),
+                "does-not-exist".into(),
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(batch.closed, vec![temp_sid.clone()]);
+    assert_eq!(batch.skipped, vec!["does-not-exist".to_string()]);
+    assert!(batch.errors.is_empty());
+
+    let after_close = browser_ffi
+        .get_session(pb::SessionRef {
+            id: temp_sid.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_close.state, pb::SessionState::Closed as i32);
+    assert!(!after_close.continuable);
+
+    // Continuing a closed temporary session returns typed ErrorCode::SessionUnavailable over FFI.
+    let mut resume_closed = TurnRequest::text("cannot continue closed temp");
+    resume_closed.mode = SessionMode::Temporary;
+    resume_closed.session_id = Some(temp_sid.clone());
+    let unavailable = browser_ffi
+        .create_turn(codec::request_to(resume_closed))
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable.code, ErrorCode::SessionUnavailable);
+
+    // Close remaining chat session cleanly via CloseSessions; already-closed temp_sid is skipped.
+    let batch2 = browser_ffi
+        .close_sessions(pb::CloseSessionsRequest {
+            session_ids: vec![temp_sid, chat_sid.clone()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(batch2.closed, vec![chat_sid]);
+    assert_eq!(batch2.skipped.len(), 1);
+    assert!(batch2.errors.is_empty());
+
+    // Workspace AgentRequest over gRPC relay + Synurang FFI with SessionRetention::Ephemeral
+    // closes its temporary session on finish and preserves typed request fields without bit-packing.
+    let options = Options {
+        root: browser_dir.path().into(),
+        listen: "127.0.0.1:0".into(),
+        self_signed: true,
+        ..Default::default()
+    };
+    let identity = options.identity().unwrap();
+    let pin = certificate_fingerprint(
+        &std::fs::read(browser_dir.path().join("tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+    let (endpoint, grpc_task) = network(browser.clone(), identity).await;
+    let workspace = relay::workspace(
+        local_dir.path(),
+        Connection::Grpc {
+            endpoint,
+            token: TOKEN.into(),
+            ca_file: None,
+            server_name: None,
+            tls_pin: Some(pin),
+        },
+    )
+    .await
+    .unwrap();
+    let ws_ffi =
+        RpcClient::embedded(workspace.clone(), tokio::runtime::Handle::current()).unwrap();
+    let job = ws_ffi
+        .start_agent(pb::AgentRequest {
+            task: "ephemeral temp agent".into(),
+            workspace: project.to_string_lossy().into_owned(),
+            account_id: "default".into(),
+            session_mode: pb::SessionMode::Temporary as i32,
+            no_shell: true,
+            max_steps: 7,
+            session_retention: pb::SessionRetention::Ephemeral as i32,
+            chat_only: true,
+            permissions: Some(pb::ToolPermissions {
+                read: true,
+                edit: false,
+                shell: false,
+                browser: true,
+                subagent: false,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let value = ws_ffi.get_agent(job.clone()).await.unwrap();
+            if value.state != "running" {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(finished.state, "completed", "{finished:?}");
+    let finished_req = finished.request.as_ref().expect("agent request preserved");
+    assert_eq!(finished_req.session_mode, pb::SessionMode::Temporary as i32);
+    assert_eq!(
+        finished_req.session_retention,
+        pb::SessionRetention::Ephemeral as i32
+    );
+    assert_eq!(finished_req.max_steps, 7);
+    assert!(finished_req.chat_only);
+    assert_eq!(
+        finished_req.permissions,
+        Some(pb::ToolPermissions {
+            read: true,
+            edit: false,
+            shell: false,
+            browser: true,
+            subagent: false,
+        })
+    );
+    let ready_temp = browser_ffi
+        .list_sessions(pb::ListSessionsRequest {
+            account_id: Some("default".into()),
+            mode: pb::SessionMode::Temporary as i32,
+            state: pb::SessionState::Ready as i32,
+        })
+        .await
+        .unwrap();
+    assert!(
+        ready_temp.sessions.is_empty(),
+        "SESSION_RETENTION_EPHEMERAL must close the browser temporary session on completion"
+    );
+    drop(ws_ffi);
+    drop(browser_ffi);
+    grpc_task.abort();
 }

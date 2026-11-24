@@ -3,8 +3,8 @@ use crate::{
     agent::{AgentBackend, AgentEvent, CancelToken, EventSink},
     cli::{poll_until, Client},
     domain::{
-        digest, Event, Message, Result as DomainResult, Run, ServiceError, SessionMode,
-        TurnRequest, TurnResult,
+        digest, ErrorCode, Event, Message, Result as DomainResult, ServiceError, SessionMode,
+        SessionRetention, TurnRequest, TurnResult,
     },
     provider::ProviderInfo,
 };
@@ -20,13 +20,13 @@ pub struct RemoteBackend {
     account: String,
     model: Option<String>,
     thinking: Option<String>,
-    temporary: bool,
+    session_mode: SessionMode,
     events: EventSink,
     artifacts: Vec<String>,
     step_artifacts: Vec<String>,
     sent_artifacts: usize,
     preserve_session: bool,
-    keep_session_after_run: bool,
+    session_retention: SessionRetention,
     chat_only: bool,
     provider: Option<ProviderInfo>,
 }
@@ -37,7 +37,7 @@ impl RemoteBackend {
         account: String,
         model: Option<String>,
         thinking: Option<String>,
-        temporary: bool,
+        session_mode: SessionMode,
     ) -> Self {
         Self {
             client,
@@ -48,13 +48,13 @@ impl RemoteBackend {
             account,
             model,
             thinking,
-            temporary,
+            session_mode,
             events: Default::default(),
             artifacts: Vec::new(),
             step_artifacts: Vec::new(),
             sent_artifacts: 0,
-            preserve_session: false,
-            keep_session_after_run: false,
+            preserve_session: true,
+            session_retention: SessionRetention::Retain,
             chat_only: false,
             provider: None,
         }
@@ -64,8 +64,19 @@ impl RemoteBackend {
         self.chat_only = chat_only;
     }
 
-    pub fn retain_session_after_run(&mut self, keep: bool) {
-        self.keep_session_after_run = keep && !self.temporary;
+    fn default_preserve_session(&self) -> bool {
+        self.session_retention.should_retain_turn()
+            || (self.carried_session.is_some() && self.session == self.carried_session)
+    }
+
+    /// Control whether Drop retains the browser session (default: `SessionRetention::Retain`).
+    /// Pass `SessionRetention::Ephemeral` for one-shot runs that must close on drop.
+    pub fn set_session_retention(&mut self, retention: SessionRetention) {
+        self.session_retention = match retention {
+            SessionRetention::Unspecified => SessionRetention::Retain,
+            explicit => explicit,
+        };
+        self.preserve_session = self.default_preserve_session();
     }
 
     pub fn continue_session(
@@ -74,9 +85,6 @@ impl RemoteBackend {
         compact_prompt: Option<String>,
         prior_artifacts: usize,
     ) {
-        if self.temporary {
-            return;
-        }
         self.session = Some(session_id.clone());
         self.carried_session = Some(session_id);
         self.compact_first_prompt = compact_prompt;
@@ -96,10 +104,8 @@ impl RemoteBackend {
         request.model = self.model.clone();
         request.thinking = self.thinking.clone();
         request.session_id = self.session.clone();
-        request.keep_session = true;
-        if self.temporary {
-            request.mode = SessionMode::Temporary;
-        }
+        request.mode = self.session_mode;
+        request.retention = SessionRetention::Retain;
         request.artifacts = if request.session_id.is_none() {
             self.artifacts.clone()
         } else {
@@ -182,6 +188,7 @@ impl RemoteBackend {
     fn emit_step_event(
         &mut self,
         event: &Event,
+        submitted: &mut bool,
         emitted: &mut String,
         on_chunk: &mut dyn FnMut(&str),
     ) {
@@ -230,6 +237,7 @@ impl RemoteBackend {
                 });
             }
             "submitted" => {
+                *submitted = true;
                 let chars = event.data["chars"].as_u64().unwrap_or(0);
                 let sid = event.data["session_id"].as_str().unwrap_or("");
                 self.events.emit(AgentEvent::BrowserStage {
@@ -261,28 +269,30 @@ impl RemoteBackend {
     ) -> DomainResult<Option<TurnResult>> {
         let mut after = 0;
         let mut sent_cancel = false;
+        let mut submitted = false;
         let cancel = self.cancel.clone();
         poll_until(Duration::from_millis(25), Some(&cancel), || {
             if cancel.is_cancelled() && !sent_cancel {
-                self.client
-                    .request("POST", &format!("/api/runs/{id}/cancel"), Some(&json!({})))?;
+                self.client.cancel_turn(id)?;
                 sent_cancel = true;
             }
-            for event in self.client.events(id, after)? {
+            for event in self.client.read_turn_events(id, after)? {
                 after = event.sequence;
-                self.emit_step_event(&event, emitted, on_chunk);
+                self.emit_step_event(&event, &mut submitted, emitted, on_chunk);
             }
-            let run: Run = serde_json::from_value(self.client.request(
-                "GET",
-                &format!("/api/runs/{id}"),
-                None,
-            )?)
-            .map_err(crate::domain::ServiceError::storage)?;
+            let run = self.client.get_turn(id)?;
             if let Some(error) = run.error {
+                if matches!(
+                    error.code,
+                    ErrorCode::AuthRequired | ErrorCode::VerificationRequired
+                ) {
+                    self.preserve_session = true;
+                }
                 let pre_submit_gone = continuing_carried
+                    && !submitted
                     && emitted.is_empty()
-                    && (error.message.contains("owned browser tab is gone")
-                        || error.message.contains("session no longer available"));
+                    && error.stage != "submit"
+                    && error.code == ErrorCode::SessionUnavailable;
                 if pre_submit_gone {
                     return Ok(ControlFlow::Break(None));
                 }
@@ -336,13 +346,7 @@ impl AgentBackend for RemoteBackend {
         self.carried_session = None;
         self.compact_first_prompt = None;
         if let Some(id) = self.session.take() {
-            self.client
-                .request(
-                    "POST",
-                    &format!("/api/sessions/{id}/close"),
-                    Some(&json!({})),
-                )
-                .map_err(|e| e.to_string())?;
+            self.client.close_session(&id).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -353,7 +357,7 @@ impl AgentBackend for RemoteBackend {
         first: bool,
         on_chunk: &mut dyn FnMut(&str),
     ) -> std::result::Result<String, String> {
-        self.preserve_session = true;
+        self.preserve_session = self.default_preserve_session();
         let result = loop {
             let continuing_carried =
                 first && self.carried_session.is_some() && self.session == self.carried_session;
@@ -378,7 +382,7 @@ impl AgentBackend for RemoteBackend {
                     "model": request.model,
                     "thinking": request.thinking,
                     "artifacts": request.artifacts,
-                    "keep_session": request.keep_session,
+                    "retention": request.retention,
                     "omit_tool_contract": request.omit_tool_contract,
                     "parallel_tool_calls": request.parallel_tool_calls,
                     "timeout_secs": request.timeout_secs,
@@ -401,13 +405,9 @@ impl AgentBackend for RemoteBackend {
                     }
                 ),
             });
-            let id = match self.client.submit(&request) {
+            let id = match self.client.create_turn(&request) {
                 Ok(id) => id,
-                Err(e)
-                    if continuing_carried
-                        && (e.message.contains("session no longer available")
-                            || e.message.contains("state mismatch")) =>
-                {
+                Err(e) if continuing_carried && e.code == ErrorCode::SessionUnavailable => {
                     self.events.emit(AgentEvent::BrowserStage {
                         stage: "session_fallback".into(),
                         detail: "previous session unavailable; starting new session".into(),
@@ -424,6 +424,10 @@ impl AgentBackend for RemoteBackend {
                 .poll_run(&id, continuing_carried, &mut emitted, on_chunk)
                 .map_err(|e| e.to_string())?
             else {
+                self.events.emit(AgentEvent::BrowserStage {
+                    stage: "session_fallback".into(),
+                    detail: "previous session unavailable; starting new session".into(),
+                });
                 self.clear_carried_session();
                 continue;
             };
@@ -445,7 +449,7 @@ impl AgentBackend for RemoteBackend {
                 model: model.clone(),
             });
         }
-        self.preserve_session = self.keep_session_after_run && !self.temporary;
+        self.preserve_session = self.session_retention.should_retain_turn();
         Ok(result.text)
     }
 }
@@ -456,11 +460,7 @@ impl Drop for RemoteBackend {
             return;
         }
         if let Some(id) = &self.session {
-            let _ = self.client.request(
-                "POST",
-                &format!("/api/sessions/{id}/close"),
-                Some(&json!({})),
-            );
+            let _ = self.client.close_session(id);
         }
     }
 }
@@ -469,7 +469,9 @@ impl Drop for RemoteBackend {
 mod tests {
     use super::*;
     use crate::{
-        domain::{default_provider, Account, ErrorCode, Result, ServiceError, Session},
+        domain::{
+            default_provider, Account, ErrorCode, Result, Run, ServiceError, Session, SessionState,
+        },
         provider::DEFAULT_INLINE_PROMPT_CHARS,
         store::Store,
     };
@@ -588,13 +590,13 @@ mod tests {
             let filename=format!("anticrumb-upload-check-{}.txt",uuid::Uuid::new_v4().simple());
             let file=client.put_bytes(&account_id,&filename,"text/plain",format!("Verification code: {token}\n").into_bytes())?;
             let mut request=TurnRequest::text(format!("Read the attached file whose name ends with {filename} and reply only with its verification code."));
-            request.account_id=account_id.clone();request.keep_session=true;request.artifacts=vec![file];request.timeout_secs=120;
+            request.account_id=account_id.clone();request.retention=SessionRetention::Retain;request.artifacts=vec![file];request.timeout_secs=120;
             let id=client.submit(&request)?;
             let response=client.wait(&id,&CancelToken::new())?;
             if !response.text.contains(&token){return Err(ServiceError::invalid("ordinary uploaded file was not read correctly"));}
             eprintln!("LIVE {provider_id}: ordinary file upload read correctly");
-            let mut backend=RemoteBackend::new(client,account_id,None,None,false);
-            backend.retain_session_after_run(true);
+            let mut backend=RemoteBackend::new(client,account_id,None,None,SessionMode::Chat);
+            backend.set_session_retention(SessionRetention::Retain);
             let first_token=format!("INITIAL_{}",uuid::Uuid::new_v4().simple());
             let initial=format!("Tool instructions: no tools are needed for this verification. Task: reply only with the verification code at the end of this file.\n{}\nVerification code: {first_token}","Input context for attachment verification.\n".repeat(80));
             let response=backend.ask_step(&initial,true,&mut |_|{}).map_err(ServiceError::invalid)?;
@@ -764,8 +766,13 @@ mod tests {
             let client = Client::at(&base, "secret").unwrap();
             for limit in [0, 32, 4_000] {
                 let id = format!("configured-{limit}");
-                let mut configured =
-                    RemoteBackend::new(client.clone(), id.clone(), None, None, false);
+                let mut configured = RemoteBackend::new(
+                    client.clone(),
+                    id.clone(),
+                    None,
+                    None,
+                    SessionMode::Chat,
+                );
                 configured.continue_session("resumed-session".into(), Some("next".into()), 0);
                 let inline = configured
                     .prepare_turn_request(&"\u{4e00}".repeat(limit))
@@ -786,8 +793,13 @@ mod tests {
                     1
                 );
             }
-            let mut limits =
-                RemoteBackend::new(client.clone(), "default".into(), None, None, false);
+            let mut limits = RemoteBackend::new(
+                client.clone(),
+                "default".into(),
+                None,
+                None,
+                SessionMode::Chat,
+            );
             limits
                 .add_artifacts(
                     &(0..10)
@@ -826,8 +838,13 @@ mod tests {
             let request = limits.prepare_turn_request(&"x".repeat(100_001)).unwrap();
             assert!(crate::protocol::prompt(&request).is_err());
             // An artifact-store failure must not submit a dangling file reference.
-            let mut missing =
-                RemoteBackend::new(client.clone(), "missing-account".into(), None, None, false);
+            let mut missing = RemoteBackend::new(
+                client.clone(),
+                "missing-account".into(),
+                None,
+                None,
+                SessionMode::Chat,
+            );
             missing.provider = limits.provider.clone();
             missing.provider.as_mut().unwrap().capabilities.file_uploads = true;
             assert!(missing
@@ -838,7 +855,7 @@ mod tests {
                 "default".into(),
                 None,
                 Some("option:1".into()),
-                false,
+                SessionMode::Chat,
             );
             backend.add_artifacts(std::slice::from_ref(&one)).unwrap();
             backend
@@ -926,10 +943,9 @@ mod tests {
             ) -> Result<TurnResult> {
                 self.seen.lock().unwrap().push(request.clone());
                 if request.session_id.as_deref() == Some("gone-tab-sess") {
-                    return Err(ServiceError::new(
-                        ErrorCode::SubmissionOutcomeUnknown,
+                    return Err(ServiceError::session_unavailable(
                         "resume",
-                        "owned browser tab is gone; create a new session from a checkpoint",
+                        "owned browser tab is gone; start a new session",
                     ));
                 }
                 Ok(TurnResult {
@@ -986,7 +1002,7 @@ mod tests {
                     remote_url: None,
                     remote_session_id: None,
                     history: vec![],
-                    state: "ready".into(),
+                    state: SessionState::Ready,
                     model: None,
                     thinking: None,
                     tool_digest: String::new(),
@@ -1010,7 +1026,7 @@ mod tests {
                     remote_url: None,
                     remote_session_id: None,
                     history: vec![],
-                    state: "ready".into(),
+                    state: SessionState::Ready,
                     model: None,
                     thinking: None,
                     tool_digest: String::new(),
@@ -1041,9 +1057,14 @@ mod tests {
         let art_new_c = art_new.clone();
         tokio::task::spawn_blocking(move || {
             let client = Client::at(&base, "secret").unwrap();
-            let mut backend =
-                RemoteBackend::new(client.clone(), "default".into(), None, None, false);
-            backend.retain_session_after_run(true);
+            let mut backend = RemoteBackend::new(
+                client.clone(),
+                "default".into(),
+                None,
+                None,
+                SessionMode::Chat,
+            );
+            backend.set_session_retention(SessionRetention::Retain);
             backend
                 .add_artifacts(&[art_old_c.clone(), art_new_c.clone()])
                 .unwrap();
@@ -1053,8 +1074,9 @@ mod tests {
                 .unwrap();
             drop(backend);
 
-            let mut fallback = RemoteBackend::new(client, "default".into(), None, None, false);
-            fallback.retain_session_after_run(true);
+            let mut fallback =
+                RemoteBackend::new(client, "default".into(), None, None, SessionMode::Chat);
+            fallback.set_session_retention(SessionRetention::Retain);
             fallback.add_artifacts(&[art_old_c, art_new_c]).unwrap();
             fallback.continue_session("gone-tab-sess".into(), Some("COMPACT_PROMPT".into()), 1);
             fallback
@@ -1153,25 +1175,441 @@ mod tests {
         ));
         tokio::task::spawn_blocking(move || {
             let client = Client::at(&base, "secret").unwrap();
-            let mut worker = RemoteBackend::new(client, "default".into(), None, None, true);
-            worker.ask_step("step 1 task", true, &mut |_| {}).unwrap();
-            worker
+            // Default retains temporary sessions across steps and after drop.
+            let mut retained = RemoteBackend::new(
+                client.clone(),
+                "default".into(),
+                None,
+                None,
+                SessionMode::Temporary,
+            );
+            retained.ask_step("step 1 task", true, &mut |_| {}).unwrap();
+            retained
                 .ask_step("step 2 tool output delta", false, &mut |_| {})
                 .unwrap();
-            drop(worker);
+            drop(retained);
+
+            // Explicit opt-out (`SessionRetention::Ephemeral`) closes on drop.
+            let mut ephemeral =
+                RemoteBackend::new(client, "default".into(), None, None, SessionMode::Temporary);
+            ephemeral.set_session_retention(SessionRetention::Ephemeral);
+            ephemeral.ask_step("ephemeral step 1", true, &mut |_| {}).unwrap();
+            ephemeral
+                .ask_step("ephemeral step 2", false, &mut |_| {})
+                .unwrap();
+            drop(ephemeral);
         })
         .await
         .unwrap();
         server.abort();
 
         let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 4);
         assert!(requests[0].session_id.is_none());
         assert_eq!(requests[0].mode, SessionMode::Temporary);
-        assert!(requests[0].keep_session);
+        assert_eq!(requests[0].retention, SessionRetention::Retain);
         assert!(requests[1].session_id.is_some());
         assert_eq!(requests[1].mode, SessionMode::Temporary);
-        assert!(requests[1].keep_session);
+        assert_eq!(requests[1].retention, SessionRetention::Retain);
+        assert!(requests[2].session_id.is_none());
+        assert_eq!(requests[2].mode, SessionMode::Temporary);
+        assert!(requests[3].session_id.is_some());
+        assert_eq!(requests[3].mode, SessionMode::Temporary);
         assert_eq!(closed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_temporary_backend_continues_across_turns_and_falls_back_when_gone() {
+        let seen = Arc::new(Mutex::new(Vec::<TurnRequest>::new()));
+        let closed = Arc::new(Mutex::new(Vec::<String>::new()));
+        struct TempRetainFake {
+            seen: Arc<Mutex<Vec<TurnRequest>>>,
+            closed: Arc<Mutex<Vec<String>>>,
+        }
+        impl crate::service::Backend for TempRetainFake {
+            fn generate(
+                &self,
+                _account: &Account,
+                session: &mut Session,
+                request: &TurnRequest,
+                _cancel: CancelToken,
+                _emit: crate::service::Emit<'_>,
+            ) -> Result<TurnResult> {
+                self.seen.lock().unwrap().push(request.clone());
+                if request.session_id.as_deref() == Some("gone-temp-sess") {
+                    return Err(ServiceError::session_unavailable(
+                        "resume",
+                        "owned browser tab is gone; start a new session",
+                    ));
+                }
+                session.remote_turns += 1;
+                Ok(TurnResult {
+                    session_id: session.id.clone(),
+                    text: "temp_ok".into(),
+                    tool_calls: vec![],
+                    artifacts: vec![],
+                    model: None,
+                    elapsed_ms: 1,
+                })
+            }
+            fn close(&self, _account: &Account, session: &Session) -> Result<()> {
+                self.closed.lock().unwrap().push(session.id.clone());
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .put(
+                "local",
+                "account",
+                "default",
+                &Account {
+                    id: "default".into(),
+                    provider: crate::domain::default_provider(),
+                    profile: dir.path().into(),
+                    subprofile: None,
+                    port: 1,
+                    headless: true,
+                    state: "ready".into(),
+                },
+            )
+            .unwrap();
+        store
+            .put(
+                "local",
+                "session",
+                "gone-temp-sess",
+                &Session {
+                    id: "gone-temp-sess".into(),
+                    provider: default_provider(),
+                    account_id: "default".into(),
+                    mode: SessionMode::Temporary,
+                    target_id: Some("gone-tab".into()),
+                    remote_url: Some("https://gemini.google.com/app".into()),
+                    remote_session_id: None,
+                    history: vec![],
+                    state: SessionState::Ready,
+                    model: None,
+                    thinking: None,
+                    tool_digest: String::new(),
+                    remote_turns: 1,
+                    last_used: 1,
+                    reuse_scope: None,
+                },
+            )
+            .unwrap();
+        let service = crate::service::Service::new(
+            store,
+            Arc::new(TempRetainFake {
+                seen: seen.clone(),
+                closed: closed.clone(),
+            }),
+        )
+        .unwrap();
+        let host = crate::rpc::host::Host::with_service(service, None, "browser", None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::rpc::server::serve(
+            host,
+            Some("secret".into()),
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            None,
+        ));
+        let first_session = tokio::task::spawn_blocking(move || {
+            let client = Client::at(&base, "secret").unwrap();
+            let mut turn1 = RemoteBackend::new(
+                client.clone(),
+                "default".into(),
+                None,
+                None,
+                SessionMode::Temporary,
+            );
+            turn1.set_chat_only(true);
+            turn1.ask_step("temp turn 1", true, &mut |_| {}).unwrap();
+            let sid = turn1.session.clone().unwrap();
+            drop(turn1);
+
+            let mut turn2 = RemoteBackend::new(
+                client.clone(),
+                "default".into(),
+                None,
+                None,
+                SessionMode::Temporary,
+            );
+            turn2.set_chat_only(true);
+            turn2.continue_session(sid.clone(), Some("COMPACT_TEMP_2".into()), 0);
+            turn2
+                .ask_step("FULL_FALLBACK_TEMP_2", true, &mut |_| {})
+                .unwrap();
+            assert_eq!(turn2.session.as_deref(), Some(sid.as_str()));
+            drop(turn2);
+
+            let mut fallback =
+                RemoteBackend::new(client, "default".into(), None, None, SessionMode::Temporary);
+            fallback.set_chat_only(true);
+            fallback.continue_session(
+                "gone-temp-sess".into(),
+                Some("COMPACT_FALLBACK".into()),
+                0,
+            );
+            fallback
+                .ask_step("FULL_FALLBACK_TEMP_3", true, &mut |_| {})
+                .unwrap();
+            assert_ne!(fallback.session.as_deref(), Some("gone-temp-sess"));
+            drop(fallback);
+            sid
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].session_id.is_none());
+        assert_eq!(requests[0].mode, SessionMode::Temporary);
+        assert_eq!(
+            requests[1].session_id.as_deref(),
+            Some(first_session.as_str())
+        );
+        assert_eq!(requests[1].mode, SessionMode::Temporary);
+        assert_eq!(
+            crate::protocol::prompt(&requests[1]).unwrap(),
+            "\n[User]\nCOMPACT_TEMP_2\n"
+        );
+        assert_eq!(requests[2].session_id.as_deref(), Some("gone-temp-sess"));
+        assert!(requests[3].session_id.is_none());
+        assert_eq!(requests[3].mode, SessionMode::Temporary);
+        assert_eq!(
+            crate::protocol::prompt(&requests[3]).unwrap(),
+            "\n[User]\nFULL_FALLBACK_TEMP_3\n"
+        );
+        assert!(closed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_backend_closes_session_on_step_two_failure_but_preserves_verification_tab() {
+        let closed = Arc::new(Mutex::new(Vec::<String>::new()));
+        struct StepTwoFailFake {
+            closed: Arc<Mutex<Vec<String>>>,
+        }
+        impl crate::service::Backend for StepTwoFailFake {
+            fn generate(
+                &self,
+                _account: &Account,
+                session: &mut Session,
+                request: &TurnRequest,
+                _cancel: CancelToken,
+                _emit: crate::service::Emit<'_>,
+            ) -> Result<TurnResult> {
+                let prompt = crate::protocol::prompt(request).unwrap();
+                if prompt.contains("fail_normal") {
+                    return Err(ServiceError::backend("synthetic step 2 failure".into(), false));
+                }
+                if prompt.contains("fail_verify") {
+                    return Err(ServiceError::new(
+                        ErrorCode::VerificationRequired,
+                        "submit",
+                        "human verification required",
+                    ));
+                }
+                session.remote_turns += 1;
+                Ok(TurnResult {
+                    session_id: session.id.clone(),
+                    text: "step1_ok".into(),
+                    tool_calls: vec![],
+                    artifacts: vec![],
+                    model: None,
+                    elapsed_ms: 1,
+                })
+            }
+            fn close(&self, _account: &Account, session: &Session) -> Result<()> {
+                self.closed.lock().unwrap().push(session.id.clone());
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .put(
+                "local",
+                "account",
+                "default",
+                &Account {
+                    id: "default".into(),
+                    provider: crate::domain::default_provider(),
+                    profile: dir.path().into(),
+                    subprofile: None,
+                    port: 1,
+                    headless: true,
+                    state: "ready".into(),
+                },
+            )
+            .unwrap();
+        let service = crate::service::Service::new(
+            store,
+            Arc::new(StepTwoFailFake {
+                closed: closed.clone(),
+            }),
+        )
+        .unwrap();
+        let host = crate::rpc::host::Host::with_service(service, None, "browser", None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::rpc::server::serve(
+            host,
+            Some("secret".into()),
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            None,
+        ));
+        let (closed_session_id, kept_session_id) = tokio::task::spawn_blocking(move || {
+            let client = Client::at(&base, "secret").unwrap();
+
+            // Multi-step ephemeral run that fails on step 2 must still close its session on drop.
+            let mut fail_normal = RemoteBackend::new(
+                client.clone(),
+                "default".into(),
+                None,
+                None,
+                SessionMode::Temporary,
+            );
+            fail_normal.set_session_retention(SessionRetention::Ephemeral);
+            fail_normal.ask_step("step 1 ok", true, &mut |_| {}).unwrap();
+            let s1 = fail_normal.session.clone().unwrap();
+            assert!(fail_normal
+                .ask_step("fail_normal", false, &mut |_| {})
+                .is_err());
+            drop(fail_normal);
+
+            // Verification failure must preserve the browser tab even when ephemeral.
+            let mut fail_verify =
+                RemoteBackend::new(client, "default".into(), None, None, SessionMode::Temporary);
+            fail_verify.set_session_retention(SessionRetention::Ephemeral);
+            fail_verify.ask_step("step 1 ok", true, &mut |_| {}).unwrap();
+            let s2 = fail_verify.session.clone().unwrap();
+            assert!(fail_verify
+                .ask_step("fail_verify", false, &mut |_| {})
+                .is_err());
+            drop(fail_verify);
+            (s1, s2)
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        let closed_ids = closed.lock().unwrap();
+        assert_eq!(closed_ids.as_slice(), &[closed_session_id]);
+        assert!(!closed_ids.contains(&kept_session_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_run_does_not_fallback_after_submitted_event_even_before_first_delta() {
+        let seen = Arc::new(Mutex::new(Vec::<TurnRequest>::new()));
+        struct PostSubmitDropFake {
+            seen: Arc<Mutex<Vec<TurnRequest>>>,
+        }
+        impl crate::service::Backend for PostSubmitDropFake {
+            fn generate(
+                &self,
+                _account: &Account,
+                session: &mut Session,
+                request: &TurnRequest,
+                _cancel: CancelToken,
+                emit: crate::service::Emit<'_>,
+            ) -> Result<TurnResult> {
+                self.seen.lock().unwrap().push(request.clone());
+                emit(
+                    "submitted",
+                    json!({"chars": 12, "session_id": session.id}),
+                )?;
+                Err(ServiceError::new(
+                    ErrorCode::SubmissionOutcomeUnknown,
+                    "stream",
+                    "owned browser tab is gone after submit",
+                ))
+            }
+            fn close(&self, _account: &Account, _session: &Session) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .put(
+                "local",
+                "account",
+                "default",
+                &Account {
+                    id: "default".into(),
+                    provider: crate::domain::default_provider(),
+                    profile: dir.path().into(),
+                    subprofile: None,
+                    port: 1,
+                    headless: true,
+                    state: "ready".into(),
+                },
+            )
+            .unwrap();
+        store
+            .put(
+                "local",
+                "session",
+                "post-submit-sess",
+                &Session {
+                    id: "post-submit-sess".into(),
+                    provider: default_provider(),
+                    account_id: "default".into(),
+                    mode: SessionMode::Temporary,
+                    target_id: Some("tab-live".into()),
+                    remote_url: Some("https://gemini.google.com/app".into()),
+                    remote_session_id: None,
+                    history: vec![],
+                    state: SessionState::Ready,
+                    model: None,
+                    thinking: None,
+                    tool_digest: String::new(),
+                    remote_turns: 1,
+                    last_used: 1,
+                    reuse_scope: None,
+                },
+            )
+            .unwrap();
+        let service = crate::service::Service::new(
+            store,
+            Arc::new(PostSubmitDropFake { seen: seen.clone() }),
+        )
+        .unwrap();
+        let host = crate::rpc::host::Host::with_service(service, None, "browser", None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::rpc::server::serve(
+            host,
+            Some("secret".into()),
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            None,
+        ));
+        let err = tokio::task::spawn_blocking(move || {
+            let client = Client::at(&base, "secret").unwrap();
+            let mut backend =
+                RemoteBackend::new(client, "default".into(), None, None, SessionMode::Temporary);
+            backend.set_chat_only(true);
+            backend.continue_session("post-submit-sess".into(), Some("COMPACT".into()), 0);
+            backend
+                .ask_step("FULL_FALLBACK", true, &mut |_| {})
+                .unwrap_err()
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        assert!(err.contains("owned browser tab is gone"));
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "must not double-submit after submitted event was emitted"
+        );
     }
 }

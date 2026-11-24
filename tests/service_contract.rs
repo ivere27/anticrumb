@@ -184,7 +184,7 @@ fn media_recovery_uses_latest_session_and_holds_gate_after_caller_cancellation()
                 remote_url: None,
                 remote_session_id: None,
                 history: vec![],
-                state: "ready".into(),
+                state: SessionState::Ready,
                 model: None,
                 thinking: None,
                 tool_digest: String::new(),
@@ -300,7 +300,7 @@ async fn temporary_turns_obey_worker_limit_and_same_session_turns_remain_serial(
 
     backend.wait_for_peer.store(false, Ordering::SeqCst);
     let mut seed = TurnRequest::text("seed");
-    seed.keep_session = true;
+    seed.retention = SessionRetention::Retain;
     let seed_id = service.submit(seed).unwrap();
     let session = service
         .wait(&seed_id)
@@ -318,7 +318,7 @@ async fn temporary_turns_obey_worker_limit_and_same_session_turns_remain_serial(
         .unwrap();
     let mut first = TurnRequest::text("first continuation");
     first.session_id = Some(session.clone());
-    first.keep_session = true;
+    first.retention = SessionRetention::Retain;
     let mut second = first.clone();
     second.messages = TurnRequest::text("second continuation").messages;
     let a = service.submit(first).unwrap();
@@ -491,7 +491,7 @@ async fn independent_accounts_execute_concurrently_and_sessions_cannot_cross_acc
         .put("local", "account", "other", &second)
         .unwrap();
     let mut a = TurnRequest::text("one");
-    a.keep_session = true;
+    a.retention = SessionRetention::Retain;
     let mut b = TurnRequest::text("two");
     b.account_id = "other".into();
     let first = service.submit(a).unwrap();
@@ -571,6 +571,7 @@ async fn sdk_mcp_negotiates_lists_and_calls_the_same_service() {
     let client = ().serve(client_io).await.unwrap();
     let tools = client.list_all_tools().await.unwrap();
     assert!(tools.iter().any(|t| t.name == "gemini_ask"));
+    assert!(tools.iter().any(|t| t.name == "gemini_session_get"));
     let templates = client.list_all_resource_templates().await.unwrap();
     assert!(templates.iter().any(|t| {
         t.uri_template == "gemini://artifacts/{account}/{id}"
@@ -605,7 +606,31 @@ async fn sdk_mcp_negotiates_lists_and_calls_the_same_service() {
     let result = client
         .call_tool(
             CallToolRequestParams::new("gemini_ask").with_arguments(
-                json!({"prompt":"mcp roundtrip"})
+                json!({
+                    "prompt": "mcp roundtrip",
+                    "session_mode": "temporary",
+                    "session_retention": "retain"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let payload_str = serde_json::to_string(&result).unwrap();
+    assert!(payload_str.contains("mcp roundtrip"));
+    let sid = result
+        .structured_content
+        .as_ref()
+        .and_then(|v| v["session_id"].as_str())
+        .expect("mcp gemini_ask returns session_id")
+        .to_owned();
+    let inspected = client
+        .call_tool(
+            CallToolRequestParams::new("gemini_session_get").with_arguments(
+                json!({"session_id": sid})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -613,10 +638,14 @@ async fn sdk_mcp_negotiates_lists_and_calls_the_same_service() {
         )
         .await
         .unwrap();
-    assert_ne!(result.is_error, Some(true));
-    assert!(serde_json::to_string(&result)
-        .unwrap()
-        .contains("mcp roundtrip"));
+    assert_ne!(inspected.is_error, Some(true));
+    let inspected_json = inspected
+        .structured_content
+        .as_ref()
+        .expect("gemini_session_get returns structured session");
+    assert_eq!(inspected_json["mode"], "temporary");
+    assert_eq!(inspected_json["state"], "ready");
+    assert_eq!(inspected_json["continuable"], true);
     client.cancel().await.unwrap();
     server.await.unwrap();
     http.abort();
@@ -703,7 +732,7 @@ async fn outcome_unknown_sessions_do_not_exhaust_retained_session_cap() {
             remote_url: None,
             remote_session_id: None,
             history: vec![],
-            state: "outcome_unknown".into(),
+            state: SessionState::OutcomeUnknown,
             model: None,
             thinking: None,
             tool_digest: String::new(),
@@ -733,7 +762,7 @@ async fn outcome_unknown_sessions_do_not_exhaust_retained_session_cap() {
             remote_url: None,
             remote_session_id: None,
             history: vec![],
-            state: "ready".into(),
+            state: SessionState::Ready,
             model: None,
             thinking: None,
             tool_digest: String::new(),

@@ -22,6 +22,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn job_session_is_temporary(job: &Value) -> Option<bool> {
+    match job["request"]["session_mode"].as_str()? {
+        "temporary" => Some(true),
+        "chat" => Some(false),
+        _ => None,
+    }
+}
+
 pub(super) trait EffectSink {
     fn send_command(&mut self, command: Command) -> std::result::Result<(), String>;
     fn write_terminal(&mut self, sequence: &str) -> std::result::Result<(), String>;
@@ -1667,7 +1675,7 @@ impl State {
         }
         self.options = next_options;
         self.parent = Some(id.into());
-        self.conversation_temporary = Some(job["request"]["temporary"] == true);
+        self.conversation_temporary = Some(job_session_is_temporary(&job) == Some(true));
         self.pending_temporary = None;
         self.active_model = None;
         self.clear_mention();
@@ -1729,7 +1737,7 @@ impl State {
         if self.options.temporary && self.conversation_temporary == Some(false) {
             self.log("  Temp chat remains ON: next turn starts a new temporary chat with local context instead of continuing the server chat (use /temp off to continue on server).");
         } else if !was_temporary && self.options.temporary && is_temp {
-            self.log("  Temp chat turned ON for this resumed temporary conversation (local context only; /new returns to saved normal mode).");
+            self.log("  Temp chat turned ON for this resumed temporary conversation (no server history; /new returns to saved normal mode).");
         }
         self.warn_if_temporary_unsupported();
     }
@@ -1942,7 +1950,7 @@ impl State {
                     .into_iter()
                     .take(30)
                     .filter_map(|j| {
-                        let temp = if j["request"]["temporary"] == true {
+                        let temp = if job_session_is_temporary(&j) == Some(true) {
                             " [temp]"
                         } else {
                             ""
@@ -2173,8 +2181,7 @@ impl State {
     fn handle_finished(&mut self, job: Value) {
         self.parent = job["id"].as_str().map(str::to_owned);
         let pending = self.pending_temporary.take();
-        self.conversation_temporary = job["request"]["temporary"]
-            .as_bool()
+        self.conversation_temporary = job_session_is_temporary(&job)
             .or(pending)
             .or(self.conversation_temporary);
         self.active = None;
@@ -2253,13 +2260,13 @@ impl State {
                     );
                 }
             }
-            "browser_turn" => {
+            crate::domain::EVENT_BROWSER_TURN => {
                 if self.debug.level >= 2 {
                     let run_id = event.data["run_id"].as_str().unwrap_or("");
                     self.log_debug("browser", &format!("turn submitted run_id={run_id}"));
                 }
             }
-            "browser_session" => {
+            crate::domain::EVENT_BROWSER_SESSION => {
                 if self.debug.level >= 1 {
                     let sid = event.data["session_id"].as_str().unwrap_or("");
                     self.log_debug("session", &format!("active session={sid}"));

@@ -336,6 +336,19 @@ impl Host {
                     .await?;
                 Ok(pb::Empty {}.encode_to_vec())
             }
+            "/anticrumb.v1.SessionService/CloseSessions" => {
+                let ids = decode!(pb::CloseSessionsRequest).session_ids;
+                let (closed, skipped, errors) = self.service.close_sessions(&ids).await;
+                Ok(pb::CloseSessionsResult {
+                    closed,
+                    skipped,
+                    errors: errors
+                        .into_iter()
+                        .map(|(id, err)| (id, codec::error_to(err)))
+                        .collect(),
+                }
+                .encode_to_vec())
+            }
             "/anticrumb.v1.SessionService/DeleteConversation" => {
                 self.service
                     .delete_conversation(&decode!(pb::SessionRef).id)
@@ -801,17 +814,35 @@ impl Host {
                         .collect()
                 })
             }
-            "/anticrumb.v1.SessionService/ListSessions" => reply!(pb::SessionList {
-                sessions: store
-                    .list::<Session>("local", "session")?
-                    .into_iter()
-                    .map(codec::session_to)
-                    .collect()
-            }),
+            "/anticrumb.v1.SessionService/GetSession" => {
+                let id = decode!(pb::SessionRef).id;
+                reply!(codec::session_to(
+                    store.get::<Session>("local", "session", &id)?
+                ))
+            }
+            "/anticrumb.v1.SessionService/ListSessions" => {
+                let req = decode!(pb::ListSessionsRequest);
+                let mode = codec::session_mode_filter(req.mode)?;
+                let state = codec::session_state_filter(req.state)?;
+                reply!(pb::SessionList {
+                    sessions: store
+                        .list::<Session>("local", "session")?
+                        .into_iter()
+                        .filter(|s| {
+                            req.account_id
+                                .as_deref()
+                                .is_none_or(|account| s.account_id == account)
+                                && mode.is_none_or(|expected| s.mode == expected)
+                                && state.is_none_or(|expected| s.state == expected)
+                        })
+                        .map(codec::session_to)
+                        .collect()
+                })
+            }
             "/anticrumb.v1.WorkspaceService/StartAgent" => reply!(pb::AgentRef {
                 id: self
                     .agents()?
-                    .start(codec::agent_request_from(decode!(pb::AgentRequest)))?
+                    .start(codec::agent_request_from(decode!(pb::AgentRequest))?)?
             }),
             "/anticrumb.v1.WorkspaceService/GetAgent" => reply!(codec::agent_to(
                 self.agents()?.snapshot(&decode!(pb::AgentRef).id)?
