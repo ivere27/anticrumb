@@ -395,7 +395,28 @@ mod tests {
         store.put("local", "session", "owned", &json!({"id":"owned","provider":"gemini-web","account_id":"default","mode":mode,"target_id":null,"remote_url":"https://gemini.google.com/app/fixture","history":[],"state":"closed","model":null,"thinking":null,"tool_digest":""})).unwrap();
     }
     fn agent(store: &Store, id: &str) {
-        store.put("local", "agent", id, &json!({"id":id,"state":"completed","request":{"task":"fixture task","workspace":"fixture","account_id":"default"}})).unwrap();
+        agent_in_conversation(store, id, id, "completed", 1);
+    }
+    fn agent_in_conversation(
+        store: &Store,
+        conv_id: &str,
+        turn_id: &str,
+        state: &str,
+        created_at: i64,
+    ) {
+        store.put(
+            "local",
+            "agent",
+            turn_id,
+            &json!({
+                "id":turn_id,
+                "conversation_id":conv_id,
+                "state":state,
+                "request":{"task":"fixture task","workspace":"fixture","account_id":"default","conversation_id":conv_id},
+                "created_at":created_at,
+                "updated_at":created_at + 1
+            }),
+        ).unwrap();
     }
     fn queue(store: &Store, id: &str) -> Job {
         agent(store, id);
@@ -404,7 +425,7 @@ mod tests {
             .unwrap();
         AgentManager::new(store.clone())
             .unwrap()
-            .delete(id)
+            .delete_conversation(id, None, None)
             .unwrap();
         store.get("local", "chat_cleanup", id).unwrap()
     }
@@ -468,7 +489,7 @@ mod tests {
         agent(&store, "legacy");
         AgentManager::new(store.clone())
             .unwrap()
-            .delete("legacy")
+            .delete_conversation("legacy", None, None)
             .unwrap();
         assert_eq!(status(&store).unwrap().unmapped, 1);
         service
@@ -536,7 +557,7 @@ mod tests {
             .unwrap();
         AgentManager::new(store.clone())
             .unwrap()
-            .delete("deleted")
+            .delete_conversation("deleted", None, None)
             .unwrap();
         let job: Job = store.get("local", "chat_cleanup", "deleted").unwrap();
         assert!(job.sessions.is_empty());
@@ -589,7 +610,7 @@ mod tests {
             .unwrap();
         AgentManager::new(store.clone())
             .unwrap()
-            .delete("deleted")
+            .delete_conversation("deleted", None, None)
             .unwrap();
         service
             .run_chat_cleanup(store.get("local", "chat_cleanup", "deleted").unwrap())
@@ -652,7 +673,7 @@ mod tests {
 
         AgentManager::new(store.clone())
             .unwrap()
-            .delete("conv-deleted")
+            .delete_conversation("conv-deleted", None, None)
             .unwrap();
         let job: Job = store.get("local", "chat_cleanup", "conv-deleted").unwrap();
         assert_eq!(job.sessions, ["temp-main", "temp-sub"]);
@@ -670,7 +691,7 @@ mod tests {
         // Once the surviving conversation is deleted too, the retained subagent session closes cleanly.
         AgentManager::new(store.clone())
             .unwrap()
-            .delete("conv-surviving")
+            .delete_conversation("conv-surviving", None, None)
             .unwrap();
         let job2: Job = store
             .get("local", "chat_cleanup", "conv-surviving")
@@ -686,5 +707,39 @@ mod tests {
         let sub_sess: Session = store.get("local", "session", "temp-sub").unwrap();
         assert_eq!(sub_sess.state, SessionState::Deleted);
         assert!(sub_sess.target_id.is_none());
+    }
+    #[tokio::test]
+    async fn deleting_multiturn_conversation_removes_all_turns_and_cleans_shared_web_chat() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        fixture(&store, "chat");
+        let backend = Arc::new(DeleteBackend::default());
+        let service = Service::new(store.clone(), backend.clone()).unwrap();
+
+        agent_in_conversation(&store, "conv-multi", "turn-1", "completed", 10);
+        store
+            .event("turn-1", "browser_session", json!({"session_id":"owned"}))
+            .unwrap();
+        agent_in_conversation(&store, "conv-multi", "turn-2", "completed", 20);
+        store
+            .event("turn-2", "browser_session", json!({"session_id":"owned"}))
+            .unwrap();
+        // Leaf turn failed before recording a browser session; deleting the conversation must
+        // still collect earlier turns' sessions and delete the web chat without shared_session conflict.
+        agent_in_conversation(&store, "conv-multi", "turn-3", "failed", 30);
+
+        AgentManager::new(store.clone())
+            .unwrap()
+            .delete_conversation("conv-multi", None, None)
+            .unwrap();
+        for turn in ["turn-1", "turn-2", "turn-3"] {
+            assert!(store.get::<Value>("local", "agent", turn).is_err());
+            assert!(store.events(turn, 0).unwrap().is_empty());
+        }
+        let job: Job = store.get("local", "chat_cleanup", "conv-multi").unwrap();
+        assert_eq!(job.sessions, ["owned"]);
+        service.run_chat_cleanup(job).await.unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(status(&store).unwrap().completed, 1);
     }
 }

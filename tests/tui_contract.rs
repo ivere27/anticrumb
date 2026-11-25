@@ -884,11 +884,11 @@ mod unix_pty {
         pty.send("/resume\r");
         pty.wait_for("Resume conversation");
         pty.send("\r");
-        pty.wait_for("Resumed agent_fixture");
+        pty.wait_for("Resumed conv_fixture");
         pty.send("Explain the previous result\r");
         pty.wait_for("Attachment turn 2 completed.");
         let tasks = observations()["tasks"].as_array().unwrap().clone();
-        assert_eq!(tasks.last().unwrap()["parent_id"], "agent_fixture");
+        assert_eq!(tasks.last().unwrap()["conversation_id"], "conv_fixture");
         assert_eq!(tasks.last().unwrap()["thinking"], "Medium");
 
         pty.send("/new\r");
@@ -1004,7 +1004,7 @@ mod unix_pty {
         pty.send("\r");
         pty.wait_for("Send a follow-up to continue.");
         pty.send("/status\r");
-        pty.wait_for("Conversation: agent_fixture_4");
+        pty.wait_for("Conversation: conv_fixture_3");
         pty.send("/resume\r");
         pty.wait_for("Resume conversation");
         pty.send("D");
@@ -1044,12 +1044,12 @@ mod unix_pty {
         pty.send("d");
         pty.wait_for("Delete conversation?");
         pty.send("d");
-        let removed = pty.wait_for("Deleted saved conversation agent_fixture_2.");
+        let removed = pty.wait_for("Deleted saved conversation conv_fixture.");
         assert!(removed.contains("Resume conversation"));
-        assert!(screen_row(&removed, 24).contains("Deleted saved conversation agent_fixture_2."));
+        assert!(screen_row(&removed, 24).contains("Deleted saved conversation conv_fixture."));
         assert_eq!(
             observations()["deleted_ids"],
-            serde_json::json!(["agent_fixture_2"])
+            serde_json::json!(["conv_fixture"])
         );
         let remaining_ids: BTreeSet<String> = observations()["saved_agents"]
             .as_array()
@@ -1057,44 +1057,30 @@ mod unix_pty {
             .iter()
             .map(|j| j["id"].as_str().unwrap().to_string())
             .collect();
-        let expected_ids: BTreeSet<String> =
-            ["agent_fixture", "agent_fixture_3", "agent_fixture_4"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+        let expected_ids: BTreeSet<String> = ["agent_fixture_3", "agent_fixture_4"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         assert_eq!(remaining_ids, expected_ids);
 
         pty.send("\x1b");
         std::thread::sleep(Duration::from_millis(150));
         pty.send("/status\r");
-        pty.wait_for("Conversation: agent_fixture_4");
+        pty.wait_for("Conversation: conv_fixture_3");
         pty.send("/resume\r");
         pty.wait_for("Resume conversation");
         pty.send("\x1b[3~");
         pty.wait_for("Delete conversation?");
         pty.send("d");
-        pty.wait_for("Deleted saved conversation agent_fixture_4.");
+        pty.wait_for("Deleted saved conversation conv_fixture_3.");
         pty.send("\x1b");
         std::thread::sleep(Duration::from_millis(150));
         pty.send("/status\r");
         pty.wait_for("Conversation: new");
-        pty.send("/resume\r");
-        pty.wait_for("Resume conversation");
-        for job_id in ["agent_fixture_3", "agent_fixture"] {
-            pty.send("d");
-            pty.wait_for("Delete conversation?");
-            pty.send("d");
-            pty.wait_for(&format!("Deleted saved conversation {job_id}."));
-        }
         assert_eq!(observations()["saved_agents"], serde_json::json!([]));
         assert_eq!(
             observations()["deleted_ids"],
-            serde_json::json!([
-                "agent_fixture_2",
-                "agent_fixture_4",
-                "agent_fixture_3",
-                "agent_fixture"
-            ])
+            serde_json::json!(["conv_fixture", "conv_fixture_3"])
         );
         pty.send("/resume\r");
         pty.wait_for("No saved conversations in this directory.");

@@ -922,7 +922,10 @@ async fn browser_screenshots_cross_stores_and_reach_the_next_agent_turn() {
             .unwrap();
         let finished = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let value = client.get_agent(job.clone()).await.unwrap();
+                let value = client
+                    .get_agent(pb::AgentRef { id: job.id.clone() })
+                    .await
+                    .unwrap();
                 if value.state != "running" {
                     break value;
                 }
@@ -2397,8 +2400,10 @@ async fn delete_agent_uses_ffi_projection_and_authenticated_rpc_without_crossing
     let embedded =
         RpcClient::embedded(workspace.clone(), tokio::runtime::Handle::current()).unwrap();
     embedded
-        .delete_agent(pb::AgentRef {
+        .delete_agent_conversation(pb::DeleteConversationRequest {
             id: "embedded".into(),
+            workspace: None,
+            account_id: None,
         })
         .await
         .unwrap();
@@ -2428,7 +2433,7 @@ async fn delete_agent_uses_ffi_projection_and_authenticated_rpc_without_crossing
     let deleted = tokio::task::spawn_blocking(move || {
         anticrumb::rpc::workspace_client::Client::for_workspace(&presentation_root)
             .unwrap()
-            .request("DELETE", "/api/agents/presentation", None)
+            .request("DELETE", "/api/conversations/presentation", None)
             .unwrap()
     })
     .await
@@ -2442,8 +2447,10 @@ async fn delete_agent_uses_ffi_projection_and_authenticated_rpc_without_crossing
         .unwrap();
     assert_eq!(
         unauthorized
-            .delete_agent(pb::AgentRef {
-                id: "network".into()
+            .delete_agent_conversation(pb::DeleteConversationRequest {
+                id: "network".into(),
+                workspace: None,
+                account_id: None,
             })
             .await
             .unwrap_err()
@@ -2458,15 +2465,19 @@ async fn delete_agent_uses_ffi_projection_and_authenticated_rpc_without_crossing
         .await
         .unwrap();
     authorized
-        .delete_agent(pb::AgentRef {
+        .delete_agent_conversation(pb::DeleteConversationRequest {
             id: "network".into(),
+            workspace: None,
+            account_id: None,
         })
         .await
         .unwrap();
     assert!(store.events("network", 0).unwrap().is_empty());
     assert!(authorized
-        .delete_agent(pb::AgentRef {
-            id: "active".into()
+        .delete_agent_conversation(pb::DeleteConversationRequest {
+            id: "active".into(),
+            workspace: None,
+            account_id: None,
         })
         .await
         .is_err());
@@ -2562,7 +2573,10 @@ async fn embedded_workspace_services_and_borrowed_clients_are_root_scoped() {
             .unwrap();
         let finished = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let value = client.get_agent(job.clone()).await.unwrap();
+                let value = client
+                    .get_agent(pb::AgentRef { id: job.id.clone() })
+                    .await
+                    .unwrap();
                 if value.state != "running" {
                     break value;
                 }
@@ -3379,7 +3393,7 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
     let run_turn = |client: RpcClient,
                     project: std::path::PathBuf,
                     task_text: String,
-                    parent_id: Option<String>,
+                    conversation_id: Option<String>,
                     temporary: bool| async move {
         let job = client
             .start_agent(pb::AgentRequest {
@@ -3388,14 +3402,17 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
                 account_id: "default".into(),
                 session_mode: codec::session_mode_to(SessionMode::from_temporary(temporary)),
                 no_shell: true,
-                parent_id,
+                conversation_id,
                 ..Default::default()
             })
             .await
             .unwrap();
         let finished = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let value = client.get_agent(job.clone()).await.unwrap();
+                let value = client
+                    .get_agent(pb::AgentRef { id: job.id.clone() })
+                    .await
+                    .unwrap();
                 if value.state != "running" {
                     break value;
                 }
@@ -3405,7 +3422,7 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
         .await
         .unwrap();
         assert_eq!(finished.state, "completed", "{finished:?}");
-        finished.id
+        finished.conversation_id
     };
 
     let read_full_prompt = |req: &TurnRequest| -> String {
@@ -3472,7 +3489,7 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
         assert_eq!(s1.remote_turns, 2);
     }
 
-    // Turn 3 (after /new or /clear -> parent_id is None): closes S1 and creates a fresh temp session S2.
+    // Turn 3 (after /new or /clear -> conversation_id is None): closes S1 and creates a fresh temp session S2.
     let turn3 = run_turn(
         client.clone(),
         project.clone(),
@@ -3630,14 +3647,19 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
             account_id: "default".into(),
             session_mode: pb::SessionMode::Temporary as i32,
             no_shell: true,
-            parent_id: Some(turn4b.clone()),
+            conversation_id: Some(turn4b.clone()),
             ..Default::default()
         })
         .await
         .unwrap();
     let failed = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let value = client.get_agent(failed_job.clone()).await.unwrap();
+            let value = client
+                .get_agent(pb::AgentRef {
+                    id: failed_job.id.clone(),
+                })
+                .await
+                .unwrap();
             if value.state != "running" {
                 break value;
             }
@@ -3675,12 +3697,27 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
         .put("local", "session", &local_s3b.id, &local_s3b)
         .unwrap();
 
-    // Turn 5 (switching `/temp off` mid-conversation): closes S3b and starts a normal Chat session S4.
+    // Attempting to continue a temporary conversation in normal mode is rejected; switching
+    // `/temp off` starts a new normal conversation (`conversation_id = None`), closing S3b
+    // and starting a normal Chat session S4.
+    let mode_err = client
+        .start_agent(pb::AgentRequest {
+            task: "cannot continue temporary conversation in normal mode".into(),
+            workspace: project.to_string_lossy().into_owned(),
+            account_id: "default".into(),
+            session_mode: pb::SessionMode::Chat as i32,
+            no_shell: true,
+            conversation_id: Some(turn4b),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(mode_err.code, ErrorCode::InvalidRequest);
     let turn5 = run_turn(
         client.clone(),
         project.clone(),
         "switch to normal server chat".into(),
-        Some(turn4b),
+        None,
         false,
     )
     .await;
@@ -3722,23 +3759,40 @@ async fn temporary_conversations_keep_browser_session_until_new_or_clear_and_rec
             .expect("remote session id");
         (local_sub.id, remote_id)
     };
+    let sub_agent_id = client
+        .get_conversation(pb::ConversationRef { id: sub_turn })
+        .await
+        .unwrap()
+        .summary
+        .unwrap()
+        .latest_agent_id;
     // Detach synthetic helper agent row so only `turn5` owns `local_sub_id` via `subagent_browser_session`.
-    workspace
+    assert!(workspace
         .service
         .store
-        .delete("local", "agent", &sub_turn)
-        .unwrap();
+        .delete("local", "agent", &sub_agent_id)
+        .unwrap());
     workspace
         .service
         .store
         .event(
-            &turn5,
+            &client
+                .get_conversation(pb::ConversationRef { id: turn5.clone() })
+                .await
+                .unwrap()
+                .summary
+                .unwrap()
+                .latest_agent_id,
             "subagent_browser_session",
             serde_json::json!({"session_id": local_sub_id}),
         )
         .unwrap();
     client
-        .delete_agent(pb::AgentRef { id: turn5 })
+        .delete_agent_conversation(pb::DeleteConversationRequest {
+            id: turn5,
+            workspace: None,
+            account_id: None,
+        })
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -3945,7 +3999,10 @@ async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_gr
         .unwrap();
     let finished = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let value = ws_ffi.get_agent(job.clone()).await.unwrap();
+            let value = ws_ffi
+                .get_agent(pb::AgentRef { id: job.id.clone() })
+                .await
+                .unwrap();
             if value.state != "running" {
                 break value;
             }

@@ -359,12 +359,68 @@ impl ArtifactService for Fixture {
         self.api.get_artifact(r).await
     }
 }
+fn job_conversation_id(job: &pb::Agent) -> &str {
+    if !job.conversation_id.is_empty() {
+        &job.conversation_id
+    } else {
+        &job.id
+    }
+}
+fn build_conversation(conv_id: &str, mut turns: Vec<pb::Agent>) -> pb::Conversation {
+    turns.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let first = &turns[0];
+    let latest = turns.last().unwrap();
+    let first_req = first.request.as_ref();
+    let latest_req = latest.request.as_ref();
+    let created_at = turns.iter().map(|t| t.created_at).min().unwrap_or(0);
+    let updated_at = turns
+        .iter()
+        .map(|t| t.updated_at.max(t.created_at))
+        .max()
+        .unwrap_or(0);
+    let any_temp = turns.iter().any(|t| {
+        t.request
+            .as_ref()
+            .is_some_and(|r| r.session_mode == pb::SessionMode::Temporary as i32)
+    });
+    let session_mode = if any_temp {
+        pb::SessionMode::Temporary as i32
+    } else {
+        pb::SessionMode::Chat as i32
+    };
+    let summary = pb::ConversationSummary {
+        id: conv_id.to_owned(),
+        latest_agent_id: latest.id.clone(),
+        workspace: latest_req.map(|r| r.workspace.clone()).unwrap_or_default(),
+        account_id: latest_req
+            .map(|r| r.account_id.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".into()),
+        state: latest.state.clone(),
+        session_mode,
+        title: first_req.map(|r| r.task.clone()).unwrap_or_default(),
+        turn_count: turns.len() as u32,
+        created_at,
+        updated_at,
+        model: latest_req.and_then(|r| r.model.clone()),
+        thinking: latest_req.and_then(|r| r.thinking.clone()),
+        chat_only: latest_req.is_some_and(|r| r.chat_only),
+    };
+    pb::Conversation {
+        summary: Some(summary),
+        turns,
+    }
+}
 #[tonic::async_trait]
 impl WorkspaceService for Fixture {
     async fn connect_client(&self, r: Request<pb::ConnectClientRequest>) -> Reply<pb::HostInfo> {
         self.api.connect_client(r).await
     }
-    async fn start_agent(&self, r: Request<pb::AgentRequest>) -> Reply<pb::AgentRef> {
+    async fn start_agent(&self, r: Request<pb::AgentRequest>) -> Reply<pb::StartAgentResponse> {
         self.api.authorize(r.metadata())?;
         let mut request = r.into_inner();
         request.environment.clear();
@@ -380,8 +436,23 @@ impl WorkspaceService for Fixture {
         } else {
             format!("agent_fixture_{n}")
         };
+        let conversation_id = request
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if n == 1 {
+                    "conv_fixture".to_owned()
+                } else {
+                    format!("conv_fixture_{n}")
+                }
+            });
+        request.conversation_id = Some(conversation_id.clone());
         state.jobs.push(pb::Agent {
             id: id.clone(),
+            conversation_id: conversation_id.clone(),
             state: "completed".into(),
             request: Some(request),
             result: Some(pb::AgentResult {
@@ -389,11 +460,15 @@ impl WorkspaceService for Fixture {
                 final_response: format!("Attachment turn {n} completed.\n\n**Important result** with *emphasis* and `file_name.rs`.\n```rust\nlet answer = 42;\n```\n\n| Item | State |\n| :--- | ---: |\n| **\u{754c}\u{8a9e}** | `ready` |\n| test | 42 |"),
                 ..Default::default()
             }),
+            created_at: n as i64,
             updated_at: n as i64,
             ..Default::default()
         });
         self.save(&state);
-        Ok(Response::new(pb::AgentRef { id }))
+        Ok(Response::new(pb::StartAgentResponse {
+            id,
+            conversation_id,
+        }))
     }
     async fn get_agent(&self, r: Request<pb::AgentRef>) -> Reply<pb::Agent> {
         self.api.authorize(r.metadata())?;
@@ -414,9 +489,80 @@ impl WorkspaceService for Fixture {
             agents: self.state.lock().unwrap().jobs.clone(),
         }))
     }
-    async fn delete_agent(&self, r: Request<pb::AgentRef>) -> Reply<pb::Empty> {
+    async fn get_conversation(&self, r: Request<pb::ConversationRef>) -> Reply<pb::Conversation> {
         self.api.authorize(r.metadata())?;
         let id = r.into_inner().id;
+        let turns: Vec<pb::Agent> = self
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|job| job_conversation_id(job) == id)
+            .cloned()
+            .collect();
+        if turns.is_empty() {
+            return Err(Status::not_found("no conversation"));
+        }
+        Ok(Response::new(build_conversation(&id, turns)))
+    }
+    async fn list_conversations(
+        &self,
+        r: Request<pb::ListConversationsRequest>,
+    ) -> Reply<pb::ConversationList> {
+        self.api.authorize(r.metadata())?;
+        let req = r.into_inner();
+        let workspace = req.workspace.as_deref().filter(|s| !s.is_empty());
+        let account_id = req.account_id.as_deref().filter(|s| !s.is_empty());
+        let limit = if req.limit == 0 {
+            50
+        } else {
+            (req.limit as usize).clamp(1, 500)
+        };
+        let state = self.state.lock().unwrap();
+        let mut grouped: std::collections::BTreeMap<String, Vec<pb::Agent>> =
+            std::collections::BTreeMap::new();
+        for job in &state.jobs {
+            if let Some(ws) = workspace {
+                if job.request.as_ref().map(|r| r.workspace.as_str()) != Some(ws) {
+                    continue;
+                }
+            }
+            if let Some(acct) = account_id {
+                let job_acct = job
+                    .request
+                    .as_ref()
+                    .map(|r| r.account_id.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("default");
+                if job_acct != acct {
+                    continue;
+                }
+            }
+            grouped
+                .entry(job_conversation_id(job).to_owned())
+                .or_default()
+                .push(job.clone());
+        }
+        let mut conversations: Vec<pb::ConversationSummary> = grouped
+            .into_iter()
+            .filter_map(|(cid, turns)| build_conversation(&cid, turns).summary)
+            .collect();
+        conversations.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        conversations.truncate(limit);
+        Ok(Response::new(pb::ConversationList { conversations }))
+    }
+    async fn delete_agent_conversation(
+        &self,
+        r: Request<pb::DeleteConversationRequest>,
+    ) -> Reply<pb::Empty> {
+        self.api.authorize(r.metadata())?;
+        let req = r.into_inner();
         let mut state = self.state.lock().unwrap();
         if self
             .observations_path
@@ -427,21 +573,48 @@ impl WorkspaceService for Fixture {
         {
             return Err(Status::failed_precondition("fixture deletion failed"));
         }
-        let index = state
+        let workspace = req.workspace.as_deref().filter(|s| !s.is_empty());
+        let account_id = req.account_id.as_deref().filter(|s| !s.is_empty());
+        let matching: Vec<&pb::Agent> = state
             .jobs
             .iter()
-            .position(|job| job.id == id)
-            .ok_or_else(|| Status::not_found("no job"))?;
-        if matches!(state.jobs[index].state.as_str(), "running" | "queued") {
-            return Err(Status::failed_precondition(
-                "interrupt the running task before deleting it",
-            ));
+            .filter(|job| job_conversation_id(job) == req.id)
+            .collect();
+        if matching.is_empty() {
+            return Err(Status::not_found("no conversation"));
         }
-        state.jobs.remove(index);
+        for job in &matching {
+            if matches!(job.state.as_str(), "running" | "queued") {
+                return Err(Status::failed_precondition(
+                    "interrupt the running task before deleting it",
+                ));
+            }
+            if let Some(ws) = workspace {
+                if job.request.as_ref().map(|r| r.workspace.as_str()) != Some(ws) {
+                    return Err(Status::invalid_argument(
+                        "conversation deletion requires the same workspace and account",
+                    ));
+                }
+            }
+            if let Some(acct) = account_id {
+                let job_acct = job
+                    .request
+                    .as_ref()
+                    .map(|r| r.account_id.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("default");
+                if job_acct != acct {
+                    return Err(Status::invalid_argument(
+                        "conversation deletion requires the same workspace and account",
+                    ));
+                }
+            }
+        }
+        state.jobs.retain(|job| job_conversation_id(job) != req.id);
         state.observations["deleted_ids"]
             .as_array_mut()
             .unwrap()
-            .push(json!(id));
+            .push(json!(req.id));
         self.save(&state);
         Ok(Response::new(pb::Empty {}))
     }
@@ -451,7 +624,10 @@ impl WorkspaceService for Fixture {
     async fn steer_agent(&self, _: Request<pb::SteerRequest>) -> Reply<pb::Empty> {
         Err(Status::unimplemented("fixture"))
     }
-    async fn resume_agent(&self, _: Request<pb::AgentRef>) -> Reply<pb::AgentRef> {
+    async fn resume_conversation(
+        &self,
+        _: Request<pb::ConversationRef>,
+    ) -> Reply<pb::StartAgentResponse> {
         Err(Status::unimplemented("fixture"))
     }
     async fn read_agent_events(&self, _: Request<pb::EventCursor>) -> Reply<pb::EventPage> {

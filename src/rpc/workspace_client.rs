@@ -398,7 +398,7 @@ impl Client {
 pub(crate) async fn start_agent(
     rpc: &RpcClient,
     mut request: AgentRequest,
-) -> Result<pb::AgentRef> {
+) -> Result<pb::StartAgentResponse> {
     request.environment = Some(
         std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
@@ -611,17 +611,10 @@ pub async fn presentation(
             rpc.get_agent(pb::AgentRef { id: (*id).into() }).await?,
         )?)
         .map_err(ServiceError::storage),
-        ("DELETE", ["api", "agents", id]) => {
-            rpc.delete_agent(pb::AgentRef { id: (*id).into() }).await?;
-            Ok(json!({"deleted":true}))
-        }
         ("POST", ["api", "agents", id, "cancel"]) => {
             rpc.cancel_agent(pb::AgentRef { id: (*id).into() }).await?;
             Ok(json!({"cancel_requested":true}))
         }
-        ("POST", ["api", "agents", id, "resume"]) => Ok(json!(
-            rpc.resume_agent(pb::AgentRef { id: (*id).into() }).await?
-        )),
         ("POST", ["api", "agents", id, "steer"]) => {
             let artifacts: Vec<String> = serde_json::from_value(
                 value.get("artifacts").cloned().unwrap_or_else(|| json!([])),
@@ -635,6 +628,54 @@ pub async fn presentation(
             .await?;
             Ok(json!({"accepted":true}))
         }
+        ("GET", ["api", "conversations"]) => {
+            let mut workspace = None;
+            let mut account_id = None;
+            let mut limit = 0u32;
+            for (k, v) in form_urlencoded::parse(query.as_bytes()) {
+                match k.as_ref() {
+                    "workspace" if !v.is_empty() => workspace = Some(v.into_owned()),
+                    "account_id" if !v.is_empty() => account_id = Some(v.into_owned()),
+                    "limit" => limit = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+            Ok(json!(rpc
+                .list_conversations(pb::ListConversationsRequest {
+                    workspace,
+                    account_id,
+                    limit,
+                })
+                .await?
+                .conversations
+                .into_iter()
+                .map(codec::conversation_summary_from)
+                .collect::<Result<Vec<_>>>()?))
+        }
+        ("GET", ["api", "conversations", id]) => serde_json::to_value(codec::conversation_from(
+            rpc.get_conversation(pb::ConversationRef { id: (*id).into() })
+                .await?,
+        )?)
+        .map_err(ServiceError::storage),
+        ("DELETE", ["api", "conversations", id]) => {
+            rpc.delete_agent_conversation(pb::DeleteConversationRequest {
+                id: (*id).into(),
+                workspace: value["workspace"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+                account_id: value["account_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+            })
+            .await?;
+            Ok(json!({"deleted":true}))
+        }
+        ("POST", ["api", "conversations", id, "resume"]) => Ok(json!(
+            rpc.resume_conversation(pb::ConversationRef { id: (*id).into() })
+                .await?
+        )),
         ("POST", ["api", "knowledge", "query"]) => Ok(json!(
             rpc.query_knowledge(pb::KnowledgeQuery {
                 query: value["query"].as_str().unwrap_or("").into(),

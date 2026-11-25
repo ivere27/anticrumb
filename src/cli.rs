@@ -219,7 +219,8 @@ Service and integration commands:
   browser [OPTIONS] [COMMAND]               stateful browser commands / interactive shell
   chat [--session ID] [--file PATH] PROMPT
   image [--file PATH] PROMPT
-  agents list|show|cancel|steer|resume|follow ID
+  conversations list|show|delete|resume ID
+  agents list|show|cancel|steer|follow ID
   runs list|show|cancel ID     sessions list|show|close|media ID
   login [ACCOUNT|PROVIDER] [--provider ID] sign in (auto-creates account & port if needed)
   providers list|show ID|add DIR_OR_FILE [--replace] [--login]|remove ID
@@ -347,7 +348,7 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
             }
         }
         "chat" | "image" => chat_command(&args[1..], command == "image"),
-        "agents" | "runs" | "sessions" => job_command(command, &args[1..]),
+        "conversations" | "agents" | "runs" | "sessions" => job_command(command, &args[1..]),
         "artifact" => {
             if args.len() != 5 || args[1] != "get" {
                 return Err(ServiceError::invalid("artifact get ACCOUNT ID DEST"));
@@ -659,11 +660,6 @@ impl PromptOptions {
             crate::gemini::set_human_pace(store.as_ref(), pace);
         }
     }
-    pub(crate) fn inherit_from_job(&mut self, job: &Value) -> Result<()> {
-        let request =
-            serde_json::from_value(job["request"].clone()).map_err(ServiceError::storage)?;
-        self.inherit(&request)
-    }
     pub(crate) fn resolve_account(&mut self, client: &Client) -> Result<()> {
         self.resolve_or_create_account(client, false).map(|_| ())
     }
@@ -791,7 +787,7 @@ impl PromptOptions {
     pub(crate) fn agent_request(
         &self,
         task: String,
-        parent_id: Option<String>,
+        conversation_id: Option<String>,
     ) -> crate::agent_service::AgentRequest {
         let perms = self.effective_permissions();
         crate::agent_service::AgentRequest {
@@ -807,7 +803,7 @@ impl PromptOptions {
             knowledge: self.knowledge.clone(),
             mcp_config: self.mcp.clone(),
             artifacts: Vec::new(),
-            parent_id,
+            conversation_id,
             chat_only: !self.agent,
             permissions: Some(perms),
             session_retention: SessionRetention::Unspecified,
@@ -868,15 +864,13 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     o.load_saved_temporary(&root());
     let client = Client::connect()?;
     o.resolve_account(&client)?;
-    let parent = if let Some(id) = &o.resume {
-        let job = client.conversation(id, &o.workspace, &o.account)?;
-        o.inherit_from_job(&job)?;
-        Some(
-            job["id"]
-                .as_str()
-                .ok_or_else(|| ServiceError::invalid("missing conversation ID"))?
-                .to_owned(),
-        )
+    let conversation_id = if let Some(id) = &o.resume {
+        let conv = client.conversation(id, &o.workspace, &o.account)?;
+        let latest = conv
+            .latest_turn()
+            .ok_or_else(|| ServiceError::invalid("conversation has no turns"))?;
+        o.inherit(&latest.request)?;
+        Some(conv.summary.id.clone())
     } else {
         None
     };
@@ -888,18 +882,13 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
         return Err(ServiceError::invalid("provide a task or follow-up prompt"));
     }
     let cli_temp_override = o.overrides.contains("temporary");
-    let mut request = o.agent_request(prepared.text, parent);
+    let mut request = o.agent_request(prepared.text, conversation_id);
     request.artifacts = client.upload_files(&o.account, &prepared.files, &prepared.temp_files)?;
-    let value = client
-        .request(
-            "POST",
-            "/api/agents",
-            Some(&serde_json::to_value(request).map_err(ServiceError::storage)?),
-        )
+    let started = client
+        .start_agent(request)
         .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))?;
-    let id = value["id"]
-        .as_str()
-        .ok_or_else(|| ServiceError::invalid("missing job id"))?;
+    let id = started.id.as_str();
+    let conv_id = started.conversation_id.as_str();
     let mode_desc = if !o.agent {
         "chat".to_owned()
     } else if o.yolo {
@@ -915,7 +904,7 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     } else {
         mode_desc
     };
-    eprintln!("mode: {mode_desc} | agent: {id}");
+    eprintln!("mode: {mode_desc} | conversation: {conv_id} | agent: {id}");
     follow_agent(&client, id, o.json, o.print)
         .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))
 }
@@ -1035,13 +1024,21 @@ fn job_command(kind: &str, args: &[String]) -> Result<()> {
     let value = match action {
         "list" => client.request("GET", &format!("/api/{kind}"), None)?,
         "show" => client.request("GET", &format!("/api/{kind}/{id}"), None)?,
-        "log" => json!(client.events(id, 0)?),
-        "cancel" | "close" | "resume" | "media" => client.request(
+        "delete" if kind == "conversations" => {
+            client.request("DELETE", &format!("/api/conversations/{id}"), None)?
+        }
+        "resume" if kind == "conversations" => client.request(
+            "POST",
+            &format!("/api/conversations/{id}/resume"),
+            Some(&json!({})),
+        )?,
+        "log" if kind != "conversations" => json!(client.events(id, 0)?),
+        "cancel" | "close" | "media" if kind != "conversations" => client.request(
             "POST",
             &format!("/api/{kind}/{id}/{action}"),
             Some(&json!({})),
         )?,
-        "steer" => {
+        "steer" if kind == "agents" => {
             let job = client.request("GET", &format!("/api/agents/{id}"), None)?;
             let workspace = Path::new(
                 job["request"]["workspace"]
@@ -1771,64 +1768,6 @@ fn connect_config(args: &[String]) -> Result<()> {
     eprintln!("Use the token printed by `anticrumb server` as ANTICRUMB_TOKEN (OpenCode/Codex), ANTHROPIC_AUTH_TOKEN (Claude), or GEMINI_API_KEY (Antigravity). Configure the provider client to trust the server certificate.");
     Ok(())
 }
-fn group_conversations(value: Value, workspace: &Path, account: &str) -> Result<Vec<Value>> {
-    let all_jobs: Vec<Value> = value
-        .as_array()
-        .ok_or_else(|| ServiceError::invalid("invalid conversation list"))?
-        .iter()
-        .filter(|v| {
-            v["request"]["workspace"]
-                .as_str()
-                .is_some_and(|s| Path::new(s) == workspace)
-                && v["request"]["account_id"] == account
-        })
-        .cloned()
-        .collect();
-
-    // Group conversation chains: only show one entry per conversation.
-    // A "leaf" is a turn whose ID is not referenced as parent_id by any
-    // other turn. Its label uses the root turn's first prompt text.
-    let parent_ids: std::collections::HashSet<&str> = all_jobs
-        .iter()
-        .filter_map(|v| v["request"]["parent_id"].as_str())
-        .collect();
-    let job_map: std::collections::HashMap<&str, &Value> = all_jobs
-        .iter()
-        .filter_map(|v| Some((v["id"].as_str()?, v)))
-        .collect();
-
-    let mut jobs: Vec<Value> = all_jobs
-        .iter()
-        .filter(|v| v["id"].as_str().is_some_and(|id| !parent_ids.contains(id)))
-        .map(|leaf| {
-            // Walk up the parent chain to find the root's first prompt.
-            let mut current = leaf;
-            for _ in 0..100 {
-                match current["request"]["parent_id"]
-                    .as_str()
-                    .and_then(|pid| job_map.get(pid))
-                {
-                    Some(parent) => current = parent,
-                    None => break,
-                }
-            }
-            let root_task = current["request"]["task"].clone();
-            let mut entry = (*leaf).clone();
-            entry["request"]["task"] = root_task;
-            entry
-        })
-        .collect();
-
-    jobs.sort_by_key(|v| {
-        std::cmp::Reverse(
-            v["updated_at"]
-                .as_u64()
-                .or(v["created_at"].as_u64())
-                .unwrap_or(0),
-        )
-    });
-    Ok(jobs)
-}
 
 fn upload_mime(path: &Path) -> &'static str {
     let extension = path
@@ -1901,28 +1840,43 @@ impl Client {
         &self,
         workspace: &Path,
         account: &str,
-    ) -> Result<Vec<Value>> {
-        let value = self.request_async("GET", "/api/agents", None).await?;
-        group_conversations(value, workspace, account)
+    ) -> Result<Vec<ConversationSummary>> {
+        let list = self
+            .rpc
+            .list_conversations(crate::rpc::pb::ListConversationsRequest {
+                workspace: Some(workspace.to_string_lossy().into_owned()),
+                account_id: Some(account.into()),
+                limit: 50,
+            })
+            .await?;
+        list.conversations
+            .into_iter()
+            .map(crate::rpc::codec::conversation_summary_from)
+            .collect()
     }
     pub(crate) async fn conversation_async(
         &self,
         id: &str,
         workspace: &Path,
         account: &str,
-    ) -> Result<Value> {
-        if id == "last" || id.is_empty() {
-            return self
-                .conversations_async(workspace, account)
+    ) -> Result<ConversationRecord> {
+        let conv_id = if id == "last" || id.is_empty() {
+            self.conversations_async(workspace, account)
                 .await?
                 .into_iter()
                 .next()
                 .ok_or_else(|| {
                     ServiceError::invalid("no saved conversations in this working directory")
-                });
-        }
-        self.request_async("GET", &format!("/api/agents/{}", identifier(id)?), None)
-            .await
+                })?
+                .id
+        } else {
+            identifier(id)?.to_owned()
+        };
+        let conv = self
+            .rpc
+            .get_conversation(crate::rpc::pb::ConversationRef { id: conv_id })
+            .await?;
+        crate::rpc::codec::conversation_from(conv)
     }
     pub(crate) async fn delete_conversation_async(
         &self,
@@ -1931,17 +1885,12 @@ impl Client {
         account: &str,
     ) -> Result<()> {
         let id = identifier(id)?;
-        let job = self
-            .request_async("GET", &format!("/api/agents/{id}"), None)
-            .await?;
-        if job["request"]["workspace"].as_str().map(Path::new) != Some(workspace)
-            || job["request"]["account_id"] != account
-        {
-            return Err(ServiceError::invalid(
-                "conversation deletion requires the same workspace and account",
-            ));
-        }
-        self.request_async("DELETE", &format!("/api/agents/{id}"), None)
+        self.rpc
+            .delete_agent_conversation(crate::rpc::pb::DeleteConversationRequest {
+                id: id.into(),
+                workspace: Some(workspace.to_string_lossy().into_owned()),
+                account_id: Some(account.into()),
+            })
             .await?;
         Ok(())
     }
@@ -1973,14 +1922,15 @@ impl Client {
     pub(crate) async fn start_agent_async(
         &self,
         request: crate::agent_service::AgentRequest,
-    ) -> Result<String> {
-        let id = crate::rpc::workspace_client::start_agent(&self.rpc, request)
-            .await?
-            .id;
-        if id.is_empty() {
-            return Err(ServiceError::invalid("missing job ID"));
+    ) -> Result<StartedAgent> {
+        let resp = crate::rpc::workspace_client::start_agent(&self.rpc, request).await?;
+        if resp.id.is_empty() || resp.conversation_id.is_empty() {
+            return Err(ServiceError::invalid("missing job or conversation ID"));
         }
-        Ok(id)
+        Ok(StartedAgent {
+            id: resp.id,
+            conversation_id: resp.conversation_id,
+        })
     }
     pub(crate) async fn clear_web_history_async(&self, account: &str) -> Result<Value> {
         self.request_async(
@@ -2007,11 +1957,23 @@ impl Client {
         self.runtime
             .block_on(self.upload_files_async(account, files, temp_files))
     }
-    pub fn conversations(&self, workspace: &Path, account: &str) -> Result<Vec<Value>> {
+    pub fn start_agent(&self, request: crate::agent_service::AgentRequest) -> Result<StartedAgent> {
+        self.runtime.block_on(self.start_agent_async(request))
+    }
+    pub fn conversations(
+        &self,
+        workspace: &Path,
+        account: &str,
+    ) -> Result<Vec<ConversationSummary>> {
         self.runtime
             .block_on(self.conversations_async(workspace, account))
     }
-    pub fn conversation(&self, id: &str, workspace: &Path, account: &str) -> Result<Value> {
+    pub fn conversation(
+        &self,
+        id: &str,
+        workspace: &Path,
+        account: &str,
+    ) -> Result<ConversationRecord> {
         self.runtime
             .block_on(self.conversation_async(id, workspace, account))
     }
@@ -2066,8 +2028,7 @@ mod tests {
         let mut previous = previous;
         previous.model = Some("old".into());
         previous.no_shell = false;
-        let job = json!({ "request": previous });
-        options.inherit_from_job(&job).unwrap();
+        options.inherit(&previous).unwrap();
         assert_eq!(options.model.as_deref(), Some("selected"));
         assert!(options.no_shell);
 
@@ -2499,56 +2460,6 @@ mod tests {
             .unwrap(),
             ("./providers/claude-web".into(), true, true)
         );
-    }
-
-    #[test]
-    fn conversations_groups_by_chain_and_labels_with_root_prompt() {
-        // Simulate the grouping logic from Client::conversations without a server.
-        let all_jobs = [
-            json!({"id":"turn-1","state":"completed","request":{"task":"Write hello world","workspace":"/ws","account_id":"default","parent_id":null},"updated_at":100}),
-            json!({"id":"turn-2","state":"completed","request":{"task":"Add error handling","workspace":"/ws","account_id":"default","parent_id":"turn-1"},"updated_at":200}),
-            json!({"id":"turn-3","state":"completed","request":{"task":"Add tests","workspace":"/ws","account_id":"default","parent_id":"turn-2"},"updated_at":300}),
-            json!({"id":"solo-1","state":"completed","request":{"task":"Standalone question","workspace":"/ws","account_id":"default","parent_id":null},"updated_at":250}),
-        ];
-
-        let parent_ids: std::collections::HashSet<&str> = all_jobs
-            .iter()
-            .filter_map(|v| v["request"]["parent_id"].as_str())
-            .collect();
-        let job_map: std::collections::HashMap<&str, &Value> = all_jobs
-            .iter()
-            .filter_map(|v| Some((v["id"].as_str()?, v)))
-            .collect();
-        let mut jobs: Vec<Value> = all_jobs
-            .iter()
-            .filter(|v| v["id"].as_str().is_some_and(|id| !parent_ids.contains(id)))
-            .map(|leaf| {
-                let mut current = leaf;
-                for _ in 0..100 {
-                    match current["request"]["parent_id"]
-                        .as_str()
-                        .and_then(|pid| job_map.get(pid))
-                    {
-                        Some(parent) => current = parent,
-                        None => break,
-                    }
-                }
-                let root_task = current["request"]["task"].clone();
-                let mut entry = (*leaf).clone();
-                entry["request"]["task"] = root_task;
-                entry
-            })
-            .collect();
-        jobs.sort_by_key(|v| std::cmp::Reverse(v["updated_at"].as_u64().unwrap_or(0)));
-
-        // Two conversations: the 3-turn chain and the standalone
-        assert_eq!(jobs.len(), 2);
-        // Most recent first: turn-3 (300) then solo-1 (250)
-        assert_eq!(jobs[0]["id"], "turn-3");
-        assert_eq!(jobs[1]["id"], "solo-1");
-        // Chain entry uses root's first prompt as label
-        assert_eq!(jobs[0]["request"]["task"], "Write hello world");
-        assert_eq!(jobs[1]["request"]["task"], "Standalone question");
     }
 
     #[test]

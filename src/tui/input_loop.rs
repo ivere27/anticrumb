@@ -692,7 +692,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     drop(updates);
     drop(worker_guard);
     loop_result?;
-    if let Some(id) = state.active.clone().or_else(|| state.parent.clone()) {
+    if let Some(id) = state.conversation_id.clone() {
         eprintln!("{}", exit_conversation_message(&id, &state));
     }
     Ok(())

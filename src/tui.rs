@@ -33,6 +33,38 @@ mod tests {
     use super::reducer::{EffectSink, ScrollBottomBadge, SelectionTarget, State, SubagentView};
     use super::render::SPINNER_FRAMES;
     use super::theme;
+
+    fn summary(
+        id: &str,
+        state: &str,
+        title: &str,
+        session_mode: crate::domain::SessionMode,
+    ) -> crate::domain::ConversationSummary {
+        crate::domain::ConversationSummary {
+            id: id.into(),
+            latest_agent_id: id.into(),
+            workspace: Default::default(),
+            account_id: "default".into(),
+            state: state.into(),
+            session_mode,
+            title: title.into(),
+            turn_count: 1,
+            created_at: 0,
+            updated_at: 0,
+            model: None,
+            thinking: None,
+            chat_only: false,
+        }
+    }
+
+    /// Wraps a single-turn job fixture as a one-turn conversation keyed by the job id.
+    fn conversation(mut job: serde_json::Value) -> crate::domain::ConversationRecord {
+        // Fixtures carry a partial `result`; the conversation loader does not need it here.
+        job.as_object_mut().unwrap().remove("result");
+        let turn: crate::domain::AgentRecord = serde_json::from_value(job).unwrap();
+        let id = turn.id.clone();
+        crate::domain::ConversationRecord::from_turns(id, vec![turn]).unwrap()
+    }
     use super::transcript::{clip, Entry};
     use super::worker::{Command, Update};
     use crate::cli::PromptOptions;
@@ -63,7 +95,10 @@ mod tests {
         state.editor.set("/cache prune 0".into());
         state.submit(&mut tx);
         assert!(rx.try_recv().is_err());
-        state.update(Update::Started("active-run".into()));
+        state.update(Update::Started {
+            id: "active-run".into(),
+            conversation_id: "active-run".into(),
+        });
         let phase = state.phase.clone();
         state.editor.set("keep this draft".into());
         state.update(Update::Cache(
@@ -115,7 +150,10 @@ mod tests {
         ));
         assert_eq!(state.copy_response, source);
         state.log("an unrelated status message");
-        state.update(Update::Started("next-turn".into()));
+        state.update(Update::Started {
+            id: "next-turn".into(),
+            conversation_id: "next-turn".into(),
+        });
         assert_eq!(state.copy_response, source);
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
@@ -129,6 +167,50 @@ mod tests {
         state.editor.set("/new".into());
         state.submit(&mut tx);
         assert!(state.copy_response.is_empty());
+    }
+
+    #[test]
+    fn load_replays_multiturn_transcript_and_separates_conversation_from_active_turn() {
+        let mut state = State::new(PromptOptions::default());
+        let turn1 = crate::domain::AgentRecord {
+            id: "agent-1".into(),
+            conversation_id: "conv-multi".into(),
+            state: "completed".into(),
+            request: PromptOptions::default()
+                .agent_request("first prompt".into(), Some("conv-multi".into())),
+            result: Some(crate::agent::AgentRunResult {
+                status: crate::agent::AgentStatus::Completed,
+                final_response: "first answer".into(),
+                ..Default::default()
+            }),
+            error: None,
+            created_at: 10,
+            updated_at: 11,
+        };
+        let turn2 = crate::domain::AgentRecord {
+            id: "agent-2".into(),
+            conversation_id: "conv-multi".into(),
+            state: "running".into(),
+            request: PromptOptions::default()
+                .agent_request("second prompt".into(), Some("conv-multi".into())),
+            result: None,
+            error: None,
+            created_at: 20,
+            updated_at: 20,
+        };
+        let conv = crate::domain::ConversationRecord::from_turns("conv-multi", vec![turn2, turn1])
+            .unwrap();
+        state.update(Update::Loaded(conv));
+
+        assert_eq!(state.conversation_id.as_deref(), Some("conv-multi"));
+        assert_eq!(state.active.as_deref(), Some("agent-2"));
+        assert_eq!(state.phase, "running");
+        assert_eq!(state.copy_response, "first answer");
+        let logs = state.logs();
+        assert!(logs.contains("Resumed conv-multi · running · 2 turns"));
+        let pos1 = logs.find("first prompt").expect("turn 1 prompt rendered");
+        let pos2 = logs.find("second prompt").expect("turn 2 prompt rendered");
+        assert!(pos1 < pos2, "turns must render in chronological order");
     }
 
     #[test]
@@ -308,9 +390,12 @@ mod tests {
             event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &mut tx,
         );
-        state.update(Update::Conversations(vec![
-            json!({"id":"one", "request":{"task":"Saved"}}),
-        ]));
+        state.update(Update::Conversations(vec![summary(
+            "one",
+            "completed",
+            "Saved",
+            crate::domain::SessionMode::Chat,
+        )]));
         state.clear_resume_web_history();
         assert!(state.history_clear_confirmation.is_some());
         state.history_clear_key(
@@ -1321,7 +1406,10 @@ mod tests {
     #[test]
     fn subagent_dynamic_status_lines_appear_update_and_disappear_on_completion() {
         let mut state = State::new(PromptOptions::default());
-        state.update(Update::Started("master-run".into()));
+        state.update(Update::Started {
+            id: "master-run".into(),
+            conversation_id: "master-run".into(),
+        });
         assert_eq!(state.subagent_rows(26), 0);
         assert!(state.subagent_status_lines(100).is_empty());
 
@@ -1425,7 +1513,10 @@ mod tests {
         assert!(state.status_text(120).contains("DBG:2(trace)"));
 
         // Live browser stages & tool completion events are surfaced clearly.
-        state.update(Update::Started("job-dbg".into()));
+        state.update(Update::Started {
+            id: "job-dbg".into(),
+            conversation_id: "job-dbg".into(),
+        });
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
             run_id: "job-dbg".into(),
@@ -1510,7 +1601,10 @@ mod tests {
         let mut state = State::new(PromptOptions::default());
         assert_eq!(state.debug.level, 0);
 
-        state.update(Update::Started("job-think".into()));
+        state.update(Update::Started {
+            id: "job-think".into(),
+            conversation_id: "job-think".into(),
+        });
         let mut initial_frame = Vec::new();
         state.render_frame(&mut initial_frame, 100, 24).unwrap();
         let initial_rendered = String::from_utf8(initial_frame).unwrap();
@@ -1564,7 +1658,10 @@ mod tests {
     #[test]
     fn live_thinking_line_appears_above_prompt_in_rendered_frame() {
         let mut state = State::new(PromptOptions::default());
-        state.update(Update::Started("job-live-think".into()));
+        state.update(Update::Started {
+            id: "job-live-think".into(),
+            conversation_id: "job-live-think".into(),
+        });
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
             run_id: "job-live-think".into(),
@@ -1845,7 +1942,7 @@ mod tests {
             ..Default::default()
         });
         state.preferences = Some(Preferences::open(dir.path()).unwrap());
-        state.parent = Some("conv-gemini".into());
+        state.conversation_id = Some("conv-gemini".into());
         state.active_model = Some("Argon High".into());
 
         // Without cached status, `/provider` queues a status fetch.
@@ -1877,7 +1974,7 @@ mod tests {
         assert_eq!(state.options.account, "claude");
         assert_eq!(state.options.provider.as_deref(), Some("claude-web"));
         assert_eq!(state.provider_name(), "Claude Web");
-        assert!(state.parent.is_none());
+        assert!(state.conversation_id.is_none());
         assert!(state.active_model.is_none());
         assert_eq!(state.catalog["models"][0]["mode_id"], "Sonnet 5.5");
         assert!(state.status_text(120).contains("claude-web/claude:ready"));
@@ -1933,7 +2030,7 @@ mod tests {
             account: "default".into(),
             ..Default::default()
         });
-        state.parent = Some("conv-gemini".into());
+        state.conversation_id = Some("conv-gemini".into());
         state.update(Update::Status(json!({
             "providers": [
                 {"id": "gemini-web", "name": "Gemini Web"}
@@ -1952,7 +2049,7 @@ mod tests {
         menu.selected = 1;
         state.select(&mut tx);
         assert_eq!(state.options.account, "default");
-        assert_eq!(state.parent.as_deref(), Some("conv-gemini"));
+        assert_eq!(state.conversation_id.as_deref(), Some("conv-gemini"));
         assert!(state.logs().contains("is not registered"));
         assert!(state.logs().contains("anticrumb providers add"));
 
@@ -3103,7 +3200,7 @@ mod tests {
 
         // 6. `/mode` remains strictly for chat/agent/yolo (no Temp option); `/mode temp` prints
         //    usage without mutating temporary mode, while `/temp` toggles it without changing agent/yolo.
-        state.parent = Some("existing-conv".into());
+        state.conversation_id = Some("existing-conv".into());
         state.conversation_temporary = Some(false);
         state.editor.set("/mode".into());
         assert!(!state.submit(&mut tx));
@@ -3264,21 +3361,23 @@ mod tests {
 
         // `/resume` conversation list tags temporary conversations with `[temp]`.
         state.update(Update::Conversations(vec![
-            json!({
-                "id": "job-temp",
-                "state": "completed",
-                "request": {"task": "ephemeral question", "session_mode": "temporary"}
-            }),
-            json!({
-                "id": "job-saved",
-                "state": "completed",
-                "request": {"task": "normal question", "session_mode": "chat"}
-            }),
+            summary(
+                "job-temp",
+                "completed",
+                "ephemeral question",
+                crate::domain::SessionMode::Temporary,
+            ),
+            summary(
+                "job-saved",
+                "completed",
+                "normal question",
+                crate::domain::SessionMode::Chat,
+            ),
         ]));
         let menu = state.menu.as_ref().expect("/resume menu opened");
         assert!(menu.choices[0]
             .label
-            .contains("completed [temp] · ephemeral question"));
+            .contains("completed [temp] · 1t · ephemeral question"));
         assert!(!menu.choices[1].label.contains("[temp]"));
     }
 
@@ -3296,7 +3395,10 @@ mod tests {
         };
         assert!(!req.is_temporary());
         state.update(Update::Accepted(0));
-        state.update(Update::Started("job-normal".into()));
+        state.update(Update::Started {
+            id: "job-normal".into(),
+            conversation_id: "job-normal".into(),
+        });
         state.update(Update::Finished(json!({
             "id": "job-normal",
             "state": "completed",
@@ -3326,7 +3428,10 @@ mod tests {
         };
         assert!(req2.is_temporary());
         state.update(Update::Accepted(0));
-        state.update(Update::Started("job-temp".into()));
+        state.update(Update::Started {
+            id: "job-temp".into(),
+            conversation_id: "job-temp".into(),
+        });
         state.editor.set("/temp off".into());
         assert!(!state.submit(&mut tx));
         let msg_active_temp = super::input_loop::exit_conversation_message("job-temp", &state);
@@ -3382,7 +3487,7 @@ mod tests {
         live_state.preferences = Some(Preferences::open(dir.path()).unwrap());
         live_state.editor.set("/temp on".into());
         assert!(!live_state.submit(&mut tx));
-        live_state.update(Update::Loaded(normal_job.clone()));
+        live_state.update(Update::Loaded(conversation(normal_job.clone())));
         assert!(live_state.options.temporary);
         assert_eq!(live_state.conversation_temporary, Some(false));
         assert!(live_state
@@ -3399,7 +3504,7 @@ mod tests {
         restarted_state.preferences = Some(Preferences::open(dir.path()).unwrap());
         restarted_state.load_model_preference();
         assert!(restarted_state.options.temporary);
-        restarted_state.update(Update::Loaded(normal_job.clone()));
+        restarted_state.update(Update::Loaded(conversation(normal_job.clone())));
         assert!(restarted_state.options.temporary);
         assert_eq!(restarted_state.conversation_temporary, Some(false));
 
@@ -3408,7 +3513,7 @@ mod tests {
         live_state.editor.set("/temp off".into());
         assert!(!live_state.submit(&mut tx));
         assert!(!live_state.preferences.as_ref().unwrap().temporary());
-        live_state.update(Update::Loaded(temp_job.clone()));
+        live_state.update(Update::Loaded(conversation(temp_job.clone())));
         assert!(live_state.options.temporary);
         assert!(live_state.logs().contains("Resumed job-temp [temp]"));
         assert!(live_state
@@ -3419,7 +3524,7 @@ mod tests {
         assert!(!live_state.options.temporary);
 
         // Deleting the active `[temp]` parent restores saved `false`, whereas deleting another ID does not.
-        live_state.update(Update::Loaded(temp_job.clone()));
+        live_state.update(Update::Loaded(conversation(temp_job.clone())));
         assert!(live_state.options.temporary);
         live_state.update(Update::ConversationDeleted("other-job".into()));
         assert!(live_state.options.temporary);
@@ -3446,7 +3551,7 @@ mod tests {
             .options
             .overrides
             .contains("temporary"));
-        started_with_cli_temp.update(Update::Loaded(temp_job));
+        started_with_cli_temp.update(Update::Loaded(conversation(temp_job)));
         assert!(started_with_cli_temp.options.temporary);
 
         // 5. `Update::Finished` without preceding `Update::Started` or `request.temporary` falls back
@@ -3513,7 +3618,7 @@ mod tests {
         assert!(!state.options.temporary);
 
         // Resume [temp] job.
-        state.update(Update::Loaded(temp_job.clone()));
+        state.update(Update::Loaded(conversation(temp_job.clone())));
         assert!(
             state.options.temporary,
             "must inherit temporary from [temp] job"
@@ -3521,7 +3626,7 @@ mod tests {
         assert_eq!(state.conversation_temporary, Some(true));
 
         // Now resume normal job WITHOUT /new in between.
-        state.update(Update::Loaded(normal_job.clone()));
+        state.update(Update::Loaded(conversation(normal_job.clone())));
         assert!(
             !state.options.temporary,
             "consecutive /resume of a normal job must not be sticky-temporary"
@@ -3543,10 +3648,10 @@ mod tests {
         state2.load_model_preference();
         assert!(state2.options.temporary);
 
-        state2.update(Update::Loaded(temp_job));
+        state2.update(Update::Loaded(conversation(temp_job)));
         assert!(state2.options.temporary);
 
-        state2.update(Update::Loaded(normal_job));
+        state2.update(Update::Loaded(conversation(normal_job)));
         assert!(
             state2.options.temporary,
             "saved /temp on must keep temporary true even when resuming normal job"
@@ -3579,7 +3684,7 @@ mod tests {
             "request": normal_req2,
             "result": {"final_response": "ok"}
         });
-        state3.update(Update::Loaded(normal_job2));
+        state3.update(Update::Loaded(conversation(normal_job2)));
         assert!(
             state3.options.temporary,
             "--temp CLI flag must keep temporary true when resuming normal job"
@@ -4032,7 +4137,7 @@ mod tests {
             "request": { "task": "hello" },
             "result": { "final_response": "world" }
         });
-        state.load(job);
+        state.load(conversation(job));
         assert_eq!(state.scroll, 0);
         assert!(!state.scroll_relative);
         assert_eq!(state.scroll_anchor_width, 0);
@@ -4040,6 +4145,9 @@ mod tests {
         assert!(state.painted_all_transcript.is_empty());
 
         // Now test /new command
+        for i in 1..=40 {
+            state.log(&format!("after-load-{i:02}"));
+        }
         state.scroll_transcript(true, 5, 80, 16);
         state.render_frame(&mut out, 80, 16).expect("render_frame");
         assert_eq!(state.scroll, 5);
@@ -4438,7 +4546,10 @@ mod tests {
         assert!(!idle_rendered.contains(&highlight_bg));
 
         // Streaming chunk arrives on new lines while active -> Streaming uses same fg/bg as Jump to bottom + spinner.
-        state.update(Update::Started("run-stream".into()));
+        state.update(Update::Started {
+            id: "run-stream".into(),
+            conversation_id: "run-stream".into(),
+        });
         state.started = Instant::now();
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
@@ -4520,7 +4631,10 @@ mod tests {
 
         // Same-line stream growth (no new line wrap yet) still triggers Streaming highlight.
         state.scroll_transcript(true, 8, 80, 16);
-        state.update(Update::Started("run-same-line".into()));
+        state.update(Update::Started {
+            id: "run-same-line".into(),
+            conversation_id: "run-same-line".into(),
+        });
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
             run_id: "run-same-line".into(),
@@ -4590,7 +4704,10 @@ mod tests {
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Idle);
 
         // 2. Hidden [TOOL_CALL] envelope streaming without visible prose must NOT trigger unread badge.
-        state.update(Update::Started("run-tool".into()));
+        state.update(Update::Started {
+            id: "run-tool".into(),
+            conversation_id: "run-tool".into(),
+        });
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
             run_id: "run-tool".into(),
@@ -4748,7 +4865,10 @@ mod tests {
         for i in 1..=36 {
             state.log(&format!("entry-{i:02}"));
         }
-        state.update(Update::Started("run-cancel".into()));
+        state.update(Update::Started {
+            id: "run-cancel".into(),
+            conversation_id: "run-cancel".into(),
+        });
         let long_stream = (1..=20)
             .map(|i| format!("stream-line-{i:02}"))
             .collect::<Vec<_>>()
@@ -4829,7 +4949,10 @@ mod tests {
         );
         assert!(!rendered.contains(&highlight_bg));
 
-        state.update(Update::Started("run-latte".into()));
+        state.update(Update::Started {
+            id: "run-latte".into(),
+            conversation_id: "run-latte".into(),
+        });
         out.clear();
         state
             .render_frame(&mut out, 80, 16)
@@ -4902,7 +5025,10 @@ mod tests {
         assert_eq!(state.scroll_anchor_evicted_lines, 0);
 
         // Scroll up while an active run is underway and snapshot the visible transcript lines.
-        state.update(Update::Started("run-evict".into()));
+        state.update(Update::Started {
+            id: "run-evict".into(),
+            conversation_id: "run-evict".into(),
+        });
         state.scroll_transcript(true, 30, 80, 16);
         state
             .render_frame(&mut out, 80, 16)

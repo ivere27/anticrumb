@@ -117,7 +117,7 @@ pub(super) struct State {
     pub theme: theme::Theme,
     pub theme_preview_origin: Option<theme::Theme>,
     pub catalog: Value,
-    pub parent: Option<String>,
+    pub conversation_id: Option<String>,
     pub active: Option<String>,
     pub conversation_temporary: Option<bool>,
     pub pending_temporary: Option<bool>,
@@ -212,7 +212,7 @@ impl State {
             catalog: Value::Null,
             files,
             editor,
-            parent: None,
+            conversation_id: None,
             active: None,
             conversation_temporary: None,
             pending_temporary: None,
@@ -838,7 +838,7 @@ impl State {
         self.options.thinking = None;
         self.load_model_preference();
 
-        self.parent = None;
+        self.conversation_id = None;
         self.conversation_temporary = None;
         self.pending_temporary = None;
         self.active_model = None;
@@ -1690,8 +1690,8 @@ impl State {
         true
     }
 
-    pub(super) fn load(&mut self, job: Value) {
-        let Some(id) = job["id"].as_str() else {
+    pub(super) fn load(&mut self, conversation: crate::domain::ConversationRecord) {
+        let Some(latest) = conversation.latest_turn() else {
             return;
         };
         // Clone options and reset `temporary` to the saved preference (unless overridden by
@@ -1703,13 +1703,17 @@ impl State {
             next_options.temporary = self.saved_temporary_preference();
         }
         let was_temporary = next_options.temporary;
-        if let Err(e) = next_options.inherit_from_job(&job) {
+        if let Err(e) = next_options.inherit(&latest.request) {
             self.error(&e.to_string());
             return;
         }
+        let conv_id = conversation.summary.id.clone();
+        let latest_id = latest.id.clone();
+        let is_temp = conversation.summary.is_temporary();
+        let turn_count = conversation.turns.len();
         self.options = next_options;
-        self.parent = Some(id.into());
-        self.conversation_temporary = Some(job_session_is_temporary(&job) == Some(true));
+        self.conversation_id = Some(conv_id.clone());
+        self.conversation_temporary = Some(is_temp);
         self.pending_temporary = None;
         self.active_model = None;
         self.clear_mention();
@@ -1723,22 +1727,26 @@ impl State {
         self.reset_scroll();
         self.clear_selection();
         self.clear_painted_regions();
-        let state_str = job["state"].as_str().unwrap_or("saved");
+        self.transcript.clear();
+        let state_str = conversation.summary.state.as_str();
         let state_face = match state_str {
             "completed" | "ready" => Face::HIGHLIGHT_BOLD,
             "failed" | "cancelled" | "outcome_unknown" | "awaiting_human" => Face::DANGER_BOLD,
             _ => Face::ACCENT,
         };
-        let is_temp = self.conversation_temporary == Some(true);
-        let plain_resumed = if is_temp {
-            format!("\nResumed {id} [temp] · {state_str}")
+        let turns_label = if turn_count == 1 {
+            "1 turn".to_owned()
         } else {
-            format!("\nResumed {id} · {state_str}")
+            format!("{turn_count} turns")
+        };
+        let plain_resumed = if is_temp {
+            format!("Resumed {conv_id} [temp] · {state_str} · {turns_label}")
+        } else {
+            format!("Resumed {conv_id} · {state_str} · {turns_label}")
         };
         let mut resumed_spans = vec![
-            ("\n".into(), Face::MUTED),
             ("· ".into(), Face::ACCENT),
-            (format!("Resumed {id}"), Face::ACCENT_BOLD),
+            (format!("Resumed {conv_id}"), Face::ACCENT_BOLD),
         ];
         if is_temp {
             resumed_spans.push((" ".into(), Face::MUTED));
@@ -1746,26 +1754,68 @@ impl State {
         }
         resumed_spans.push((" · ".into(), Face::MUTED));
         resumed_spans.push((state_str.into(), state_face));
+        resumed_spans.push((" · ".into(), Face::MUTED));
+        resumed_spans.push((turns_label, Face::MUTED));
         self.log_spans(&plain_resumed, resumed_spans);
-        self.push_entry(
-            &format!("› {}", job["request"]["task"].as_str().unwrap_or("")),
-            Entry::Prompt(job["request"]["task"].as_str().unwrap_or("").into()),
-        );
+        for turn in &conversation.turns {
+            let task = turn.request.task.as_str();
+            self.push_entry(&format!("› {task}"), Entry::Prompt(task.into()));
+            if let Some(result) = &turn.result {
+                if !result.final_response.is_empty() {
+                    self.log_markdown(&result.final_response);
+                    self.copy_response = result.final_response.clone();
+                }
+                if !result.files_changed.is_empty()
+                    || (turn.state != "completed" && !turn.is_active())
+                {
+                    let changed = result.files_changed.len();
+                    let files_label = format!("{changed} file(s) changed");
+                    let turn_face = if turn.state == "completed" {
+                        Face::HIGHLIGHT_BOLD
+                    } else {
+                        Face::DANGER_BOLD
+                    };
+                    self.log_spans(
+                        &format!("  {} · {files_label}", turn.state),
+                        vec![
+                            ("  ".into(), Face::MUTED),
+                            (turn.state.clone(), turn_face),
+                            (" · ".into(), Face::MUTED),
+                            (
+                                files_label,
+                                if changed > 0 {
+                                    Face::HIGHLIGHT_BOLD
+                                } else {
+                                    Face::MUTED
+                                },
+                            ),
+                        ],
+                    );
+                }
+            } else if !matches!(turn.state.as_str(), "completed" | "ready")
+                && !turn.is_active()
+                && turn.error.is_none()
+            {
+                self.log_spans(
+                    &format!("  {}", turn.state),
+                    vec![
+                        ("  ".into(), Face::MUTED),
+                        (turn.state.clone(), Face::DANGER_BOLD),
+                    ],
+                );
+            }
+            if let Some(error) = &turn.error {
+                self.log_error(&format!("! {error}"));
+            }
+        }
         self.load_history();
-        if job["state"] == "running" {
-            self.active = Some(id.into());
+        if latest.is_active() {
+            self.active = Some(latest_id);
             self.phase = "running".into();
             self.started = Instant::now();
         } else {
             self.phase = "ready".into();
             self.active = None;
-            if let Some(answer) = job["result"]["final_response"].as_str() {
-                self.log_markdown(answer);
-                self.copy_response = answer.into();
-            }
-            if !job["error"].is_null() {
-                self.log_error(&format!("! {}", job["error"]));
-            }
             self.log("Send a follow-up to continue. Previous actions will not be replayed automatically.");
         }
         if self.options.temporary && self.conversation_temporary == Some(false) {
@@ -1919,11 +1969,15 @@ impl State {
                     );
                 }
             }
-            Update::Started(id) => {
+            Update::Started {
+                id,
+                conversation_id,
+            } => {
                 if self.debug.level >= 1 {
-                    self.log_debug("agent", &format!("started job {id}"));
+                    self.log_debug("agent", &format!("started job {id} ({conversation_id})"));
                 }
                 self.active = Some(id);
+                self.conversation_id = Some(conversation_id);
                 if let Some(temp) = self.pending_temporary.take() {
                     self.conversation_temporary = Some(temp);
                 }
@@ -1938,7 +1992,7 @@ impl State {
                 self.started = Instant::now();
             }
             Update::Error(error) => self.error(&error),
-            Update::Loaded(job) => self.load(job),
+            Update::Loaded(conversation) => self.load(conversation),
             Update::Models(capability) => {
                 if self.active.is_none() {
                     self.phase = "ready".into();
@@ -1977,27 +2031,24 @@ impl State {
             Update::BrowserControl(text) => self.log(&text),
             Update::Cache(report, options) => self.log(&super::cache::report(&report, options)),
             Update::CacheError(error) => self.log_error(&format!("Cache: {error}")),
-            Update::Conversations(jobs) => {
+            Update::Conversations(conversations) => {
                 self.resume_notice = None;
                 self.phase = "ready".into();
-                let choices: Vec<_> = jobs
+                let choices: Vec<_> = conversations
                     .into_iter()
                     .take(30)
-                    .filter_map(|j| {
-                        let temp = if job_session_is_temporary(&j) == Some(true) {
-                            " [temp]"
-                        } else {
-                            ""
-                        };
-                        Some(Choice {
+                    .map(|c| {
+                        let temp = if c.is_temporary() { " [temp]" } else { "" };
+                        Choice {
                             label: format!(
-                                "{}{} · {}",
-                                j["state"].as_str().unwrap_or("saved"),
+                                "{}{} · {}t · {}",
+                                c.state,
                                 temp,
-                                clip(j["request"]["task"].as_str().unwrap_or(""), 80)
+                                c.turn_count.max(1),
+                                clip(&c.title, 72)
                             ),
-                            value: Selection::Resume(j["id"].as_str()?.into()),
-                        })
+                            value: Selection::Resume(c.id),
+                        }
                     })
                     .collect();
                 if choices.is_empty() {
@@ -2013,8 +2064,8 @@ impl State {
             Update::ConversationDeleted(id) => {
                 self.deleting_conversation = None;
                 self.phase = "ready".into();
-                if self.parent.as_deref() == Some(&id) {
-                    self.parent = None;
+                if self.conversation_id.as_deref() == Some(&id) {
+                    self.conversation_id = None;
                     self.conversation_temporary = None;
                     self.pending_temporary = None;
                     self.reset_temporary_to_preference();
@@ -2213,7 +2264,9 @@ impl State {
     }
 
     fn handle_finished(&mut self, job: Value) {
-        self.parent = job["id"].as_str().map(str::to_owned);
+        if let Some(conv_id) = job["conversation_id"].as_str().filter(|s| !s.is_empty()) {
+            self.conversation_id = Some(conv_id.to_owned());
+        }
         let pending = self.pending_temporary.take();
         self.conversation_temporary = job_session_is_temporary(&job)
             .or(pending)

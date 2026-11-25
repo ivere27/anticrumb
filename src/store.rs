@@ -298,6 +298,85 @@ impl Store {
               INSERT INTO transfer_stats(run_id,reused) VALUES(NEW.run_id,1)
               ON CONFLICT(run_id) DO UPDATE SET reused=1;
             END;
+            CREATE TABLE IF NOT EXISTS agent_turns(
+              id TEXT PRIMARY KEY,
+              conversation_id TEXT NOT NULL,
+              workspace TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              session_mode TEXT NOT NULL,
+              chat_only INTEGER NOT NULL DEFAULT 0,
+              task TEXT NOT NULL DEFAULT '',
+              model TEXT,
+              thinking TEXT,
+              created_at INTEGER NOT NULL DEFAULT 0,
+              updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS agent_turns_conv_order ON agent_turns(conversation_id, created_at ASC, id ASC);
+            CREATE INDEX IF NOT EXISTS agent_turns_scope_updated ON agent_turns(workspace, account_id, updated_at DESC, created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS agent_turns_insert AFTER INSERT ON objects WHEN NEW.scope='local' AND NEW.kind='agent' BEGIN
+              INSERT INTO agent_turns(id,conversation_id,workspace,account_id,state,session_mode,chat_only,task,model,thinking,created_at,updated_at) VALUES(
+                NEW.id,
+                coalesce(nullif(json_extract(NEW.payload,'$.conversation_id'),''), nullif(json_extract(NEW.payload,'$.request.conversation_id'),''), NEW.id),
+                coalesce(json_extract(NEW.payload,'$.request.workspace'),''),
+                coalesce(nullif(json_extract(NEW.payload,'$.request.account_id'),''),'default'),
+                coalesce(json_extract(NEW.payload,'$.state'),''),
+                coalesce(nullif(json_extract(NEW.payload,'$.request.session_mode'),''),'chat'),
+                CASE WHEN coalesce(json_extract(NEW.payload,'$.request.chat_only'),0) THEN 1 ELSE 0 END,
+                coalesce(json_extract(NEW.payload,'$.request.task'),''),
+                nullif(json_extract(NEW.payload,'$.request.model'),''),
+                nullif(json_extract(NEW.payload,'$.request.thinking'),''),
+                coalesce(json_extract(NEW.payload,'$.created_at'),0),
+                CASE WHEN coalesce(json_extract(NEW.payload,'$.updated_at'),0) > coalesce(json_extract(NEW.payload,'$.created_at'),0)
+                     THEN json_extract(NEW.payload,'$.updated_at')
+                     ELSE coalesce(json_extract(NEW.payload,'$.created_at'),0) END
+              )
+              ON CONFLICT(id) DO UPDATE SET
+                conversation_id=excluded.conversation_id,
+                workspace=excluded.workspace,
+                account_id=excluded.account_id,
+                state=excluded.state,
+                session_mode=excluded.session_mode,
+                chat_only=excluded.chat_only,
+                task=excluded.task,
+                model=excluded.model,
+                thinking=excluded.thinking,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at;
+            END;
+            CREATE TRIGGER IF NOT EXISTS agent_turns_update AFTER UPDATE ON objects WHEN NEW.scope='local' AND NEW.kind='agent' BEGIN
+              INSERT INTO agent_turns(id,conversation_id,workspace,account_id,state,session_mode,chat_only,task,model,thinking,created_at,updated_at) VALUES(
+                NEW.id,
+                coalesce(nullif(json_extract(NEW.payload,'$.conversation_id'),''), nullif(json_extract(NEW.payload,'$.request.conversation_id'),''), NEW.id),
+                coalesce(json_extract(NEW.payload,'$.request.workspace'),''),
+                coalesce(nullif(json_extract(NEW.payload,'$.request.account_id'),''),'default'),
+                coalesce(json_extract(NEW.payload,'$.state'),''),
+                coalesce(nullif(json_extract(NEW.payload,'$.request.session_mode'),''),'chat'),
+                CASE WHEN coalesce(json_extract(NEW.payload,'$.request.chat_only'),0) THEN 1 ELSE 0 END,
+                coalesce(json_extract(NEW.payload,'$.request.task'),''),
+                nullif(json_extract(NEW.payload,'$.request.model'),''),
+                nullif(json_extract(NEW.payload,'$.request.thinking'),''),
+                coalesce(json_extract(NEW.payload,'$.created_at'),0),
+                CASE WHEN coalesce(json_extract(NEW.payload,'$.updated_at'),0) > coalesce(json_extract(NEW.payload,'$.created_at'),0)
+                     THEN json_extract(NEW.payload,'$.updated_at')
+                     ELSE coalesce(json_extract(NEW.payload,'$.created_at'),0) END
+              )
+              ON CONFLICT(id) DO UPDATE SET
+                conversation_id=excluded.conversation_id,
+                workspace=excluded.workspace,
+                account_id=excluded.account_id,
+                state=excluded.state,
+                session_mode=excluded.session_mode,
+                chat_only=excluded.chat_only,
+                task=excluded.task,
+                model=excluded.model,
+                thinking=excluded.thinking,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at;
+            END;
+            CREATE TRIGGER IF NOT EXISTS agent_turns_delete AFTER DELETE ON objects WHEN OLD.scope='local' AND OLD.kind='agent' BEGIN
+              DELETE FROM agent_turns WHERE id=OLD.id;
+            END;
             PRAGMA max_page_count=262144;",
         )
         .map_err(ServiceError::storage)?;
@@ -1206,101 +1285,227 @@ impl Store {
         tx.commit().map_err(ServiceError::storage)?;
         Ok(value)
     }
-    pub(crate) fn delete_agent_turn(
+    pub fn list_conversations(
         &self,
-        id: &str,
+        workspace: Option<&Path>,
+        account_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>> {
+        let conn = self.conn.lock().map_err(ServiceError::storage)?;
+        let workspace_str = workspace.map(|p| p.to_string_lossy().into_owned());
+        let limit = if limit == 0 { 50 } else { limit.clamp(1, 500) } as i64;
+        let mut conditions = Vec::new();
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(ws) = &workspace_str {
+            conditions.push("workspace = ?");
+            bind.push(ws);
+        }
+        if let Some(acct) = &account_id {
+            conditions.push("account_id = ?");
+            bind.push(acct);
+        }
+        bind.push(&limit);
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "WITH ranked AS (
+               SELECT
+                 id,
+                 conversation_id,
+                 workspace,
+                 account_id,
+                 state,
+                 chat_only,
+                 model,
+                 thinking,
+                 FIRST_VALUE(task) OVER (PARTITION BY conversation_id ORDER BY created_at ASC, id ASC) AS first_task,
+                 ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at DESC, id DESC) AS rn_last,
+                 COUNT(*) OVER (PARTITION BY conversation_id) AS turn_count,
+                 MIN(created_at) OVER (PARTITION BY conversation_id) AS conv_created_at,
+                 MAX(updated_at) OVER (PARTITION BY conversation_id) AS conv_updated_at,
+                 MAX(CASE WHEN session_mode = 'temporary' THEN 1 ELSE 0 END) OVER (PARTITION BY conversation_id) AS any_temporary
+               FROM agent_turns
+               {where_clause}
+             )
+             SELECT
+               conversation_id,
+               id,
+               workspace,
+               account_id,
+               state,
+               any_temporary,
+               first_task,
+               turn_count,
+               conv_created_at,
+               conv_updated_at,
+               model,
+               thinking,
+               chat_only
+             FROM ranked
+             WHERE rn_last = 1
+             ORDER BY conv_updated_at DESC, conv_created_at DESC, conversation_id DESC
+             LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(ServiceError::storage)?;
+        let rows = stmt
+            .query_map(bind.as_slice(), |r| {
+                let session_mode = if r.get::<_, i64>(5)? != 0 {
+                    SessionMode::Temporary
+                } else {
+                    SessionMode::Chat
+                };
+                Ok(ConversationSummary {
+                    id: r.get(0)?,
+                    latest_agent_id: r.get(1)?,
+                    workspace: PathBuf::from(r.get::<_, String>(2)?),
+                    account_id: r.get(3)?,
+                    state: r.get(4)?,
+                    session_mode,
+                    title: r.get(6)?,
+                    turn_count: u32::try_from(r.get::<_, i64>(7)?.max(0)).unwrap_or(u32::MAX),
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
+                    model: r.get(10)?,
+                    thinking: r.get(11)?,
+                    chat_only: r.get::<_, i64>(12)? != 0,
+                })
+            })
+            .map_err(ServiceError::storage)?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(ServiceError::storage)
+    }
+    pub fn get_conversation(&self, conversation_id: &str) -> Result<ConversationRecord> {
+        let conn = self.conn.lock().map_err(ServiceError::storage)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.payload
+                 FROM agent_turns t
+                 JOIN objects o ON o.scope='local' AND o.kind='agent' AND o.id=t.id
+                 WHERE t.conversation_id=?1
+                 ORDER BY t.created_at ASC, t.id ASC",
+            )
+            .map_err(ServiceError::storage)?;
+        let rows = stmt
+            .query_map([conversation_id], |r| r.get::<_, String>(0))
+            .map_err(ServiceError::storage)?;
+        let turns: Vec<AgentRecord> = rows
+            .map(|r| {
+                serde_json::from_str(&r.map_err(ServiceError::storage)?)
+                    .map_err(ServiceError::storage)
+            })
+            .collect::<Result<_>>()?;
+        ConversationRecord::from_turns(conversation_id, turns).ok_or_else(|| {
+            ServiceError::new(ErrorCode::NotFound, "agent", "saved conversation not found")
+        })
+    }
+    pub(crate) fn delete_conversation(
+        &self,
+        conversation_id: &str,
+        workspace: Option<&Path>,
+        account_id: Option<&str>,
         is_active_control: impl Fn(&str) -> bool,
     ) -> Result<()> {
         let mut conn = self.conn.lock().map_err(ServiceError::storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ServiceError::storage)?;
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT payload FROM objects WHERE scope='local' AND kind='agent' AND id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(ServiceError::storage)?;
-        let job: AgentRecord = serde_json::from_str(&raw.ok_or_else(|| {
-            ServiceError::new(ErrorCode::NotFound, "agent", "saved conversation not found")
-        })?)
-        .map_err(ServiceError::storage)?;
-        if is_active_control(id) || job.is_active() {
-            return Err(ServiceError::invalid(
-                "conversation is still running; interrupt it and wait for it to stop before deleting",
-            ));
-        }
-        let children: Vec<(String, String)> = {
+        let raw_turns: Vec<(String, String)> = {
             let mut statement = tx
-                .prepare("SELECT id,payload FROM objects WHERE scope='local' AND kind='agent' AND json_extract(payload,'$.request.parent_id')=?1")
+                .prepare(
+                    "SELECT o.id, o.payload
+                     FROM agent_turns t
+                     JOIN objects o ON o.scope='local' AND o.kind='agent' AND o.id=t.id
+                     WHERE t.conversation_id=?1
+                     ORDER BY t.created_at ASC, t.id ASC",
+                )
                 .map_err(ServiceError::storage)?;
             let rows = statement
-                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map([conversation_id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(ServiceError::storage)?;
             rows.collect::<std::result::Result<_, _>>()
                 .map_err(ServiceError::storage)?
         };
-        for (child_id, raw) in children {
-            let mut child: AgentRecord =
-                serde_json::from_str(&raw).map_err(ServiceError::storage)?;
-            if is_active_control(&child_id) || child.is_active() {
-                return Err(ServiceError::invalid(
-                    "a follow-up to this conversation is still running; wait for it to stop before deleting",
-                ));
-            }
-            if child.request.workspace != job.request.workspace
-                || child.request.account_id != job.request.account_id
-            {
-                return Err(ServiceError::invalid(
-                    "cannot delete a conversation referenced by another workspace or account",
-                ));
-            }
-            child.request.parent_id = job.request.parent_id.clone();
-            tx.execute(
-                "UPDATE objects SET payload=?1 WHERE scope='local' AND kind='agent' AND id=?2",
-                params![
-                    serde_json::to_string(&child).map_err(ServiceError::storage)?,
-                    child_id
-                ],
-            )
-            .map_err(ServiceError::storage)?;
+        if raw_turns.is_empty() {
+            return Err(ServiceError::new(
+                ErrorCode::NotFound,
+                "agent",
+                "saved conversation not found",
+            ));
         }
-        let ownership_events: Vec<(String, Value)> = {
+        let mut turns = Vec::with_capacity(raw_turns.len());
+        for (turn_id, raw) in raw_turns {
+            let job: AgentRecord = serde_json::from_str(&raw).map_err(ServiceError::storage)?;
+            if is_active_control(&turn_id) || job.is_active() {
+                return Err(ServiceError::invalid(
+                    "conversation is still running; interrupt it and wait for it to stop before deleting",
+                ));
+            }
+            if let Some(expected_ws) = workspace {
+                if job.request.workspace != expected_ws {
+                    return Err(ServiceError::invalid(
+                        "conversation deletion requires the same workspace and account",
+                    ));
+                }
+            }
+            if let Some(expected_acct) = account_id {
+                let job_acct = if job.request.account_id.is_empty() {
+                    "default"
+                } else {
+                    job.request.account_id.as_str()
+                };
+                if job_acct != expected_acct {
+                    return Err(ServiceError::invalid(
+                        "conversation deletion requires the same workspace and account",
+                    ));
+                }
+            }
+            turns.push(job);
+        }
+        let cleanup_account = if turns[0].request.account_id.is_empty() {
+            "default".into()
+        } else {
+            turns[0].request.account_id.clone()
+        };
+        let mut ownership_events: Vec<(String, Value)> = Vec::new();
+        {
             let mut statement = tx
                 .prepare("SELECT kind,data FROM events WHERE run_id=?1 AND kind IN ('browser_turn','browser_session','subagent_browser_session')")
                 .map_err(ServiceError::storage)?;
-            let rows = statement
-                .query_map([id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
-                .map_err(ServiceError::storage)?;
-            let mut collected = Vec::new();
-            for row in rows {
-                let (kind, raw) = row.map_err(ServiceError::storage)?;
-                let data: Value = serde_json::from_str(&raw).map_err(ServiceError::storage)?;
-                collected.push((kind, data));
+            for turn in &turns {
+                let rows = statement
+                    .query_map([&turn.id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(ServiceError::storage)?;
+                for row in rows {
+                    let (kind, raw) = row.map_err(ServiceError::storage)?;
+                    let data: Value = serde_json::from_str(&raw).map_err(ServiceError::storage)?;
+                    ownership_events.push((kind, data));
+                }
             }
-            collected
         };
         let cleanup_job =
-            crate::service::cleanup::build_job(id, &job.request.account_id, ownership_events);
+            crate::service::cleanup::build_job(conversation_id, &cleanup_account, ownership_events);
         tx.execute(
             "INSERT INTO objects VALUES('local','chat_cleanup',?1,?2) ON CONFLICT(scope,kind,id) DO UPDATE SET payload=excluded.payload",
             params![
-                id,
+                conversation_id,
                 serde_json::to_string(&cleanup_job).map_err(ServiceError::storage)?
             ],
         )
         .map_err(ServiceError::storage)?;
-        tx.execute("DELETE FROM events WHERE run_id=?1", [id])
+        for turn in &turns {
+            tx.execute("DELETE FROM events WHERE run_id=?1", [&turn.id])
+                .map_err(ServiceError::storage)?;
+            tx.execute(
+                "DELETE FROM objects WHERE scope='local' AND kind='agent' AND id=?1",
+                [&turn.id],
+            )
             .map_err(ServiceError::storage)?;
-        tx.execute(
-            "DELETE FROM objects WHERE scope='local' AND kind='agent' AND id=?1",
-            [id],
-        )
-        .map_err(ServiceError::storage)?;
+        }
         tx.commit().map_err(ServiceError::storage)?;
         Ok(())
     }
