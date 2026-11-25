@@ -713,13 +713,8 @@ impl State {
         let theme_name = self.theme.name.to_owned();
         let workspace = self.options.workspace.display().to_string();
         let account = self.options.account.clone();
-        let conversation = self
-            .active
-            .as_ref()
-            .or(self.parent.as_ref())
-            .map(String::as_str)
-            .unwrap_or("new")
-            .to_owned();
+        let conversation = self.conversation_id.as_deref().unwrap_or("new").to_owned();
+        let active_turn = self.active.clone();
         let perms = self.options.effective_permissions();
         let store = crate::store::Store::open(&crate::cli::root()).ok();
         let pace = self
@@ -812,6 +807,9 @@ impl State {
                 (format!("Conversation: {conversation}"), Face::HIGHLIGHT),
             ],
         );
+        if let Some(turn_id) = active_turn {
+            self.log_kv("· ", Face::ACCENT, "Active turn", &turn_id, Face::MUTED);
+        }
         self.log_kv(
             "· ",
             Face::ACCENT,
@@ -1013,7 +1011,7 @@ impl State {
                     (detail, Face::MUTED),
                 ],
             );
-            if (self.active.is_some() || self.parent.is_some())
+            if (self.conversation_id.is_some() || self.active.is_some())
                 && self.conversation_temporary != Some(true)
             {
                 self.log("  Next turn opens a new temporary chat with local context instead of continuing the server chat.");
@@ -1030,6 +1028,16 @@ impl State {
                     (detail, Face::MUTED),
                 ],
             );
+            if self.conversation_temporary == Some(true)
+                && self.active.is_none()
+                && self.conversation_id.is_some()
+            {
+                self.conversation_id = None;
+                self.conversation_temporary = None;
+                self.log("  Detached from the temporary conversation; the next turn starts a fresh normal conversation.");
+            } else if self.conversation_temporary == Some(true) && self.active.is_some() {
+                self.log("  Current temporary turn continues; the next turn starts a fresh normal conversation.");
+            }
         }
     }
 
@@ -1303,7 +1311,7 @@ impl State {
                     self.send(sink, command);
                 }
                 "/new" | "/clear" if !self.busy() => {
-                    self.parent = None;
+                    self.conversation_id = None;
                     self.conversation_temporary = None;
                     self.pending_temporary = None;
                     self.reset_temporary_to_preference();
@@ -1620,9 +1628,13 @@ impl State {
             }
             .into();
             self.started = Instant::now();
+            if !self.options.temporary && self.conversation_temporary == Some(true) {
+                self.conversation_id = None;
+                self.conversation_temporary = None;
+            }
             let request = self
                 .options
-                .agent_request(prepared.text, self.parent.clone());
+                .agent_request(prepared.text, self.conversation_id.clone());
             self.pending_temporary = Some(request.is_temporary());
             Command::Start(request, prepared.files, prepared.temp_files)
         };

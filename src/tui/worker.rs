@@ -15,11 +15,14 @@ pub(super) enum Update {
     Status(Value),
     StatusReport(Option<Value>),
     StatusDisconnected,
-    Started(String),
+    Started {
+        id: String,
+        conversation_id: String,
+    },
     Event(crate::domain::Event),
     Finished(Value),
-    Loaded(Value),
-    Conversations(Vec<Value>),
+    Loaded(ConversationRecord),
+    Conversations(Vec<ConversationSummary>),
     ConversationDeleted(String),
     ConversationDeleteError(String),
     WebHistoryQueued(Value),
@@ -214,13 +217,18 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             request.artifacts = client
                                 .upload_files_async(&request.account_id, &files, &temp_files)
                                 .await?;
-                            let id = client.start_agent_async(request).await?;
-                            active = Some(id.clone());
+                            let started = client.start_agent_async(request).await?;
+                            active = Some(started.id.clone());
                             after = 0;
                             active_interval = ACTIVE_POLL_MIN;
                             next_active_at = Instant::now();
                             let _ = tx.send(Update::Accepted(files.len())).await;
-                            let _ = tx.send(Update::Started(id)).await;
+                            let _ = tx
+                                .send(Update::Started {
+                                    id: started.id,
+                                    conversation_id: started.conversation_id,
+                                })
+                                .await;
                         }
                         Command::Steer {
                             id,
@@ -440,17 +448,22 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             }
                         }
                         Command::Load(id, mut options) => {
-                            let job = client
+                            let conv = client
                                 .conversation_async(&id, &options.workspace, &options.account)
                                 .await?;
-                            options.inherit_from_job(&job)?;
-                            if job["state"] == "running" {
-                                active = job["id"].as_str().map(str::to_owned);
+                            let latest = conv
+                                .latest_turn()
+                                .ok_or_else(|| ServiceError::invalid("conversation has no turns"))?;
+                            options.inherit(&latest.request)?;
+                            if latest.is_active() {
+                                active = Some(latest.id.clone());
                                 after = 0;
                                 active_interval = ACTIVE_POLL_MIN;
                                 next_active_at = Instant::now();
+                            } else {
+                                active = None;
                             }
-                            let _ = tx.send(Update::Loaded(job)).await;
+                            let _ = tx.send(Update::Loaded(conv)).await;
                         }
                         Command::SearchMentions { .. } => {
                             // Handled by MentionSearchHandle directly; this arm
@@ -488,7 +501,7 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             return Ok(());
                         }
                         let agent = client.agent_async(&id).await?;
-                        if agent.state != "running" {
+                        if !matches!(agent.state.as_str(), "running" | "queued") {
                             // Drain events written between the first read and terminal state persistence.
                             for event in client.events_async(&id, after).await? {
                                 after = event.sequence;

@@ -339,30 +339,6 @@ pub trait AccountServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<Account>>;
 
 
-    fn attach_browser(&self, context: Context,
-
-        request: AttachBrowserRequest,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
-
-
-    fn open_login(&self, context: Context,
-
-        request: AccountRef,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
-
-
-    fn set_browser_mode(&self, context: Context,
-
-        request: SetBrowserModeRequest,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
-
-
     fn pause_account(&self, context: Context,
 
         request: AccountRef,
@@ -377,6 +353,30 @@ pub trait AccountServiceService: synurang_call::Service + 'static {
 
 
     ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
+
+
+    fn attach_browser(&self, context: Context,
+
+        request: AttachBrowserRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
+
+
+    fn set_browser_mode(&self, context: Context,
+
+        request: SetBrowserModeRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
+
+
+    fn open_login(&self, context: Context,
+
+        request: AccountRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
 
 
     fn get_web_usage(&self, context: Context,
@@ -468,72 +468,6 @@ pub fn register_account_service<S: AccountServiceService>(instance: &mut Instanc
 
     {
         let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/AttachBrowser",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<AttachBrowserRequest>();
-                    let responses = responses.typed::<BrowserStatus>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.attach_browser(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/OpenLogin",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<AccountRef>();
-                    let responses = responses.typed::<Empty>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.open_login(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/SetBrowserMode",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<SetBrowserModeRequest>();
-                    let responses = responses.typed::<BrowserStatus>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.set_browser_mode(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
         instance.register("/anticrumb.v1.AccountService/PauseAccount",
             false,
             false,
@@ -569,6 +503,72 @@ pub fn register_account_service<S: AccountServiceService>(instance: &mut Instanc
 
 
                     let response = service.get_browser_status(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/AttachBrowser",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<AttachBrowserRequest>();
+                    let responses = responses.typed::<BrowserStatus>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.attach_browser(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/SetBrowserMode",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<SetBrowserModeRequest>();
+                    let responses = responses.typed::<BrowserStatus>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.set_browser_mode(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/OpenLogin",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<AccountRef>();
+                    let responses = responses.typed::<Empty>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.open_login(context,
                         request).await?;
                     responses.send(response).await
 
@@ -1215,7 +1215,7 @@ pub trait WorkspaceServiceService: synurang_call::Service + 'static {
         request: AgentRequest,
 
 
-    ) -> impl synurang_call::ServiceFuture<Result<AgentRef>>;
+    ) -> impl synurang_call::ServiceFuture<Result<StartAgentResponse>>;
 
 
     fn get_agent(&self, context: Context,
@@ -1234,9 +1234,9 @@ pub trait WorkspaceServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<AgentList>>;
 
 
-    fn delete_agent(&self, context: Context,
+    fn steer_agent(&self, context: Context,
 
-        request: AgentRef,
+        request: SteerRequest,
 
 
     ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
@@ -1250,28 +1250,44 @@ pub trait WorkspaceServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
 
 
-    fn steer_agent(&self, context: Context,
-
-        request: SteerRequest,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
-
-
-    fn resume_agent(&self, context: Context,
-
-        request: AgentRef,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<AgentRef>>;
-
-
     fn read_agent_events(&self, context: Context,
 
         request: EventCursor,
 
 
     ) -> impl synurang_call::ServiceFuture<Result<EventPage>>;
+
+
+    fn get_conversation(&self, context: Context,
+
+        request: ConversationRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Conversation>>;
+
+
+    fn list_conversations(&self, context: Context,
+
+        request: ListConversationsRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<ConversationList>>;
+
+
+    fn resume_conversation(&self, context: Context,
+
+        request: ConversationRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<StartAgentResponse>>;
+
+
+    fn delete_agent_conversation(&self, context: Context,
+
+        request: DeleteConversationRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
 
 
     fn query_knowledge(&self, context: Context,
@@ -1316,7 +1332,7 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
                 let service = service.clone();
                 Box::pin(async move {
                     let mut requests = requests.typed::<AgentRequest>();
-                    let responses = responses.typed::<AgentRef>();
+                    let responses = responses.typed::<StartAgentResponse>();
 
                     let request = requests.one().await?;
 
@@ -1375,19 +1391,19 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
 
     {
         let service = service.clone();
-        instance.register("/anticrumb.v1.WorkspaceService/DeleteAgent",
+        instance.register("/anticrumb.v1.WorkspaceService/SteerAgent",
             false,
             false,
             move |context, requests, responses| {
                 let service = service.clone();
                 Box::pin(async move {
-                    let mut requests = requests.typed::<AgentRef>();
+                    let mut requests = requests.typed::<SteerRequest>();
                     let responses = responses.typed::<Empty>();
 
                     let request = requests.one().await?;
 
 
-                    let response = service.delete_agent(context,
+                    let response = service.steer_agent(context,
                         request).await?;
                     responses.send(response).await
 
@@ -1419,50 +1435,6 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
 
     {
         let service = service.clone();
-        instance.register("/anticrumb.v1.WorkspaceService/SteerAgent",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<SteerRequest>();
-                    let responses = responses.typed::<Empty>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.steer_agent(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.WorkspaceService/ResumeAgent",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<AgentRef>();
-                    let responses = responses.typed::<AgentRef>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.resume_agent(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
         instance.register("/anticrumb.v1.WorkspaceService/ReadAgentEvents",
             false,
             false,
@@ -1476,6 +1448,94 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
 
 
                     let response = service.read_agent_events(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/GetConversation",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ConversationRef>();
+                    let responses = responses.typed::<Conversation>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.get_conversation(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/ListConversations",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ListConversationsRequest>();
+                    let responses = responses.typed::<ConversationList>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.list_conversations(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/ResumeConversation",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ConversationRef>();
+                    let responses = responses.typed::<StartAgentResponse>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.resume_conversation(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/DeleteAgentConversation",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<DeleteConversationRequest>();
+                    let responses = responses.typed::<Empty>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.delete_agent_conversation(context,
                         request).await?;
                     responses.send(response).await
 

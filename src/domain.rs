@@ -721,7 +721,7 @@ pub struct AgentRequest {
     #[serde(default)]
     pub artifacts: Vec<String>,
     #[serde(default)]
-    pub parent_id: Option<String>,
+    pub conversation_id: Option<String>,
     #[serde(default)]
     pub chat_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -761,6 +761,8 @@ where
 pub struct AgentRecord {
     pub id: String,
     #[serde(default)]
+    pub conversation_id: String,
+    #[serde(default)]
     pub state: String,
     pub request: AgentRequest,
     #[serde(default)]
@@ -776,6 +778,99 @@ pub struct AgentRecord {
 impl AgentRecord {
     pub fn is_active(&self) -> bool {
         matches!(self.state.as_str(), "running" | "queued")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartedAgent {
+    pub id: String,
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub id: String,
+    pub latest_agent_id: String,
+    pub workspace: PathBuf,
+    pub account_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub session_mode: SessionMode,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub turn_count: u32,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub chat_only: bool,
+}
+
+impl ConversationSummary {
+    pub const fn is_temporary(&self) -> bool {
+        self.session_mode.is_temporary()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationRecord {
+    pub summary: ConversationSummary,
+    pub turns: Vec<AgentRecord>,
+}
+
+impl ConversationRecord {
+    /// Builds a conversation record from its turns, sorting them chronologically
+    /// and deriving the summary from a single source of truth.
+    pub fn from_turns(id: impl Into<String>, mut turns: Vec<AgentRecord>) -> Option<Self> {
+        turns.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let first = turns.first()?;
+        let latest = turns.last()?;
+        let created_at = turns.iter().map(|t| t.created_at).min().unwrap_or(0);
+        let updated_at = turns
+            .iter()
+            .map(|t| t.updated_at.max(t.created_at))
+            .max()
+            .unwrap_or(0);
+        let session_mode = if turns.iter().any(|t| t.request.is_temporary()) {
+            SessionMode::Temporary
+        } else {
+            SessionMode::Chat
+        };
+        let account_id = if latest.request.account_id.is_empty() {
+            "default".into()
+        } else {
+            latest.request.account_id.clone()
+        };
+        let summary = ConversationSummary {
+            id: id.into(),
+            latest_agent_id: latest.id.clone(),
+            workspace: latest.request.workspace.clone(),
+            account_id,
+            state: latest.state.clone(),
+            session_mode,
+            title: first.request.task.clone(),
+            turn_count: u32::try_from(turns.len()).unwrap_or(u32::MAX),
+            created_at,
+            updated_at,
+            model: latest.request.model.clone(),
+            thinking: latest.request.thinking.clone(),
+            chat_only: latest.request.chat_only,
+        };
+        Some(Self { summary, turns })
+    }
+
+    pub fn latest_turn(&self) -> Option<&AgentRecord> {
+        self.turns.last()
     }
 }
 

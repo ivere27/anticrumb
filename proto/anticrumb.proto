@@ -41,22 +41,9 @@ package anticrumb.v1;
 option java_package = "io.anticrumb.v1";
 option java_multiple_files = true;
 
-// Standard gRPC client binding on a same-user local connection. No transport
-// preamble or bearer token. Browser selection is explicit and workspace tools
-// always execute on the local daemon.
-message ConnectClientRequest {
-  string protocol = 1;
-  RemoteBrowser remote = 2;
-  optional uint32 workers = 3;
-  optional string pace = 4;
-}
-message RemoteBrowser {
-  string endpoint = 1;
-  string token = 2;
-  optional string ca_file = 3;
-  optional string server_name = 4;
-  optional string tls_pin = 5;
-}
+// =============================================================================
+// Services
+// =============================================================================
 
 service PlatformService {
   rpc GetInfo(Empty) returns (HostInfo);
@@ -80,15 +67,15 @@ service ProviderService {
 service AccountService {
   rpc ListAccounts(Empty) returns (AccountList);
   rpc CreateAccount(CreateAccountRequest) returns (Account);
-  // Explicitly attaches a running, verified Chrome profile on the daemon host.
-  rpc AttachBrowser(AttachBrowserRequest) returns (BrowserStatus);
-  // Opens a visible managed profile on the daemon host, never the TUI host.
-  rpc OpenLogin(AccountRef) returns (Empty);
-  // Switches the managed account browser between headless and visible window mode.
-  rpc SetBrowserMode(SetBrowserModeRequest) returns (BrowserStatus);
   rpc PauseAccount(AccountRef) returns (Account);
   // Connectivity/profile diagnostics. Authentication is last-verified evidence.
   rpc GetBrowserStatus(AccountRef) returns (BrowserStatus);
+  // Explicitly attaches a running, verified Chrome profile on the daemon host.
+  rpc AttachBrowser(AttachBrowserRequest) returns (BrowserStatus);
+  // Switches the managed account browser between headless and visible window mode.
+  rpc SetBrowserMode(SetBrowserModeRequest) returns (BrowserStatus);
+  // Opens a visible managed profile on the daemon host, never the TUI host.
+  rpc OpenLogin(AccountRef) returns (Empty);
   // Explicit live read of the signed-in account's usage page. Does not submit a
   // model turn, refresh the model catalog, or infer exact quota from local use.
   rpc GetWebUsage(AccountRef) returns (WebUsage);
@@ -153,316 +140,130 @@ service WorkspaceService {
   // Idempotently binds this local IPC connection to a browser backend. This
   // operation is unavailable on network listeners and internal FFI modules.
   rpc ConnectClient(ConnectClientRequest) returns (HostInfo);
-  rpc StartAgent(AgentRequest) returns (AgentRef);
+  rpc StartAgent(AgentRequest) returns (StartAgentResponse);
   rpc GetAgent(AgentRef) returns (Agent);
   rpc ListAgents(Empty) returns (AgentList);
-  // Delete one finished local record and its events, and queue removal of its
-  // recorded web chats. Active records and active dependent turns reject.
-  rpc DeleteAgent(AgentRef) returns (Empty);
-  rpc CancelAgent(AgentRef) returns (Empty);
   rpc SteerAgent(SteerRequest) returns (Empty);
-  rpc ResumeAgent(AgentRef) returns (AgentRef);
+  rpc CancelAgent(AgentRef) returns (Empty);
   rpc ReadAgentEvents(EventCursor) returns (EventPage);
+  rpc GetConversation(ConversationRef) returns (Conversation);
+  rpc ListConversations(ListConversationsRequest) returns (ConversationList);
+  rpc ResumeConversation(ConversationRef) returns (StartAgentResponse);
+  // Delete one finished local conversation (all turns and events) and queue
+  // removal of its recorded web chats. Any active turn rejects.
+  rpc DeleteAgentConversation(DeleteConversationRequest) returns (Empty);
   rpc QueryKnowledge(KnowledgeQuery) returns (KnowledgeResults);
 }
 
+// =============================================================================
+// Shared Types
+// =============================================================================
+
 message Empty {}
-message ProviderRef { string id = 1; }
-message ProviderCapabilities {
-  bool browser_auth = 1;
-  bool temporary_sessions = 2;
-  bool file_uploads = 3;
-  bool image_generation = 4;
-  bool web_usage = 5;
-  bool web_history_cleanup = 6;
-  bool native_tools = 7;
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_REQUEST = 1;
+  UNSUPPORTED_CAPABILITY = 2;
+  NOT_FOUND = 3;
+  WORKSPACE_CONFLICT = 4;
+  TOOL_PROTOCOL_INVALID = 5;
+  AUTH_REQUIRED = 6;
+  VERIFICATION_REQUIRED = 7;
+  RATE_LIMITED = 8;
+  QUEUE_FULL = 9;
+  UI_CONTRACT_CHANGED = 10;
+  // Pre-submit session loss (tab closed, reset, navigated away, evicted, or
+  // invalidated). Safe for callers with local context to start a fresh session,
+  // unlike SUBMISSION_OUTCOME_UNKNOWN.
+  SESSION_UNAVAILABLE = 11;
+  SUBMISSION_OUTCOME_UNKNOWN = 12;
+  TRANSPORT_DISCONNECTED = 13;
+  UPLOAD_FAILED = 14;
+  MEDIA_DOWNLOAD_FAILED = 15;
+  CANCELLED = 16;
+  DEADLINE_EXCEEDED = 17;
+  STORAGE_FAILURE = 18;
+  INTERNAL = 19;
 }
-message ProviderInfo {
-  string id = 1;
-  string name = 2;
-  string version = 3;
-  string kind = 4;
-  optional string entry_url = 5;
-  string default_model = 6;
-  string source = 7;
-  ProviderCapabilities capabilities = 8;
-  // Follow-up agent prompts above this character count are attached as text files.
-  // Absent means 2000; zero attaches every nonempty follow-up.
-  optional uint32 inline_prompt_chars = 9;
+
+// Wire-compatible with Synurang core.v1.Error's first three fields. The extra
+// fields preserve actionable application errors across FFI, IPC, and gRPC.
+// Network failures use the corresponding gRPC status and these encoded details.
+message ErrorDetail {
+  ErrorCode code = 1;
+  string message = 2;
+  int32 grpc_code = 3;
+  string stage = 4;
+  string retry = 5; // never, after_human, after_delay, after_adapter_update, after_reconcile
 }
-message ProviderList { repeated ProviderInfo providers = 1; }
-message RegisterProviderRequest {
-  string id = 1;
-  string name = 2;
-  string version = 3;
-  string kind = 4;
-  optional string entry_url = 5;
-  repeated string allowed_origins = 6;
-  optional string default_model = 7;
-  optional string scripts_dir = 8;
-  map<string, string> scripts = 9;
-  ProviderCapabilities capabilities = 10;
-  repeated string auth_url_substrings = 11;
-  repeated string chat_url_prefixes = 12;
-  repeated string reusable_path_prefixes = 13;
-  optional string usage_url = 14;
-  optional string observer_binding = 15;
-  bool requires_models_control = 16;
-  optional uint32 inline_prompt_chars = 17;
+
+enum SessionMode {
+  SESSION_MODE_UNSPECIFIED = 0;
+  SESSION_MODE_CHAT = 1;
+  SESSION_MODE_TEMPORARY = 2; // Not anonymous guest mode; avoids server chat history.
 }
-message AccountRef { string account_id = 1; }
-message WebHistoryCleanupStatus {
-  string account_id = 1;
-  string state = 2; // idle, pending, running, completed, failed, interrupted
-  uint32 deleted = 3;
-  string error = 4;
-  int64 started_at = 5;
-  int64 updated_at = 6;
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_READY = 1;
+  SESSION_STATE_RUNNING = 2;
+  SESSION_STATE_AWAITING_HUMAN = 3;
+  SESSION_STATE_CLEANUP_PENDING = 4;
+  SESSION_STATE_CLOSED = 5;
+  SESSION_STATE_DELETED = 6;
+  SESSION_STATE_INVALIDATED = 7;
+  SESSION_STATE_OUTCOME_UNKNOWN = 8;
 }
-message TurnRef { string id = 1; }
-message SessionRef { string id = 1; }
-message AgentRef { string id = 1; }
+
+enum SessionRetention {
+  SESSION_RETENTION_UNSPECIFIED = 0;
+  SESSION_RETENTION_EPHEMERAL = 1; // Close the browser session after this turn or agent run ends.
+  SESSION_RETENTION_RETAIN = 2; // Keep the browser session open for follow-ups until closed or invalidated.
+}
+
+message EventCursor {
+  string run_id = 1;
+  int64 after = 2;
+}
+
+message Event {
+  string run_id = 1;
+  int64 sequence = 2;
+  string kind = 3;
+  string data_json = 4; // Extensible event payload, not an executable command.
+  int64 at = 5;
+}
+
+message EventPage {
+  repeated Event events = 1;
+}
+
+// =============================================================================
+// PlatformService Messages
+// =============================================================================
 
 message HostInfo {
   string server_id = 1; // Stable for a host state directory; scopes client caches.
-  string version = 2;
-  string platform = 3;
-  repeated string services = 4; // Fully qualified registered service names.
-  uint32 max_artifact_bytes = 5;
-  uint32 max_message_bytes = 6;
-  string role = 7; // browser or workspace
+  string role = 2; // browser or workspace
+  string version = 3;
+  string platform = 4;
+  repeated string services = 5; // Fully qualified registered service names.
+  uint32 max_artifact_bytes = 6;
+  uint32 max_message_bytes = 7;
 }
-message Account {
-  string id = 1;
-  string provider = 2;
-  string state = 3;
-  string profile = 4; // Diagnostic path on the browser host, not a client path.
-  optional string subprofile = 5;
-  uint32 port = 6;
-  bool headless = 7;
-}
-message AccountList { repeated Account accounts = 1; }
-message CreateAccountRequest {
-  string id = 1;
-  uint32 port = 2; // 0 = auto-assign next free CDP port
-  string provider = 3;
-}
-message AttachBrowserRequest { string account_id = 1; uint32 port = 2; }
-message SetBrowserModeRequest { string account_id = 1; bool headless = 2; }
-message BrowserStatus {
-  string account_id = 1;
-  string account_state = 2;
-  bool connected = 3;
-  string endpoint = 4;
-  optional string browser = 5;
-  string profile = 6;
-  optional bool profile_matches = 7;
-  optional bool headless = 8;
-  uint64 owned_sessions = 9;
-  optional bool last_verified_sign_in = 10;
-  optional int64 checked_at = 11; // Unix milliseconds; absent means never checked.
-  LoginStatus login = 12;
-}
-message LoginStatus {
-  string state = 1; // waiting, refreshing, ready, failed, or timed_out.
-  string error = 2; // Safe diagnostic for an explicitly opened sign-in flow.
-}
-message WebUsage {
-  string account_id = 1;
-  string server_id = 2;
-  int64 checked_at = 3; // Unix milliseconds of this successful observation.
-  optional string plan = 4;
-  repeated WebUsageLimit limits = 5;
-  string notice = 6; // Explains fields the web account does not expose.
-  string updated_label = 7; // The page's own update description, when shown.
-  string timezone = 8; // Browser timezone for the page's reset descriptions.
-}
-message WebUsageLimit {
-  string label = 1;
-  // Preserve site-provided values and units. Absent does not mean zero.
-  optional string used = 2;
-  optional string remaining = 3;
-  optional string limit = 4;
-  optional string reset = 5;
-  string status = 6;
-  string detail = 7;
-  optional double used_percent = 8; // Only when the page explicitly shows it.
-}
-message BrowserFetchRequest {
-  string account_id = 1;
-  string url = 2;
-  uint32 wait_ms = 3;
-  uint32 max_chars = 4;
-}
-message BrowserFetchResponse {
-  string url = 1;
-  string title = 2;
-  string text = 3;
-}
-message BrowserControlRequest {
-  string account_id = 1;
-  string session_id = 2;
-  string tab_id = 3;
-  uint32 timeout_ms = 4;
-  uint32 max_chars = 5;
-  uint32 wait_ms = 6; // Optional delay before observing the result, within timeout_ms.
-  oneof command {
-    Empty tabs = 10;
-    BrowserNavigate open = 11;
-    Empty use_tab = 12;
-    Empty snapshot = 13;
-    BrowserNavigate navigate = 14;
-    Empty back = 15;
-    Empty forward = 16;
-    Empty reload = 17;
-    BrowserTarget click = 18;
-    BrowserTextInput fill = 19;
-    BrowserTextInput type = 20;
-    BrowserKey press = 21;
-    BrowserSelect select = 22;
-    BrowserScroll scroll = 23;
-    BrowserWait wait = 24;
-    Empty close = 25;
-    Empty reset = 26;
-    BrowserCapture screenshot = 27;
-    BrowserPoint click_point = 28;
-    BrowserWheel wheel = 29;
-  }
-}
-message BrowserNavigate { string url = 1; }
-message BrowserRole { string role = 1; string name = 2; }
-message BrowserTarget {
-  oneof locator {
-    string ref = 1;
-    string css = 2;
-    string name = 3;
-    BrowserRole role = 4;
-  }
-}
-message BrowserTextInput { BrowserTarget target = 1; string text = 2; }
-message BrowserKey { string key = 1; BrowserTarget target = 2; repeated string modifiers = 3; }
-// Regions use viewport CSS pixels. Points use pixels in the identified screenshot.
-message BrowserRegion { double x = 1; double y = 2; double width = 3; double height = 4; }
-message BrowserCapture { BrowserRegion region = 1; }
-message BrowserPoint { string screenshot_id = 1; double x = 2; double y = 3; }
-message BrowserWheel { BrowserPoint point = 1; double delta_x = 2; double delta_y = 3; }
-message BrowserScreenshot {
-  string id = 1;
-  string artifact_id = 2;
-  uint32 width = 3;
-  uint32 height = 4;
-  BrowserRegion region = 5;
-  // Internal capture bytes; the RPC host stores them as an artifact and clears this field.
-  bytes png = 6;
-}
-message BrowserSelect { BrowserTarget target = 1; string value = 2; }
-message BrowserScroll { int32 x = 1; int32 y = 2; BrowserTarget target = 3; }
-message BrowserWait {
-  BrowserTarget target = 1;
-  enum State { VISIBLE = 0; HIDDEN = 1; }
-  State state = 2;
-}
-message BrowserControlElement {
-  string ref_id = 1;
-  string tag = 2;
-  string role = 3;
-  string label = 4;
-  string value = 5;
-  string href = 6;
-  bool disabled = 7;
-  optional bool checked = 8;
-  repeated BrowserSelectOption options = 9;
-}
-message BrowserSelectOption { string value = 1; string label = 2; bool selected = 3; }
-message BrowserTab {
-  string tab_id = 1;
-  string url = 2;
-  string title = 3;
-}
-message BrowserSnapshot {
-  string tab_id = 1;
-  string url = 2;
-  string title = 3;
-  string text = 4;
-  repeated BrowserControlElement elements = 5;
-  bool text_truncated = 6;
-  bool elements_truncated = 7;
-  BrowserScreenshot screenshot = 8;
-}
-message BrowserControlResponse {
-  string session_id = 1;
-  string active_tab_id = 2;
-  repeated BrowserTab tabs = 3;
-  BrowserSnapshot page = 4;
-  string message = 5;
-}
-message ThinkingOption {
-  string level = 1;
-  string label = 2;
-  string sublabel = 3;
-  bool selected = 4;
-  bool locked = 5;
-  optional string rate_limit_reset = 6;
-  uint32 index = 7;
-}
-message ModelOption {
-  string mode_id = 1;
-  string label = 2;
-  string sublabel = 3;
-  bool selected = 4;
-  bool locked = 5;
-  optional string rate_limit_reset = 6;
-  uint32 index = 7;
-}
-message ThinkingOptions { repeated ThinkingOption options = 1; }
-message ModelCatalog {
-  string account_id = 1;
-  string server_id = 2;
-  optional int64 checked_at = 3;
-  repeated ModelOption models = 4;
-  repeated ThinkingOption thinking = 5;
-  map<string, ThinkingOptions> model_thinking = 6;
-  string provider = 7;
-  optional string adapter = 8;
-}
-message AccountStatus {
-  string id = 1;
-  string state = 2;
-  optional string selected_model = 3;
-  ModelCatalog catalog = 4;
-  LoginStatus login = 5;
-  string provider = 6;
-}
-message HostStatus {
-  string server_id = 1;
-  repeated AccountStatus accounts = 2;
-  Usage usage = 3;
-  repeated ProviderInfo providers = 4;
-  // Actual browser connection owned by a workspace host.
-  BrowserConnection browser_connection = 5;
-  ChatCleanupStatus chat_cleanup = 6;
-  // Local daemon process and IPC diagnostics, populated only on local IPC.
-  RuntimeStatus runtime = 7;
-  uint32 active_agents = 8; // Active agents in the selected workspace store.
-}
+
 message RuntimeStatus {
   uint32 pid = 1;
   string version = 2;
   bool automatic = 3;
-  string transport = 4; // unix or named_pipe
-  string endpoint = 5;
-  uint64 uptime_ms = 6;
-  uint32 connected_clients = 7; // All IPC connections, including this caller.
-  bool stopping = 8;
+  bool stopping = 4;
+  string transport = 5; // unix or named_pipe
+  string endpoint = 6;
+  uint64 uptime_ms = 7;
+  uint32 connected_clients = 8; // All IPC connections, including this caller.
 }
-message ChatCleanupStatus {
-  uint32 pending = 1;
-  uint32 running = 2;
-  uint32 failed = 3;
-  uint32 completed = 4;
-  uint32 unmapped = 5;
-  string last_error = 6;
-}
+
 message BrowserConnection {
   string transport = 1; // local or grpc
   string endpoint = 2; // Sanitized network origin; empty for local transports.
@@ -470,29 +271,67 @@ message BrowserConnection {
   bool connected = 4; // A bounded live probe reached that same browser peer.
   string error = 5; // Safe diagnostic, never credentials or raw remote errors.
 }
+
+message AccountStatus {
+  string id = 1;
+  string provider = 2;
+  string state = 3;
+  optional string selected_model = 4;
+  LoginStatus login = 5;
+  ModelCatalog catalog = 6;
+}
+
 message Usage {
   uint64 queued = 1;
   uint64 running = 2;
-  uint64 input_chars = 3;
-  uint64 output_chars = 4;
-  uint64 completed = 5;
+  uint64 completed = 3;
+  uint64 reused_turns = 4;
+  uint64 input_chars = 5;
   uint64 submitted_chars = 6;
-  uint64 reused_turns = 7;
+  uint64 output_chars = 7;
   optional uint64 input_tokens = 8; // Absent when upstream does not report it.
   optional uint64 output_tokens = 9;
 }
-message PruneRequest { uint32 days = 1; }
+
+message ChatCleanupStatus {
+  uint32 pending = 1;
+  uint32 running = 2;
+  uint32 completed = 3;
+  uint32 failed = 4;
+  uint32 unmapped = 5;
+  string last_error = 6;
+}
+
+message HostStatus {
+  string server_id = 1;
+  // Local daemon process and IPC diagnostics, populated only on local IPC.
+  RuntimeStatus runtime = 2;
+  // Actual browser connection owned by a workspace host.
+  BrowserConnection browser_connection = 3;
+  repeated ProviderInfo providers = 4;
+  repeated AccountStatus accounts = 5;
+  Usage usage = 6;
+  uint32 active_agents = 7; // Active agents in the selected workspace store.
+  ChatCleanupStatus chat_cleanup = 8;
+}
+
+message PruneRequest {
+  uint32 days = 1;
+}
+
 message PruneResult {
   uint64 expired_cache = 1;
   uint64 runs = 2;
   uint64 artifacts = 3;
   uint64 blob_bytes_reclaimed = 4;
 }
+
 message CacheRequest {
   uint32 days = 1; // Zero selects the default of seven days.
   bool prune = 2;
   bool dry_run = 3;
 }
+
 message CacheStats {
   uint32 retention_days = 1;
   uint64 blob_bytes = 2;
@@ -507,13 +346,380 @@ message CacheStats {
   bool pruned = 11;
   bool busy = 12;
 }
+
 message CacheStoreReport {
   string role = 1;
   string server_id = 2;
   CacheStats stats = 3;
   string error = 4; // Partial failures never imply that both hosts were cleaned.
 }
-message CacheReport { repeated CacheStoreReport stores = 1; }
+
+message CacheReport {
+  repeated CacheStoreReport stores = 1;
+}
+
+// =============================================================================
+// ProviderService Messages
+// =============================================================================
+
+message ProviderRef {
+  string id = 1;
+}
+
+message ProviderCapabilities {
+  bool browser_auth = 1;
+  bool temporary_sessions = 2;
+  bool file_uploads = 3;
+  bool image_generation = 4;
+  bool web_usage = 5;
+  bool web_history_cleanup = 6;
+  bool native_tools = 7;
+}
+
+message ProviderInfo {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  string kind = 4;
+  string source = 5;
+  optional string entry_url = 6;
+  string default_model = 7;
+  // Follow-up agent prompts above this character count are attached as text files.
+  // Absent means 2000; zero attaches every nonempty follow-up.
+  optional uint32 inline_prompt_chars = 8;
+  ProviderCapabilities capabilities = 9;
+}
+
+message ProviderList {
+  repeated ProviderInfo providers = 1;
+}
+
+message RegisterProviderRequest {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  string kind = 4;
+  optional string entry_url = 5;
+  repeated string allowed_origins = 6;
+  repeated string auth_url_substrings = 7;
+  repeated string chat_url_prefixes = 8;
+  repeated string reusable_path_prefixes = 9;
+  optional string usage_url = 10;
+  optional string default_model = 11;
+  bool requires_models_control = 12;
+  optional uint32 inline_prompt_chars = 13;
+  optional string observer_binding = 14;
+  optional string scripts_dir = 15;
+  map<string, string> scripts = 16;
+  ProviderCapabilities capabilities = 17;
+}
+
+// =============================================================================
+// AccountService Messages
+// =============================================================================
+
+message AccountRef {
+  string account_id = 1;
+}
+
+message Account {
+  string id = 1;
+  string provider = 2;
+  string state = 3;
+  string profile = 4; // Diagnostic path on the browser host, not a client path.
+  optional string subprofile = 5;
+  uint32 port = 6;
+  bool headless = 7;
+}
+
+message AccountList {
+  repeated Account accounts = 1;
+}
+
+message CreateAccountRequest {
+  string id = 1;
+  string provider = 2;
+  uint32 port = 3; // 0 = auto-assign next free CDP port
+}
+
+message AttachBrowserRequest {
+  string account_id = 1;
+  uint32 port = 2;
+}
+
+message SetBrowserModeRequest {
+  string account_id = 1;
+  bool headless = 2;
+}
+
+message LoginStatus {
+  string state = 1; // waiting, refreshing, ready, failed, or timed_out.
+  string error = 2; // Safe diagnostic for an explicitly opened sign-in flow.
+}
+
+message BrowserStatus {
+  string account_id = 1;
+  string account_state = 2;
+  bool connected = 3;
+  string endpoint = 4;
+  optional string browser = 5;
+  optional bool headless = 6;
+  string profile = 7;
+  optional bool profile_matches = 8;
+  uint64 owned_sessions = 9;
+  optional bool last_verified_sign_in = 10;
+  optional int64 checked_at = 11; // Unix milliseconds; absent means never checked.
+  LoginStatus login = 12;
+}
+
+message WebUsageLimit {
+  string label = 1;
+  // Preserve site-provided values and units. Absent does not mean zero.
+  optional string used = 2;
+  optional string remaining = 3;
+  optional string limit = 4;
+  optional double used_percent = 5; // Only when the page explicitly shows it.
+  optional string reset = 6;
+  string status = 7;
+  string detail = 8;
+}
+
+message WebUsage {
+  string account_id = 1;
+  string server_id = 2;
+  optional string plan = 3;
+  repeated WebUsageLimit limits = 4;
+  string notice = 5; // Explains fields the web account does not expose.
+  string updated_label = 6; // The page's own update description, when shown.
+  string timezone = 7; // Browser timezone for the page's reset descriptions.
+  int64 checked_at = 8; // Unix milliseconds of this successful observation.
+}
+
+message WebHistoryCleanupStatus {
+  string account_id = 1;
+  string state = 2; // idle, pending, running, completed, failed, interrupted
+  uint32 deleted = 3;
+  string error = 4;
+  int64 started_at = 5;
+  int64 updated_at = 6;
+}
+
+message BrowserFetchRequest {
+  string account_id = 1;
+  string url = 2;
+  uint32 wait_ms = 3;
+  uint32 max_chars = 4;
+}
+
+message BrowserFetchResponse {
+  string url = 1;
+  string title = 2;
+  string text = 3;
+}
+
+message BrowserNavigate {
+  string url = 1;
+}
+
+message BrowserRole {
+  string role = 1;
+  string name = 2;
+}
+
+message BrowserTarget {
+  oneof locator {
+    string ref = 1;
+    string css = 2;
+    string name = 3;
+    BrowserRole role = 4;
+  }
+}
+
+// Regions use viewport CSS pixels. Points use pixels in the identified screenshot.
+message BrowserRegion {
+  double x = 1;
+  double y = 2;
+  double width = 3;
+  double height = 4;
+}
+
+message BrowserPoint {
+  string screenshot_id = 1;
+  double x = 2;
+  double y = 3;
+}
+
+message BrowserCapture {
+  BrowserRegion region = 1;
+}
+
+message BrowserTextInput {
+  BrowserTarget target = 1;
+  string text = 2;
+}
+
+message BrowserKey {
+  string key = 1;
+  BrowserTarget target = 2;
+  repeated string modifiers = 3;
+}
+
+message BrowserSelect {
+  BrowserTarget target = 1;
+  string value = 2;
+}
+
+message BrowserScroll {
+  BrowserTarget target = 1;
+  int32 x = 2;
+  int32 y = 3;
+}
+
+message BrowserWheel {
+  BrowserPoint point = 1;
+  double delta_x = 2;
+  double delta_y = 3;
+}
+
+message BrowserWait {
+  enum State {
+    VISIBLE = 0;
+    HIDDEN = 1;
+  }
+  BrowserTarget target = 1;
+  State state = 2;
+}
+
+message BrowserControlRequest {
+  string account_id = 1;
+  string session_id = 2;
+  string tab_id = 3;
+  uint32 timeout_ms = 4;
+  uint32 max_chars = 5;
+  uint32 wait_ms = 6; // Optional delay before observing the result, within timeout_ms.
+  oneof command {
+    Empty tabs = 7;
+    BrowserNavigate open = 8;
+    Empty use_tab = 9;
+    Empty close = 10;
+    Empty reset = 11;
+    Empty snapshot = 12;
+    BrowserCapture screenshot = 13;
+    BrowserNavigate navigate = 14;
+    Empty back = 15;
+    Empty forward = 16;
+    Empty reload = 17;
+    BrowserTarget click = 18;
+    BrowserPoint click_point = 19;
+    BrowserTextInput fill = 20;
+    BrowserTextInput type = 21;
+    BrowserKey press = 22;
+    BrowserSelect select = 23;
+    BrowserScroll scroll = 24;
+    BrowserWheel wheel = 25;
+    BrowserWait wait = 26;
+  }
+}
+
+message BrowserSelectOption {
+  string value = 1;
+  string label = 2;
+  bool selected = 3;
+}
+
+message BrowserControlElement {
+  string ref_id = 1;
+  string tag = 2;
+  string role = 3;
+  string label = 4;
+  string value = 5;
+  string href = 6;
+  bool disabled = 7;
+  optional bool checked = 8;
+  repeated BrowserSelectOption options = 9;
+}
+
+message BrowserScreenshot {
+  string id = 1;
+  string artifact_id = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  BrowserRegion region = 5;
+  // Internal capture bytes; the RPC host stores them as an artifact and clears this field.
+  bytes png = 6;
+}
+
+message BrowserTab {
+  string tab_id = 1;
+  string url = 2;
+  string title = 3;
+}
+
+message BrowserSnapshot {
+  string tab_id = 1;
+  string url = 2;
+  string title = 3;
+  string text = 4;
+  bool text_truncated = 5;
+  repeated BrowserControlElement elements = 6;
+  bool elements_truncated = 7;
+  BrowserScreenshot screenshot = 8;
+}
+
+message BrowserControlResponse {
+  string session_id = 1;
+  string active_tab_id = 2;
+  repeated BrowserTab tabs = 3;
+  BrowserSnapshot page = 4;
+  string message = 5;
+}
+
+// =============================================================================
+// ModelService Messages
+// =============================================================================
+
+message ModelOption {
+  uint32 index = 1;
+  string mode_id = 2;
+  string label = 3;
+  string sublabel = 4;
+  bool selected = 5;
+  bool locked = 6;
+  optional string rate_limit_reset = 7;
+}
+
+message ThinkingOption {
+  uint32 index = 1;
+  string level = 2;
+  string label = 3;
+  string sublabel = 4;
+  bool selected = 5;
+  bool locked = 6;
+  optional string rate_limit_reset = 7;
+}
+
+message ThinkingOptions {
+  repeated ThinkingOption options = 1;
+}
+
+message ModelCatalog {
+  string account_id = 1;
+  string server_id = 2;
+  string provider = 3;
+  optional string adapter = 4;
+  optional int64 checked_at = 5;
+  repeated ModelOption models = 6;
+  repeated ThinkingOption thinking = 7;
+  map<string, ThinkingOptions> model_thinking = 8;
+}
+
+// =============================================================================
+// TurnService Messages
+// =============================================================================
+
+message TurnRef {
+  string id = 1;
+}
 
 message ToolDefinition {
   string kind = 1; // function or custom
@@ -521,13 +727,19 @@ message ToolDefinition {
   string description = 3;
   string parameters_json = 4; // Valid JSON schema; bounded by request limits.
 }
+
 message ToolCall {
   string kind = 1;
   string id = 2;
   string name = 3;
   string arguments_json = 4;
 }
-message ToolResult { string call_id = 1; string content = 2; }
+
+message ToolResult {
+  string call_id = 1;
+  string content = 2;
+}
+
 message ContentBlock {
   oneof value {
     string text = 1;
@@ -536,54 +748,40 @@ message ContentBlock {
     string artifact_id = 4;
   }
 }
-message Message { string role = 1; repeated ContentBlock blocks = 2; }
-enum SessionMode {
-  SESSION_MODE_UNSPECIFIED = 0;
-  SESSION_MODE_CHAT = 1;
-  SESSION_MODE_TEMPORARY = 2; // Not anonymous guest mode; avoids server chat history.
+
+message Message {
+  string role = 1;
+  repeated ContentBlock blocks = 2;
 }
-enum SessionState {
-  SESSION_STATE_UNSPECIFIED = 0;
-  SESSION_STATE_READY = 1;
-  SESSION_STATE_RUNNING = 2;
-  SESSION_STATE_CLOSED = 3;
-  SESSION_STATE_DELETED = 4;
-  SESSION_STATE_INVALIDATED = 5;
-  SESSION_STATE_OUTCOME_UNKNOWN = 6;
-  SESSION_STATE_AWAITING_HUMAN = 7;
-  SESSION_STATE_CLEANUP_PENDING = 8;
-}
-enum SessionRetention {
-  SESSION_RETENTION_UNSPECIFIED = 0;
-  SESSION_RETENTION_EPHEMERAL = 1; // Close the browser session after this turn or agent run ends.
-  SESSION_RETENTION_RETAIN = 2; // Keep the browser session open for follow-ups until closed or invalidated.
-}
+
 message TurnRequest {
   string account_id = 1;
   optional string session_id = 2;
-  repeated Message messages = 3;
-  repeated ToolDefinition tools = 4;
-  string tool_choice_json = 5;
-  bool parallel_tool_calls = 6;
-  optional uint64 output_token_hint = 7;
-  optional string model = 8;
-  optional string thinking = 9;
-  SessionMode mode = 10; // Defaults to SESSION_MODE_CHAT when unspecified.
-  repeated string artifacts = 11;
-  uint64 timeout_secs = 12;
-  optional string idempotency_key = 13;
-  bool generate_image = 14;
-  SessionRetention retention = 15; // Defaults to SESSION_RETENTION_EPHEMERAL when unspecified.
-  optional string reuse_scope = 16;
+  SessionMode mode = 3; // Defaults to SESSION_MODE_CHAT when unspecified.
+  SessionRetention retention = 4; // Defaults to SESSION_RETENTION_EPHEMERAL when unspecified.
+  optional string reuse_scope = 5;
+  optional string model = 6;
+  optional string thinking = 7;
+  repeated Message messages = 8;
+  repeated string artifacts = 9;
+  repeated ToolDefinition tools = 10;
+  string tool_choice_json = 11;
+  bool parallel_tool_calls = 12;
+  bool generate_image = 13;
+  optional string idempotency_key = 14;
+  uint64 timeout_secs = 15;
+  optional uint64 output_token_hint = 16;
 }
+
 message TurnResult {
   string session_id = 1;
-  string text = 2;
-  repeated ToolCall tool_calls = 3;
-  repeated string artifacts = 4;
-  optional string model = 5;
+  optional string model = 2;
+  string text = 3;
+  repeated ToolCall tool_calls = 4;
+  repeated string artifacts = 5;
   uint64 elapsed_ms = 6;
 }
+
 message Turn {
   string id = 1;
   string state = 2;
@@ -593,7 +791,11 @@ message Turn {
   int64 created_at = 6;
   int64 updated_at = 7;
 }
-message ListTurnsRequest { uint32 limit = 1; }
+
+message ListTurnsRequest {
+  uint32 limit = 1;
+}
+
 message TurnSummary {
   string id = 1;
   string account_id = 2;
@@ -602,44 +804,62 @@ message TurnSummary {
   uint64 output_chars = 5;
   int64 updated_at = 6;
 }
-message TurnList { repeated TurnSummary turns = 1; }
-message EventCursor { string run_id = 1; int64 after = 2; }
-message Event {
-  int64 sequence = 1;
-  string run_id = 2;
-  string kind = 3;
-  string data_json = 4; // Extensible event payload, not an executable command.
-  int64 at = 5;
+
+message TurnList {
+  repeated TurnSummary turns = 1;
 }
-message EventPage { repeated Event events = 1; }
+
+// =============================================================================
+// SessionService Messages
+// =============================================================================
+
+message SessionRef {
+  string id = 1;
+}
+
 message Session {
   string id = 1;
   string account_id = 2;
-  SessionMode mode = 3;
-  SessionState state = 4;
-  optional string model = 5;
-  optional string thinking = 6;
-  int64 last_used = 7;
-  uint64 remote_turns = 8;
-  string provider = 9;
-  optional string reuse_scope = 10;
-  bool continuable = 11;
+  string provider = 3;
+  SessionMode mode = 4;
+  SessionState state = 5;
+  bool continuable = 6;
+  optional string reuse_scope = 7;
+  optional string model = 8;
+  optional string thinking = 9;
+  uint64 remote_turns = 10;
+  int64 last_used = 11;
 }
+
 message ListSessionsRequest {
   optional string account_id = 1;
   SessionMode mode = 2; // SESSION_MODE_UNSPECIFIED matches all modes.
   SessionState state = 3; // SESSION_STATE_UNSPECIFIED matches all states.
 }
-message SessionList { repeated Session sessions = 1; }
+
+message SessionList {
+  repeated Session sessions = 1;
+}
+
 message CloseSessionsRequest {
   repeated string session_ids = 1;
 }
+
 message CloseSessionsResult {
   repeated string closed = 1;
   repeated string skipped = 2;
   map<string, ErrorDetail> errors = 3;
 }
-message ArtifactRef { string account_id = 1; string id = 2; }
+
+// =============================================================================
+// ArtifactService Messages
+// =============================================================================
+
+message ArtifactRef {
+  string account_id = 1;
+  string id = 2;
+}
+
 message PutArtifactMeta {
   string account_id = 1;
   string name = 2; // Basename only; slash, colon, NUL, '.', and '..' are rejected.
@@ -647,64 +867,56 @@ message PutArtifactMeta {
   string sha256 = 4; // Required lowercase SHA-256 hex; receiver checks before committing.
   uint64 size = 5; // Required total byte length; receiver checks before committing.
 }
+
 message PutArtifactChunk {
   oneof payload {
     PutArtifactMeta meta = 1; // First message only.
     bytes data = 2; // Zero or more byte chunks after meta.
   }
 }
+
 message Artifact {
   string id = 1;
   string scope = 2;
-  string hash = 3;
+  string name = 3;
   string mime = 4;
-  string name = 5;
+  string hash = 5;
   uint64 size = 6;
   string origin = 7;
   int64 created_at = 8;
 }
+
 message GetArtifactChunk {
   oneof payload {
     Artifact artifact = 1; // First message only.
     bytes data = 2; // Zero or more byte chunks after artifact metadata.
   }
 }
-message ArtifactList { repeated Artifact artifacts = 1; }
 
-// Wire-compatible with Synurang core.v1.Error's first three fields. The extra
-// fields preserve actionable application errors across FFI, IPC, and gRPC.
-// Network failures use the corresponding gRPC status and these encoded details.
-message ErrorDetail {
-  ErrorCode code = 1;
-  string message = 2;
-  int32 grpc_code = 3;
-  string stage = 4;
-  string retry = 5; // never, after_human, after_delay, after_adapter_update, after_reconcile
+message ArtifactList {
+  repeated Artifact artifacts = 1;
 }
-enum ErrorCode {
-  ERROR_CODE_UNSPECIFIED = 0;
-  INVALID_REQUEST = 1;
-  UNSUPPORTED_CAPABILITY = 2;
-  AUTH_REQUIRED = 3;
-  VERIFICATION_REQUIRED = 4;
-  RATE_LIMITED = 5;
-  UI_CONTRACT_CHANGED = 6;
-  TRANSPORT_DISCONNECTED = 7;
-  SUBMISSION_OUTCOME_UNKNOWN = 8;
-  UPLOAD_FAILED = 9;
-  MEDIA_DOWNLOAD_FAILED = 10;
-  TOOL_PROTOCOL_INVALID = 11;
-  WORKSPACE_CONFLICT = 12;
-  CANCELLED = 13;
-  DEADLINE_EXCEEDED = 14;
-  QUEUE_FULL = 15;
-  NOT_FOUND = 16;
-  STORAGE_FAILURE = 17;
-  INTERNAL = 18;
-  // Pre-submit session loss (tab closed, reset, navigated away, evicted, or
-  // invalidated). Safe for callers with local context to start a fresh session,
-  // unlike SUBMISSION_OUTCOME_UNKNOWN.
-  SESSION_UNAVAILABLE = 19;
+
+// =============================================================================
+// WorkspaceService Messages
+// =============================================================================
+
+message RemoteBrowser {
+  string endpoint = 1;
+  string token = 2;
+  optional string ca_file = 3;
+  optional string server_name = 4;
+  optional string tls_pin = 5;
+}
+
+// Standard gRPC client binding on a same-user local connection. No transport
+// preamble or bearer token. Browser selection is explicit and workspace tools
+// always execute on the local daemon.
+message ConnectClientRequest {
+  string protocol = 1;
+  RemoteBrowser remote = 2;
+  optional uint32 workers = 3;
+  optional string pace = 4;
 }
 
 message ToolPermissions {
@@ -714,50 +926,55 @@ message ToolPermissions {
   bool browser = 4;
   bool subagent = 5;
 }
+
+message AgentRef {
+  string id = 1;
+}
+
 message AgentRequest {
   string task = 1;
   string workspace = 2; // Local workspace host path, never a browser host path.
   string account_id = 3;
-  optional string model = 4;
-  optional string thinking = 5;
-  SessionMode session_mode = 6; // Defaults to SESSION_MODE_CHAT when unspecified.
-  bool no_shell = 7;
-  uint32 max_steps = 8; // Zero selects the agent engine's default step budget.
-  optional string knowledge = 9;
-  optional string mcp_config = 10;
-  repeated string artifacts = 11;
-  optional string parent_id = 12;
-  // Transient client environment for local shell/MCP execution. Never persisted
-  // or included in Agent responses. Browser hosts do not expose WorkspaceService.
-  map<string, string> environment = 13;
+  // Multi-turn conversation identity. Absent starts a new conversation.
+  optional string conversation_id = 4;
+  optional string model = 5;
+  optional string thinking = 6;
+  SessionMode session_mode = 7; // Defaults to SESSION_MODE_CHAT when unspecified.
   // Controls whether the agent's browser session is retained after the run.
   // SESSION_RETENTION_UNSPECIFIED retains while holding the workspace lease.
-  SessionRetention session_retention = 14;
+  SessionRetention session_retention = 8;
   // Single-turn conversational mode without coding tools or workspace instructions.
-  bool chat_only = 15;
+  bool chat_only = 9;
+  bool no_shell = 10;
   // Explicit per-capability tool policy; omitted falls back to workspace defaults.
-  optional ToolPermissions permissions = 16;
+  optional ToolPermissions permissions = 11;
+  uint32 max_steps = 12; // Zero selects the agent engine's default step budget.
+  repeated string artifacts = 13;
+  optional string knowledge = 14;
+  optional string mcp_config = 15;
+  // Transient client environment for local shell/MCP execution. Never persisted
+  // or included in Agent responses. Browser hosts do not expose WorkspaceService.
+  map<string, string> environment = 16;
 }
-message Agent {
+
+message StartAgentResponse {
   string id = 1;
-  string state = 2;
-  AgentRequest request = 3;
-  optional AgentResult result = 4;
-  optional ErrorDetail error = 5;
-  int64 created_at = 6;
-  int64 updated_at = 7;
+  string conversation_id = 2;
 }
-message AgentResult {
-  string status = 1;
-  string final_response = 2;
-  repeated string files_changed = 3;
-  repeated AgentStep steps = 4;
-  string task = 5;
-  bool temp_chat = 6;
-  uint64 elapsed_ms = 7;
+
+message AgentToolCall {
+  string tool = 1;
+  string args_json = 2;
 }
-message AgentToolCall { string tool = 1; string args_json = 2; }
-message AgentObservation { string tool = 1; bool ok = 2; string output = 3; uint64 elapsed_ms = 4; repeated string artifacts = 5; }
+
+message AgentObservation {
+  string tool = 1;
+  bool ok = 2;
+  string output = 3;
+  repeated string artifacts = 4;
+  uint64 elapsed_ms = 5;
+}
+
 message AgentStep {
   uint32 step = 1;
   string model_response = 2;
@@ -765,8 +982,94 @@ message AgentStep {
   repeated AgentObservation observations = 4;
   repeated string notes = 5;
 }
-message AgentList { repeated Agent agents = 1; }
-message SteerRequest { string id = 1; string message = 2; repeated string artifacts = 3; }
-message KnowledgeQuery { string query = 1; optional string source = 2; uint32 limit = 3; }
-message KnowledgeExcerpt { string source = 1; string path = 2; uint64 line = 3; string text = 4; string hash = 5; string citation = 6; }
-message KnowledgeResults { repeated KnowledgeExcerpt excerpts = 1; }
+
+message AgentResult {
+  string status = 1;
+  string task = 2;
+  string final_response = 3;
+  repeated string files_changed = 4;
+  repeated AgentStep steps = 5;
+  bool temp_chat = 6;
+  uint64 elapsed_ms = 7;
+}
+
+message Agent {
+  string id = 1;
+  string conversation_id = 2;
+  string state = 3;
+  AgentRequest request = 4;
+  optional AgentResult result = 5;
+  optional ErrorDetail error = 6;
+  int64 created_at = 7;
+  int64 updated_at = 8;
+}
+
+message AgentList {
+  repeated Agent agents = 1;
+}
+
+message SteerRequest {
+  string id = 1;
+  string message = 2;
+  repeated string artifacts = 3;
+}
+
+message ConversationRef {
+  string id = 1;
+}
+
+message ListConversationsRequest {
+  optional string workspace = 1;
+  optional string account_id = 2;
+  uint32 limit = 3; // Zero selects the default page size (50).
+}
+
+message ConversationSummary {
+  string id = 1;
+  string latest_agent_id = 2;
+  string workspace = 3;
+  string account_id = 4;
+  string title = 5;
+  string state = 6;
+  SessionMode session_mode = 7;
+  bool chat_only = 8;
+  optional string model = 9;
+  optional string thinking = 10;
+  uint32 turn_count = 11;
+  int64 created_at = 12;
+  int64 updated_at = 13;
+}
+
+message ConversationList {
+  repeated ConversationSummary conversations = 1;
+}
+
+message Conversation {
+  ConversationSummary summary = 1;
+  repeated Agent turns = 2;
+}
+
+message DeleteConversationRequest {
+  string id = 1;
+  optional string workspace = 2;
+  optional string account_id = 3;
+}
+
+message KnowledgeQuery {
+  string query = 1;
+  optional string source = 2;
+  uint32 limit = 3;
+}
+
+message KnowledgeExcerpt {
+  string source = 1;
+  string path = 2;
+  uint64 line = 3;
+  string text = 4;
+  string hash = 5;
+  string citation = 6;
+}
+
+message KnowledgeResults {
+  repeated KnowledgeExcerpt excerpts = 1;
+}

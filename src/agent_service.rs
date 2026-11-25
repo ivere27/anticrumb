@@ -488,12 +488,13 @@ impl AgentManager {
     fn prepare_continuation(
         &self,
         request: &mut AgentRequest,
+        prior_turns: &[AgentRecord],
         allow_session_continuation: bool,
     ) -> Result<(String, Option<String>, usize)> {
         let new_artifacts = request.artifacts.clone();
-        let context = self.context(request)?;
+        let context = self.context(request, prior_turns)?;
         let continued_session = if allow_session_continuation {
-            self.continuable_parent_session(request)
+            self.continuable_parent_session(request, prior_turns)
         } else {
             None
         };
@@ -544,6 +545,7 @@ impl AgentManager {
         self: &Arc<Self>,
         job_id: &str,
         request: &AgentRequest,
+        prior_turns: &[AgentRecord],
         control: &RunControl,
         stale_workspace_sessions: &[String],
         context: &str,
@@ -574,8 +576,8 @@ impl AgentManager {
             task.push_str(&excerpts_suffix);
         }
         let continued = continued_session.map(|session_id| {
-            let has_tool_contract =
-                !request.chat_only && self.session_has_tool_contract(request, &session_id);
+            let has_tool_contract = !request.chat_only
+                && self.session_has_tool_contract(request, &session_id, prior_turns);
             let compact = if request.chat_only {
                 Some(format!("{}{excerpts_suffix}", request.task))
             } else if has_tool_contract {
@@ -675,7 +677,7 @@ impl AgentManager {
         controls.remove(job_id);
     }
 
-    pub fn start(self: &Arc<Self>, mut request: AgentRequest) -> Result<String> {
+    pub fn start(self: &Arc<Self>, mut request: AgentRequest) -> Result<StartedAgent> {
         self.ensure_accepting_jobs()?;
         if request.task.trim().is_empty() || request.task.len() > 48000 {
             return Err(ServiceError::invalid("task must be 1..48000 bytes"));
@@ -683,6 +685,9 @@ impl AgentManager {
         request.workspace = fs::canonicalize(&request.workspace).map_err(ServiceError::storage)?;
         if !request.workspace.is_dir() {
             return Err(ServiceError::invalid("workspace must be a directory"));
+        }
+        if request.account_id.trim().is_empty() {
+            request.account_id = "default".into();
         }
         let mut controls = self.controls.lock().map_err(ServiceError::storage)?;
         // cancel_all sets stopping before taking this lock, so a job cannot
@@ -693,20 +698,33 @@ impl AgentManager {
         let artifact_lease = self.store.blob_lease()?;
         let lease = self.acquire_workspace_lease(&controls, &request.workspace)?;
         let has_workspace_lease = lease.is_some();
+        let requested_temporary = request.is_temporary();
         if !has_workspace_lease {
             request.session_mode = SessionMode::Temporary;
         }
+        let (conversation_id, prior_turns) = self.resolve_conversation(
+            &controls,
+            &mut request,
+            requested_temporary,
+            has_workspace_lease,
+        )?;
         let (context, continued_session, prior_artifact_count) =
-            self.prepare_continuation(&mut request, has_workspace_lease)?;
+            self.prepare_continuation(&mut request, &prior_turns, has_workspace_lease)?;
         let id = id("agent");
         let control = self.new_run_control(&id);
-        let created_at = now_ms();
+        let min_created_at = prior_turns
+            .iter()
+            .map(|t| t.created_at)
+            .max()
+            .map_or(0, |prev| prev.saturating_add(1));
+        let created_at = now_ms().max(min_created_at);
         self.store.put(
             "local",
             "agent",
             &id,
             &AgentRecord {
                 id: id.clone(),
+                conversation_id: conversation_id.clone(),
                 state: "running".into(),
                 request: request.clone(),
                 result: None,
@@ -719,16 +737,14 @@ impl AgentManager {
         drop(artifact_lease);
         drop(controls);
         let stale_workspace_sessions = if has_workspace_lease {
-            let keep_conversation_jobs = if continued_session.is_some() {
-                self.conversation_ancestors(&request)
-            } else {
-                std::collections::HashSet::new()
-            };
+            let keep_conversation_id = continued_session
+                .is_some()
+                .then_some(conversation_id.as_str());
             self.idle_workspace_sessions(
                 &request.workspace,
                 &request.account_id,
                 &id,
-                &keep_conversation_jobs,
+                keep_conversation_id,
             )
             .unwrap_or_default()
             .into_iter()
@@ -744,6 +760,7 @@ impl AgentManager {
         );
         let manager = self.clone();
         let job_id = id.clone();
+        let worker_conversation_id = conversation_id.clone();
         let worker_gate = request
             .is_temporary()
             .then(|| self.worker_gate(&request.account_id));
@@ -752,6 +769,7 @@ impl AgentManager {
                 manager.run_agent_job(
                     &job_id,
                     &request,
+                    &prior_turns,
                     &control,
                     &stale_workspace_sessions,
                     &context,
@@ -782,16 +800,20 @@ impl AgentManager {
             };
             let terminal = AgentRecord {
                 id: job_id.clone(),
+                conversation_id: worker_conversation_id,
                 state,
                 request,
                 result: value,
                 error,
                 created_at,
-                updated_at: now_ms(),
+                updated_at: now_ms().max(created_at),
             };
             manager.finish_agent_job(&job_id, terminal, lease);
         });
-        Ok(id)
+        Ok(StartedAgent {
+            id,
+            conversation_id,
+        })
     }
     pub fn cancel_all(&self) {
         self.stopping
@@ -817,6 +839,128 @@ impl AgentManager {
         }
         self.store.get("local", "agent", id)
     }
+    fn resolve_conversation(
+        &self,
+        controls: &HashMap<String, RunControl>,
+        request: &mut AgentRequest,
+        requested_temporary: bool,
+        has_workspace_lease: bool,
+    ) -> Result<(String, Vec<AgentRecord>)> {
+        let Some(conv_id) = request
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+        else {
+            let conv_id = id("conv");
+            request.conversation_id = Some(conv_id.clone());
+            return Ok((conv_id, Vec::new()));
+        };
+        let conv = self.store.get_conversation(&conv_id)?;
+        let has_storage_failure = {
+            let failures = self.failures.lock().map_err(ServiceError::storage)?;
+            conv.turns
+                .iter()
+                .any(|turn| failures.contains_key(&turn.id))
+        };
+        if has_storage_failure {
+            return Err(ServiceError::invalid(
+                "repair agent storage and restart before continuing this conversation",
+            ));
+        }
+        if conv
+            .turns
+            .iter()
+            .any(|turn| controls.contains_key(&turn.id) || turn.is_active())
+        {
+            return Err(ServiceError::invalid(
+                "use steering while the previous turn is running",
+            ));
+        }
+        let latest = conv.latest_turn().ok_or_else(|| {
+            ServiceError::new(ErrorCode::NotFound, "agent", "saved conversation not found")
+        })?;
+        let latest_account = if latest.request.account_id.is_empty() {
+            "default"
+        } else {
+            latest.request.account_id.as_str()
+        };
+        if latest.request.workspace != request.workspace || latest_account != request.account_id {
+            return Err(ServiceError::invalid(
+                "resume requires the same workspace and account",
+            ));
+        }
+        let has_temp_turn = conv.summary.is_temporary();
+        if !requested_temporary && has_temp_turn {
+            return Err(ServiceError::invalid(
+                "cannot continue a temporary conversation in normal mode; start a new conversation or keep temporary mode",
+            ));
+        }
+        if !has_workspace_lease && !requested_temporary && !has_temp_turn {
+            return Err(ServiceError::new(
+                ErrorCode::WorkspaceConflict,
+                "agent",
+                "another process holds this workspace; cannot continue a normal conversation without the workspace lease",
+            ));
+        }
+        request.conversation_id = Some(conv_id.clone());
+        Ok((conv_id, conv.turns))
+    }
+    pub fn list_conversations(
+        &self,
+        workspace: Option<&Path>,
+        account_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>> {
+        let canonical = workspace.map(|w| fs::canonicalize(w).unwrap_or_else(|_| w.to_path_buf()));
+        let mut list = self
+            .store
+            .list_conversations(canonical.as_deref(), account_id, limit)?;
+        let failures = self.failures.lock().map_err(ServiceError::storage)?;
+        if !failures.is_empty() {
+            for summary in &mut list {
+                if let Some(failed) = failures.get(&summary.latest_agent_id) {
+                    summary.state = failed.state.clone();
+                    summary.updated_at = summary
+                        .updated_at
+                        .max(failed.updated_at.max(failed.created_at));
+                }
+            }
+            list.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        }
+        Ok(list)
+    }
+    pub fn conversation(&self, conversation_id: &str) -> Result<ConversationRecord> {
+        let mut conv = self.store.get_conversation(conversation_id)?;
+        let failures = self.failures.lock().map_err(ServiceError::storage)?;
+        if !failures.is_empty() {
+            let mut changed = false;
+            for turn in &mut conv.turns {
+                if let Some(failed) = failures.get(&turn.id) {
+                    *turn = failed.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                conv = ConversationRecord::from_turns(conversation_id, conv.turns).ok_or_else(
+                    || {
+                        ServiceError::new(
+                            ErrorCode::NotFound,
+                            "agent",
+                            "saved conversation not found",
+                        )
+                    },
+                )?;
+            }
+        }
+        Ok(conv)
+    }
     pub fn cancel(&self, id: &str) -> Result<()> {
         let controls = self.controls.lock().map_err(ServiceError::storage)?;
         let c = controls
@@ -825,9 +969,14 @@ impl AgentManager {
         c.cancel.cancel();
         Ok(())
     }
-    /// Remove one saved turn. Direct descendants retain their own records and
-    /// continue from the preceding surviving parent, excluding the deleted turn.
-    pub fn delete(&self, id: &str) -> Result<()> {
+    /// Remove an entire saved conversation (all turns and events) and queue
+    /// cleanup of its recorded web chats.
+    pub fn delete_conversation(
+        &self,
+        conversation_id: &str,
+        workspace: Option<&Path>,
+        account_id: Option<&str>,
+    ) -> Result<()> {
         let controls = self.controls.lock().map_err(ServiceError::storage)?;
         if !self
             .failures
@@ -839,8 +988,13 @@ impl AgentManager {
                 "repair agent storage and restart before deleting saved conversations",
             ));
         }
-        self.store
-            .delete_agent_turn(id, |active_id| controls.contains_key(active_id))
+        let canonical = workspace.map(|w| fs::canonicalize(w).unwrap_or_else(|_| w.to_path_buf()));
+        self.store.delete_conversation(
+            conversation_id,
+            canonical.as_deref(),
+            account_id,
+            |active_id| controls.contains_key(active_id),
+        )
     }
     pub fn steer(&self, id: &str, message: &str, artifacts: Vec<String>) -> Result<()> {
         if message.is_empty() || message.len() > 16000 {
@@ -867,14 +1021,19 @@ impl AgentManager {
         c.inbox.push_with_artifacts(message.into(), artifacts);
         Ok(())
     }
-    pub fn resume(self: &Arc<Self>, id: &str) -> Result<String> {
-        let mut job: AgentRecord = self.store.get("local", "agent", id)?;
-        if job.state == "running" {
-            return Err(ServiceError::invalid("agent is still running"));
+    pub fn resume(self: &Arc<Self>, conversation_id: &str) -> Result<StartedAgent> {
+        let conv = self.conversation(conversation_id)?;
+        if conv.turns.iter().any(AgentRecord::is_active) {
+            return Err(ServiceError::invalid("conversation is still running"));
         }
-        job.request.parent_id = Some(id.into());
-        job.request.task = "Continue the previous task from its recorded state. Inspect current files and processes first. Do not replay completed writes or commands, or operations whose outcomes are unknown.".into();
-        self.start(job.request)
+        let latest = conv.latest_turn().ok_or_else(|| {
+            ServiceError::new(ErrorCode::NotFound, "agent", "saved conversation not found")
+        })?;
+        let mut request = latest.request.clone();
+        request.conversation_id = Some(conversation_id.to_owned());
+        request.session_mode = conv.summary.session_mode;
+        request.task = "Continue the previous task from its recorded state. Inspect current files and processes first. Do not replay completed writes or commands, or operations whose outcomes are unknown.".into();
+        self.start(request)
     }
 
     fn validate_artifacts(&self, account: &str, artifacts: &[String]) -> Result<()> {
@@ -952,40 +1111,13 @@ impl AgentManager {
         Ok(sessions)
     }
 
-    fn conversation_ancestors(&self, request: &AgentRequest) -> std::collections::HashSet<String> {
-        const MAX_CONVERSATION_ANCESTORS: usize = 64;
-        let mut ancestors = std::collections::HashSet::new();
-        let mut current = request.parent_id.clone();
-        while ancestors.len() < MAX_CONVERSATION_ANCESTORS {
-            let Some(id) = current else {
-                break;
-            };
-            let Ok(job) = self.snapshot(&id) else {
-                break;
-            };
-            if job.request.workspace != request.workspace
-                || job.request.account_id != request.account_id
-                || job.request.session_mode != request.session_mode
-            {
-                break;
-            }
-            if !ancestors.insert(id) {
-                break;
-            }
-            current = job.request.parent_id;
-        }
-        ancestors
-    }
-
-    fn session_has_tool_contract(&self, request: &AgentRequest, session_id: &str) -> bool {
-        let mut current = request.parent_id.clone();
-        for _ in 0..8 {
-            let Some(parent_id) = current else {
-                break;
-            };
-            let Ok(job) = self.snapshot(&parent_id) else {
-                break;
-            };
+    fn session_has_tool_contract(
+        &self,
+        request: &AgentRequest,
+        session_id: &str,
+        prior_turns: &[AgentRecord],
+    ) -> bool {
+        for job in prior_turns.iter().rev().take(8) {
             if job.request.workspace != request.workspace
                 || job.request.account_id != request.account_id
                 || job.request.session_mode != request.session_mode
@@ -995,31 +1127,31 @@ impl AgentManager {
             if job.state == "completed"
                 && !job.request.chat_only
                 && self
-                    .browser_session_ids(&parent_id)
+                    .browser_session_ids(&job.id)
                     .ok()
                     .is_some_and(|sids| sids.last().map(String::as_str) == Some(session_id))
             {
                 return true;
             }
-            current = job.request.parent_id;
         }
         false
     }
 
-    fn continuable_parent_session(&self, request: &AgentRequest) -> Option<String> {
+    fn continuable_parent_session(
+        &self,
+        request: &AgentRequest,
+        prior_turns: &[AgentRecord],
+    ) -> Option<String> {
         let expected_mode = request.session_mode;
-        let mut current = request.parent_id.clone();
-        for _ in 0..8 {
-            let parent_id = current?;
-            let job = self.snapshot(&parent_id).ok()?;
-            let previous = job.request;
+        for job in prior_turns.iter().rev().take(8) {
+            let previous = &job.request;
             if previous.workspace != request.workspace
                 || previous.account_id != request.account_id
                 || previous.session_mode != request.session_mode
             {
                 return None;
             }
-            let sid = self.browser_session_ids(&parent_id).ok()?.pop();
+            let sid = self.browser_session_ids(&job.id).ok()?.pop();
             if job.state != "completed" {
                 let clean_unsubmitted_failure = match sid.as_deref() {
                     None => true,
@@ -1033,7 +1165,6 @@ impl AgentManager {
                         }),
                 };
                 if clean_unsubmitted_failure {
-                    current = previous.parent_id;
                     continue;
                 }
                 return None;
@@ -1058,7 +1189,7 @@ impl AgentManager {
         workspace: &std::path::Path,
         account_id: &str,
         exclude_agent_id: &str,
-        keep_conversation_jobs: &std::collections::HashSet<String>,
+        keep_conversation_id: Option<&str>,
     ) -> Result<Vec<String>> {
         let mut sids = std::collections::BTreeSet::new();
         for job in self.store.list::<AgentRecord>("local", "agent")? {
@@ -1069,7 +1200,7 @@ impl AgentManager {
             if req.workspace != workspace || req.account_id != account_id {
                 continue;
             }
-            let include_subagents = !keep_conversation_jobs.contains(&job.id);
+            let include_subagents = keep_conversation_id != Some(job.conversation_id.as_str());
             for sid in self
                 .job_session_ids(&job.id, include_subagents)
                 .unwrap_or_default()
@@ -1088,23 +1219,18 @@ impl AgentManager {
     }
 
     /// Bounded, explicitly scoped observations for a follow-up. Never rerun the old task.
-    fn context(&self, request: &mut AgentRequest) -> Result<String> {
-        let mut current = request.parent_id.clone();
+    fn context(&self, request: &mut AgentRequest, prior_turns: &[AgentRecord]) -> Result<String> {
         let mut turns = Vec::new();
         let mut remaining = 18000;
-        for _ in 0..8 {
-            let Some(id) = current else {
-                break;
-            };
-            let job = self.snapshot(&id)?;
-            let previous = job.request;
+        for job in prior_turns.iter().rev().take(8) {
+            let previous = &job.request;
             if previous.workspace != request.workspace || previous.account_id != request.account_id
             {
                 return Err(ServiceError::invalid(
                     "resume requires the same workspace and account",
                 ));
             }
-            if job.state == "running" {
+            if job.is_active() {
                 return Err(ServiceError::invalid(
                     "use steering while the previous turn is running",
                 ));
@@ -1114,7 +1240,7 @@ impl AgentManager {
                     request.artifacts.push(artifact.clone());
                 }
             }
-            let observations = self.collect_steered_artifacts(&id, &mut request.artifacts)?;
+            let observations = self.collect_steered_artifacts(&job.id, &mut request.artifacts)?;
             let final_response: String = job
                 .result
                 .as_ref()
@@ -1149,7 +1275,6 @@ impl AgentManager {
             if remaining == 0 {
                 break;
             }
-            current = previous.parent_id;
         }
         if turns.is_empty() {
             return Ok(String::new());
@@ -1162,11 +1287,15 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn saved_turn(store: &Store, id: &str, parent: Option<&str>, state: &str) {
+    fn saved_turn(store: &Store, conv_id: &str, id: &str, state: &str, created_at: i64) {
+        let workspace =
+            fs::canonicalize(store.root()).unwrap_or_else(|_| store.root().to_path_buf());
         store.put("local", "agent", id, &json!({
-            "id":id,"state":state,
-            "request":{"task":format!("task for {id}"),"workspace":store.root(),"account_id":"default","parent_id":parent},
-            "result":{"final_response":format!("answer for {id}")}
+            "id":id,"conversation_id":conv_id,"state":state,
+            "request":{"task":format!("task for {id}"),"workspace":workspace,"account_id":"default","conversation_id":conv_id},
+            "result":{"final_response":format!("answer for {id}")},
+            "created_at":created_at,
+            "updated_at":created_at + 1
         })).unwrap();
         store
             .event(
@@ -1176,15 +1305,99 @@ mod tests {
             )
             .unwrap();
     }
+
     #[test]
-    fn delete_removes_only_selected_turn_and_events_and_preserves_followup_context() {
+    fn resolve_conversation_enforces_mode_lease_and_failure_overlay() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let manager = AgentManager::new(store.clone()).unwrap();
-        saved_turn(&store, "ancestor", None, "completed");
-        saved_turn(&store, "removed", Some("ancestor"), "completed");
-        saved_turn(&store, "child", Some("removed"), "completed");
-        saved_turn(&store, "other", None, "interrupted");
+        let ws = fs::canonicalize(dir.path()).unwrap();
+
+        store
+            .put(
+                "local",
+                "agent",
+                "t-normal",
+                &json!({
+                    "id":"t-normal","conversation_id":"conv-normal","state":"completed",
+                    "request":{"task":"normal task","workspace":ws,"account_id":"default","conversation_id":"conv-normal","session_mode":"chat"},
+                    "created_at":10,"updated_at":11
+                }),
+            )
+            .unwrap();
+        store
+            .put(
+                "local",
+                "agent",
+                "t-temp",
+                &json!({
+                    "id":"t-temp","conversation_id":"conv-temp","state":"completed",
+                    "request":{"task":"temp task","workspace":ws,"account_id":"default","conversation_id":"conv-temp","session_mode":"temporary"},
+                    "created_at":20,"updated_at":21
+                }),
+            )
+            .unwrap();
+
+        let controls = manager.controls.lock().unwrap();
+        let mut normal_on_temp: AgentRequest = serde_json::from_value(json!({
+            "task":"next","workspace":ws,"account_id":"default","conversation_id":"conv-temp","session_mode":"chat"
+        }))
+        .unwrap();
+        assert_eq!(
+            manager
+                .resolve_conversation(&controls, &mut normal_on_temp, false, true)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+
+        let mut normal_no_lease: AgentRequest = serde_json::from_value(json!({
+            "task":"next","workspace":ws,"account_id":"default","conversation_id":"conv-normal","session_mode":"temporary"
+        }))
+        .unwrap();
+        assert_eq!(
+            manager
+                .resolve_conversation(&controls, &mut normal_no_lease, false, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceConflict
+        );
+
+        let mut temp_on_normal: AgentRequest = serde_json::from_value(json!({
+            "task":"next","workspace":ws,"account_id":"default","conversation_id":"conv-normal","session_mode":"temporary"
+        }))
+        .unwrap();
+        let (conv_id, prior) = manager
+            .resolve_conversation(&controls, &mut temp_on_normal, true, false)
+            .unwrap();
+        assert_eq!(conv_id, "conv-normal");
+        assert_eq!(prior.len(), 1);
+        drop(controls);
+
+        let mut failed: AgentRecord = store.get("local", "agent", "t-normal").unwrap();
+        failed.state = "failed".into();
+        failed.updated_at = 99;
+        manager
+            .failures
+            .lock()
+            .unwrap()
+            .insert("t-normal".into(), failed);
+        let list = manager
+            .list_conversations(Some(&ws), Some("default"), 10)
+            .unwrap();
+        assert_eq!(list[0].id, "conv-normal");
+        assert_eq!(list[0].state, "failed");
+        assert_eq!(list[0].updated_at, 99);
+    }
+    #[test]
+    fn delete_conversation_removes_all_turns_and_events_and_preserves_other_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store.clone()).unwrap();
+        saved_turn(&store, "conv-a", "turn-1", "completed", 10);
+        saved_turn(&store, "conv-a", "turn-2", "completed", 20);
+        saved_turn(&store, "conv-a", "turn-3", "completed", 30);
+        saved_turn(&store, "conv-b", "other", "interrupted", 25);
         let artifact = store
             .artifact(
                 "default",
@@ -1204,19 +1417,28 @@ mod tests {
                 &json!({"id":"browser-session","provider":"gemini-web","account_id":"default","mode":"chat","state":"idle"}),
             )
             .unwrap();
-        manager.delete("removed").unwrap();
-        assert_eq!(
-            manager.snapshot("removed").unwrap_err().code,
-            ErrorCode::NotFound
-        );
-        assert!(store.events("removed", 0).unwrap().is_empty());
-        assert_eq!(store.list::<Value>("local", "agent").unwrap().len(), 3);
-        assert_eq!(store.events("child", 0).unwrap().len(), 1);
+        let list = manager
+            .list_conversations(Some(dir.path()), Some("default"), 20)
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "conv-a");
+        assert_eq!(list[0].turn_count, 3);
+        assert_eq!(list[0].title, "task for turn-1");
+        assert_eq!(list[0].latest_agent_id, "turn-3");
+        assert_eq!(list[1].id, "conv-b");
+
+        manager
+            .delete_conversation("conv-a", Some(dir.path()), Some("default"))
+            .unwrap();
+        for deleted in ["turn-1", "turn-2", "turn-3"] {
+            assert_eq!(
+                manager.snapshot(deleted).unwrap_err().code,
+                ErrorCode::NotFound
+            );
+            assert!(store.events(deleted, 0).unwrap().is_empty());
+        }
+        assert_eq!(store.list::<Value>("local", "agent").unwrap().len(), 1);
         assert_eq!(store.events("other", 0).unwrap().len(), 1);
-        assert_eq!(
-            store.get::<Value>("local", "agent", "child").unwrap()["request"]["parent_id"],
-            "ancestor"
-        );
         assert_eq!(fs::read_to_string(project_file).unwrap(), "project content");
         assert_eq!(
             store.artifact_bytes("default", &artifact.id).unwrap().1,
@@ -1228,68 +1450,68 @@ mod tests {
                 .unwrap()["state"],
             "idle"
         );
-        let mut followup: AgentRequest = serde_json::from_value(json!({
-            "task":"next","workspace":dir.path(),"parent_id":"child"
-        }))
-        .unwrap();
-        let context = manager.context(&mut followup).unwrap();
-        assert!(context.contains("task for child") && context.contains("task for ancestor"));
-        assert!(!context.contains("task for removed"));
         drop(manager);
         let reopened = Store::open(dir.path()).unwrap();
-        assert!(reopened.get::<Value>("local", "agent", "removed").is_err());
-        assert!(reopened.events("removed", 0).unwrap().is_empty());
-        // Deleting the root of a remaining chain detaches its direct child.
+        assert!(reopened.get_conversation("conv-a").is_err());
+        assert!(reopened.get_conversation("conv-b").is_ok());
         let manager = AgentManager::new(reopened.clone()).unwrap();
-        manager.delete("ancestor").unwrap();
-        assert!(manager
-            .snapshot("child")
-            .unwrap()
-            .request
-            .parent_id
-            .is_none());
-        assert!(manager
-            .context(&mut followup)
-            .unwrap()
-            .contains("task for child"));
         assert_eq!(
-            manager.delete("missing").unwrap_err().code,
+            manager
+                .delete_conversation("missing", None, None)
+                .unwrap_err()
+                .code,
             ErrorCode::NotFound
         );
     }
+    #[cfg(unix)]
     #[test]
-    fn delete_rejects_active_turns_and_dependents_and_rolls_back_all_changes() {
+    fn conversation_list_and_delete_canonicalize_symlinked_store_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = Store::open(&link).unwrap();
+        let manager = AgentManager::new(store.clone()).unwrap();
+        saved_turn(&store, "conv-link", "turn-link", "completed", 10);
+
+        let list = manager
+            .list_conversations(Some(&link), Some("default"), 20)
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "conv-link");
+
+        manager
+            .delete_conversation("conv-link", Some(&link), Some("default"))
+            .unwrap();
+        assert!(store.get_conversation("conv-link").is_err());
+    }
+    #[test]
+    fn delete_conversation_rejects_active_turns_and_rolls_back_all_changes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let manager = AgentManager::new(store.clone()).unwrap();
         for state in ["running", "queued"] {
-            saved_turn(&store, "target", None, state);
+            saved_turn(&store, "conv-active", "target", state, 1);
             assert!(manager
-                .delete("target")
+                .delete_conversation("conv-active", None, None)
                 .unwrap_err()
                 .message
                 .contains("still running"));
             assert!(manager.snapshot("target").is_ok());
         }
-        saved_turn(&store, "target", None, "completed");
-        saved_turn(&store, "a-child", Some("target"), "completed");
-        saved_turn(&store, "z-child", Some("target"), "running");
+        saved_turn(&store, "conv-active", "target", "completed", 1);
+        saved_turn(&store, "conv-active", "a-child", "completed", 2);
+        saved_turn(&store, "conv-active", "z-child", "running", 3);
         assert!(manager
-            .delete("target")
+            .delete_conversation("conv-active", None, None)
             .unwrap_err()
             .message
-            .contains("follow-up"));
-        assert_eq!(
-            manager
-                .snapshot("a-child")
-                .unwrap()
-                .request
-                .parent_id
-                .as_deref(),
-            Some("target")
-        );
+            .contains("still running"));
+        assert!(manager.snapshot("target").is_ok());
+        assert!(manager.snapshot("a-child").is_ok());
         assert!(!store.events("target", 0).unwrap().is_empty());
-        saved_turn(&store, "z-child", Some("target"), "completed");
+        saved_turn(&store, "conv-active", "z-child", "completed", 3);
         for id in ["target", "z-child"] {
             manager.controls.lock().unwrap().insert(
                 id.into(),
@@ -1300,7 +1522,9 @@ mod tests {
                 },
             );
             assert!(
-                manager.delete("target").is_err(),
+                manager
+                    .delete_conversation("conv-active", None, None)
+                    .is_err(),
                 "terminal writes may still be in flight while control is registered"
             );
             manager.controls.lock().unwrap().remove(id);
@@ -1309,6 +1533,7 @@ mod tests {
             "storage-failure".into(),
             AgentRecord {
                 id: "storage-failure".into(),
+                conversation_id: "conv-err".into(),
                 state: "failed".into(),
                 request: AgentRequest {
                     environment: None,
@@ -1323,7 +1548,7 @@ mod tests {
                     knowledge: None,
                     mcp_config: None,
                     artifacts: vec![],
-                    parent_id: None,
+                    conversation_id: Some("conv-err".into()),
                     chat_only: false,
                     permissions: None,
                     session_retention: SessionRetention::Unspecified,
@@ -1335,7 +1560,7 @@ mod tests {
             },
         );
         assert!(manager
-            .delete("target")
+            .delete_conversation("conv-active", None, None)
             .unwrap_err()
             .message
             .contains("repair"));
@@ -1345,19 +1570,10 @@ mod tests {
             .unwrap()
             .contains_key("storage-failure"));
         manager.failures.lock().unwrap().clear();
-        manager.delete("target").unwrap();
-        assert!(manager
-            .snapshot("a-child")
-            .unwrap()
-            .request
-            .parent_id
-            .is_none());
-        assert!(manager
-            .snapshot("z-child")
-            .unwrap()
-            .request
-            .parent_id
-            .is_none());
+        manager
+            .delete_conversation("conv-active", None, None)
+            .unwrap();
+        assert!(store.get_conversation("conv-active").is_err());
     }
     #[test]
     fn followups_keep_scoped_attachments_steering_and_bounded_context() {
@@ -1383,10 +1599,10 @@ mod tests {
             )
             .unwrap();
         let original: AgentRequest = serde_json::from_value(
-            json!({"task":"original task","workspace":dir.path(),"artifacts":[a.id]}),
+            json!({"task":"original task","workspace":dir.path(),"conversation_id":"conv-1","artifacts":[a.id]}),
         )
         .unwrap();
-        store.put("local", "agent", "previous", &json!({"id":"previous","state":"completed","request":original,"result":{"final_response":"done","files_changed":["output.txt"]}})).unwrap();
+        store.put("local", "agent", "previous", &json!({"id":"previous","conversation_id":"conv-1","state":"completed","request":original,"result":{"final_response":"done","files_changed":["output.txt"]},"created_at":1,"updated_at":2})).unwrap();
         store
             .event(
                 "previous",
@@ -1395,10 +1611,11 @@ mod tests {
             )
             .unwrap();
         let mut next: AgentRequest = serde_json::from_value(
-            json!({"task":"now explain the change","workspace":dir.path(),"parent_id":"previous"}),
+            json!({"task":"now explain the change","workspace":dir.path(),"conversation_id":"conv-1"}),
         )
         .unwrap();
-        let context = manager.context(&mut next).unwrap();
+        let prior = store.get_conversation("conv-1").unwrap().turns;
+        let context = manager.context(&mut next, &prior).unwrap();
         assert_eq!(next.task, "now explain the change");
         assert_eq!(next.artifacts, vec![a.id, b.id]);
         assert!(context.contains("keep the public API"));
@@ -1406,7 +1623,7 @@ mod tests {
         assert!(!context.contains("PRIVATE FILE CONTENT"));
         assert!(context.chars().count() < 19000);
         next.account_id = "other".into();
-        assert!(manager.context(&mut next).is_err());
+        assert!(manager.context(&mut next, &prior).is_err());
         assert!(manager
             .validate_artifacts("other", &next.artifacts)
             .is_err());
@@ -1448,9 +1665,10 @@ mod tests {
                 "agent",
                 "turn-1",
                 &json!({
-                    "id":"turn-1","state":"completed",
-                    "request":{"task":"first","workspace":ws,"account_id":"default","parent_id":null,"session_mode":"chat"},
-                    "result":{"final_response":"ok"}
+                    "id":"turn-1","conversation_id":"conv-chat","state":"completed",
+                    "request":{"task":"first","workspace":ws,"account_id":"default","conversation_id":"conv-chat","session_mode":"chat"},
+                    "result":{"final_response":"ok"},
+                    "created_at":1,"updated_at":2
                 }),
             )
             .unwrap();
@@ -1463,21 +1681,25 @@ mod tests {
             .unwrap();
 
         let followup: AgentRequest = serde_json::from_value(json!({
-            "task":"second","workspace":ws,"account_id":"default","parent_id":"turn-1"
+            "task":"second","workspace":ws,"account_id":"default","conversation_id":"conv-chat"
         }))
         .unwrap();
+        let chat_turns = store.get_conversation("conv-chat").unwrap().turns;
         assert_eq!(
-            manager.continuable_parent_session(&followup).as_deref(),
+            manager
+                .continuable_parent_session(&followup, &chat_turns)
+                .as_deref(),
             Some("sess-ready")
         );
         let mut temp_followup = followup.clone();
         temp_followup.session_mode = SessionMode::Temporary;
-        assert!(manager.continuable_parent_session(&temp_followup).is_none());
+        assert!(manager
+            .continuable_parent_session(&temp_followup, &chat_turns)
+            .is_none());
 
-        let empty_keep = std::collections::HashSet::new();
         assert_eq!(
             manager
-                .idle_workspace_sessions(&ws, "default", "turn-2", &empty_keep)
+                .idle_workspace_sessions(&ws, "default", "turn-2", None)
                 .unwrap(),
             vec!["sess-ready"]
         );
@@ -1491,7 +1713,9 @@ mod tests {
             .put("local", "session", "sess-ready", &evicted)
             .unwrap();
         assert_eq!(
-            manager.continuable_parent_session(&followup).as_deref(),
+            manager
+                .continuable_parent_session(&followup, &chat_turns)
+                .as_deref(),
             Some("sess-ready")
         );
 
@@ -1505,7 +1729,9 @@ mod tests {
             .put("local", "session", "sess-ready", &evicted)
             .unwrap();
         assert_eq!(
-            manager.continuable_parent_session(&followup).as_deref(),
+            manager
+                .continuable_parent_session(&followup, &chat_turns)
+                .as_deref(),
             Some("sess-ready")
         );
         store
@@ -1514,18 +1740,22 @@ mod tests {
                 "agent",
                 "turn-2-failed",
                 &json!({
-                    "id":"turn-2-failed","state":"failed",
-                    "request":{"task":"failed step","workspace":ws,"account_id":"default","parent_id":"turn-1","session_mode":"chat"},
-                    "error":{"code":"internal","message":"prepare failed"}
+                    "id":"turn-2-failed","conversation_id":"conv-chat","state":"failed",
+                    "request":{"task":"failed step","workspace":ws,"account_id":"default","conversation_id":"conv-chat","session_mode":"chat"},
+                    "error":{"code":"internal","message":"prepare failed"},
+                    "created_at":3,"updated_at":4
                 }),
             )
             .unwrap();
         let after_failed: AgentRequest = serde_json::from_value(json!({
-            "task":"retry after prepare failure","workspace":ws,"account_id":"default","parent_id":"turn-2-failed"
+            "task":"retry after prepare failure","workspace":ws,"account_id":"default","conversation_id":"conv-chat"
         }))
         .unwrap();
+        let chat_turns_after_fail = store.get_conversation("conv-chat").unwrap().turns;
         assert_eq!(
-            manager.continuable_parent_session(&after_failed).as_deref(),
+            manager
+                .continuable_parent_session(&after_failed, &chat_turns_after_fail)
+                .as_deref(),
             Some("sess-ready")
         );
 
@@ -1561,9 +1791,10 @@ mod tests {
                 "agent",
                 "temp-turn-1",
                 &json!({
-                    "id":"temp-turn-1","state":"completed",
-                    "request":{"task":"temp first","workspace":ws,"account_id":"default","parent_id":null,"session_mode":"temporary","chat_only":true},
-                    "result":{"final_response":"ok"}
+                    "id":"temp-turn-1","conversation_id":"conv-temp","state":"completed",
+                    "request":{"task":"temp first","workspace":ws,"account_id":"default","conversation_id":"conv-temp","session_mode":"temporary","chat_only":true},
+                    "result":{"final_response":"ok"},
+                    "created_at":10,"updated_at":11
                 }),
             )
             .unwrap();
@@ -1576,12 +1807,13 @@ mod tests {
             .unwrap();
 
         let temp_continue: AgentRequest = serde_json::from_value(json!({
-            "task":"temp second","workspace":ws,"account_id":"default","parent_id":"temp-turn-1","session_mode":"temporary"
+            "task":"temp second","workspace":ws,"account_id":"default","conversation_id":"conv-temp","session_mode":"temporary"
         }))
         .unwrap();
+        let temp_turns = store.get_conversation("conv-temp").unwrap().turns;
         assert_eq!(
             manager
-                .continuable_parent_session(&temp_continue)
+                .continuable_parent_session(&temp_continue, &temp_turns)
                 .as_deref(),
             Some("sess-temp-ready")
         );
@@ -1589,7 +1821,7 @@ mod tests {
         let mut normal_after_temp = temp_continue.clone();
         normal_after_temp.session_mode = SessionMode::Chat;
         assert!(manager
-            .continuable_parent_session(&normal_after_temp)
+            .continuable_parent_session(&normal_after_temp, &temp_turns)
             .is_none());
         // Sub-agent sessions recorded on a turn stay alive during follow-ups in the same
         // conversation, never hijack `continuable_parent_session`, and are closed on `/new`.
@@ -1625,21 +1857,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            manager.continuable_parent_session(&followup).as_deref(),
+            manager
+                .continuable_parent_session(&followup, &chat_turns)
+                .as_deref(),
             Some("sess-ready")
         );
-        let keep_turn1 = manager.conversation_ancestors(&followup);
         assert_eq!(
             manager
-                .idle_workspace_sessions(&ws, "default", "turn-next", &keep_turn1)
+                .idle_workspace_sessions(&ws, "default", "turn-next", Some("conv-chat"))
                 .unwrap(),
             vec!["sess-ready", "sess-temp-ready"]
         );
-        // Starting a fresh conversation (`/new` / `/clear`) clears `keep_conversation_jobs` and
+        // Starting a fresh conversation (`/new` / `/clear`) clears `keep_conversation_id` and
         // closes idle main, temporary, and sub-agent sessions in this workspace.
         assert_eq!(
             manager
-                .idle_workspace_sessions(&ws, "default", "turn-next", &empty_keep)
+                .idle_workspace_sessions(&ws, "default", "turn-next", None)
                 .unwrap(),
             vec!["sess-ready", "sess-subagent", "sess-temp-ready"]
         );
@@ -1654,7 +1887,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             manager
-                .continuable_parent_session(&temp_continue)
+                .continuable_parent_session(&temp_continue, &temp_turns)
                 .as_deref(),
             Some("sess-temp-ready")
         );
@@ -1666,18 +1899,22 @@ mod tests {
                 "agent",
                 "temp-turn-2-failed",
                 &json!({
-                    "id":"temp-turn-2-failed","state":"failed",
-                    "request":{"task":"temp failed","workspace":ws,"account_id":"default","parent_id":"temp-turn-1","session_mode":"temporary"},
-                    "error":{"code":"internal","message":"prepare failed"}
+                    "id":"temp-turn-2-failed","conversation_id":"conv-temp","state":"failed",
+                    "request":{"task":"temp failed","workspace":ws,"account_id":"default","conversation_id":"conv-temp","session_mode":"temporary"},
+                    "error":{"code":"internal","message":"prepare failed"},
+                    "created_at":12,"updated_at":13
                 }),
             )
             .unwrap();
         let retry_temp: AgentRequest = serde_json::from_value(json!({
-            "task":"temp retry","workspace":ws,"account_id":"default","parent_id":"temp-turn-2-failed","session_mode":"temporary"
+            "task":"temp retry","workspace":ws,"account_id":"default","conversation_id":"conv-temp","session_mode":"temporary"
         }))
         .unwrap();
+        let temp_turns_after_fail = store.get_conversation("conv-temp").unwrap().turns;
         assert_eq!(
-            manager.continuable_parent_session(&retry_temp).as_deref(),
+            manager
+                .continuable_parent_session(&retry_temp, &temp_turns_after_fail)
+                .as_deref(),
             Some("sess-temp-ready")
         );
 
@@ -1689,9 +1926,10 @@ mod tests {
                 "agent",
                 "temp-after-normal-agent",
                 &json!({
-                    "id":"temp-after-normal-agent","state":"completed",
-                    "request":{"task":"temp chat","workspace":ws,"account_id":"default","parent_id":"turn-1","session_mode":"temporary","chat_only":true},
-                    "result":{"final_response":"ok"}
+                    "id":"temp-after-normal-agent","conversation_id":"conv-chat","state":"completed",
+                    "request":{"task":"temp chat","workspace":ws,"account_id":"default","conversation_id":"conv-chat","session_mode":"temporary","chat_only":true},
+                    "result":{"final_response":"ok"},
+                    "created_at":20,"updated_at":21
                 }),
             )
             .unwrap();
@@ -1703,10 +1941,15 @@ mod tests {
             )
             .unwrap();
         let agent_in_temp: AgentRequest = serde_json::from_value(json!({
-            "task":"now use tools","workspace":ws,"account_id":"default","parent_id":"temp-after-normal-agent","session_mode":"temporary","chat_only":false
+            "task":"now use tools","workspace":ws,"account_id":"default","conversation_id":"conv-chat","session_mode":"temporary","chat_only":false
         }))
         .unwrap();
-        assert!(!manager.session_has_tool_contract(&agent_in_temp, "sess-temp-ready"));
+        let mixed_turns = store.get_conversation("conv-chat").unwrap().turns;
+        assert!(!manager.session_has_tool_contract(
+            &agent_in_temp,
+            "sess-temp-ready",
+            &mixed_turns
+        ));
 
         // Closed or invalidated temporary sessions cannot be reopened from a URL.
         for dead_state in [SessionState::Closed, SessionState::Invalidated] {
@@ -1715,7 +1958,9 @@ mod tests {
                 .put("local", "session", "sess-temp-ready", &relay_temp)
                 .unwrap();
             assert!(
-                manager.continuable_parent_session(&temp_continue).is_none(),
+                manager
+                    .continuable_parent_session(&temp_continue, &temp_turns)
+                    .is_none(),
                 "temporary session in state {dead_state} must not continue"
             );
         }
@@ -1733,9 +1978,10 @@ mod tests {
                 "agent",
                 "long-task",
                 &json!({
-                    "id":"long-task", "state":"completed",
-                    "request":{"task":"long task","workspace":workspace,"account_id":"default"},
-                    "result":{"final_response":"done"}
+                    "id":"long-task", "conversation_id":"conv-long", "state":"completed",
+                    "request":{"task":"long task","workspace":workspace,"account_id":"default","conversation_id":"conv-long"},
+                    "result":{"final_response":"done"},
+                    "created_at":1,"updated_at":2
                 }),
             )
             .unwrap();
@@ -1788,20 +2034,18 @@ mod tests {
             )
             .unwrap();
         let followup: AgentRequest = serde_json::from_value(json!({
-            "task":"continue", "workspace":workspace, "account_id":"default", "parent_id":"long-task"
+            "task":"continue", "workspace":workspace, "account_id":"default", "conversation_id":"conv-long"
         })).unwrap();
+        let long_turns = store.get_conversation("conv-long").unwrap().turns;
         assert_eq!(
-            manager.continuable_parent_session(&followup).as_deref(),
+            manager
+                .continuable_parent_session(&followup, &long_turns)
+                .as_deref(),
             Some("after-checkpoint")
         );
         assert_eq!(
             manager
-                .idle_workspace_sessions(
-                    &workspace,
-                    "default",
-                    "next-task",
-                    &std::collections::HashSet::new()
-                )
+                .idle_workspace_sessions(&workspace, "default", "next-task", None)
                 .unwrap(),
             vec!["after-checkpoint"]
         );
@@ -1816,6 +2060,7 @@ mod tests {
 
         for iter in 0..32 {
             let job_id = format!("agent-race-{iter}");
+            let conv_id = format!("conv-race-{iter}");
             let request = AgentRequest {
                 environment: None,
                 task: format!("turn {iter}"),
@@ -1829,7 +2074,7 @@ mod tests {
                 knowledge: None,
                 mcp_config: None,
                 artifacts: vec![],
-                parent_id: None,
+                conversation_id: Some(conv_id.clone()),
                 chat_only: false,
                 permissions: None,
                 session_retention: SessionRetention::Retain,
@@ -1847,6 +2092,7 @@ mod tests {
                         &job_id,
                         &AgentRecord {
                             id: job_id.clone(),
+                            conversation_id: conv_id.clone(),
                             state: "running".into(),
                             request: request.clone(),
                             result: None,
@@ -1862,6 +2108,7 @@ mod tests {
 
             let terminal = AgentRecord {
                 id: job_id.clone(),
+                conversation_id: conv_id.clone(),
                 state: "completed".into(),
                 request,
                 result: Some(AgentRunResult {
@@ -1908,7 +2155,9 @@ mod tests {
                 events.iter().any(|ev| ev.kind == "agent_terminal"),
                 "iter {iter}: agent_terminal missing after completed snapshot"
             );
-            manager.delete(&job_id).unwrap();
+            manager
+                .delete_conversation(&conv_id, Some(&workspace), Some("default"))
+                .unwrap();
             worker.join().unwrap();
         }
     }

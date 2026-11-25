@@ -906,18 +906,29 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
         knowledge: r.knowledge,
         mcp_config: r.mcp_config.map(|p| p.to_string_lossy().into_owned()),
         artifacts: r.artifacts,
-        parent_id: r.parent_id,
         session_retention: session_retention_to(r.session_retention),
         chat_only: r.chat_only,
         permissions: r.permissions.map(tool_permissions_to),
+        conversation_id: r.conversation_id,
     }
 }
 pub fn agent_request_from(r: pb::AgentRequest) -> Result<d::AgentRequest> {
+    let account_id = if r.account_id.trim().is_empty() {
+        "default".into()
+    } else {
+        r.account_id
+    };
+    let conversation_id = r
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     Ok(d::AgentRequest {
         environment: (!r.environment.is_empty()).then(|| r.environment.into_iter().collect()),
         task: r.task,
         workspace: PathBuf::from(r.workspace),
-        account_id: r.account_id,
+        account_id,
         model: r.model,
         thinking: r.thinking,
         session_mode: session_mode_from(r.session_mode)?,
@@ -926,7 +937,7 @@ pub fn agent_request_from(r: pb::AgentRequest) -> Result<d::AgentRequest> {
         knowledge: r.knowledge,
         mcp_config: r.mcp_config.map(PathBuf::from),
         artifacts: r.artifacts,
-        parent_id: r.parent_id,
+        conversation_id,
         chat_only: r.chat_only,
         permissions: r.permissions.map(tool_permissions_from),
         session_retention: session_retention_from(r.session_retention)?,
@@ -937,6 +948,7 @@ pub fn agent_to(record: d::AgentRecord) -> pb::Agent {
     request.environment = None;
     pb::Agent {
         id: record.id,
+        conversation_id: record.conversation_id,
         state: record.state,
         request: Some(agent_request_to(request)),
         result: record.result.map(|res| pb::AgentResult {
@@ -1036,6 +1048,7 @@ pub fn agent_from(value: pb::Agent) -> Result<d::AgentRecord> {
         .transpose()?;
     Ok(d::AgentRecord {
         id: value.id,
+        conversation_id: value.conversation_id,
         state: value.state,
         request,
         result,
@@ -1043,6 +1056,54 @@ pub fn agent_from(value: pb::Agent) -> Result<d::AgentRecord> {
         created_at: value.created_at,
         updated_at: value.updated_at,
     })
+}
+pub fn conversation_summary_to(s: d::ConversationSummary) -> pb::ConversationSummary {
+    pb::ConversationSummary {
+        id: s.id,
+        latest_agent_id: s.latest_agent_id,
+        workspace: s.workspace.to_string_lossy().into_owned(),
+        account_id: s.account_id,
+        state: s.state,
+        session_mode: session_mode_to(s.session_mode),
+        title: s.title,
+        turn_count: s.turn_count,
+        created_at: s.created_at,
+        updated_at: s.updated_at,
+        model: s.model,
+        thinking: s.thinking,
+        chat_only: s.chat_only,
+    }
+}
+pub fn conversation_summary_from(s: pb::ConversationSummary) -> Result<d::ConversationSummary> {
+    Ok(d::ConversationSummary {
+        id: s.id,
+        latest_agent_id: s.latest_agent_id,
+        workspace: PathBuf::from(s.workspace),
+        account_id: s.account_id,
+        state: s.state,
+        session_mode: session_mode_from(s.session_mode)?,
+        title: s.title,
+        turn_count: s.turn_count,
+        created_at: s.created_at,
+        updated_at: s.updated_at,
+        model: s.model,
+        thinking: s.thinking,
+        chat_only: s.chat_only,
+    })
+}
+pub fn conversation_to(c: d::ConversationRecord) -> pb::Conversation {
+    pb::Conversation {
+        summary: Some(conversation_summary_to(c.summary)),
+        turns: c.turns.into_iter().map(agent_to).collect(),
+    }
+}
+pub fn conversation_from(c: pb::Conversation) -> Result<d::ConversationRecord> {
+    let summary = conversation_summary_from(
+        c.summary
+            .ok_or_else(|| ServiceError::invalid("missing conversation summary"))?,
+    )?;
+    let turns = c.turns.into_iter().map(agent_from).collect::<Result<_>>()?;
+    Ok(d::ConversationRecord { summary, turns })
 }
 pub fn status_from(status: pb::HostStatus) -> Value {
     let accounts: Vec<_> = status
@@ -1105,6 +1166,7 @@ mod tests {
             .contains("transient-fixture-value"));
         let response = agent_to(d::AgentRecord {
             id: "fixture".into(),
+            conversation_id: "conv-fixture".into(),
             state: "running".into(),
             request,
             result: None,
@@ -1242,7 +1304,7 @@ mod tests {
             knowledge: None,
             mcp_config: None,
             artifacts: vec![],
-            parent_id: None,
+            conversation_id: Some("conv-typed".into()),
             chat_only: true,
             permissions: Some(d::ToolPermissions {
                 read: true,

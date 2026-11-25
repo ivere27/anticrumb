@@ -839,11 +839,15 @@ impl Host {
                         .collect()
                 })
             }
-            "/anticrumb.v1.WorkspaceService/StartAgent" => reply!(pb::AgentRef {
-                id: self
+            "/anticrumb.v1.WorkspaceService/StartAgent" => {
+                let started = self
                     .agents()?
-                    .start(codec::agent_request_from(decode!(pb::AgentRequest))?)?
-            }),
+                    .start(codec::agent_request_from(decode!(pb::AgentRequest))?)?;
+                reply!(pb::StartAgentResponse {
+                    id: started.id,
+                    conversation_id: started.conversation_id,
+                })
+            }
             "/anticrumb.v1.WorkspaceService/GetAgent" => reply!(codec::agent_to(
                 self.agents()?.snapshot(&decode!(pb::AgentRef).id)?
             )),
@@ -854,12 +858,41 @@ impl Host {
                     .map(codec::agent_to)
                     .collect()
             }),
+            "/anticrumb.v1.WorkspaceService/GetConversation" => reply!(codec::conversation_to(
+                self.agents()?
+                    .conversation(&decode!(pb::ConversationRef).id)?
+            )),
+            "/anticrumb.v1.WorkspaceService/ListConversations" => {
+                let r = decode!(pb::ListConversationsRequest);
+                let workspace = r
+                    .workspace
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(Path::new);
+                let account_id = r.account_id.as_deref().filter(|s| !s.is_empty());
+                reply!(pb::ConversationList {
+                    conversations: self
+                        .agents()?
+                        .list_conversations(workspace, account_id, r.limit as usize)?
+                        .into_iter()
+                        .map(codec::conversation_summary_to)
+                        .collect()
+                })
+            }
             "/anticrumb.v1.WorkspaceService/CancelAgent" => {
                 self.agents()?.cancel(&decode!(pb::AgentRef).id)?;
                 reply!(pb::Empty {})
             }
-            "/anticrumb.v1.WorkspaceService/DeleteAgent" => {
-                self.agents()?.delete(&decode!(pb::AgentRef).id)?;
+            "/anticrumb.v1.WorkspaceService/DeleteAgentConversation" => {
+                let r = decode!(pb::DeleteConversationRequest);
+                let workspace = r
+                    .workspace
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(Path::new);
+                let account_id = r.account_id.as_deref().filter(|s| !s.is_empty());
+                self.agents()?
+                    .delete_conversation(&r.id, workspace, account_id)?;
                 self.service.start_chat_cleanup();
                 reply!(pb::Empty {})
             }
@@ -868,9 +901,13 @@ impl Host {
                 self.agents()?.steer(&r.id, &r.message, r.artifacts)?;
                 reply!(pb::Empty {})
             }
-            "/anticrumb.v1.WorkspaceService/ResumeAgent" => reply!(pb::AgentRef {
-                id: self.agents()?.resume(&decode!(pb::AgentRef).id)?
-            }),
+            "/anticrumb.v1.WorkspaceService/ResumeConversation" => {
+                let started = self.agents()?.resume(&decode!(pb::ConversationRef).id)?;
+                reply!(pb::StartAgentResponse {
+                    id: started.id,
+                    conversation_id: started.conversation_id,
+                })
+            }
             "/anticrumb.v1.WorkspaceService/QueryKnowledge" => {
                 let r = decode!(pb::KnowledgeQuery);
                 reply!(pb::KnowledgeResults {
