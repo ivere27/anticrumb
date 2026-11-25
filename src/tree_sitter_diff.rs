@@ -109,6 +109,7 @@ pub enum SupportedLanguage {
     Bash,
     Ruby,
     Json,
+    Dart,
 }
 
 impl SupportedLanguage {
@@ -128,6 +129,7 @@ impl SupportedLanguage {
             "bash" | "sh" => Some(Self::Bash),
             "ruby" => Some(Self::Ruby),
             "json" => Some(Self::Json),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -148,6 +150,7 @@ impl SupportedLanguage {
             Self::Bash => "bash",
             Self::Ruby => "ruby",
             Self::Json => "json",
+            Self::Dart => "dart",
         }
     }
 
@@ -172,19 +175,20 @@ impl SupportedLanguage {
     #[cfg(feature = "tree-sitter")]
     pub fn language_fn(&self) -> tree_sitter::Language {
         match self {
-            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Self::Python => tree_sitter_python::LANGUAGE.into(),
-            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Self::Go => tree_sitter_go::LANGUAGE.into(),
-            Self::C => tree_sitter_c::LANGUAGE.into(),
-            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-            Self::Java => tree_sitter_java::LANGUAGE.into(),
-            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
-            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Rust => ts_grammars::rust::LANGUAGE.into(),
+            Self::Python => ts_grammars::python::LANGUAGE.into(),
+            Self::JavaScript => ts_grammars::javascript::LANGUAGE.into(),
+            Self::TypeScript => ts_grammars::typescript::LANGUAGE.into(),
+            Self::Tsx => ts_grammars::tsx::LANGUAGE.into(),
+            Self::Go => ts_grammars::go::LANGUAGE.into(),
+            Self::C => ts_grammars::c::LANGUAGE.into(),
+            Self::Cpp => ts_grammars::cpp::LANGUAGE.into(),
+            Self::Java => ts_grammars::java::LANGUAGE.into(),
+            Self::CSharp => ts_grammars::csharp::LANGUAGE.into(),
+            Self::Bash => ts_grammars::bash::LANGUAGE.into(),
+            Self::Ruby => ts_grammars::ruby::LANGUAGE.into(),
+            Self::Json => ts_grammars::json::LANGUAGE.into(),
+            Self::Dart => ts_grammars::dart::LANGUAGE.into(),
         }
     }
 }
@@ -447,6 +451,10 @@ fn is_module_level_container(lang: SupportedLanguage, kind: &str) -> bool {
         SupportedLanguage::Ruby => matches!(kind, "program"),
         SupportedLanguage::Go => matches!(kind, "source_file"),
         SupportedLanguage::Bash => matches!(kind, "program"),
+        SupportedLanguage::Dart => matches!(
+            kind,
+            "source_file" | "class_body" | "enum_body" | "extension_body"
+        ),
     }
 }
 
@@ -865,6 +873,77 @@ fn check_primary_definition<'a>(
                 None
             }
         }
+        SupportedLanguage::Dart => is_dart_primary_definition(node),
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+pub(super) fn is_dart_const_or_final_top_level_var(node: &tree_sitter::Node) -> bool {
+    if node.kind() != "top_level_variable_declaration" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let is_const_or_final = node
+        .named_children(&mut cursor)
+        .any(|ch| ch.kind() == "static_final_declaration_list");
+    is_const_or_final
+}
+
+/// Checks Dart primary definitions (`tree-sitter-dart` 0.3.0 AST).
+/// Class/mixin/extension members are wrapped in `member_declaration`; unwrap `method_declaration`
+/// so enclosing-hunk lookup and container child iteration agree cleanly, while keeping
+/// constructor `declaration` wrappers intact.
+#[cfg(feature = "tree-sitter")]
+fn is_dart_primary_definition<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+    match node.kind() {
+        "class_declaration"
+        | "mixin_declaration"
+        | "mixin_application_class"
+        | "enum_declaration"
+        | "extension_declaration"
+        | "extension_type_declaration"
+        | "type_alias"
+        | "function_declaration"
+        | "getter_declaration"
+        | "setter_declaration"
+        | "method_declaration" => Some(*node),
+        "top_level_variable_declaration" => {
+            if is_dart_const_or_final_top_level_var(node) {
+                Some(*node)
+            } else {
+                None
+            }
+        }
+        "member_declaration" => {
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                if ch.kind() == "method_declaration" {
+                    return Some(ch);
+                }
+                if ch.kind() == "declaration" {
+                    let mut dc = ch.walk();
+                    let is_callable_sig = ch.named_children(&mut dc).any(|gc| {
+                        matches!(
+                            gc.kind(),
+                            "constructor_signature"
+                                | "constant_constructor_signature"
+                                | "factory_constructor_signature"
+                                | "redirecting_factory_constructor_signature"
+                                | "primary_constructor_body_signature"
+                                | "function_signature"
+                                | "getter_signature"
+                                | "setter_signature"
+                                | "operator_signature"
+                        )
+                    });
+                    if is_callable_sig {
+                        return Some(*node);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -974,6 +1053,7 @@ pub(super) fn is_test_file_path(path: &Path) -> bool {
             && (lower_p_str.starts_with("test_") || lower_p_str.contains("/test_")))
         || lower_p_str.ends_with("_test.sh")
         || lower_p_str.ends_with(".bats")
+        || lower_p_str.ends_with("_test.dart")
     {
         return true;
     }

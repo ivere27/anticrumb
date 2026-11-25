@@ -549,6 +549,18 @@ pub(super) fn is_type_or_const_def_node(lang: SupportedLanguage, node: &tree_sit
                 | "record_declaration"
         ),
         SupportedLanguage::Ruby => matches!(kind, "class" | "module"),
+        SupportedLanguage::Dart => {
+            matches!(
+                kind,
+                "class_declaration"
+                    | "mixin_declaration"
+                    | "mixin_application_class"
+                    | "enum_declaration"
+                    | "extension_declaration"
+                    | "extension_type_declaration"
+                    | "type_alias"
+            ) || super::is_dart_const_or_final_top_level_var(&target)
+        }
         SupportedLanguage::Bash | SupportedLanguage::Json => false,
     }
 }
@@ -569,6 +581,9 @@ fn is_class_like_type_node(node: &tree_sitter::Node) -> bool {
             | "abstract_class_declaration"
             | "class_specifier"
             | "class"
+            | "mixin_declaration"
+            | "extension_declaration"
+            | "extension_type_declaration"
     )
 }
 
@@ -628,7 +643,8 @@ fn strip_line_doc_prefix(lang: SupportedLanguage, trimmed: &str) -> Option<&str>
         | SupportedLanguage::Tsx
         | SupportedLanguage::Java
         | SupportedLanguage::C
-        | SupportedLanguage::Cpp => trimmed
+        | SupportedLanguage::Cpp
+        | SupportedLanguage::Dart => trimmed
             .strip_prefix("///")
             .or_else(|| trimmed.strip_prefix("//"))
             .map(str::trim),
@@ -968,7 +984,30 @@ fn derive_js_module_stem(spec: &str) -> Option<String> {
     }
 }
 
-/// Extracts imports (`import_specs`, `imported_symbols`, and `alias_map`) from a file's AST across all 8 languages.
+#[cfg(feature = "tree-sitter")]
+fn derive_dart_module_stem(spec: &str) -> Option<String> {
+    let clean = spec
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(spec)
+        .trim()
+        .trim_end_matches('/');
+    let clean = clean.strip_prefix("package:").unwrap_or(clean);
+    let stripped = clean.strip_suffix(".dart").unwrap_or(clean);
+    let last = stripped.rsplit('/').next().unwrap_or(stripped).trim();
+    if last.is_empty()
+        || last == "."
+        || last == ".."
+        || last.contains(':')
+        || !last.chars().any(|c| c.is_alphanumeric())
+    {
+        None
+    } else {
+        Some(last.to_string())
+    }
+}
+
+/// Extracts imports (`import_specs`, `imported_symbols`, and `alias_map`) from a file's AST across supported languages.
 #[cfg(feature = "tree-sitter")]
 fn collect_file_imports(
     lang: SupportedLanguage,
@@ -1590,8 +1629,150 @@ fn collect_file_imports(
                     }
                 }
             }
+            SupportedLanguage::Dart => {
+                if kind == "import_or_export" {
+                    let mut c = node.walk();
+                    for ch in node.named_children(&mut c) {
+                        if ch.kind() == "library_import" {
+                            let mut ic = ch.walk();
+                            for imp in ch.named_children(&mut ic) {
+                                if imp.kind() != "import_specification" {
+                                    continue;
+                                }
+                                let uri_raw = imp
+                                    .child_by_field_name("uri")
+                                    .and_then(|u| source.get(u.start_byte()..u.end_byte()))
+                                    .map(str::trim)
+                                    .unwrap_or("");
+                                let Some(spec) = extract_first_quoted_str(uri_raw) else {
+                                    continue;
+                                };
+                                if spec.starts_with("dart:") {
+                                    continue;
+                                }
+                                let alias = imp
+                                    .child_by_field_name("alias")
+                                    .and_then(|a| source.get(a.start_byte()..a.end_byte()))
+                                    .map(str::trim)
+                                    .filter(|a| is_valid_ident(a));
+
+                                let mut show_syms: Vec<String> = Vec::new();
+                                let mut sc = imp.walk();
+                                for sub in imp.named_children(&mut sc) {
+                                    if sub.kind() == "combinator"
+                                        && sub.child(0).is_some_and(|c| c.kind() == "show")
+                                    {
+                                        let mut cc = sub.walk();
+                                        for id_n in sub.named_children(&mut cc) {
+                                            if id_n.kind() == "identifier" {
+                                                if let Some(id_s) =
+                                                    source.get(id_n.start_byte()..id_n.end_byte())
+                                                {
+                                                    let t = id_s.trim();
+                                                    if !t.is_empty() {
+                                                        show_syms.push(t.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !show_syms.is_empty() {
+                                    for sym in show_syms {
+                                        record_import_entry(
+                                            spec.clone(),
+                                            Some(sym),
+                                            false,
+                                            import_specs,
+                                            imported_symbols,
+                                        );
+                                    }
+                                } else {
+                                    record_import_entry(
+                                        spec.clone(),
+                                        None,
+                                        false,
+                                        import_specs,
+                                        imported_symbols,
+                                    );
+                                }
+                                if let Some(al) = alias {
+                                    if let Some(stem) = derive_dart_module_stem(&spec) {
+                                        alias_map.insert(al.to_string(), stem);
+                                    }
+                                    record_import_entry(
+                                        spec,
+                                        Some(al.to_string()),
+                                        true,
+                                        import_specs,
+                                        imported_symbols,
+                                    );
+                                }
+                            }
+                        } else if ch.kind() == "library_export" {
+                            if let Some(u) = ch.child_by_field_name("uri") {
+                                let uri_raw =
+                                    source.get(u.start_byte()..u.end_byte()).unwrap_or("");
+                                if let Some(spec) = extract_first_quoted_str(uri_raw) {
+                                    if !spec.starts_with("dart:") {
+                                        record_import_entry(
+                                            spec,
+                                            None,
+                                            false,
+                                            import_specs,
+                                            imported_symbols,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if matches!(kind, "part_directive" | "part_of_directive") {
+                    let uri_node = node.child_by_field_name("uri").or_else(|| {
+                        let mut pc = node.walk();
+                        let found = node.named_children(&mut pc).find(|ch| ch.kind() == "uri");
+                        found
+                    });
+                    if let Some(u) = uri_node {
+                        let uri_raw = source.get(u.start_byte()..u.end_byte()).unwrap_or("");
+                        if let Some(spec) = extract_first_quoted_str(uri_raw) {
+                            if !spec.starts_with("dart:") {
+                                record_import_entry(
+                                    spec,
+                                    None,
+                                    false,
+                                    import_specs,
+                                    imported_symbols,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             SupportedLanguage::Bash | SupportedLanguage::Json => {}
         }
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+fn extract_first_quoted_str(raw: &str) -> Option<String> {
+    let mut best: Option<(usize, char)> = None;
+    for q in ['\'', '"'] {
+        if let Some(idx) = raw.find(q) {
+            if best.is_none_or(|(b, _)| idx < b) {
+                best = Some((idx, q));
+            }
+        }
+    }
+    let (start, q) = best?;
+    let rest = &raw[start + 1..];
+    let end = rest.find(q)?;
+    let inner = rest[..end].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
     }
 }
 
@@ -1823,6 +2004,7 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
                 | SupportedLanguage::Tsx
                 | SupportedLanguage::JavaScript
                 | SupportedLanguage::CSharp
+                | SupportedLanguage::Dart
         ) {
             if let Some(rest) = trimmed.strip_suffix('!') {
                 trimmed = rest.trim_end();
@@ -1963,6 +2145,24 @@ fn extract_lhs_qualifiers(lang: SupportedLanguage, lhs: &str) -> Vec<&str> {
         i += ch_len;
     }
     out
+}
+
+/// Finds the receiver expression text of the nearest enclosing Dart `cascade` node
+/// for a `cascade_call_expression` (`obj..foo()`, `obj?..foo()`).
+#[cfg(feature = "tree-sitter")]
+fn find_enclosing_cascade_receiver<'a>(node: &tree_sitter::Node<'a>, source: &'a str) -> &'a str {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "cascade" {
+            return p
+                .named_child(0)
+                .and_then(|r| source.get(r.start_byte()..r.end_byte()))
+                .map(str::trim)
+                .unwrap_or("");
+        }
+        cur = p.parent();
+    }
+    ""
 }
 
 /// Scans deleted (`-`) diff lines in changed hunks for PascalCase/SCREAMING_CASE constants, types,
@@ -2334,6 +2534,56 @@ pub(super) fn extract_local_and_query_from_ast(
                             // PascalCase call (e.g. Go exported `EnqueueJob`, Python/JS constructor `Foo()`)
                             type_refs.insert(sym.to_string());
                             call_refs.insert(sym.to_string());
+                        } else {
+                            call_refs.insert(sym.to_string());
+                        }
+                    }
+                }
+            }
+        } else if kind == "cascade_call_expression" && lang == SupportedLanguage::Dart {
+            if let Some(prop_n) = node.child_by_field_name("property") {
+                let sym = source
+                    .get(prop_n.start_byte()..prop_n.end_byte())
+                    .map(str::trim)
+                    .unwrap_or("");
+                if is_valid_ident(sym) && !is_noise_or_builtin_ident(sym) {
+                    let recv = find_enclosing_cascade_receiver(&node, source);
+                    let quals = extract_lhs_qualifiers(lang, recv);
+                    if !quals.is_empty() {
+                        for q in quals {
+                            qual_refs.push((q.to_string(), sym.to_string()));
+                            if looks_like_type_or_const(q) && !is_noise_or_builtin_ident(q) {
+                                type_refs.insert(q.to_string());
+                            }
+                        }
+                    } else {
+                        if looks_like_type_or_const(sym) {
+                            type_refs.insert(sym.to_string());
+                        }
+                        call_refs.insert(sym.to_string());
+                    }
+                }
+            } else if let Some(fn_n) = node.child_by_field_name("function") {
+                let raw = source
+                    .get(fn_n.start_byte()..fn_n.end_byte())
+                    .unwrap_or("")
+                    .trim();
+                if let Some((lhs, rhs, _)) = split_rightmost_call_sep(lang, raw) {
+                    let sym = rhs
+                        .split(['<', '('])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches(['?', '!']);
+                    if is_valid_ident(sym) && !is_noise_or_builtin_ident(sym) {
+                        let quals = extract_lhs_qualifiers(lang, lhs);
+                        if !quals.is_empty() {
+                            for q in quals {
+                                qual_refs.push((q.to_string(), sym.to_string()));
+                                if looks_like_type_or_const(q) && !is_noise_or_builtin_ident(q) {
+                                    type_refs.insert(q.to_string());
+                                }
+                            }
                         } else {
                             call_refs.insert(sym.to_string());
                         }
@@ -3155,6 +3405,44 @@ fn resolve_candidate_files_for_query(
                     }
                 }
             }
+            SupportedLanguage::Dart => {
+                if let Some(pkg_rest) = spec.strip_prefix("package:") {
+                    if let Some((pkg_name, rel_path)) = pkg_rest.split_once('/') {
+                        let pkg_lib_suffix = format!("{pkg_name}/lib/{rel_path}");
+                        let mut matched = false;
+                        for idx in index.find_by_suffix(&pkg_lib_suffix) {
+                            add_idx(&mut scored, idx, true, false, None);
+                            matched = true;
+                        }
+                        if !matched {
+                            let lib_suffix = format!("lib/{rel_path}");
+                            let slash_lib_suffix = format!("/{lib_suffix}");
+                            for idx in index.find_by_suffix(&lib_suffix) {
+                                let cand_norm = &index.entries[idx].norm;
+                                // Match root `lib/<rel_path>` or same-package subdirectory
+                                // `<pkg_root>/lib/<rel_path>` (mirroring reverse matching) so
+                                // third-party or differently-named pubspec imports never collide
+                                // across sibling monorepo packages.
+                                let allowed = cand_norm == &lib_suffix
+                                    || cand_norm.strip_suffix(&slash_lib_suffix).is_some_and(
+                                        |pkg_root| {
+                                            src_path_norm.starts_with(&format!("{pkg_root}/"))
+                                        },
+                                    );
+                                if allowed {
+                                    add_idx(&mut scored, idx, true, false, None);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let norm = normalize_rel(src_dir, spec);
+                    add_rel_path(&mut scored, norm.clone(), true, false, None);
+                    if norm.extension().is_none() {
+                        add_rel_path(&mut scored, norm.with_extension("dart"), true, false, None);
+                    }
+                }
+            }
             SupportedLanguage::Bash | SupportedLanguage::Json => {}
         }
     }
@@ -3806,7 +4094,8 @@ fn complete_deleted_header_syntax(reconstructed: &str, lang: SupportedLanguage) 
         | SupportedLanguage::CSharp
         | SupportedLanguage::JavaScript
         | SupportedLanguage::TypeScript
-        | SupportedLanguage::Tsx => {
+        | SupportedLanguage::Tsx
+        | SupportedLanguage::Dart => {
             let mut open_curly = 0usize;
             let mut close_curly = 0usize;
             let mut open_paren = 0usize;
@@ -3865,6 +4154,7 @@ fn extract_deleted_targets_with_fallbacks(
             | SupportedLanguage::TypeScript
             | SupportedLanguage::Tsx
             | SupportedLanguage::JavaScript
+            | SupportedLanguage::Dart
     ) {
         let inner = completed.as_deref().unwrap_or(reconstructed);
         let wrapped = format!("class __AnticrumbDelWrap {{\n{inner}\n}}\n");
@@ -4428,6 +4718,37 @@ fn import_spec_matches_target_file(
                     format!("{spec}.rb")
                 };
                 target_def_norm == rb || target_def_norm.ends_with(&format!("/{rb}"))
+            }
+        }
+        SupportedLanguage::Dart => {
+            if let Some(pkg_rest) = spec.strip_prefix("package:") {
+                if let Some((pkg_name, rel_path)) = pkg_rest.split_once('/') {
+                    let pkg_lib = format!("{pkg_name}/lib/{rel_path}");
+                    if target_def_norm == pkg_lib
+                        || target_def_norm.ends_with(&format!("/{pkg_lib}"))
+                    {
+                        return true;
+                    }
+                    let lib_rel = format!("lib/{rel_path}");
+                    if target_def_norm == lib_rel {
+                        return true;
+                    }
+                    // For a single-package app living inside a subdirectory whose directory name
+                    // differs from its pubspec package name (e.g. `mobile/lib/...`), still allow
+                    // intra-package matches while rejecting cross-package monorepo collisions.
+                    if let Some(target_pkg_root) =
+                        target_def_norm.strip_suffix(&format!("/{lib_rel}"))
+                    {
+                        let cand_norm = normalize_path_key(cand_path);
+                        return cand_norm.starts_with(&format!("{target_pkg_root}/"));
+                    }
+                    false
+                } else {
+                    false
+                }
+            } else {
+                let rel = normalize_rel(cand_dir, spec);
+                target_def_norm == rel || target_def_norm == format!("{rel}.dart")
             }
         }
         SupportedLanguage::Bash | SupportedLanguage::Json => false,
@@ -5139,6 +5460,11 @@ pub(super) fn resolve_reverse_callers_context(
                     | "import_declaration"
                     | "using_directive"
                     | "preproc_include"
+                    | "import_or_export"
+                    | "library_import"
+                    | "library_export"
+                    | "part_directive"
+                    | "part_of_directive"
                     | "jsx_closing_element"
                     | "string_literal"
                     | "raw_string_literal"
@@ -5200,6 +5526,22 @@ pub(super) fn resolve_reverse_callers_context(
                         | "type_spec"
                         | "field_declaration"
                         | "property_declaration"
+                        | "function_signature"
+                        | "getter_signature"
+                        | "setter_signature"
+                        | "constructor_signature"
+                        | "constant_constructor_signature"
+                        | "factory_constructor_signature"
+                        | "redirecting_factory_constructor_signature"
+                        | "mixin_declaration"
+                        | "extension_declaration"
+                        | "extension_type_declaration"
+                        | "initialized_identifier"
+                        | "initialized_variable_declaration"
+                        | "static_final_declaration"
+                        | "field_formal_parameter"
+                        | "typed_identifier"
+                        | "enum_entry"
                 )
             {
                 return true;
@@ -5251,6 +5593,13 @@ pub(super) fn resolve_reverse_callers_context(
                 return true;
             }
             if pk == "identifier_pattern" {
+                return true;
+            }
+            if cand_lang == SupportedLanguage::Dart
+                && ((pk == "type_alias" && node.kind() == "type_identifier")
+                    || (matches!(pk, "mixin_application_class" | "extension_type_name")
+                        && node.kind() == "identifier"))
+            {
                 return true;
             }
             false
@@ -5433,7 +5782,13 @@ pub(super) fn resolve_reverse_callers_context(
                             .is_some_and(|c| c.id() == node.id()))
                     || (matches!(
                         pk,
-                        "member_expression" | "jsx_member_expression" | "nested_identifier"
+                        "member_expression"
+                            | "null_aware_member_expression"
+                            | "cascade_call_expression"
+                            | "cascade_member_expression"
+                            | "cascade_null_aware_member_expression"
+                            | "jsx_member_expression"
+                            | "nested_identifier"
                     ) && p
                         .child_by_field_name("property")
                         .is_some_and(|c| c.id() == node.id()))
@@ -5524,6 +5879,50 @@ pub(super) fn resolve_reverse_callers_context(
                         record_hit(sym, None, hit_line, false, enclosing_stack, out_hits);
                     }
                 }
+            } else if kind == "cascade_call_expression" && lang == SupportedLanguage::Dart {
+                if let Some(prop_n) = node.child_by_field_name("property") {
+                    let sym = source
+                        .get(prop_n.start_byte()..prop_n.end_byte())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let hit_line = prop_n.start_position().row + 1;
+                    let recv = find_enclosing_cascade_receiver(&node, source);
+                    let quals = extract_lhs_qualifiers(lang, recv);
+                    record_hit(
+                        sym,
+                        quals.last().copied(),
+                        hit_line,
+                        false,
+                        enclosing_stack,
+                        out_hits,
+                    );
+                } else if let Some(fn_n) = node.child_by_field_name("function") {
+                    let raw = source
+                        .get(fn_n.start_byte()..fn_n.end_byte())
+                        .unwrap_or("")
+                        .trim();
+                    let hit_line = fn_n.child_by_field_name("property").map_or_else(
+                        || fn_n.start_position().row + 1,
+                        |n| n.start_position().row + 1,
+                    );
+                    if let Some((lhs, rhs, is_static_sep)) = split_rightmost_call_sep(lang, raw) {
+                        let sym = rhs
+                            .split(['<', '('])
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_end_matches(['?', '!']);
+                        let quals = extract_lhs_qualifiers(lang, lhs);
+                        record_hit(
+                            sym,
+                            quals.last().copied(),
+                            hit_line,
+                            is_static_sep,
+                            enclosing_stack,
+                            out_hits,
+                        );
+                    }
+                }
             } else if kind == "macro_invocation" {
                 if let Some(m_n) = node.child_by_field_name("macro") {
                     let raw = source
@@ -5547,7 +5946,13 @@ pub(super) fn resolve_reverse_callers_context(
                         out_hits,
                     );
                 }
-            } else if matches!(kind, "new_expression" | "object_creation_expression") {
+            } else if matches!(
+                kind,
+                "new_expression"
+                    | "object_creation_expression"
+                    | "const_object_expression"
+                    | "constructor_invocation"
+            ) {
                 if let Some(t_n) = node
                     .child_by_field_name("constructor")
                     .or_else(|| node.child_by_field_name("type"))
@@ -8207,5 +8612,259 @@ pub fn run_thing(x: i32) -> i32 { x + 1 }
         assert_eq!(buf_ok, data);
         assert!(!truncated_ok);
         assert!(!sig_ok.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_dart_imports_multiline_show_part_and_monorepo_packages() {
+        let dart_src = "\
+import 'package:pkg_a/models/user.dart'
+    show
+      UserRecord,
+      UserRole;
+import 'package:pkg_a/models/hidden.dart'
+    hide
+      InternalThing;
+import 'package:pkg_a/utils/math_ops.dart' as math_alias;
+import 'package:pkg_a/utils/calc.dart' as c;
+@Deprecated('use v2')
+part 'user.g.dart';
+part of 'library_root.dart';
+@Deprecated('legacy library')
+part of my_legacy_lib;
+
+const int kMaxRetries = 3;
+final String kDefaultTag = 'v1';
+var mutableCount = 0;
+int mutableTyped = 1;
+";
+        let tree = parse_with_timeout(SupportedLanguage::Dart, dart_src).unwrap();
+        let mut import_specs = Vec::new();
+        let mut imported_symbols = HashMap::new();
+        let mut alias_map = HashMap::new();
+        collect_file_imports(
+            SupportedLanguage::Dart,
+            &tree.root_node(),
+            dart_src,
+            &mut import_specs,
+            &mut imported_symbols,
+            &mut alias_map,
+        );
+
+        assert!(
+            imported_symbols
+                .get("UserRecord")
+                .is_some_and(|v| v.iter().any(|s| s == "package:pkg_a/models/user.dart")),
+            "multiline show combinator must extract UserRecord: {imported_symbols:?}"
+        );
+        assert!(
+            imported_symbols
+                .get("UserRole")
+                .is_some_and(|v| v.iter().any(|s| s == "package:pkg_a/models/user.dart")),
+            "multiline show combinator must extract UserRole: {imported_symbols:?}"
+        );
+        assert!(
+            !imported_symbols.contains_key("InternalThing"),
+            "hide combinator must NOT register hidden symbols as shown: {imported_symbols:?}"
+        );
+        assert_eq!(
+            alias_map.get("math_alias").map(String::as_str),
+            Some("math_ops"),
+            "multi-char Dart import alias must populate alias_map: {alias_map:?}"
+        );
+        assert_eq!(
+            alias_map.get("c").map(String::as_str),
+            Some("calc"),
+            "single-char Dart import alias must populate alias_map: {alias_map:?}"
+        );
+        assert!(
+            imported_symbols
+                .get("math_alias")
+                .is_some_and(|v| v.iter().any(|s| s == "package:pkg_a/utils/math_ops.dart")),
+            "multi-char Dart alias must register in imported_symbols: {imported_symbols:?}"
+        );
+        assert!(
+            import_specs.iter().any(|s| s == "user.g.dart"),
+            "annotated part directive must extract URI node, not annotation string: {import_specs:?}"
+        );
+        assert!(
+            import_specs.iter().any(|s| s == "library_root.dart"),
+            "part of directive must be collected: {import_specs:?}"
+        );
+        assert!(
+            !import_specs
+                .iter()
+                .any(|s| s == "use v2" || s == "legacy library"),
+            "annotation string arguments on part/part-of directives must NOT leak into import_specs: {import_specs:?}"
+        );
+
+        // Verify `is_type_or_const_def_node` matches `is_dart_primary_definition` for top-level vars
+        let mut var_results = Vec::new();
+        let mut cursor = tree.root_node().walk();
+        for ch in tree.root_node().named_children(&mut cursor) {
+            if ch.kind() == "top_level_variable_declaration" {
+                let text = &dart_src[ch.start_byte()..ch.end_byte()];
+                var_results.push((
+                    text.trim().to_string(),
+                    is_type_or_const_def_node(SupportedLanguage::Dart, &ch),
+                ));
+            }
+        }
+        assert_eq!(var_results.len(), 4);
+        assert!(var_results[0].1, "const top-level var must be true");
+        assert!(var_results[1].1, "final top-level var must be true");
+        assert!(!var_results[2].1, "mutable var must be false");
+        assert!(
+            !var_results[3].1,
+            "mutable typed top-level var must be false"
+        );
+
+        // Monorepo candidate resolution: `package:pkg_a/models/user.dart` must prefer `packages/pkg_a/lib/...`
+        let mono_files = vec![
+            PathBuf::from("packages/pkg_a/lib/models/user.dart"),
+            PathBuf::from("packages/pkg_b/lib/models/user.dart"),
+            PathBuf::from("packages/pkg_a/lib/app.dart"),
+            PathBuf::from("packages/pkg_a/test/models/user.dart"),
+        ];
+        let mono_idx = TrackedRepoIndex::build(&mono_files);
+        let q_mono = FileRefQuery {
+            file_path: PathBuf::from("packages/pkg_a/lib/app.dart"),
+            lang: SupportedLanguage::Dart,
+            type_or_const_refs: HashSet::from(["UserRecord".to_string()]),
+            qualified_refs: Vec::new(),
+            call_refs: HashSet::new(),
+            import_specs: vec!["package:pkg_a/models/user.dart".to_string()],
+            imported_symbols: HashMap::new(),
+        };
+        let resolved_mono = resolve_candidate_files_for_query(&q_mono, &mono_idx);
+        let pinned_paths: Vec<&Path> = resolved_mono
+            .iter()
+            .filter(|c| c.pinned_by_import)
+            .map(|c| c.path.as_path())
+            .collect();
+        assert_eq!(
+            pinned_paths,
+            vec![Path::new("packages/pkg_a/lib/models/user.dart")],
+            "monorepo package: import must resolve strictly to pkg_a, not pkg_b"
+        );
+
+        // Monorepo third-party / mismatched pubspec package name fallback must NOT cross package boundaries
+        let mono_ext_files = vec![
+            PathBuf::from("packages/pkg_a/lib/app.dart"),
+            PathBuf::from("packages/pkg_a/lib/models/local_only.dart"),
+            PathBuf::from("packages/pkg_b/lib/models/user.dart"),
+            PathBuf::from("mobile/lib/ui/screen.dart"),
+            PathBuf::from("mobile/lib/models/user.dart"),
+        ];
+        let mono_ext_idx = TrackedRepoIndex::build(&mono_ext_files);
+        let q_third_party = FileRefQuery {
+            file_path: PathBuf::from("packages/pkg_a/lib/app.dart"),
+            lang: SupportedLanguage::Dart,
+            type_or_const_refs: HashSet::from(["UserRecord".to_string()]),
+            qualified_refs: Vec::new(),
+            call_refs: HashSet::new(),
+            import_specs: vec!["package:some_third_party_sdk/models/user.dart".to_string()],
+            imported_symbols: HashMap::new(),
+        };
+        let third_party_pinned: Vec<PathBuf> =
+            resolve_candidate_files_for_query(&q_third_party, &mono_ext_idx)
+                .into_iter()
+                .filter(|c| c.pinned_by_import)
+                .map(|c| c.path)
+                .collect();
+        assert!(
+            third_party_pinned.is_empty(),
+            "third-party package: import in pkg_a must NOT cross-pin pkg_b or mobile: {third_party_pinned:?}"
+        );
+        let q_subdir_pkg = FileRefQuery {
+            file_path: PathBuf::from("mobile/lib/ui/screen.dart"),
+            lang: SupportedLanguage::Dart,
+            type_or_const_refs: HashSet::from(["UserRecord".to_string()]),
+            qualified_refs: Vec::new(),
+            call_refs: HashSet::new(),
+            import_specs: vec!["package:acme_mobile/models/user.dart".to_string()],
+            imported_symbols: HashMap::new(),
+        };
+        let subdir_pinned: Vec<PathBuf> =
+            resolve_candidate_files_for_query(&q_subdir_pkg, &mono_ext_idx)
+                .into_iter()
+                .filter(|c| c.pinned_by_import)
+                .map(|c| c.path)
+                .collect();
+        assert_eq!(
+            subdir_pinned,
+            vec![PathBuf::from("mobile/lib/models/user.dart")],
+            "subdirectory package with different pubspec name must pin only its own lib/, never sibling pkg_b"
+        );
+
+        // Single-package repo fallback: `package:my_app/models/user.dart` -> `lib/models/user.dart`
+        let single_files = vec![
+            PathBuf::from("lib/models/user.dart"),
+            PathBuf::from("lib/app.dart"),
+            PathBuf::from("test/models/user.dart"),
+        ];
+        let single_idx = TrackedRepoIndex::build(&single_files);
+        let q_single = FileRefQuery {
+            file_path: PathBuf::from("lib/app.dart"),
+            lang: SupportedLanguage::Dart,
+            type_or_const_refs: HashSet::from(["UserRecord".to_string()]),
+            qualified_refs: Vec::new(),
+            call_refs: HashSet::new(),
+            import_specs: vec!["package:my_app/models/user.dart".to_string()],
+            imported_symbols: HashMap::new(),
+        };
+        let resolved_single = resolve_candidate_files_for_query(&q_single, &single_idx);
+        let single_pinned: Vec<&Path> = resolved_single
+            .iter()
+            .filter(|c| c.pinned_by_import)
+            .map(|c| c.path.as_path())
+            .collect();
+        assert_eq!(
+            single_pinned,
+            vec![Path::new("lib/models/user.dart")],
+            "single-package root repo must still resolve package: to lib/ (and ignore test/)"
+        );
+
+        // Reverse `import_spec_matches_target_file` checks for monorepo & single-app layouts
+        assert!(import_spec_matches_target_file(
+            SupportedLanguage::Dart,
+            Path::new("packages/app/lib/main.dart"),
+            "package:pkg_a/models/user.dart",
+            Path::new("packages/pkg_a/lib/models/user.dart"),
+            "packages/pkg_a/lib/models/user.dart",
+            "user",
+        ));
+        assert!(!import_spec_matches_target_file(
+            SupportedLanguage::Dart,
+            Path::new("packages/app/lib/main.dart"),
+            "package:pkg_a/models/user.dart",
+            Path::new("packages/pkg_b/lib/models/user.dart"),
+            "packages/pkg_b/lib/models/user.dart",
+            "user",
+        ));
+        assert!(import_spec_matches_target_file(
+            SupportedLanguage::Dart,
+            Path::new("lib/main.dart"),
+            "package:demo_app/models/user.dart",
+            Path::new("lib/models/user.dart"),
+            "lib/models/user.dart",
+            "user",
+        ));
+        assert!(import_spec_matches_target_file(
+            SupportedLanguage::Dart,
+            Path::new("mobile/lib/ui/screen.dart"),
+            "package:acme_mobile/models/user.dart",
+            Path::new("mobile/lib/models/user.dart"),
+            "mobile/lib/models/user.dart",
+            "user",
+        ));
+        assert!(!import_spec_matches_target_file(
+            SupportedLanguage::Dart,
+            Path::new("lib/main.dart"),
+            "package:demo_app/models/user.dart",
+            Path::new("test/models/user.dart"),
+            "test/models/user.dart",
+            "user",
+        ));
     }
 }

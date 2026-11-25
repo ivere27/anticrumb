@@ -7677,3 +7677,1055 @@ static VX_CUDA_DEVICE float vx_scale(float x, float gain) {
     assert_eq!(diff_expand::format_human_size(1024 * 1024 - 1), "1 MiB");
     assert_eq!(diff_expand::format_human_size(1024 * 1023), "1023 KiB");
 }
+
+#[test]
+fn test_dart_ast_expansion_signatures_and_hybrid_layer3() {
+    // 1. Registry & test-path conventions
+    assert_eq!(
+        LanguageRegistry::builtin().candidates_for_path(Path::new("lib/services/order.dart")),
+        Some(LanguageCandidates::Exact(SupportedLanguage::Dart))
+    );
+    assert!(is_test_file_path(Path::new("lib/services/order_test.dart")));
+    assert!(is_test_file_path(Path::new("test/order_service.dart")));
+    assert!(!is_test_file_path(Path::new("lib/services/order.dart")));
+
+    // 2. End-to-end git repo test: AST expansion, async signature, @annotation, Layer 3 forward & reverse
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["config", "user.name", "Tester"])
+        .status()
+        .unwrap();
+
+    std::fs::create_dir_all(repo.join("lib/models")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/services")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/ui")).unwrap();
+
+    let model_src = "\
+/// Represents a customer ledger entry in cents.
+class LedgerEntry {
+  final String accountId;
+  final int amountCents;
+
+  const LedgerEntry({required this.accountId, required this.amountCents});
+}
+
+/// Computes processing fee in cents.
+int computeProcessingFee(int amountCents) {
+  return amountCents ~/ 100;
+}
+";
+    let service_v1 = "\
+import 'dart:async';
+import 'package:demo_app/models/ledger_entry.dart';
+
+/// Orchestrates ledger settlements.
+@immutable
+class SettlementService {
+  final String endpoint;
+
+  const SettlementService({required this.endpoint});
+
+  @protected
+  Future<LedgerEntry> settleTransfer(String accountId, int amountCents) async {
+    final fee = computeProcessingFee(amountCents);
+    final net = amountCents - fee;
+    return LedgerEntry(accountId: accountId, amountCents: net);
+  }
+}
+";
+    let caller_src = "\
+import 'package:demo_app/services/settlement_service.dart';
+
+class CheckoutController {
+  final SettlementService service;
+
+  const CheckoutController(this.service);
+
+  Future<void> submitOrder(String id, int cents) async {
+    await service.settleTransfer(id, cents);
+  }
+}
+";
+
+    std::fs::write(repo.join("lib/models/ledger_entry.dart"), model_src).unwrap();
+    std::fs::write(
+        repo.join("lib/services/settlement_service.dart"),
+        service_v1,
+    )
+    .unwrap();
+    std::fs::write(repo.join("lib/ui/checkout_controller.dart"), caller_src).unwrap();
+
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-q", "-m", "initial dart repo"])
+        .status()
+        .unwrap();
+
+    // Modify settleTransfer body
+    let service_v2 = service_v1.replace(
+        "final net = amountCents - fee;",
+        "final net = amountCents - fee - 1;",
+    );
+    std::fs::write(
+        repo.join("lib/services/settlement_service.dart"),
+        &service_v2,
+    )
+    .unwrap();
+
+    let mut warnings = Vec::new();
+    let expanded = diff_expand::generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        usize::MAX,
+        HybridConfig::full(),
+        &mut warnings,
+    )
+    .expect("Dart hybrid diff should succeed");
+
+    assert!(
+        warnings.is_empty(),
+        "Dart diff should not emit fallback warnings: {warnings:?}"
+    );
+    assert!(
+        expanded.contains("class SettlementService")
+            && expanded.contains("Future<LedgerEntry> settleTransfer")
+            && expanded.contains("async"),
+        "Dart hunk header should include class scope, method signature, and async modifier:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("class LedgerEntry") || expanded.contains("computeProcessingFee"),
+        "Layer 3 forward should resolve Dart package: import definitions:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("checkout_controller.dart") && expanded.contains("submitOrder"),
+        "Layer 3 reverse should detect Dart caller across files:\n{expanded}"
+    );
+
+    // 3. Modern Dart 3 constructs (mixin, enum, extension, extension type, typedef, const, constructors)
+    let dart3_src = "\
+typedef PriceFormatter = String Function(int cents);
+typedef int LegacyComparator(int a, int b);
+const int kDefaultFeeCents = 50;
+int topLevelCompute(int x) {
+  return x + 1;
+}
+String get topLevelLabel => 'v1';
+set topLevelLabel(String value) {}
+class AuditedBase = Object with AuditMixin;
+mixin AuditMixin {
+  void recordAudit(String event) {}
+}
+enum OrderState { pending, settled }
+extension IntCentsExt on int {
+  String get formatted => '\\$$this';
+}
+extension type AccountId(String raw) {
+  bool get isValid => raw.isNotEmpty;
+}
+class Order {
+  final String id;
+  const Order.empty() : id = '';
+  factory Order.fromJson(Map<String, Object?> json) {
+    final raw = json['id']?.toString() ?? '';
+    final trimmed = raw.trim();
+    final normalized = trimmed.toUpperCase();
+    final validated = normalized.isEmpty ? 'UNKNOWN' : normalized;
+    final prefix = validated.startsWith('ORD') ? validated : 'ORD-$validated';
+    final finalId = prefix.substring(0, prefix.length);
+    return Order._(finalId);
+  }
+  const Order._(this.id);
+}
+";
+    let tree = diff_expand::parse_with_timeout(SupportedLanguage::Dart, dart3_src)
+        .expect("Dart 3 source should parse");
+    assert!(
+        !tree.root_node().has_error(),
+        "Dart 3 source should parse without errors: {}",
+        tree.root_node().to_sexp()
+    );
+    let dart3_lines: Vec<&str> = dart3_src.lines().collect();
+
+    // Check short_def_label, bare_def_name, and is_container_definition_node across Dart constructs
+    let mut labels = Vec::new();
+    let mut containers = Vec::new();
+    let mut factory_foldable = false;
+    let mut const_ctor_found = false;
+    fn collect_dart_defs(
+        node: tree_sitter::Node,
+        lines: &[&str],
+        src: &str,
+        labels: &mut Vec<(String, String)>,
+        containers: &mut Vec<String>,
+        factory_foldable: &mut bool,
+        const_ctor_found: &mut bool,
+    ) {
+        if let Some(matched) = check_primary_definition(SupportedLanguage::Dart, &node) {
+            let bare = ast_compact::bare_def_name(SupportedLanguage::Dart, &matched, lines, src)
+                .unwrap_or_default();
+            let short = diff_expand::short_def_label(SupportedLanguage::Dart, &matched, lines, src)
+                .unwrap_or_default();
+            if !labels.iter().any(|(b, s)| b == &bare && s == &short) {
+                labels.push((bare.clone(), short));
+            }
+            if is_container_definition_node(&matched) && !containers.contains(&bare) {
+                containers.push(bare.clone());
+            }
+            if bare == "Order.fromJson"
+                && ast_compact::is_foldable_function_node(SupportedLanguage::Dart, &matched)
+                && signature::find_ast_body_node(SupportedLanguage::Dart, &matched).is_some()
+            {
+                *factory_foldable = true;
+            }
+            if bare == "Order.empty" {
+                *const_ctor_found = true;
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            collect_dart_defs(
+                ch,
+                lines,
+                src,
+                labels,
+                containers,
+                factory_foldable,
+                const_ctor_found,
+            );
+        }
+    }
+    collect_dart_defs(
+        tree.root_node(),
+        &dart3_lines,
+        dart3_src,
+        &mut labels,
+        &mut containers,
+        &mut factory_foldable,
+        &mut const_ctor_found,
+    );
+
+    assert!(
+        labels
+            .iter()
+            .any(|(b, s)| b == "PriceFormatter" && s == "type PriceFormatter"),
+        "modern typedef label mismatch: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(b, s)| b == "LegacyComparator" && s == "type LegacyComparator"),
+        "legacy typedef must extract alias name (not return type): {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(b, s)| b == "kDefaultFeeCents" && s == "const kDefaultFeeCents"),
+        "top-level const label mismatch: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(b, s)| b == "topLevelCompute" && s == "fn topLevelCompute"),
+        "top-level function label must apply Dart fn prefix: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(b, s)| b == "topLevelLabel" && s == "fn topLevelLabel"),
+        "top-level getter/setter label must apply Dart fn prefix: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(b, s)| b == "AuditedBase" && s == "class AuditedBase"),
+        "mixin application class label mismatch: {labels:?}"
+    );
+    assert!(
+        containers.contains(&"AuditMixin".to_string())
+            && containers.contains(&"IntCentsExt".to_string())
+            && containers.contains(&"AccountId".to_string()),
+        "Dart mixin/extension/extension type must be container defs: {containers:?}"
+    );
+    assert!(
+        factory_foldable,
+        "body-bearing Dart factory constructor must be foldable with AST block body (labels: {labels:?})"
+    );
+    assert!(
+        const_ctor_found,
+        "bodyless named const constructor must be recognized as primary def (labels: {labels:?})"
+    );
+    let added_body: String = dart3_src.lines().map(|l| format!("+{l}\n")).collect();
+    let added_lines_count = dart3_src.lines().count();
+    let raw_new_chunk = format!(
+        "diff --git a/lib/order.dart b/lib/order.dart\n\
+         new file mode 100644\n\
+         --- /dev/null\n\
+         +++ b/lib/order.dart\n\
+         @@ -0,0 +1,{added_lines_count} @@\n\
+         {added_body}"
+    );
+    let (skel, _line_map, folded_count, total_foldable) =
+        ast_compact::skeletonize_new_chunk_progressive(
+            &raw_new_chunk,
+            &raw_new_chunk,
+            None,
+            Path::new("lib/order.dart"),
+            64,
+        )
+        .expect("Dart factory constructor body should skeletonize");
+    assert!(
+        folded_count >= 1 && total_foldable >= 1 && skel.contains("factory Order.fromJson"),
+        "expected factory Order.fromJson to be folded: folded={folded_count}/{total_foldable}\n{skel}"
+    );
+
+    // Verify enclosing expansion inside mixin, extension, and extension type
+    let (s, e, sig) = find_enclosing_definition(
+        SupportedLanguage::Dart,
+        &tree.root_node(),
+        11,
+        11,
+        dart3_src,
+    );
+    assert_eq!((s, e), (11, 11));
+    assert!(
+        sig.as_deref()
+            .is_some_and(|s| s.contains("mixin AuditMixin") && s.contains("recordAudit")),
+        "expected mixin parent scope in Dart signature, got: {sig:?}"
+    );
+    let (ext_s, ext_e, ext_sig) = find_enclosing_definition(
+        SupportedLanguage::Dart,
+        &tree.root_node(),
+        15,
+        15,
+        dart3_src,
+    );
+    assert_eq!((ext_s, ext_e), (15, 15));
+    assert!(
+        ext_sig
+            .as_deref()
+            .is_some_and(|s| s.contains("extension IntCentsExt") && s.contains("formatted")),
+        "expected extension parent scope in Dart getter signature, got: {ext_sig:?}"
+    );
+    let (et_s, et_e, et_sig) = find_enclosing_definition(
+        SupportedLanguage::Dart,
+        &tree.root_node(),
+        18,
+        18,
+        dart3_src,
+    );
+    assert_eq!((et_s, et_e), (18, 18));
+    assert!(
+        et_sig
+            .as_deref()
+            .is_some_and(|s| s.contains("extension type AccountId") && s.contains("isValid")),
+        "expected extension type parent scope in Dart getter signature, got: {et_sig:?}"
+    );
+
+    // 4. Dart `@isTest` / `@meta.isTest` scope & inline test folding on top-level, class method, and member_declaration
+    let dart_test_src = "\
+@isTest
+void topLevelTestHelper(String name) {
+  final a = 1;
+  final b = 2;
+  final c = a + b;
+  final d = c * 2;
+  assert(d == 6);
+}
+
+class TestSuiteHelper {
+  @meta.isTest
+  void classMethodHelper() {
+    final x = 1;
+    final y = 2;
+    final z = x + y;
+    final w = z * 2;
+    assert(w == 6);
+  }
+
+  @isTestGroup
+  void abstractGroup();
+}
+";
+    let t_tree = diff_expand::parse_with_timeout(SupportedLanguage::Dart, dart_test_src)
+        .expect("Dart test annotations should parse");
+    assert!(!t_tree.root_node().has_error());
+    let t_lines: Vec<&str> = dart_test_src.lines().collect();
+
+    let mut checked_top = false;
+    let mut checked_method = false;
+    let mut checked_member = false;
+    fn check_test_scopes(
+        node: tree_sitter::Node,
+        lines: &[&str],
+        checked_top: &mut bool,
+        checked_method: &mut bool,
+        checked_member: &mut bool,
+    ) {
+        if node.kind() == "function_declaration" {
+            assert!(is_test_scope(SupportedLanguage::Dart, &node, None, lines));
+            *checked_top = true;
+        } else if node.kind() == "method_declaration" {
+            assert!(is_test_scope(SupportedLanguage::Dart, &node, None, lines));
+            *checked_method = true;
+        } else if node.kind() == "member_declaration"
+            && node
+                .named_children(&mut node.walk())
+                .any(|c| c.kind() == "declaration")
+        {
+            assert!(is_test_scope(SupportedLanguage::Dart, &node, None, lines));
+            *checked_member = true;
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            check_test_scopes(ch, lines, checked_top, checked_method, checked_member);
+        }
+    }
+    check_test_scopes(
+        t_tree.root_node(),
+        &t_lines,
+        &mut checked_top,
+        &mut checked_method,
+        &mut checked_member,
+    );
+    assert!(checked_top && checked_method && checked_member);
+
+    let inline_blocks = ast_compact::find_inline_test_blocks(
+        SupportedLanguage::Dart,
+        &t_tree.root_node(),
+        dart_test_src,
+    );
+    let inline_names: Vec<&str> = inline_blocks
+        .iter()
+        .flat_map(|b| b.test_names.iter().map(String::as_str))
+        .collect();
+    assert!(
+        inline_names.contains(&"topLevelTestHelper") && inline_names.contains(&"classMethodHelper"),
+        "Dart inline test folding should detect both top-level and class-method @isTest defs: {inline_names:?}"
+    );
+}
+
+#[test]
+fn test_dart_edge_cases_async_arrow_abstract_alias_null_aware_const_and_call_test_scope() {
+    // 1. `async =>` arrow function signature preservation & `abstract class` method primary defs
+    let edge_src = "\
+Future<int> addAsyncArrow(int a, int b) async => a + b;
+
+abstract class PaymentGateway {
+  Future<void> fetchBalance(String accountId);
+  int get retryCount;
+}
+";
+    let edge_tree = diff_expand::parse_with_timeout(SupportedLanguage::Dart, edge_src)
+        .expect("Dart edge-case source should parse");
+    assert!(
+        !edge_tree.root_node().has_error(),
+        "Dart edge-case source should parse without errors: {}",
+        edge_tree.root_node().to_sexp()
+    );
+    let (_s, _e, arrow_sig) = find_enclosing_definition(
+        SupportedLanguage::Dart,
+        &edge_tree.root_node(),
+        1,
+        1,
+        edge_src,
+    );
+    assert!(
+        arrow_sig
+            .as_deref()
+            .is_some_and(|s| s.contains("addAsyncArrow") && s.contains("async")),
+        "Dart async arrow function signature must preserve `async`, got: {arrow_sig:?}"
+    );
+    let (abs_s, abs_e, abs_sig) = find_enclosing_definition(
+        SupportedLanguage::Dart,
+        &edge_tree.root_node(),
+        4,
+        4,
+        edge_src,
+    );
+    assert_eq!((abs_s, abs_e), (4, 4));
+    assert!(
+        abs_sig
+            .as_deref()
+            .is_some_and(|s| s.contains("class PaymentGateway") && s.contains("fetchBalance")),
+        "Dart abstract method must expand with class scope and method signature, got: {abs_sig:?}"
+    );
+    let (get_s, get_e, get_sig) = find_enclosing_definition(
+        SupportedLanguage::Dart,
+        &edge_tree.root_node(),
+        5,
+        5,
+        edge_src,
+    );
+    assert_eq!((get_s, get_e), (5, 5));
+    assert!(
+        get_sig
+            .as_deref()
+            .is_some_and(|s| s.contains("class PaymentGateway") && s.contains("retryCount")),
+        "Dart abstract getter must expand with class scope and getter signature, got: {get_sig:?}"
+    );
+
+    // 2. Call-based Dart test scope detection (`test`, `testWidgets`, `group`)
+    let call_test_src = "\
+void outsideHelper() {
+  final ok = true;
+}
+
+void main() {
+  group('billing suite', () {
+    void insideGroupHelper() {}
+
+    test('computes fee', () {
+      int insideTestHelper() => 42;
+    });
+
+    testWidgets('renders badge', (tester) async {
+      void insideWidgetHelper() {}
+    });
+  });
+}
+";
+    let ct_tree = diff_expand::parse_with_timeout(SupportedLanguage::Dart, call_test_src)
+        .expect("Dart call-based test source should parse");
+    assert!(!ct_tree.root_node().has_error());
+    let ct_lines: Vec<&str> = call_test_src.lines().collect();
+
+    let mut scope_results: Vec<(String, bool)> = Vec::new();
+    fn collect_fn_test_scopes(
+        node: tree_sitter::Node,
+        lines: &[&str],
+        src: &str,
+        out: &mut Vec<(String, bool)>,
+    ) {
+        if node.kind() == "function_declaration" {
+            if let Some(name) =
+                ast_compact::bare_def_name(SupportedLanguage::Dart, &node, lines, src)
+            {
+                out.push((
+                    name,
+                    is_test_scope(SupportedLanguage::Dart, &node, None, lines),
+                ));
+            }
+        } else if node.kind() == "local_function_declaration" {
+            let mut lc = node.walk();
+            let local_name = node
+                .named_children(&mut lc)
+                .find(|c| c.kind() == "function_signature")
+                .and_then(|sig| sig.child_by_field_name("name"))
+                .and_then(|n| get_node_text_same_line(&n, lines));
+            if let Some(name) = local_name {
+                out.push((
+                    name.to_string(),
+                    is_test_scope(SupportedLanguage::Dart, &node, None, lines),
+                ));
+            }
+        }
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            collect_fn_test_scopes(ch, lines, src, out);
+        }
+    }
+    collect_fn_test_scopes(
+        ct_tree.root_node(),
+        &ct_lines,
+        call_test_src,
+        &mut scope_results,
+    );
+    assert!(
+        scope_results
+            .iter()
+            .any(|(n, t)| n == "outsideHelper" && !t),
+        "non-test helper must NOT be marked test scope: {scope_results:?}"
+    );
+    assert!(
+        scope_results
+            .iter()
+            .any(|(n, t)| n == "insideGroupHelper" && *t),
+        "helper inside Dart group(...) must be marked test scope: {scope_results:?}"
+    );
+    assert!(
+        scope_results
+            .iter()
+            .any(|(n, t)| n == "insideTestHelper" && *t),
+        "helper inside Dart test(...) must be marked test scope: {scope_results:?}"
+    );
+    assert!(
+        scope_results
+            .iter()
+            .any(|(n, t)| n == "insideWidgetHelper" && *t),
+        "helper inside Dart testWidgets(...) must be marked test scope: {scope_results:?}"
+    );
+
+    // 3. End-to-end Layer 3 forward & reverse: `import ... as alias`, `null_aware_member_expression`,
+    //    `const_object_expression`, and abstract method signature change
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["config", "user.name", "Tester"])
+        .status()
+        .unwrap();
+
+    std::fs::create_dir_all(repo.join("lib/utils")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/models")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/services")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/ui")).unwrap();
+
+    let math_ops_v1 = "\
+/// Computes tiered discount in cents.
+int computeDiscount(int cents) {
+  return cents ~/ 10;
+}
+";
+    let other_ops_src = "\
+int computeDiscount(int cents) {
+  return cents ~/ 5;
+}
+";
+    let fee_calc_src = "\
+/// Computes platform tax in cents.
+int computeTax(int cents) {
+  return cents ~/ 20;
+}
+";
+    let ledger_v1 = "\
+class LedgerEntry {
+  final String accountId;
+  final int amountCents;
+
+  const LedgerEntry({required this.accountId, required this.amountCents});
+}
+";
+    let gateway_v1 = "\
+abstract class PaymentGateway {
+  Future<void> fetchBalance(String accountId);
+}
+";
+    let service_v1 = "\
+import 'package:demo_app/utils/math_ops.dart' as m;
+import 'package:demo_app/utils/fee_calc.dart' as fees;
+
+class SettlementService {
+  int settleTransfer(String accountId, int cents) {
+    final discount = m.computeDiscount(cents);
+    final tax = fees.computeTax(cents);
+    return cents - discount + tax;
+  }
+}
+";
+    let caller_null_aware = "\
+import 'package:demo_app/services/settlement_service.dart';
+import 'package:demo_app/models/ledger_entry.dart';
+import 'package:demo_app/services/payment_gateway.dart';
+import 'package:demo_app/utils/math_ops.dart' as m;
+
+class OtherService {
+  static int settleTransfer(String id, int cents) => cents;
+}
+
+class NullableCheckout {
+  final SettlementService? service;
+  final PaymentGateway gateway;
+
+  const NullableCheckout(this.service, this.gateway);
+
+  Future<void> runNullAware(String id, int cents) async {
+    service?.settleTransfer(id, cents);
+    await gateway.fetchBalance(id);
+    final d = m.computeDiscount(cents);
+    assert(d >= 0);
+  }
+
+  Object makeConstEntry() {
+    return const LedgerEntry(accountId: 'fixed', amountCents: 100);
+  }
+
+  int unrelatedNullAware(String id, int cents) {
+    return OtherService?.settleTransfer(id, cents) ?? 0;
+  }
+}
+";
+    let unrelated_alias_caller = "\
+import 'package:demo_app/utils/other_ops.dart' as other_alias;
+
+int useOtherDiscount(int cents) {
+  return other_alias.computeDiscount(cents);
+}
+";
+
+    std::fs::write(repo.join("lib/utils/math_ops.dart"), math_ops_v1).unwrap();
+    std::fs::write(repo.join("lib/utils/other_ops.dart"), other_ops_src).unwrap();
+    std::fs::write(repo.join("lib/utils/fee_calc.dart"), fee_calc_src).unwrap();
+    std::fs::write(repo.join("lib/models/ledger_entry.dart"), ledger_v1).unwrap();
+    std::fs::write(repo.join("lib/services/payment_gateway.dart"), gateway_v1).unwrap();
+    std::fs::write(
+        repo.join("lib/services/settlement_service.dart"),
+        service_v1,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib/ui/nullable_checkout.dart"),
+        caller_null_aware,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib/ui/unrelated_alias_caller.dart"),
+        unrelated_alias_caller,
+    )
+    .unwrap();
+
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-q", "-m", "initial dart edge-case repo"])
+        .status()
+        .unwrap();
+
+    // Edit:
+    // - service_v1: touch lines calling `m.computeDiscount` & `fees.computeTax` to trigger Layer 3
+    //   forward resolution via import aliases, and trigger Layer 3 reverse on `service?.settleTransfer`
+    // - math_ops_v1: triggers Layer 3 reverse on `m.computeDiscount` (excluding `other_alias.computeDiscount`)
+    // - ledger_v1: triggers Layer 3 reverse on `const LedgerEntry(...)` (isolated in `makeConstEntry`)
+    // - gateway_v1: triggers Layer 3 reverse on abstract method `fetchBalance`
+    std::fs::write(
+        repo.join("lib/services/settlement_service.dart"),
+        service_v1
+            .replace(
+                "final discount = m.computeDiscount(cents);",
+                "final discount = m.computeDiscount(cents + 1);",
+            )
+            .replace(
+                "final tax = fees.computeTax(cents);",
+                "final tax = fees.computeTax(cents + 1);",
+            ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib/utils/math_ops.dart"),
+        math_ops_v1.replace(
+            "int computeDiscount(int cents)",
+            "int computeDiscount(int cents, {int cap = 0})",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib/models/ledger_entry.dart"),
+        ledger_v1.replace(
+            "final int amountCents;",
+            "final int amountCents;\n  final String currency;",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib/services/payment_gateway.dart"),
+        gateway_v1.replace(
+            "Future<void> fetchBalance(String accountId);",
+            "Future<int> fetchBalance(String accountId, {bool force = false});",
+        ),
+    )
+    .unwrap();
+
+    let mut warnings = Vec::new();
+    let expanded = diff_expand::generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        usize::MAX,
+        HybridConfig::full(),
+        &mut warnings,
+    )
+    .expect("Dart edge-case hybrid diff should succeed");
+
+    assert!(
+        warnings.is_empty(),
+        "Dart edge-case diff should not emit warnings: {warnings:?}"
+    );
+    // Forward via multi-char alias `fees.computeTax(...)`
+    assert!(
+        expanded.contains("int computeTax(int cents)"),
+        "Layer 3 forward must resolve Dart `import ... as fees` qualified call:\n{expanded}"
+    );
+    // Reverse for `service?.settleTransfer`, `const LedgerEntry`, `gateway.fetchBalance`, and `m.computeDiscount`
+    assert!(
+        expanded.contains("nullable_checkout.dart") && expanded.contains("runNullAware"),
+        "Layer 3 reverse must detect Dart null-aware, const-object, abstract-method, and aliased callers:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("service?.settleTransfer(id, cents);"),
+        "Layer 3 reverse must pinpoint null_aware_member_expression call site:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("await gateway.fetchBalance(id);"),
+        "Layer 3 reverse must pinpoint caller of changed abstract method:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("final d = m.computeDiscount(cents);"),
+        "Layer 3 reverse must pinpoint 1-char aliased call `m.computeDiscount`:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("makeConstEntry")
+            && expanded.contains("return const LedgerEntry(accountId: 'fixed', amountCents: 100);"),
+        "Layer 3 reverse must pinpoint const_object_expression call site:\n{expanded}"
+    );
+    assert!(
+        !expanded.contains("unrelatedNullAware"),
+        "Layer 3 reverse must reject unrelated uppercase `OtherService?.settleTransfer`:\n{expanded}"
+    );
+    assert!(
+        !expanded.contains("unrelated_alias_caller.dart"),
+        "Layer 3 reverse must reject unrelated namespace alias `other_alias.computeDiscount`:\n{expanded}"
+    );
+
+    // Also verify 1-char alias `m.computeDiscount` in Layer 3 forward when math_ops.dart is unmodified
+    std::fs::write(repo.join("lib/utils/math_ops.dart"), math_ops_v1).unwrap();
+    let mut warnings_fwd = Vec::new();
+    let expanded_fwd = diff_expand::generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        usize::MAX,
+        HybridConfig::full(),
+        &mut warnings_fwd,
+    )
+    .expect("Dart 1-char alias forward diff should succeed");
+    assert!(
+        expanded_fwd.contains("int computeDiscount(int cents)"),
+        "Layer 3 forward must resolve Dart 1-char `import ... as m` qualified call `m.computeDiscount`:\n{expanded_fwd}"
+    );
+}
+
+#[test]
+fn test_dart_cascade_calls_and_decl_name_exclusions() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["config", "user.name", "Tester"])
+        .status()
+        .unwrap();
+
+    std::fs::create_dir_all(repo.join("lib/core")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/app")).unwrap();
+    std::fs::create_dir_all(repo.join("lib/unrelated")).unwrap();
+
+    let builder_v1 = "\
+class AuditBuilder {
+  void applyAudit(String id) {}
+  void recordMetric(String id) {}
+  void finalizeBatch(String id) {}
+}
+";
+    let defs_v1 = "\
+mixin BaseAuditMixin {
+  void mark() {}
+}
+typedef AuditToken = String;
+class AuditedEntry = Object with BaseAuditMixin;
+extension type VaultId(String raw) {
+  bool get isValid => raw.isNotEmpty;
+}
+";
+    let cascade_caller_v1 = "\
+import 'package:demo_app/core/audit_builder.dart';
+import 'package:demo_app/core/audit_defs.dart';
+
+class OtherBuilder {
+  void applyAudit(String id) {}
+}
+
+class Holder {
+  final AuditBuilder child;
+  Holder(this.child);
+}
+
+void runCascade(AuditBuilder builder, AuditBuilder? maybeBuilder, Holder holder, String id) {
+  builder..applyAudit(id);
+  maybeBuilder?..recordMetric(id);
+  holder..child.finalizeBatch(id);
+}
+
+void runNullAwareCascade(AuditBuilder? maybeBuilder, String id) {
+  maybeBuilder?..applyAudit(id);
+}
+
+void runChainedCascade(Holder holder, String id) {
+  holder..child.applyAudit(id);
+}
+
+void runUnrelatedCascade(String id) {
+  OtherBuilder()..applyAudit(id);
+}
+
+typedef WrappedAuditToken = AuditToken;
+mixin ExtraMixin {}
+class ExtendedAuditedEntry = AuditedEntry with ExtraMixin;
+bool checkVault(VaultId id) => id.isValid;
+";
+    // Same-named declarations in an unrelated file must NOT be flagged as reverse callers
+    let unrelated_redecl = "\
+mixin LocalMixin {}
+typedef AuditToken = int;
+class AuditedEntry = Object with LocalMixin;
+extension type VaultId(int raw) {
+  bool get isValid => raw > 0;
+}
+";
+
+    std::fs::write(repo.join("lib/core/audit_builder.dart"), builder_v1).unwrap();
+    std::fs::write(repo.join("lib/core/audit_defs.dart"), defs_v1).unwrap();
+    std::fs::write(repo.join("lib/app/cascade_caller.dart"), cascade_caller_v1).unwrap();
+    std::fs::write(repo.join("lib/unrelated/redecl.dart"), unrelated_redecl).unwrap();
+
+    Command::new("git")
+        .current_dir(repo)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-q", "-m", "initial dart cascade & decl test"])
+        .status()
+        .unwrap();
+
+    // 1. Forward check: touch cascade call lines in cascade_caller.dart (builder unchanged)
+    std::fs::write(
+        repo.join("lib/app/cascade_caller.dart"),
+        cascade_caller_v1
+            .replace(
+                "builder..applyAudit(id);",
+                "builder..applyAudit(id.trim());",
+            )
+            .replace(
+                "maybeBuilder?..recordMetric(id);",
+                "maybeBuilder?..recordMetric(id.trim());",
+            )
+            .replace(
+                "holder..child.finalizeBatch(id);",
+                "holder..child.finalizeBatch(id.trim());",
+            ),
+    )
+    .unwrap();
+
+    let mut warnings_fwd = Vec::new();
+    let expanded_fwd = diff_expand::generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        usize::MAX,
+        HybridConfig::full(),
+        &mut warnings_fwd,
+    )
+    .expect("Dart cascade forward hybrid diff should succeed");
+    assert!(
+        warnings_fwd.is_empty(),
+        "Dart cascade forward diff should not emit warnings: {warnings_fwd:?}"
+    );
+    assert!(
+        expanded_fwd.contains("void applyAudit(String id)")
+            && expanded_fwd.contains("void recordMetric(String id)")
+            && expanded_fwd.contains("void finalizeBatch(String id)"),
+        "Layer 3 forward must resolve Dart cascade (`..`, `?..`, chained) method calls:\n{expanded_fwd}"
+    );
+
+    // 2. Reverse check: restore cascade_caller.dart and change AuditBuilder::applyAudit + Dart type defs
+    std::fs::write(repo.join("lib/app/cascade_caller.dart"), cascade_caller_v1).unwrap();
+    std::fs::write(
+        repo.join("lib/core/audit_builder.dart"),
+        builder_v1.replace(
+            "void applyAudit(String id) {}",
+            "void applyAudit(String id, {bool strict = true}) {}",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib/core/audit_defs.dart"),
+        defs_v1
+            .replace("typedef AuditToken = String;", "typedef AuditToken = Uri;")
+            .replace(
+                "class AuditedEntry = Object with BaseAuditMixin;",
+                "class AuditedEntry = Comparable<Object> with BaseAuditMixin;",
+            )
+            .replace(
+                "extension type VaultId(String raw)",
+                "extension type VaultId(Uri raw)",
+            ),
+    )
+    .unwrap();
+
+    let mut warnings_rev = Vec::new();
+    let expanded_rev = diff_expand::generate_expanded_diff_with_config(
+        repo,
+        GitDiffSource::Unstaged,
+        usize::MAX,
+        HybridConfig::full(),
+        &mut warnings_rev,
+    )
+    .expect("Dart cascade & decl-exclusion reverse hybrid diff should succeed");
+    assert!(
+        warnings_rev.is_empty(),
+        "Dart reverse diff should not emit warnings: {warnings_rev:?}"
+    );
+    assert!(
+        expanded_rev.contains("builder..applyAudit(id);"),
+        "Layer 3 reverse must detect Dart `..` cascade caller:\n{expanded_rev}"
+    );
+    assert!(
+        expanded_rev.contains("maybeBuilder?..applyAudit(id);"),
+        "Layer 3 reverse must detect Dart `?..` null-aware cascade caller:\n{expanded_rev}"
+    );
+    assert!(
+        expanded_rev.contains("holder..child.applyAudit(id);"),
+        "Layer 3 reverse must detect chained Dart `..child.method()` cascade caller:\n{expanded_rev}"
+    );
+    assert!(
+        !expanded_rev.contains("runUnrelatedCascade"),
+        "Layer 3 reverse must reject unrelated uppercase cascade `OtherBuilder()..applyAudit`:\n{expanded_rev}"
+    );
+    assert!(
+        expanded_rev.contains("WrappedAuditToken")
+            && expanded_rev.contains("ExtendedAuditedEntry")
+            && expanded_rev.contains("checkVault"),
+        "Layer 3 reverse must still detect genuine RHS/usage references to typedef, mixin application class, and extension type:\n{expanded_rev}"
+    );
+    assert!(
+        !expanded_rev.contains("unrelated/redecl.dart"),
+        "Layer 3 reverse must NOT flag Dart type_alias, mixin_application_class, or extension_type_name declarations as callers:\n{expanded_rev}"
+    );
+}

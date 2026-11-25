@@ -930,6 +930,44 @@ pub(super) fn is_test_scope(
                 }
             }
         }
+        SupportedLanguage::Dart => {
+            let mut curr = Some(*node);
+            while let Some(ancestor) = curr {
+                match ancestor.kind() {
+                    "function_declaration"
+                    | "method_declaration"
+                    | "member_declaration"
+                    | "class_declaration" => {
+                        let mut ac = ancestor.walk();
+                        for ch in ancestor.named_children(&mut ac) {
+                            if ch.kind() == "annotation" {
+                                if let Some(name) = ch
+                                    .child_by_field_name("name")
+                                    .and_then(|n| get_node_text_same_line(&n, lines))
+                                {
+                                    let short =
+                                        name.trim().rsplit('.').next().unwrap_or(name.trim());
+                                    if matches!(short, "isTest" | "isTestGroup") {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "call_expression" => {
+                        if let Some(fn_node) = ancestor.child_by_field_name("function") {
+                            if let Some(fn_name) = get_node_text_same_line(&fn_node, lines) {
+                                if matches!(fn_name.trim(), "test" | "testWidgets" | "group") {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                curr = ancestor.parent();
+            }
+        }
         _ => {}
     }
 
@@ -1099,6 +1137,7 @@ pub(super) fn is_attribute_or_comment_only(
             | SupportedLanguage::JavaScript
             | SupportedLanguage::TypeScript
             | SupportedLanguage::Tsx
+            | SupportedLanguage::Dart
     );
 
     let mut has_non_empty = false;
