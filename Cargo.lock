@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "anticrumb"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2644,7 +2644,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts-grammars"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "cc",
  "flate2",
@@ -3109,7 +3109,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "flate2",
  "serde_json",
