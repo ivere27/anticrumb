@@ -162,22 +162,30 @@ fn main() {
         "cargo:rustc-env=ANTICRUMB_BUILD_CHANNEL={}",
         resolve_build_channel()
     );
-    let build_time = env::var("ANTICRUMB_BUILD_TIME")
-        .or_else(|_| {
-            env::var("SOURCE_DATE_EPOCH")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(format_utc_timestamp)
-                .ok_or(env::VarError::NotPresent)
-        })
-        .unwrap_or_else(|_| {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            format_utc_timestamp(secs)
-        });
-    println!("cargo:rustc-env=ANTICRUMB_BUILD_TIME={build_time}");
+    println!("cargo:rerun-if-env-changed=ANTICRUMB_BUILD_TIME");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    if let Some(explicit_time) = env::var("ANTICRUMB_BUILD_TIME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        println!("cargo:rustc-env=ANTICRUMB_BUILD_TIME={explicit_time}");
+    } else {
+        let build_epoch = env::var("SOURCE_DATE_EPOCH")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+        println!("cargo:rustc-env=ANTICRUMB_BUILD_EPOCH={build_epoch}");
+        println!(
+            "cargo:rustc-env=ANTICRUMB_BUILD_TIME={}",
+            format_utc_timestamp(build_epoch)
+        );
+    }
 
     println!("cargo:rerun-if-env-changed=ANTICRUMB_GIT_HEAD");
     if let Some(git_head) = env::var("ANTICRUMB_GIT_HEAD")
