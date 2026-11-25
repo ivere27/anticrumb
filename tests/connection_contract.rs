@@ -502,6 +502,56 @@ fn invalid_connection_flags_do_not_change_state_or_disclose_url_credentials() {
     assert!(!env.saved().exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn help_banner_formats_build_time_for_runtime_timezone() {
+    let env = Environment::new();
+    let run_help = |tz: &str| {
+        let output = env
+            .command()
+            .args(["--help"])
+            .env("TZ", tz)
+            .output()
+            .expect("run anticrumb --help");
+        assert!(
+            output.status.success(),
+            "help failed for TZ={tz}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let utc_line = run_help("UTC");
+    assert!(
+        utc_line.contains(&format!("built: {})", anticrumb::build_info::build_time())),
+        "expected UTC build time when TZ=UTC, got: {utc_line}"
+    );
+
+    let kst_line = run_help("KST-9");
+    assert!(
+        kst_line.contains("built: ") && kst_line.ends_with(" +09:00)"),
+        "expected +09:00 build time when TZ=KST-9, got: {kst_line}"
+    );
+
+    if std::path::Path::new("/usr/share/zoneinfo/Asia/Seoul").exists() {
+        let seoul_line = run_help("Asia/Seoul");
+        assert_eq!(
+            seoul_line, kst_line,
+            "Asia/Seoul should match KST-9 (+09:00)"
+        );
+    }
+
+    let est_line = run_help("EST5");
+    assert!(
+        est_line.contains("built: ") && est_line.ends_with(" -05:00)"),
+        "expected -05:00 build time when TZ=EST5, got: {est_line}"
+    );
+}
+
 #[test]
 fn bare_listen_prints_build_banner_once_and_regenerate_token_rotates_secret() {
     let env = Environment::new();
@@ -526,6 +576,21 @@ fn bare_listen_prints_build_banner_once_and_regenerate_token_rotates_secret() {
         full.matches(&banner_prefix).count(),
         1,
         "expected build banner once in daemon log: {full}"
+    );
+    let banner_line = full
+        .lines()
+        .find(|line| line.contains(&banner_prefix))
+        .expect("banner line in daemon log");
+    let (prefix, _) = banner_line
+        .split_once(' ')
+        .and_then(|(date, rest)| {
+            let (time, tail) = rest.split_once(' ')?;
+            Some((format!("{date} {time}"), tail))
+        })
+        .expect("timestamp prefix on banner line");
+    assert!(
+        prefix.starts_with('[') && prefix.ends_with(']') && prefix.len() == 21,
+        "expected compact local log timestamp without per-line offset: {banner_line}"
     );
     assert!(full.contains("built: "), "{full}");
     assert!(full.contains("TLS certificate mode: self-signed"), "{full}");
