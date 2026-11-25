@@ -117,7 +117,7 @@ L19: pub fn reserve_funds(account_id: u64, amount_cents: u64, timeout_ms: u64, i
 
 ---
 
-## 3. Supported Languages (13 Built-In Tree-sitter Grammars)
+## 3. Supported Languages (14 Built-In Tree-sitter Grammars)
 
 | Language | Extensions | Layer 1/2 AST Expansion | Layer 3-①/② Extraction & Import Resolution |
 |---|---|---|---|
@@ -130,6 +130,7 @@ L19: pub fn reserve_funds(account_id: u64, amount_cents: u64, timeout_ms: u64, i
 | **C#** | `.cs` | `class`, `struct`, `interface`, `enum`, `record`, methods, `[Attr]` | `using Namespace;` + same-directory siblings, `/// <summary>` docs |
 | **C / C++ / CUDA** | `.c`, `.h`, `.cc`, `.cpp`, `.hpp`, `.cxx`, `.hxx`, `.cu`, `.cuh` (plus `.inc` via priority gate) | `fn`, `struct`, `class`, `enum`, `namespace`, templates | `#include "..."` + paired header/source siblings, `///`/`/** */` |
 | **Ruby** | `.rb` | `class`, `module`, `def`, `def self.foo` | `require_relative`, `require`, `#` docs |
+| **Dart** | `.dart` | `class`, `mixin`, `enum`, `extension`, `extension type`, `typedef`, functions, methods, constructors, `@annotation` | `import 'package:...'`, relative `import`/`export`/`part`, `///` docs |
 | **Bash / JSON** | `.sh`, `.bash`, `.json` | Enclosing function / key expansion (Layer 2) | Excluded from Layer 3 cross-file resolution |
 
 Extension mappings are declared in `src/tree_sitter_diff/extensions.json`:

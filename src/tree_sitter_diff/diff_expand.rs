@@ -362,6 +362,9 @@ pub(super) fn is_container_definition_node(node: &tree_sitter::Node) -> bool {
             | "class_specifier"
             | "struct_declaration"
             | "record_declaration"
+            | "mixin_declaration"
+            | "extension_declaration"
+            | "extension_type_declaration"
     )
 }
 
@@ -3368,7 +3371,7 @@ struct AstDefSpan {
 }
 
 #[cfg(feature = "tree-sitter")]
-fn short_def_label(
+pub(super) fn short_def_label(
     lang: SupportedLanguage,
     matched: &tree_sitter::Node,
     lines: &[&str],
@@ -3379,7 +3382,7 @@ fn short_def_label(
         "struct_item" | "struct_declaration" | "struct_specifier" => Some("struct"),
         "enum_item" | "enum_declaration" | "enum_specifier" => Some("enum"),
         "trait_item" => Some("trait"),
-        "type_item" | "type_alias_declaration" | "type_definition" => Some("type"),
+        "type_item" | "type_alias_declaration" | "type_definition" | "type_alias" => Some("type"),
         "macro_definition" => Some("macro"),
         "const_item" => Some("const"),
         "static_item" => Some("static"),
@@ -3389,8 +3392,10 @@ fn short_def_label(
         },
         "function_declaration" => match lang {
             SupportedLanguage::Go => Some("func"),
+            SupportedLanguage::Dart => Some("fn"),
             _ => Some("function"),
         },
+        "getter_declaration" | "setter_declaration" => Some("fn"),
         "method_declaration" => match lang {
             SupportedLanguage::Go => Some("func"),
             _ => None,
@@ -3400,7 +3405,20 @@ fn short_def_label(
         | "class_declaration"
         | "abstract_class_declaration"
         | "class_specifier"
-        | "class" => Some("class"),
+        | "class"
+        | "mixin_application_class" => Some("class"),
+        "mixin_declaration" => Some("mixin"),
+        "extension_declaration" | "extension_type_declaration" => Some("extension"),
+        "top_level_variable_declaration" if lang == SupportedLanguage::Dart => {
+            match matched
+                .child_by_field_name("modifier")
+                .and_then(|m| super::get_node_text_same_line(&m, lines))
+            {
+                Some("const") => Some("const"),
+                Some("final") => Some("final"),
+                _ => None,
+            }
+        }
         "interface_declaration" => Some("interface"),
         "record_declaration" => Some("record"),
         "module" => Some("module"),
@@ -3416,6 +3434,17 @@ fn short_def_label(
             .unwrap_or(*matched),
         _ => *matched,
     };
+    if lang == SupportedLanguage::Dart {
+        if let Some(name) = ast_compact::extract_dart_def_name(&target, lines) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Some(match kind_prefix {
+                    Some(k) => signature::truncate_preview(&format!("{k} {trimmed}"), 40),
+                    None => signature::truncate_preview(trimmed, 40),
+                });
+            }
+        }
+    }
     if let Some(name_node) = target.child_by_field_name("name") {
         if let Some(name) = super::get_node_text_same_line(&name_node, lines) {
             let trimmed = name.trim();

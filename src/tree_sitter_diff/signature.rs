@@ -901,6 +901,39 @@ pub(super) fn find_ast_parameters_node<'a>(
     if let Some(p) = target.child_by_field_name("parameters") {
         return Some(p);
     }
+    if lang == SupportedLanguage::Dart {
+        let mut dart_target = target;
+        if dart_target.kind() == "member_declaration" {
+            let mut cursor = dart_target.walk();
+            for ch in dart_target.named_children(&mut cursor) {
+                if matches!(ch.kind(), "method_declaration" | "declaration") {
+                    dart_target = ch;
+                    break;
+                }
+            }
+        }
+        if let Some(sig) = dart_target.child_by_field_name("signature") {
+            if let Some(p) = sig.child_by_field_name("parameters") {
+                return Some(p);
+            }
+            if sig.kind() == "method_signature" {
+                let mut sc = sig.walk();
+                for ch in sig.named_children(&mut sc) {
+                    if let Some(p) = ch.child_by_field_name("parameters") {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        if dart_target.kind() == "declaration" {
+            let mut dc = dart_target.walk();
+            for ch in dart_target.named_children(&mut dc) {
+                if let Some(p) = ch.child_by_field_name("parameters") {
+                    return Some(p);
+                }
+            }
+        }
+    }
     if matches!(
         lang,
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript | SupportedLanguage::Tsx
@@ -1642,6 +1675,30 @@ pub(super) fn find_ast_body_node<'a>(
     lang: SupportedLanguage,
     target: &tree_sitter::Node<'a>,
 ) -> Option<tree_sitter::Node<'a>> {
+    if lang == SupportedLanguage::Dart {
+        if target.kind() == "member_declaration" {
+            let mut cursor = target.walk();
+            for ch in target.named_children(&mut cursor) {
+                if ch.kind() == "method_declaration" {
+                    return find_ast_body_node(lang, &ch);
+                }
+            }
+        }
+        if let Some(body) = target.child_by_field_name("body") {
+            // In tree-sitter-dart, `function_body` starts with optional `async`/`async*`/`sync*`
+            // modifiers before the `{ ... }` `block`. Return the inner `block` so async modifiers
+            // stay in the extracted signature and brace-delimited body folding works cleanly.
+            if body.kind() == "function_body" {
+                let mut bc = body.walk();
+                for ch in body.named_children(&mut bc) {
+                    if ch.kind() == "block" {
+                        return Some(ch);
+                    }
+                }
+            }
+            return Some(body);
+        }
+    }
     if let Some(body) = target.child_by_field_name("body") {
         return Some(body);
     }
@@ -1718,7 +1775,16 @@ fn find_ast_signature_bounds<'a>(
         *node
     };
     let body = find_ast_body_node(lang, &target)?;
-    let body_start = body.start_byte();
+    let mut body_start = body.start_byte();
+    if lang == SupportedLanguage::Dart && body.kind() == "function_body" {
+        let mut bc = body.walk();
+        for ch in body.children(&mut bc) {
+            if ch.kind() == "=>" {
+                body_start = ch.start_byte();
+                break;
+            }
+        }
+    }
     let target_start = target.start_byte();
     let mut last_anno_end = None;
 
@@ -2061,6 +2127,29 @@ fn extract_key_decorators_list(
             }
             raw_decs.reverse();
         }
+        SupportedLanguage::Dart => {
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                if ch.kind() == "annotation" {
+                    if let Some(txt) = source.get(ch.start_byte()..ch.end_byte()) {
+                        raw_decs.push(txt.trim().to_string());
+                    }
+                }
+            }
+            if let Some(parent) = node.parent().filter(|p| p.kind() == "member_declaration") {
+                let mut pc = parent.walk();
+                for ch in parent.named_children(&mut pc) {
+                    if ch.kind() == "annotation" {
+                        if let Some(txt) = source.get(ch.start_byte()..ch.end_byte()) {
+                            let t = txt.trim().to_string();
+                            if !raw_decs.contains(&t) {
+                                raw_decs.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => return Vec::new(),
     }
 
@@ -2147,6 +2236,30 @@ fn extract_key_decorators_list(
                         | "@computed"
                         | "@action"
                         | "@observable"
+                )
+            }
+            SupportedLanguage::Dart => {
+                let head = d.split('(').next().unwrap_or(d).trim();
+                matches!(
+                    head,
+                    "@immutable"
+                        | "@visibleForTesting"
+                        | "@visibleForOverriding"
+                        | "@protected"
+                        | "@mustCallSuper"
+                        | "@mustBeOverridden"
+                        | "@nonVirtual"
+                        | "@sealed"
+                        | "@Deprecated"
+                        | "@deprecated"
+                        | "@pragma"
+                        | "@JsonSerializable"
+                        | "@freezed"
+                        | "@Riverpod"
+                        | "@riverpod"
+                        | "@injectable"
+                        | "@singleton"
+                        | "@lazySingleton"
                 )
             }
             _ => false,
@@ -2659,6 +2772,40 @@ pub(super) fn extract_parent_scope_prefix(
                     }
                 }
             }
+            SupportedLanguage::Dart => match kind {
+                "class_declaration" | "mixin_declaration" | "enum_declaration" => {
+                    if let Some(name_node) = ancestor.child_by_field_name("name") {
+                        if let Some(name) = get_node_text_same_line(&name_node, lines) {
+                            let keyword = match kind {
+                                "mixin_declaration" => "mixin",
+                                "enum_declaration" => "enum",
+                                _ => "class",
+                            };
+                            return Some(format!("{keyword} {name}"));
+                        }
+                    }
+                }
+                "extension_declaration" => {
+                    if let Some(name_node) = ancestor.child_by_field_name("name") {
+                        if let Some(name) = get_node_text_same_line(&name_node, lines) {
+                            return Some(format!("extension {name}"));
+                        }
+                    }
+                    if let Some(cls_node) = ancestor.child_by_field_name("class") {
+                        if let Some(cls) = get_node_text_same_line(&cls_node, lines) {
+                            return Some(format!("extension on {cls}"));
+                        }
+                    }
+                }
+                "extension_type_declaration" => {
+                    if let Some(name_node) = ancestor.child_by_field_name("name") {
+                        if let Some(name) = get_node_text_same_line(&name_node, lines) {
+                            return Some(format!("extension type {name}"));
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         curr = ancestor.parent();

@@ -306,6 +306,12 @@ pub fn execute_with_jobs(
         Action::Test => {
             run_checked(
                 &cargo,
+                &["test", "--locked", "-p", "ts-grammars", "--all-targets"],
+                root,
+                extra_env,
+            )?;
+            run_checked(
+                &cargo,
                 &["test", "--locked", "-p", "anticrumb", "--all-targets"],
                 root,
                 extra_env,

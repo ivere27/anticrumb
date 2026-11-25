@@ -27,7 +27,8 @@
     "sh": "bash",
     "bash": "bash",
     "rb": "ruby",
-    "json": "json"
+    "json": "json",
+    "dart": "dart"
   },
   "priority": {
     "inc": ["cpp"]

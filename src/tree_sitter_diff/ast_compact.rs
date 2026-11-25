@@ -158,6 +158,13 @@ pub(super) fn bare_def_name(
         }
     }
 
+    // Dart definitions store names inside nested signature/declaration nodes
+    if lang == SupportedLanguage::Dart {
+        if let Some(name) = extract_dart_def_name(&target, lines) {
+            return Some(signature::truncate_preview(&name, 40));
+        }
+    }
+
     if let Some(name_node) = target
         .child_by_field_name("name")
         .or_else(|| target.child_by_field_name("property"))
@@ -180,6 +187,139 @@ pub(super) fn bare_def_name(
     } else {
         Some(signature::truncate_preview(token, 40))
     }
+}
+
+fn extract_dart_signature_name(sig: &tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut cursor = sig.walk();
+    for (idx, ch) in sig.children(&mut cursor).enumerate() {
+        if sig.field_name_for_child(idx as u32) == Some("name") {
+            if let Some(txt) = get_node_text_same_line(&ch, lines) {
+                let t = txt.trim();
+                if !t.is_empty() && t != "." {
+                    parts.push(t);
+                }
+            }
+        }
+    }
+    if !parts.is_empty() {
+        return Some(parts.join("."));
+    }
+    if let Some(op) = sig.child_by_field_name("operator") {
+        if let Some(txt) = get_node_text_same_line(&op, lines) {
+            let t = txt.trim();
+            if !t.is_empty() {
+                return Some(format!("operator{t}"));
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn extract_dart_def_name(target: &tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    match target.kind() {
+        "member_declaration" => {
+            let mut cursor = target.walk();
+            for ch in target.named_children(&mut cursor) {
+                if let Some(name) = extract_dart_def_name(&ch, lines) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        "method_declaration"
+        | "function_declaration"
+        | "getter_declaration"
+        | "setter_declaration" => {
+            let sig = target.child_by_field_name("signature")?;
+            if sig.kind() == "method_signature" {
+                let mut sc = sig.walk();
+                for ch in sig.named_children(&mut sc) {
+                    if let Some(name) = extract_dart_signature_name(&ch, lines) {
+                        return Some(name);
+                    }
+                }
+                None
+            } else {
+                extract_dart_signature_name(&sig, lines)
+            }
+        }
+        "declaration" => {
+            let mut cursor = target.walk();
+            for ch in target.named_children(&mut cursor) {
+                if let Some(name) = extract_dart_signature_name(&ch, lines) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        "mixin_application_class" => {
+            let mut cursor = target.walk();
+            for ch in target.named_children(&mut cursor) {
+                if ch.kind() == "identifier" {
+                    if let Some(txt) = get_node_text_same_line(&ch, lines) {
+                        let t = txt.trim();
+                        if !t.is_empty() {
+                            return Some(t.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "type_alias" => {
+            let mut cursor = target.walk();
+            for ch in target.named_children(&mut cursor) {
+                if ch.kind() == "type_identifier" {
+                    if let Some(txt) = get_node_text_same_line(&ch, lines) {
+                        let t = txt.trim();
+                        if !t.is_empty() {
+                            return Some(t.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "top_level_variable_declaration" => {
+            let mut cursor = target.walk();
+            for ch in target.named_children(&mut cursor) {
+                if ch.kind() == "static_final_declaration_list" {
+                    let mut lc = ch.walk();
+                    for item in ch.named_children(&mut lc) {
+                        if let Some(name_node) = item.child_by_field_name("name") {
+                            if let Some(txt) = get_node_text_same_line(&name_node, lines) {
+                                let t = txt.trim();
+                                if !t.is_empty() {
+                                    return Some(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn has_dart_test_annotation(node: &tree_sitter::Node, lines: &[&str]) -> bool {
+    let mut cursor = node.walk();
+    for ch in node.named_children(&mut cursor) {
+        if ch.kind() == "annotation" {
+            if let Some(name) = ch
+                .child_by_field_name("name")
+                .and_then(|n| get_node_text_same_line(&n, lines))
+            {
+                let short = name.trim().rsplit('.').next().unwrap_or(name.trim());
+                if matches!(short, "isTest" | "isTestGroup") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Checks if a Rust `mod_item` has a body (`declaration_list`, excluding external `mod tests;`)
@@ -1030,6 +1170,32 @@ pub(super) fn find_inline_test_blocks(
                     return;
                 }
             }
+            SupportedLanguage::Dart => {
+                if matches!(node.kind(), "function_declaration" | "method_declaration")
+                    && has_dart_test_annotation(&node, lines)
+                {
+                    let s = node.start_position().row + 1;
+                    let e = (node.end_position().row + 1).min(max_line);
+                    let name = bare_def_name(lang, &node, lines, source)
+                        .unwrap_or_else(|| "test".to_string());
+                    out.push(InlineTestBlock {
+                        start_line: s,
+                        end_line: e,
+                        scope_label: None,
+                        test_names: vec![name],
+                    });
+                    return;
+                }
+                if matches!(
+                    node.kind(),
+                    "function_declaration"
+                        | "method_declaration"
+                        | "getter_declaration"
+                        | "setter_declaration"
+                ) {
+                    return;
+                }
+            }
             SupportedLanguage::Bash | SupportedLanguage::Json => return,
         }
 
@@ -1508,6 +1674,13 @@ pub(super) fn is_foldable_function_node(lang: SupportedLanguage, node: &tree_sit
         SupportedLanguage::Ruby => matches!(kind, "method" | "singleton_method"),
         SupportedLanguage::Bash => kind == "function_definition",
         SupportedLanguage::Json => false,
+        SupportedLanguage::Dart => matches!(
+            kind,
+            "function_declaration"
+                | "method_declaration"
+                | "getter_declaration"
+                | "setter_declaration"
+        ),
     }
 }
 
