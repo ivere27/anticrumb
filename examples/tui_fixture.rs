@@ -417,6 +417,8 @@ fn build_conversation(conv_id: &str, mut turns: Vec<pb::Agent>) -> pb::Conversat
 }
 #[tonic::async_trait]
 impl WorkspaceService for Fixture {
+    type WatchAgentEventsStream = anticrumb::rpc::server::TypedStream<pb::Event>;
+
     async fn connect_client(&self, r: Request<pb::ConnectClientRequest>) -> Reply<pb::HostInfo> {
         self.api.connect_client(r).await
     }
@@ -635,6 +637,16 @@ impl WorkspaceService for Fixture {
     }
     async fn read_agent_events(&self, _: Request<pb::EventCursor>) -> Reply<pb::EventPage> {
         Ok(Response::new(pb::EventPage::default()))
+    }
+    async fn watch_agent_events(
+        &self,
+        r: Request<pb::EventCursor>,
+    ) -> Reply<Self::WatchAgentEventsStream> {
+        self.api.authorize(r.metadata())?;
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn query_knowledge(&self, _: Request<pb::KnowledgeQuery>) -> Reply<pb::KnowledgeResults> {
         Err(Status::unimplemented("fixture"))

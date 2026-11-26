@@ -373,7 +373,18 @@ impl RpcClient {
         }
     }
     pub async fn watch_events(&self, cursor: pb::EventCursor) -> Result<EventStream> {
-        let path = "/anticrumb.v1.TurnService/WatchEvents";
+        self.watch_event_stream("/anticrumb.v1.TurnService/WatchEvents", cursor)
+            .await
+    }
+    pub async fn watch_agent_events(&self, cursor: pb::EventCursor) -> Result<EventStream> {
+        self.watch_event_stream("/anticrumb.v1.WorkspaceService/WatchAgentEvents", cursor)
+            .await
+    }
+    async fn watch_event_stream(
+        &self,
+        path: &'static str,
+        cursor: pb::EventCursor,
+    ) -> Result<EventStream> {
         match self.transport.as_ref() {
             Transport::Embedded { module: host, .. } => {
                 let call = host

@@ -2,6 +2,10 @@
 use super::{
     debug_log::DebugLogger,
     editor::Editor,
+    layout::{
+        AfterTurnPolicy, InspectorConfig, InspectorMode, INSPECTOR_MAX_WIDTH_PCT,
+        INSPECTOR_MIN_WIDTH_PCT,
+    },
     markdown::Face,
     model_picker::{self, ModelChoice},
     reducer::{EffectSink, State},
@@ -42,6 +46,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
         "Runtime health, clients, jobs, browser connection, model and workspace",
     ),
     ("/theme", "Choose a terminal color palette"),
+    (
+        "/inspector",
+        "Configure Tool Inspector layout (inline|side|off, width, after-turn, follow)",
+    ),
     (
         "/browse",
         "Control web pages: open, snapshot, click, fill, press, tabs, close; /browse help",
@@ -85,6 +93,14 @@ pub(super) enum PermissionKind {
     Ast,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InspectorField {
+    Mode,
+    Width,
+    AfterTurn,
+    Follow,
+}
+
 pub(super) enum Selection {
     Provider {
         account_id: String,
@@ -97,6 +113,10 @@ pub(super) enum Selection {
     },
     Model(ModelChoice),
     Theme(theme::Theme),
+    Inspector {
+        field: InspectorField,
+        config: InspectorConfig,
+    },
     Resume(String),
     DeleteConversation(String),
     CancelDelete,
@@ -678,7 +698,23 @@ impl State {
             ),
             (
                 "Wheel / PgUp",
-                "Scroll transcript; drag transcript to select & copy",
+                "Scroll transcript (or right Inspector pane); drag to select & copy",
+            ),
+            (
+                "← / → (empty)",
+                "Switch previous / next tool (→ past last tool resumes live Follow)",
+            ),
+            (
+                "Ctrl+O",
+                "Toggle fullscreen Tool Inspector overlay (←/→ tool, ↑↓ scroll, f follow, Esc close)",
+            ),
+            (
+                "Alt+L / Alt+I",
+                "Toggle Inspector live Follow feed / toggle Inspector panel on or off",
+            ),
+            (
+                "Alt+↑ / Alt+↓",
+                "Scroll focused Tool Inspector (Alt+PgUp / Alt+PgDn for pages)",
             ),
             ("/copy", "Copy last assistant response with Markdown"),
             (
@@ -766,6 +802,14 @@ impl State {
             Face::HIGHLIGHT,
         );
         self.log_kv("· ", Face::ACCENT, "Theme", &theme_name, Face::ACCENT);
+        let inspector_summary = self.layout.inspector.summary();
+        self.log_kv(
+            "· ",
+            Face::ACCENT,
+            "Inspector",
+            &inspector_summary,
+            Face::ACCENT,
+        );
         self.log_kv(
             "· ",
             Face::ACCENT,
@@ -857,6 +901,122 @@ impl State {
             sink,
             Command::WebHistoryStatus(self.options.account.clone(), true),
         );
+    }
+
+    pub(super) fn open_inspector_menu(&mut self, config: InspectorConfig, selected: usize) {
+        if self.inspector_preview_origin.is_none() {
+            self.inspector_preview_origin = Some(self.layout.inspector);
+        }
+        let cfg = config.normalized();
+        let choices = vec![
+            Choice {
+                label: format!("Mode         ‹ {} ›", cfg.mode.label()),
+                value: Selection::Inspector {
+                    field: InspectorField::Mode,
+                    config: cfg,
+                },
+            },
+            Choice {
+                label: format!("Width        ‹ {}% ›", cfg.width_pct),
+                value: Selection::Inspector {
+                    field: InspectorField::Width,
+                    config: cfg,
+                },
+            },
+            Choice {
+                label: format!("After-turn   ‹ {} ›", cfg.after_turn.label()),
+                value: Selection::Inspector {
+                    field: InspectorField::AfterTurn,
+                    config: cfg,
+                },
+            },
+            Choice {
+                label: format!(
+                    "Auto-follow  ‹ {} ›",
+                    if cfg.follow { "Follow" } else { "Manual" }
+                ),
+                value: Selection::Inspector {
+                    field: InspectorField::Follow,
+                    config: cfg,
+                },
+            },
+        ];
+        self.menu = Some(Menu {
+            title: "Inspector · ↑↓ move · ←→/Space change · Enter save · Esc cancel".into(),
+            choices,
+            selected: selected.min(3),
+        });
+    }
+
+    pub(super) fn shift_inspector_menu_item(&mut self, forward: bool) -> bool {
+        let Some(menu) = self.menu.as_ref() else {
+            return false;
+        };
+        let selected = menu.selected;
+        let Some(Choice {
+            value: Selection::Inspector { field, mut config },
+            ..
+        }) = menu.choices.get(selected)
+        else {
+            return false;
+        };
+        match field {
+            InspectorField::Mode => config.mode = config.mode.cycle(forward),
+            InspectorField::Width => {
+                config.width_pct = if forward {
+                    config
+                        .width_pct
+                        .saturating_add(5)
+                        .min(INSPECTOR_MAX_WIDTH_PCT)
+                } else {
+                    config
+                        .width_pct
+                        .saturating_sub(5)
+                        .max(INSPECTOR_MIN_WIDTH_PCT)
+                };
+            }
+            InspectorField::AfterTurn => config.after_turn = config.after_turn.cycle(forward),
+            InspectorField::Follow => config.follow = !config.follow,
+        }
+        let cfg = config.normalized();
+        self.layout.inspector = cfg;
+        self.tool_blocks.apply_after_turn_policy(cfg.after_turn);
+        self.tool_blocks.bump_layout_rev();
+        self.open_inspector_menu(cfg, selected);
+        true
+    }
+
+    pub(super) fn apply_inspector_config(&mut self, config: InspectorConfig, announce: bool) {
+        let prev = self.layout.inspector;
+        let cfg = config.normalized();
+        self.layout.inspector = cfg;
+        if cfg.mode != InspectorMode::Off {
+            self.inspector_last_active_mode = cfg.mode;
+        }
+        if cfg.after_turn != prev.after_turn {
+            self.tool_blocks.apply_after_turn_policy(cfg.after_turn);
+        }
+        if cfg.follow != prev.follow {
+            self.tool_blocks.apply_follow_default(cfg.follow);
+        }
+        self.tool_blocks.bump_layout_rev();
+        if let Some(data) = &self.preferences {
+            if let Err(e) = data.set_inspector_config(&cfg) {
+                self.log_error(&format!("Inspector setting could not be saved: {e}"));
+            }
+        }
+        if announce {
+            let summary = cfg.summary();
+            let plain = format!("Inspector: {summary}");
+            self.log_spans(
+                &plain,
+                vec![
+                    ("· ".into(), Face::ACCENT),
+                    ("Inspector: ".into(), Face::MUTED),
+                    (summary, Face::HIGHLIGHT_BOLD),
+                ],
+            );
+        }
     }
 
     pub(super) fn open_permissions(
@@ -1266,6 +1426,58 @@ impl State {
                         self.log("Unknown theme. Use /theme to select a palette.");
                     }
                 }
+                "/inspector" => {
+                    if arg.is_empty() {
+                        let cfg = self.layout.inspector;
+                        self.open_inspector_menu(cfg, 0);
+                    } else {
+                        let mut cfg = self.layout.inspector;
+                        let mut valid = true;
+                        let mut explicit_follow = false;
+                        for token in arg.split_whitespace() {
+                            match token.to_ascii_lowercase().as_str() {
+                                "inline" => cfg.mode = InspectorMode::Inline,
+                                "side" => cfg.mode = InspectorMode::Side,
+                                "off" => cfg.mode = InspectorMode::Off,
+                                "fit" => cfg.after_turn = AfterTurnPolicy::Fit,
+                                "collapse" => cfg.after_turn = AfterTurnPolicy::Collapse,
+                                "keep" => cfg.after_turn = AfterTurnPolicy::Keep,
+                                "follow" | "auto" => {
+                                    cfg.follow = true;
+                                    explicit_follow = true;
+                                }
+                                "manual" => {
+                                    cfg.follow = false;
+                                    explicit_follow = true;
+                                }
+                                other => {
+                                    if let Ok(pct) = other.trim_end_matches('%').parse::<u8>() {
+                                        if (INSPECTOR_MIN_WIDTH_PCT..=INSPECTOR_MAX_WIDTH_PCT)
+                                            .contains(&pct)
+                                        {
+                                            cfg.width_pct = pct;
+                                        } else {
+                                            valid = false;
+                                            break;
+                                        }
+                                    } else {
+                                        valid = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if valid {
+                            self.inspector_preview_origin = None;
+                            self.apply_inspector_config(cfg, true);
+                            if explicit_follow {
+                                self.tool_blocks.apply_follow_default(cfg.follow);
+                            }
+                        } else {
+                            self.log("Usage: /inspector [inline|side|off | 35..=70 | fit|collapse|keep | follow|manual]");
+                        }
+                    }
+                }
                 "/browse" => {
                     let parsed = crate::browser_control::terminal::parse(arg);
                     match parsed {
@@ -1331,11 +1543,16 @@ impl State {
                     self.subagents.clear();
                     self.tool_approvals.clear();
                     self.answered_approvals.clear();
+                    self.inspector_zoom = false;
+                    self.inspector_zoom_scroll = 0;
                     self.reset_scroll();
                     self.clear_selection();
                     self.clear_painted_regions();
                     if command == "/clear" {
                         self.transcript.clear();
+                        self.tool_blocks.clear();
+                    } else {
+                        self.seal_active_tool_block(true);
                     }
                     self.log("New conversation. Saved conversations are available in /resume.");
                 }
@@ -1737,11 +1954,18 @@ impl State {
         if let Some(original) = self.theme_preview_origin.take() {
             self.theme = original;
         }
+        if let Some(original) = self.inspector_preview_origin.take() {
+            self.layout.inspector = original;
+            self.tool_blocks
+                .apply_after_turn_policy(original.after_turn);
+            self.tool_blocks.bump_layout_rev();
+        }
         self.menu = self.resume_menu.take();
     }
 
     pub(super) fn select(&mut self, sink: &mut dyn EffectSink) {
         self.theme_preview_origin = None;
+        self.inspector_preview_origin = None;
         let Some(mut menu) = self.menu.take() else {
             return;
         };
@@ -1786,6 +2010,7 @@ impl State {
                 );
             }
             Selection::Theme(theme) => self.choose_theme(theme),
+            Selection::Inspector { config, .. } => self.apply_inspector_config(config, true),
             Selection::Mode { agent, yolo } => self.set_agent_mode(agent, yolo),
             Selection::Temporary(temporary) => self.set_temporary(temporary),
             Selection::Permission { perms, .. } => self.apply_permissions(perms),

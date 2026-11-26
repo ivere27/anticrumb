@@ -1266,6 +1266,15 @@ pub trait WorkspaceServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<EventPage>>;
 
 
+    fn watch_agent_events(&self, context: Context,
+
+        request: EventCursor,
+
+
+        responses: Sender<Event>,
+    ) -> impl synurang_call::ServiceFuture<Result<()>>;
+
+
     fn get_conversation(&self, context: Context,
 
         request: ConversationRef,
@@ -1480,6 +1489,27 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
                     let response = service.read_agent_events(context,
                         request).await?;
                     responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/WatchAgentEvents",
+            false,
+            true,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<EventCursor>();
+                    let responses = responses.typed::<Event>();
+
+                    let request = requests.one().await?;
+
+
+                    service.watch_agent_events(context,
+                        request, responses).await
 
                 })
             })?;

@@ -46,6 +46,13 @@ pub(super) fn report(report: &pb::CacheReport, options: Options) -> String {
             format!("  Reclaimable {} · {} artifacts, {} temporary directories, {} orphan files, {} expired cache entries",
                 size(stats.reclaimable_bytes), stats.eligible_artifacts, stats.temporary_entries, stats.orphan_blobs, stats.expired_cache)
         });
+        if stats.pruned_events > 0 || stats.compacted_turns > 0 {
+            let verb = if stats.pruned { "Pruned" } else { "Eligible" };
+            lines.push(format!(
+                "  {verb} SQLite retention: {} old events, {} aged turn tool payloads",
+                stats.pruned_events, stats.compacted_turns
+            ));
+        }
         lines.push(format!(
             "  Last cleanup: {}",
             if stats.last_cleanup == 0 {

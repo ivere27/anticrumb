@@ -798,20 +798,22 @@ impl Host {
                 self.service.cancel(&decode!(pb::TurnRef).id)?;
                 reply!(pb::Empty {})
             }
-            "/anticrumb.v1.TurnService/ReadEvents"
-            | "/anticrumb.v1.WorkspaceService/ReadAgentEvents" => {
+            "/anticrumb.v1.TurnService/ReadEvents" => {
                 let r = decode!(pb::EventCursor);
-                if path.contains("TurnService") {
-                    self.service.snapshot(&r.run_id)?;
-                } else {
-                    self.agents()?.snapshot(&r.run_id)?;
-                }
+                self.service.snapshot(&r.run_id)?;
                 reply!(pb::EventPage {
                     events: store
                         .events(&r.run_id, r.after)?
                         .into_iter()
                         .map(codec::event_to)
                         .collect()
+                })
+            }
+            "/anticrumb.v1.WorkspaceService/ReadAgentEvents" => {
+                let r = decode!(pb::EventCursor);
+                let events = self.agents()?.read_events(&r.run_id, r.after)?;
+                reply!(pb::EventPage {
+                    events: events.into_iter().map(codec::event_to).collect()
                 })
             }
             "/anticrumb.v1.SessionService/GetSession" => {
@@ -1171,6 +1173,28 @@ impl Host {
                 tokio::select! {
                     _ = tx.closed() => break,
                     _ = sub.wait() => {}
+                }
+            }
+        });
+        Ok(rx)
+    }
+    pub async fn watch_agent(
+        self: &Arc<Self>,
+        cursor: pb::EventCursor,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<pb::Event>>> {
+        if self.role != "workspace" {
+            return Err(ServiceError::new(
+                ErrorCode::UnsupportedCapability,
+                "rpc",
+                "workspace tools are not available on a browser host",
+            ));
+        }
+        let mut inner = self.agents()?.watch_events(&cursor.run_id, cursor.after)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(item) = inner.recv().await {
+                if tx.send(item.map(codec::event_to)).await.is_err() {
+                    break;
                 }
             }
         });

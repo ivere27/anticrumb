@@ -147,6 +147,9 @@ service WorkspaceService {
   rpc ApproveTool(ApproveToolRequest) returns (Empty);
   rpc CancelAgent(AgentRef) returns (Empty);
   rpc ReadAgentEvents(EventCursor) returns (EventPage);
+  // Live push stream for active agent turns (serves RAM LiveEventLog with
+  // zero SQLite reads/polling; falls back to durable SQLite events for completed turns).
+  rpc WatchAgentEvents(EventCursor) returns (stream Event);
   rpc GetConversation(ConversationRef) returns (Conversation);
   rpc ListConversations(ListConversationsRequest) returns (ConversationList);
   rpc ResumeConversation(ConversationRef) returns (StartAgentResponse);
@@ -352,6 +355,8 @@ message CacheStats {
   int64 last_cleanup = 10;
   bool pruned = 11;
   bool busy = 12;
+  uint64 pruned_events = 13;    // non-ownership events deleted by retention
+  uint64 compacted_turns = 14;  // aged agent turns whose heavy step payloads were pruned
 }
 
 message CacheStoreReport {
@@ -1000,6 +1005,7 @@ message AgentResult {
   repeated AgentStep steps = 5;
   bool temp_chat = 6;
   uint64 elapsed_ms = 7;
+  bool inspector_pruned = 8; // true once heavy step payloads are compacted after retention
 }
 
 message Agent {

@@ -1007,6 +1007,7 @@ pub fn agent_to(record: d::AgentRecord) -> pb::Agent {
             task: res.task,
             temp_chat: res.temp_chat,
             elapsed_ms: u64::try_from(res.elapsed_ms).unwrap_or(u64::MAX),
+            inspector_pruned: res.inspector_pruned,
         }),
         error: record.error.map(error_to),
         created_at: record.created_at,
@@ -1064,6 +1065,7 @@ pub fn agent_from(value: pb::Agent) -> Result<d::AgentRecord> {
                 files_changed: res.files_changed,
                 temp_chat: res.temp_chat,
                 elapsed_ms: u128::from(res.elapsed_ms),
+                inspector_pruned: res.inspector_pruned,
             })
         })
         .transpose()?;

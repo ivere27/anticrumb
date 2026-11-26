@@ -4,6 +4,7 @@ mod table;
 
 use super::theme::Theme;
 use crossterm::{queue, style};
+use std::borrow::Cow;
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
@@ -110,6 +111,16 @@ fn push(spans: &mut Line, text: &str, face: Face) {
     }
 }
 
+fn push_char(spans: &mut Line, ch: char, face: Face) {
+    if let Some(last) = spans.last_mut().filter(|span| span.face == face) {
+        last.text.push(ch);
+    } else {
+        let mut text = String::with_capacity(ch.len_utf8());
+        text.push(ch);
+        spans.push(Span { text, face });
+    }
+}
+
 pub(super) fn strip_controls<'a>(
     text: &'a str,
     allow_newlines_and_tabs: bool,
@@ -119,7 +130,23 @@ pub(super) fn strip_controls<'a>(
     })
 }
 
-fn clean(text: &str) -> String {
+/// Zero-allocation fast path for `clean` when `text` contains no ANSI escapes,
+/// ASCII controls (other than `\n`/`\t`), DEL (`0x7f`), or UTF-8 C1 controls (`0xC2 0x80..0x9F`).
+pub(super) fn clean_cow(text: &str) -> Cow<'_, str> {
+    if text
+        .bytes()
+        .all(|b| b != 0x7f && b != 0xc2 && (b >= 0x20 || b == b'\n' || b == b'\t'))
+    {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(clean_alloc(text))
+}
+
+pub(super) fn clean(text: &str) -> String {
+    clean_cow(text).into_owned()
+}
+
+fn clean_alloc(text: &str) -> String {
     let mut chars = text.chars().peekable();
     let mut output = String::with_capacity(text.len());
     while let Some(ch) = chars.next() {
@@ -196,7 +223,7 @@ fn inline(text: &str, face: Face, depth: usize, budget: &mut usize, spans: &mut 
                 .next()
                 .filter(char::is_ascii_punctuation)
             {
-                push(spans, &next.to_string(), face);
+                push_char(spans, next, face);
                 at += 1 + next.len_utf8();
                 continue;
             }
@@ -243,7 +270,7 @@ fn inline(text: &str, face: Face, depth: usize, budget: &mut usize, spans: &mut 
             push(spans, &text[at..at + count], face);
             at += count;
         } else {
-            push(spans, &ch.to_string(), face);
+            push_char(spans, ch, face);
             at += ch.len_utf8();
         }
     }
@@ -268,7 +295,7 @@ fn wrap(spans: Line, width: usize, lines: &mut Vec<Line>) {
                     lines.push(std::mem::take(&mut line));
                     used = 0;
                 }
-                push(&mut line, &ch.to_string(), span.face);
+                push_char(&mut line, ch, span.face);
                 used += cells;
             }
         }
@@ -277,7 +304,7 @@ fn wrap(spans: Line, width: usize, lines: &mut Vec<Line>) {
 }
 
 pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
-    let text = clean(text);
+    let text = clean_cow(text);
     let mut result = Vec::new();
     let mut fence = None::<(char, usize)>;
     let source: Vec<_> = text.split('\n').collect();
@@ -337,7 +364,7 @@ pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
 }
 
 pub(super) fn literal(text: &str, face: Face, width: usize) -> Vec<Line> {
-    let text = clean(text);
+    let text = clean_cow(text);
     let mut result = Vec::new();
     for line in text.split('\n') {
         let mut spans = Vec::new();
@@ -354,16 +381,17 @@ pub(super) fn prefixed(
     body_face: Face,
     width: usize,
 ) -> Vec<Line> {
-    let prefix = clean(prefix);
-    let body = clean(body);
+    let prefix = clean_cow(prefix);
+    let body = clean_cow(body);
     let mut result = Vec::new();
+    let mut indent: Option<String> = None;
     for (index, line) in body.split('\n').enumerate() {
         let mut spans = Vec::new();
         if index == 0 {
             push(&mut spans, &prefix, prefix_face);
         } else {
-            let indent = " ".repeat(prefix.chars().count());
-            push(&mut spans, &indent, prefix_face);
+            let spaces = indent.get_or_insert_with(|| " ".repeat(prefix.chars().count()));
+            push(&mut spans, spaces, prefix_face);
         }
         push(&mut spans, line, body_face);
         wrap(spans, width, &mut result);
@@ -374,7 +402,7 @@ pub(super) fn prefixed(
 pub(super) fn spans(parts: &[(&str, Face)], width: usize) -> Vec<Line> {
     let mut line = Vec::new();
     for (text, face) in parts {
-        let cleaned = clean(text);
+        let cleaned = clean_cow(text);
         push(&mut line, &cleaned, *face);
     }
     let mut result = Vec::new();
@@ -480,6 +508,131 @@ fn write_styled_line(
         style::SetBackgroundColor(theme.background),
         style::SetForegroundColor(theme.text)
     )
+}
+
+pub(super) fn write_spaces(out: &mut impl Write, mut count: usize) -> io::Result<()> {
+    const SPACES: &str = "                                                                ";
+    while count > 0 {
+        let chunk = count.min(SPACES.len());
+        out.write_all(&SPACES.as_bytes()[..chunk])?;
+        count -= chunk;
+    }
+    Ok(())
+}
+
+fn write_face_style(
+    out: &mut impl Write,
+    face: Face,
+    theme: Theme,
+    selected: bool,
+) -> io::Result<()> {
+    let (fg, bg) = span_colors(face, theme, selected);
+    queue!(
+        out,
+        style::SetAttribute(style::Attribute::Reset),
+        style::SetBackgroundColor(bg),
+        style::SetForegroundColor(fg)
+    )?;
+    if face.bold {
+        queue!(out, style::SetAttribute(style::Attribute::Bold))?;
+    }
+    if face.italic {
+        queue!(out, style::SetAttribute(style::Attribute::Italic))?;
+    }
+    if face.strike {
+        queue!(out, style::SetAttribute(style::Attribute::CrossedOut))?;
+    }
+    Ok(())
+}
+
+/// Stream a styled line clipped to `max_width` display columns directly to `out`
+/// with zero intermediate `Vec`/`String` allocations, optionally preceded by a single
+/// indent space and right-padded with spaces up to `pad_to.min(max_width)`.
+/// Returns the number of display columns written (excluding right padding).
+pub(super) fn write_clipped_padded_line(
+    out: &mut impl Write,
+    line: &[Span],
+    leading_space: bool,
+    max_width: usize,
+    pad_to: usize,
+    theme: Theme,
+) -> io::Result<usize> {
+    let mut used = 0usize;
+    let mut last_face: Option<Face> = None;
+    if leading_space && max_width > 0 {
+        write_face_style(out, Face::TEXT, theme, false)?;
+        out.write_all(b" ")?;
+        used = 1;
+        last_face = Some(Face::TEXT);
+    }
+    'spans: for span in line {
+        if used >= max_width {
+            break;
+        }
+        let cleaned = clean_cow(&span.text);
+        // Fast path: find the longest prefix with no newline/tab/control chars that fits `max_width`.
+        let mut fast_end = 0usize;
+        let mut fast_w = 0usize;
+        let mut needs_slow = false;
+        for (byte_idx, ch) in cleaned.char_indices() {
+            if matches!(ch, '\n' | '\r' | '\t') || ch.is_control() {
+                needs_slow = true;
+                break;
+            }
+            let cw = ch.width().unwrap_or(0);
+            if used + fast_w + cw > max_width {
+                break;
+            }
+            fast_w += cw;
+            fast_end = byte_idx + ch.len_utf8();
+        }
+        if !needs_slow {
+            if fast_end > 0 {
+                if last_face != Some(span.face) {
+                    write_face_style(out, span.face, theme, false)?;
+                    last_face = Some(span.face);
+                }
+                out.write_all(&cleaned.as_bytes()[..fast_end])?;
+                used += fast_w;
+            }
+            if fast_end < cleaned.len() {
+                break 'spans;
+            }
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for ch in cleaned.chars() {
+            let ch = if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            };
+            if ch.is_control() {
+                continue;
+            }
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > max_width {
+                break 'spans;
+            }
+            if last_face != Some(span.face) {
+                write_face_style(out, span.face, theme, false)?;
+                last_face = Some(span.face);
+            }
+            out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+            used += cw;
+        }
+    }
+    queue!(
+        out,
+        style::SetAttribute(style::Attribute::Reset),
+        style::SetBackgroundColor(theme.background),
+        style::SetForegroundColor(theme.text)
+    )?;
+    let fill = pad_to.min(max_width).saturating_sub(used);
+    if fill > 0 {
+        write_spaces(out, fill)?;
+    }
+    Ok(used)
 }
 
 pub(super) fn write_line(out: &mut impl Write, line: &Line, theme: Theme) -> io::Result<()> {

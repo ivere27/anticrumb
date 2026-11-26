@@ -53,6 +53,13 @@ pub struct AgentStepRecord {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentRunResult {
@@ -64,6 +71,9 @@ pub struct AgentRunResult {
     pub files_changed: Vec<String>,
     pub temp_chat: bool,
     pub elapsed_ms: u128,
+    /// True once heavy step payloads have been compacted by SQLite retention.
+    #[serde(default)]
+    pub inspector_pruned: bool,
 }
 
 /// Progress notifications emitted while an agent runs. Consumers (CLI renderer, job log,
@@ -114,6 +124,8 @@ pub enum AgentEvent {
         id: String,
         step: usize,
         calls: Vec<ToolCallRequest>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        call_indices: Vec<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
@@ -127,6 +139,14 @@ pub enum AgentEvent {
         index: usize,
         tool: String,
         args: Value,
+    },
+    /// Live incremental stdout/stderr chunk from a running tool (RAM-only, never persisted to SQLite).
+    ToolOutputChunk {
+        step: usize,
+        index: usize,
+        tool: String,
+        stream: OutputStream,
+        text: String,
     },
     ToolFinished {
         step: usize,
@@ -174,6 +194,22 @@ pub enum AgentEvent {
     Failed {
         error: String,
     },
+}
+
+impl AgentEvent {
+    /// High-frequency or large transient events delivered exclusively via the in-memory
+    /// `LiveEventLog` + `WatchAgentEvents` stream (0 SQLite INSERTs).
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolOutputChunk { .. }
+                | Self::ModelChunk { .. }
+                | Self::BrowserStage { .. }
+                | Self::SubagentProgress { .. }
+                | Self::RequestPayload { .. }
+                | Self::ModelInput { .. }
+        )
+    }
 }
 
 type SinkFn = dyn Fn(AgentEvent) + Send + Sync;

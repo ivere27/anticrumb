@@ -4226,3 +4226,134 @@ async fn agent_tool_approval_ask_mode_works_across_synurang_ffi_and_grpc() {
     drop(ws_ffi);
     grpc_task.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_agent_events_streams_ephemeral_tool_output_with_zero_sqlite_inserts() {
+    let browser_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+    let project = local_dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+
+    let (browser, echo) = fixture(browser_dir.path());
+    *echo.replies.lock().unwrap() = [
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {
+                        "tool": "run_shell",
+                        "args": {"command": "printf 'stream-alpha\\n'; sleep 0.12; printf 'stream-beta\\n'"}
+                    }
+                ]
+            })
+        ),
+        "stream turn complete".to_string(),
+    ]
+    .into();
+
+    let options = Options {
+        root: browser_dir.path().into(),
+        listen: "127.0.0.1:0".into(),
+        self_signed: true,
+        ..Default::default()
+    };
+    let identity = options.identity().unwrap();
+    let pin = certificate_fingerprint(
+        &std::fs::read(browser_dir.path().join("tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+    let (endpoint, grpc_task) = network(browser, identity).await;
+    let workspace = relay::workspace(
+        local_dir.path(),
+        Connection::Grpc {
+            endpoint,
+            token: TOKEN.into(),
+            ca_file: None,
+            server_name: None,
+            tls_pin: Some(pin),
+        },
+    )
+    .await
+    .unwrap();
+    let ws_store = workspace.service.store.clone();
+    let ws_ffi = RpcClient::embedded(workspace, tokio::runtime::Handle::current()).unwrap();
+
+    let job = ws_ffi
+        .start_agent(pb::AgentRequest {
+            task: "Run shell command and stream live output".into(),
+            workspace: project.to_string_lossy().into_owned(),
+            account_id: "default".into(),
+            chat_only: false,
+            no_shell: false,
+            permissions: Some(pb::ToolPermissions {
+                read: true,
+                edit: false,
+                shell: true,
+                browser: false,
+                subagent: false,
+                ast: false,
+            }),
+            tool_approval: pb::ToolApprovalMode::Auto as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut stream = ws_ffi
+        .watch_agent_events(pb::EventCursor {
+            run_id: job.id.clone(),
+            after: 0,
+        })
+        .await
+        .unwrap();
+
+    let mut streamed_kinds = Vec::new();
+    let mut streamed_stdout = String::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(ev) = stream.next().await {
+            let ev = ev.unwrap();
+            if ev.kind == "tool_output_chunk" {
+                let data: serde_json::Value = serde_json::from_str(&ev.data_json).unwrap();
+                if let Some(t) = data["text"].as_str() {
+                    streamed_stdout.push_str(t);
+                }
+            }
+            streamed_kinds.push(ev.kind);
+        }
+    })
+    .await
+    .expect("watch_agent_events stream must terminate after agent_terminal");
+
+    assert!(
+        streamed_kinds.iter().any(|k| k == "tool_output_chunk"),
+        "expected live tool_output_chunk over WatchAgentEvents: {streamed_kinds:?}"
+    );
+    assert!(
+        streamed_stdout.contains("stream-alpha") && streamed_stdout.contains("stream-beta"),
+        "unexpected streamed shell output: {streamed_stdout:?}"
+    );
+    assert!(streamed_kinds.iter().any(|k| k == "tool_started"));
+    assert!(streamed_kinds.iter().any(|k| k == "tool_finished"));
+    assert!(streamed_kinds.iter().any(|k| k == "agent_terminal"));
+
+    // Verify SQLite events table has 0 INSERTs for any ephemeral kind!
+    let db_events = ws_store.events(&job.id, 0).unwrap();
+    let db_kinds: Vec<&str> = db_events.iter().map(|e| e.kind.as_str()).collect();
+    for ephemeral in [
+        "tool_output_chunk",
+        "model_chunk",
+        "browser_stage",
+        "subagent_progress",
+        "request_payload",
+        "model_input",
+    ] {
+        assert!(
+            !db_kinds.contains(&ephemeral),
+            "ephemeral event {ephemeral} must NOT be persisted in SQLite: {db_kinds:?}"
+        );
+    }
+
+    drop(ws_ffi);
+    grpc_task.abort();
+}

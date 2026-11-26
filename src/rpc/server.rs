@@ -237,11 +237,14 @@ impl GrpcApi {
     }
     async fn stream<Req: ServerStreamReq>(
         &self,
-        _path: &str,
+        path: &str,
         request: Req,
     ) -> std::result::Result<tonic::Response<TypedStream<Req::Item>>, tonic::Status> {
         let host = self.selected_host().await?;
-        let rx = request.open_stream(host).await.map_err(codec::status)?;
+        let rx = request
+            .open_stream(host, path)
+            .await
+            .map_err(codec::status)?;
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx).map(|v| v.map_err(codec::status)),
         )))
@@ -264,6 +267,7 @@ trait ServerStreamReq: Sized {
     async fn open_stream(
         self,
         host: Arc<Host>,
+        path: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<Self::Item>>>;
 }
 
@@ -273,8 +277,13 @@ impl ServerStreamReq for pb::EventCursor {
     async fn open_stream(
         self,
         host: Arc<Host>,
+        path: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<Self::Item>>> {
-        host.watch(self).await
+        if path == "/anticrumb.v1.WorkspaceService/WatchAgentEvents" {
+            host.watch_agent(self).await
+        } else {
+            host.watch(self).await
+        }
     }
 }
 
@@ -284,6 +293,7 @@ impl ServerStreamReq for pb::ArtifactRef {
     async fn open_stream(
         self,
         host: Arc<Host>,
+        _path: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<Self::Item>>> {
         host.get_artifact_stream(self).await
     }

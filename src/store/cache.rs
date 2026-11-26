@@ -220,6 +220,82 @@ pub(super) fn directory_size(path: &Path, newest: &mut SystemTime) -> Result<Opt
     Ok(Some(bytes))
 }
 
+fn clip_summary_str(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+fn compact_tool_args(args: &serde_json::Value) -> serde_json::Value {
+    const SUMMARY_KEYS: &[&str] = &[
+        "path",
+        "command",
+        "url",
+        "pattern",
+        "name",
+        "label",
+        "action",
+        "id",
+        "read_only",
+        "replace_all",
+        "query",
+        "cwd",
+        "glob",
+        "symbol",
+        "start_line",
+        "end_line",
+    ];
+    let Some(map) = args.as_object() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let mut out = serde_json::Map::new();
+    for &key in SUMMARY_KEYS {
+        let Some(val) = map.get(key) else {
+            continue;
+        };
+        let compacted = match val {
+            serde_json::Value::String(s) => serde_json::Value::String(clip_summary_str(s, 256)),
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Null => val.clone(),
+            _ => continue,
+        };
+        out.insert(key.to_owned(), compacted);
+    }
+    if let Some(serde_json::Value::String(task)) = map.get("task") {
+        if task.len() <= 256 {
+            out.insert("task".to_owned(), serde_json::Value::String(task.clone()));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn compact_agent_record(record: &mut AgentRecord) -> bool {
+    let Some(result) = record.result.as_mut() else {
+        return false;
+    };
+    if result.inspector_pruned || result.steps.is_empty() {
+        return false;
+    }
+    for step in &mut result.steps {
+        step.model_response.clear();
+        step.notes.clear();
+        for tc in &mut step.tool_calls {
+            tc.args = compact_tool_args(&tc.args);
+        }
+        for obs in &mut step.observations {
+            obs.output.clear();
+        }
+    }
+    result.inspector_pruned = true;
+    true
+}
+
 impl Store {
     pub fn cache_report(&self, options: Options) -> Result<CacheStats> {
         Ok(self.cache_at(options, now_ms(), None)?.unwrap())
@@ -316,6 +392,54 @@ impl Store {
                 }
             }
         }
+        let pruned_events: u64 = tx
+            .query_row(
+                "SELECT count(*) FROM events e
+                 WHERE e.at < ?1
+                   AND e.kind NOT IN ('browser_turn','browser_session','subagent_browser_session')
+                   AND NOT EXISTS(
+                       SELECT 1 FROM agent_turns t
+                       WHERE t.id = e.run_id
+                         AND t.state IN ('queued','running')
+                   )
+                   AND NOT EXISTS(
+                       SELECT 1 FROM run_stats r
+                       WHERE r.id = e.run_id
+                         AND r.state IN ('queued','preparing','submitted','running')
+                   )",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(ServiceError::storage)?;
+        let mut compacted_payloads: Vec<(String, String)> = Vec::new();
+        {
+            let mut query = tx
+                .prepare(
+                    "SELECT o.id, o.payload
+                     FROM agent_turns t
+                     JOIN objects o ON o.scope='local' AND o.kind='agent' AND o.id=t.id
+                     WHERE t.updated_at > 0
+                       AND t.updated_at < ?1
+                       AND t.state NOT IN ('queued','running')",
+                )
+                .map_err(ServiceError::storage)?;
+            let rows = query
+                .query_map([cutoff], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(ServiceError::storage)?;
+            for row in rows {
+                let (id, payload) = row.map_err(ServiceError::storage)?;
+                let Ok(mut record) = serde_json::from_str::<AgentRecord>(&payload) else {
+                    continue;
+                };
+                if compact_agent_record(&mut record) {
+                    let serialized =
+                        serde_json::to_string(&record).map_err(ServiceError::storage)?;
+                    compacted_payloads.push((id, serialized));
+                }
+            }
+        }
         let mut stats = CacheStats {
             retention_days: options.days,
             last_cleanup: last,
@@ -328,6 +452,8 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(ServiceError::storage)?,
+            pruned_events,
+            compacted_turns: compacted_payloads.len() as u64,
             ..Default::default()
         };
         let mut removals = Vec::new();
@@ -445,6 +571,32 @@ impl Store {
         if options.prune && !options.dry_run {
             tx.execute("DELETE FROM cache WHERE expires<?1", [now])
                 .map_err(ServiceError::storage)?;
+            if stats.pruned_events > 0 {
+                tx.execute(
+                    "DELETE FROM events
+                     WHERE at < ?1
+                       AND kind NOT IN ('browser_turn','browser_session','subagent_browser_session')
+                       AND NOT EXISTS(
+                           SELECT 1 FROM agent_turns t
+                           WHERE t.id = events.run_id
+                             AND t.state IN ('queued','running')
+                       )
+                       AND NOT EXISTS(
+                           SELECT 1 FROM run_stats r
+                           WHERE r.id = events.run_id
+                             AND r.state IN ('queued','preparing','submitted','running')
+                       )",
+                    [cutoff],
+                )
+                .map_err(ServiceError::storage)?;
+            }
+            for (id, payload) in &compacted_payloads {
+                tx.execute(
+                    "UPDATE objects SET payload=?2 WHERE scope='local' AND kind='agent' AND id=?1",
+                    params![id, payload],
+                )
+                .map_err(ServiceError::storage)?;
+            }
             for (scope, id) in &candidates {
                 tx.execute(
                     "DELETE FROM objects WHERE scope=?1 AND kind='artifact' AND id=?2",
@@ -477,6 +629,13 @@ impl Store {
             stats.last_cleanup = now;
             conn.execute("INSERT INTO objects VALUES('local','maintenance','cache',?1) ON CONFLICT(scope,kind,id) DO UPDATE SET payload=excluded.payload",
                 [serde_json::json!({"last_cleanup":now}).to_string()]).map_err(ServiceError::storage)?;
+            if stats.pruned_events > 0
+                || stats.compacted_turns > 0
+                || stats.expired_cache > 0
+                || !candidates.is_empty()
+            {
+                let _ = conn.execute_batch("PRAGMA incremental_vacuum(256); PRAGMA optimize;");
+            }
         }
         Ok(Some(stats))
     }
@@ -890,5 +1049,285 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         dropper.handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn cache_retention_prunes_old_non_ownership_events_compacts_aged_steps_and_preserves_recent() {
+        use crate::agent::{AgentRunResult, AgentStatus, AgentStepRecord, ToolCallRequest, ToolOutput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let now = now_ms();
+        let old_ts = now - 10 * 86_400_000;
+        let recent_ts = now - 2 * 86_400_000;
+
+        let make_heavy_result = || AgentRunResult {
+            status: AgentStatus::Completed,
+            final_response: "Final summary preserved".into(),
+            files_changed: vec!["src/main.rs".into()],
+            elapsed_ms: 420,
+            inspector_pruned: false,
+            steps: vec![AgentStepRecord {
+                step: 1,
+                model_response: "Verbose reasoning text".repeat(50),
+                tool_calls: vec![
+                    ToolCallRequest {
+                        tool: "edit_file".into(),
+                        args: json!({
+                            "path": "src/main.rs",
+                            "replace_all": true,
+                            "old_text": "old_body".repeat(200),
+                            "new_text": "new_body".repeat(200),
+                        }),
+                    },
+                    ToolCallRequest {
+                        tool: "run_shell".into(),
+                        args: json!({"command": "cargo test --lib"}),
+                    },
+                ],
+                observations: vec![
+                    ToolOutput {
+                        tool: "edit_file".into(),
+                        ok: true,
+                        output: "updated src/main.rs".into(),
+                        artifacts: vec![],
+                        elapsed_ms: 12,
+                    },
+                    ToolOutput {
+                        tool: "run_shell".into(),
+                        ok: true,
+                        output: "test output ".repeat(300),
+                        artifacts: vec![],
+                        elapsed_ms: 350,
+                    },
+                ],
+                notes: vec!["verbose note".into()],
+            }],
+            ..Default::default()
+        };
+
+        let make_record = |id: &str, conv: &str, state: &str, updated_at: i64, res: Option<AgentRunResult>| AgentRecord {
+            id: id.into(),
+            conversation_id: conv.into(),
+            state: state.into(),
+            request: AgentRequest {
+                environment: None,
+                task: "test task".into(),
+                workspace: dir.path().to_path_buf(),
+                account_id: "default".into(),
+                model: None,
+                thinking: None,
+                session_mode: SessionMode::Chat,
+                no_shell: false,
+                max_steps: 4,
+                knowledge: None,
+                mcp_config: None,
+                artifacts: vec![],
+                conversation_id: Some(conv.into()),
+                chat_only: false,
+                permissions: None,
+                session_retention: SessionRetention::Retain,
+                tool_approval: ToolApprovalMode::Auto,
+            },
+            result: res,
+            error: None,
+            created_at: updated_at - 1000,
+            updated_at,
+        };
+
+        // 1. Old completed turn (10 days old) + non-ownership & ownership events.
+        store
+            .put(
+                "local",
+                "agent",
+                "turn-old",
+                &make_record("turn-old", "conv-old", "completed", old_ts, Some(make_heavy_result())),
+            )
+            .unwrap();
+        // 2. Old still-running turn (10 days old) — events must NOT be deleted.
+        store
+            .put(
+                "local",
+                "agent",
+                "turn-active",
+                &make_record("turn-active", "conv-active", "running", old_ts, None),
+            )
+            .unwrap();
+        // 3. Recent completed turn (2 days old) — must remain 100% lossless for /resume.
+        store
+            .put(
+                "local",
+                "agent",
+                "turn-recent",
+                &make_record("turn-recent", "conv-recent", "completed", recent_ts, Some(make_heavy_result())),
+            )
+            .unwrap();
+
+        // Insert events and backdate old ones explicitly.
+        for kind in ["tool_started", "tool_finished", "step_started", "browser_turn", "browser_session", "subagent_browser_session"] {
+            store.event("turn-old", kind, json!({"k": kind})).unwrap();
+        }
+        store.event("turn-active", "tool_started", json!({"tool": "read_file"})).unwrap();
+        store.event("turn-recent", "tool_started", json!({"tool": "read_file"})).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE events SET at = ?1 WHERE run_id IN ('turn-old', 'turn-active')",
+                [old_ts],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE events SET at = ?1 WHERE run_id = 'turn-recent'",
+                [recent_ts],
+            )
+            .unwrap();
+        }
+
+        // Dry run reports exact counts without mutating DB.
+        let dry = store
+            .cache_at(
+                Options {
+                    days: 7,
+                    prune: true,
+                    dry_run: true,
+                },
+                now,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(dry.pruned_events, 3);
+        assert_eq!(dry.compacted_turns, 1);
+        assert!(!dry.pruned);
+        assert_eq!(store.events("turn-old", 0).unwrap().len(), 6);
+        assert!(
+            !store
+                .get::<AgentRecord>("local", "agent", "turn-old")
+                .unwrap()
+                .result
+                .unwrap()
+                .inspector_pruned
+        );
+
+        // Real prune deletes expired non-ownership events, keeps ownership + active + recent,
+        // and compacts old turn steps once.
+        let pruned = store
+            .cache_at(
+                Options {
+                    days: 7,
+                    prune: true,
+                    dry_run: false,
+                },
+                now,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pruned.pruned_events, 3);
+        assert_eq!(pruned.compacted_turns, 1);
+
+        let old_events: Vec<String> = store
+            .events("turn-old", 0)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            old_events,
+            vec!["browser_turn", "browser_session", "subagent_browser_session"]
+        );
+        assert_eq!(store.events("turn-active", 0).unwrap().len(), 1);
+        assert_eq!(store.events("turn-recent", 0).unwrap().len(), 1);
+
+        // Old turn compacted: inspector_pruned = true, heavy payloads dropped, summary & metadata kept.
+        let old_rec: AgentRecord = store.get("local", "agent", "turn-old").unwrap();
+        let old_res = old_rec.result.unwrap();
+        assert!(old_res.inspector_pruned);
+        assert_eq!(old_res.final_response, "Final summary preserved");
+        assert_eq!(old_res.files_changed, vec!["src/main.rs"]);
+        assert_eq!(old_res.steps.len(), 1);
+        assert!(old_res.steps[0].model_response.is_empty());
+        assert_eq!(old_res.steps[0].tool_calls[0].tool, "edit_file");
+        assert_eq!(old_res.steps[0].tool_calls[0].args["path"], "src/main.rs");
+        assert_eq!(old_res.steps[0].tool_calls[0].args["replace_all"], true);
+        assert!(old_res.steps[0].tool_calls[0].args.get("old_text").is_none());
+        assert!(old_res.steps[0].tool_calls[0].args.get("new_text").is_none());
+        assert_eq!(
+            old_res.steps[0].tool_calls[1].args["command"],
+            "cargo test --lib"
+        );
+        assert!(old_res.steps[0].observations[1].output.is_empty());
+        assert_eq!(old_res.steps[0].observations[1].elapsed_ms, 350);
+
+        // Recent turn (< 7d) is 100% lossless for /resume Tool Inspector restoration.
+        let recent_rec: AgentRecord = store.get("local", "agent", "turn-recent").unwrap();
+        let recent_res = recent_rec.result.unwrap();
+        assert!(!recent_res.inspector_pruned);
+        assert!(recent_res.steps[0].tool_calls[0].args["old_text"]
+            .as_str()
+            .unwrap()
+            .starts_with("old_body"));
+        assert!(recent_res.steps[0].observations[1]
+            .output
+            .starts_with("test output"));
+
+        // Second prune is idempotent (0 events, 0 compacted turns).
+        let second = store
+            .cache_at(
+                Options {
+                    days: 7,
+                    prune: true,
+                    dry_run: false,
+                },
+                now,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.pruned_events, 0);
+        assert_eq!(second.compacted_turns, 0);
+
+        // Verify EXPLAIN QUERY PLAN uses events_at and PK lookups on agent_turns / run_stats (no table scans).
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT count(*) FROM events e
+                 WHERE e.at < ?1
+                   AND e.kind NOT IN ('browser_turn','browser_session','subagent_browser_session')
+                   AND NOT EXISTS(
+                       SELECT 1 FROM agent_turns t
+                       WHERE t.id = e.run_id
+                         AND t.state IN ('queued','running')
+                   )
+                   AND NOT EXISTS(
+                       SELECT 1 FROM run_stats r
+                       WHERE r.id = e.run_id
+                         AND r.state IN ('queued','preparing','submitted','running')
+                   )",
+            )
+            .unwrap();
+        let plan_lines: Vec<String> = stmt
+            .query_map([now], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan_lines.join("\n");
+        assert!(
+            plan.contains("USING INDEX events_at"),
+            "expected events_at index: {plan}"
+        );
+        assert!(
+            plan.contains("sqlite_autoindex_agent_turns_1") || plan.contains("USING PRIMARY KEY"),
+            "expected agent_turns PK lookup: {plan}"
+        );
+        assert!(
+            plan.contains("sqlite_autoindex_run_stats_1") || plan.contains("USING PRIMARY KEY"),
+            "expected run_stats PK lookup: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN "),
+            "retention query must not full-scan any table: {plan}"
+        );
     }
 }

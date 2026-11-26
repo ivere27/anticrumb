@@ -422,17 +422,18 @@ mod unix_pty {
         out
     }
 
+    fn latest_frame(text: &str) -> &str {
+        text.rsplit_once("\x1b[?2026h")
+            .or_else(|| text.rsplit_once("\x1b[1;1H\x1b[J"))
+            .map_or(text, |(_, rest)| rest)
+    }
+
     fn frame(text: &str) -> String {
-        let latest = text
-            .rsplit_once("\x1b[1;1H\x1b[J")
-            .map_or(text, |(_, rest)| rest);
-        strip_csi(latest)
+        strip_csi(latest_frame(text))
     }
 
     fn screen_row(text: &str, row: usize) -> String {
-        let latest = text
-            .rsplit_once("\x1b[1;1H\x1b[J")
-            .map_or(text, |(_, rest)| rest);
+        let latest = latest_frame(text);
         let bytes = latest.as_bytes();
         let mut moves: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut i = 0;

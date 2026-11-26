@@ -1127,6 +1127,8 @@ pub struct CacheStats {
     pub last_cleanup: i64,
     pub pruned: bool,
     pub busy: bool,
+    pub pruned_events: u64,
+    pub compacted_turns: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

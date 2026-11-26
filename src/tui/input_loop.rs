@@ -143,16 +143,24 @@ fn is_ignored_input(input: &Input) -> bool {
     )
 }
 
-fn render_stdout(state: &mut State) -> Result<()> {
+const FRAME_BUF_INIT_CAP: usize = 16 * 1024;
+const FRAME_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
+
+fn render_stdout(state: &mut State, buf: &mut Vec<u8>) -> Result<()> {
     let (width, height) = terminal::size().map_err(ServiceError::storage)?;
-    let mut buf = Vec::with_capacity(8192);
-    state.render_frame(&mut buf, width, height)?;
+    buf.clear();
+    state.render_frame(buf, width, height)?;
     if buf.is_empty() {
         return Ok(());
     }
     let mut out = io::stdout().lock();
-    out.write_all(&buf).map_err(ServiceError::storage)?;
-    out.flush().map_err(ServiceError::storage)
+    out.write_all(buf).map_err(ServiceError::storage)?;
+    out.flush().map_err(ServiceError::storage)?;
+    if buf.capacity() > FRAME_BUF_SHRINK_THRESHOLD {
+        buf.clear();
+        buf.shrink_to(FRAME_BUF_INIT_CAP);
+    }
+    Ok(())
 }
 
 pub(super) fn handle_input(
@@ -199,10 +207,14 @@ pub(super) fn handle_input(
                     KeyCode::Char(' ')
                         if key.modifiers.is_empty() && key.kind == event::KeyEventKind::Press =>
                     {
-                        state.toggle_permission_menu_item();
+                        if !state.toggle_permission_menu_item() {
+                            state.shift_inspector_menu_item(true);
+                        }
                     }
                     KeyCode::Left | KeyCode::Right => {
-                        if !state.toggle_permission_menu_item() {
+                        if !state.toggle_permission_menu_item()
+                            && !state.shift_inspector_menu_item(key.code == KeyCode::Right)
+                        {
                             let menu = state.menu.as_mut().unwrap();
                             if let Some(Choice {
                                 value: Selection::Model(model),
@@ -216,6 +228,52 @@ pub(super) fn handle_input(
                     KeyCode::Enter => state.select(sink),
                     _ => {}
                 }
+                return Ok(false);
+            }
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            // Priority 1: Ctrl+O fullscreen Inspector overlay modal routing.
+            if state.inspector_zoom {
+                match key.code {
+                    KeyCode::Esc => {
+                        state.inspector_zoom = false;
+                        state.inspector_zoom_scroll = 0;
+                    }
+                    KeyCode::Char('o' | 'O') if ctrl && !alt => {
+                        state.inspector_zoom = false;
+                        state.inspector_zoom_scroll = 0;
+                    }
+                    KeyCode::Left if !ctrl && !alt => {
+                        state.select_prev_next_tool(false);
+                    }
+                    KeyCode::Right if !ctrl && !alt => {
+                        state.select_prev_next_tool(true);
+                    }
+                    KeyCode::Up => state.scroll_zoom_overlay(true, 1, None),
+                    KeyCode::Down => state.scroll_zoom_overlay(false, 1, None),
+                    KeyCode::PageUp => state.scroll_zoom_overlay(true, 10, None),
+                    KeyCode::PageDown => state.scroll_zoom_overlay(false, 10, None),
+                    KeyCode::Home => state.scroll_zoom_overlay(true, 0, Some(true)),
+                    KeyCode::End => state.scroll_zoom_overlay(false, 0, Some(false)),
+                    KeyCode::Char('f' | 'F' | 'l' | 'L') if !ctrl && !alt => {
+                        state.toggle_inspector_follow();
+                    }
+                    KeyCode::Char('l' | 'L') if alt && !ctrl => {
+                        state.toggle_inspector_follow();
+                    }
+                    KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
+                        if !ctrl && !alt && !state.tool_approvals.is_empty() =>
+                    {
+                        if key.kind == event::KeyEventKind::Press {
+                            state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            // Ctrl+O opens fullscreen Inspector overlay (works even with draft text in composer).
+            if ctrl && !alt && matches!(key.code, KeyCode::Char('o' | 'O')) {
+                state.toggle_inspector_zoom();
                 return Ok(false);
             }
             if !state.tool_approvals.is_empty()
@@ -232,6 +290,36 @@ pub(super) fn handle_input(
                         state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
                     }
                     return Ok(false);
+                }
+            }
+            // Priority 2: Tool Inspector Alt+* shortcuts MUST precede catch-all Char/Up/Down/PgUp/PgDn.
+            if alt && !ctrl {
+                match key.code {
+                    KeyCode::Char('i' | 'I') => {
+                        state.toggle_inspector_mode();
+                        return Ok(false);
+                    }
+                    KeyCode::Char('l' | 'L') => {
+                        state.toggle_inspector_follow();
+                        return Ok(false);
+                    }
+                    KeyCode::Up => {
+                        state.scroll_focused_inspector(true, 3);
+                        return Ok(false);
+                    }
+                    KeyCode::Down => {
+                        state.scroll_focused_inspector(false, 3);
+                        return Ok(false);
+                    }
+                    KeyCode::PageUp => {
+                        state.scroll_focused_inspector(true, 10);
+                        return Ok(false);
+                    }
+                    KeyCode::PageDown => {
+                        state.scroll_focused_inspector(false, 10);
+                        return Ok(false);
+                    }
+                    _ => {}
                 }
             }
             match key.code {
@@ -336,8 +424,30 @@ pub(super) fn handle_input(
                 {
                     state.editor.word_right();
                 }
-                KeyCode::Left => state.editor.left(),
-                KeyCode::Right => state.editor.right(),
+                KeyCode::Left => {
+                    if key.modifiers.is_empty()
+                        && state.editor.text.is_empty()
+                        && state.mention.is_none()
+                        && state.completion.is_none()
+                        && !state.tool_blocks.is_empty()
+                    {
+                        state.select_prev_next_tool(false);
+                    } else {
+                        state.editor.left();
+                    }
+                }
+                KeyCode::Right => {
+                    if key.modifiers.is_empty()
+                        && state.editor.text.is_empty()
+                        && state.mention.is_none()
+                        && state.completion.is_none()
+                        && !state.tool_blocks.is_empty()
+                    {
+                        state.select_prev_next_tool(true);
+                    } else {
+                        state.editor.right();
+                    }
+                }
                 KeyCode::Home => state.editor.home(),
                 KeyCode::End => state.editor.end(),
                 KeyCode::Backspace
@@ -508,6 +618,10 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         crate::store::Store::open(&crate::cli::root())?.model_catalog(&state.options.account)?;
     state.theme = theme::find(&prefs.theme()).unwrap_or(theme::THEMES[0]);
     state.debug.level = prefs.debug_level();
+    state.layout.inspector = prefs.inspector_config();
+    if state.layout.inspector.mode != super::layout::InspectorMode::Off {
+        state.inspector_last_active_mode = state.layout.inspector.mode;
+    }
     state.preferences = Some(prefs);
     state.load_model_preference();
     state.load_history();
@@ -588,6 +702,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         let mut dirty = true;
         let mut urgent = true;
         let mut last_render = Instant::now();
+        let mut frame_buf = Vec::with_capacity(FRAME_BUF_INIT_CAP);
         let mut mode_refresh = tokio::time::interval_at(
             tokio::time::Instant::now() + INPUT_MODE_REFRESH,
             INPUT_MODE_REFRESH,
@@ -619,14 +734,14 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
             // Coalesce bursts of background updates (streamed events) into at
             // most one repaint per UPDATE_FRAME; input repaints right away.
             if dirty && (urgent || last_render.elapsed() >= UPDATE_FRAME) {
-                render_stdout(&mut state)?;
+                render_stdout(&mut state, &mut frame_buf)?;
                 dirty = false;
                 urgent = false;
                 last_render = Instant::now();
             }
 
             let dragging = state.selection_drag.is_some();
-            let animating = state.busy() || state.mention_loading();
+            let animating = state.needs_animation() || state.mention_loading();
             let deadline = [
                 dirty.then(|| last_render + UPDATE_FRAME),
                 animating.then(|| last_render + ANIMATION_FRAME),

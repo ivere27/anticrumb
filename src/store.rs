@@ -82,7 +82,8 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(ServiceError::storage)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA auto_vacuum=INCREMENTAL;
+            PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS objects(
               scope TEXT NOT NULL,
@@ -100,6 +101,7 @@ impl Store {
               at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS events_run ON events(run_id,sequence);
+            CREATE INDEX IF NOT EXISTS events_at ON events(at);
             CREATE TABLE IF NOT EXISTS idempotency(
               scope TEXT NOT NULL,
               key TEXT NOT NULL,
@@ -465,6 +467,46 @@ impl Store {
         let mut stmt=conn.prepare("SELECT sequence,kind,data,at FROM events WHERE run_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 256").map_err(ServiceError::storage)?;
         let rows = stmt
             .query_map(params![run_id, after], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(ServiceError::storage)?;
+        rows.map(|row| {
+            let (sequence, kind, data, at) = row.map_err(ServiceError::storage)?;
+            Ok(Event {
+                sequence,
+                kind,
+                data: serde_json::from_str(&data).map_err(ServiceError::storage)?,
+                at,
+                run_id: run_id.into(),
+            })
+        })
+        .collect()
+    }
+    pub fn events_by_kinds(&self, run_id: &str, kinds: &[&str]) -> Result<Vec<Event>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..kinds.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT sequence,kind,data,at FROM events WHERE run_id=?1 AND kind IN ({placeholders}) ORDER BY sequence"
+        );
+        let conn = self.conn.lock().map_err(ServiceError::storage)?;
+        let mut stmt = conn.prepare(&sql).map_err(ServiceError::storage)?;
+        let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + kinds.len());
+        values.push(&run_id);
+        for kind in kinds {
+            values.push(kind);
+        }
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values), |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,

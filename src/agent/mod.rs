@@ -17,8 +17,9 @@ pub use backend::AgentBackend;
 pub use cancel::CancelToken;
 pub use engine::CodingAgent;
 pub use events::{
-    AgentConfig, AgentEvent, AgentRunResult, AgentStatus, AgentStepRecord, EventSink, RunControl,
-    SteerInbox, ToolCallRequest, ToolOutput, DEFAULT_MAX_AGENT_STEPS, DEFAULT_SHELL_TIMEOUT_SECS,
+    AgentConfig, AgentEvent, AgentRunResult, AgentStatus, AgentStepRecord, EventSink, OutputStream,
+    RunControl, SteerInbox, ToolCallRequest, ToolOutput, DEFAULT_MAX_AGENT_STEPS,
+    DEFAULT_SHELL_TIMEOUT_SECS,
 };
 pub use parser::{parse_response, parse_tool_calls, ParsedResponse};
 pub use prompts::{
@@ -27,7 +28,7 @@ pub use prompts::{
 };
 pub use tools::{
     AgentTool, BrowserControlFn, BrowserFetchFn, SpawnAgentFn, SpawnAgentOutcome, ToolContent,
-    ToolContext, ToolRegistry,
+    ToolContext, ToolOutputFn, ToolRegistry,
 };
 
 #[cfg(test)]
