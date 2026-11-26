@@ -3992,6 +3992,7 @@ async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_gr
                 shell: false,
                 browser: true,
                 subagent: false,
+                ast: true,
             }),
             ..Default::default()
         })
@@ -4028,6 +4029,7 @@ async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_gr
             shell: false,
             browser: true,
             subagent: false,
+            ast: true,
         })
     );
     let ready_temp = browser_ffi
@@ -4116,6 +4118,7 @@ async fn agent_tool_approval_ask_mode_works_across_synurang_ffi_and_grpc() {
                 shell: false,
                 browser: false,
                 subagent: false,
+                ast: true,
             }),
             tool_approval: pb::ToolApprovalMode::Ask as i32,
             ..Default::default()

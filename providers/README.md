@@ -43,9 +43,9 @@ Gemini keeps its native implementation. Use the startup override directory for i
 Set this top-level field in the provider's `provider.json`, then restart the browser daemon:
 
 ```json
-"inline_prompt_chars": 2000
+"inline_prompt_chars": 8000
 ```
 
-The default is 2,000 Unicode characters. Follow-ups above it become text attachments; an exact-length message stays inline. `0` attaches every nonempty follow-up. The initial prompt is always attached when uploads are supported; providers without uploads use inline text.
+The default is 8,000 Unicode characters. Follow-ups above it become text attachments; an exact-length message stays inline. `0` attaches every nonempty follow-up. The initial prompt is always attached when uploads are supported; providers without uploads use inline text.
 
 For Gemini, copy [gemini-web/provider.json](gemini-web/provider.json) into the override directory before editing. New agent runs, including resumed chats, receive the setting. See [attachment limits](../docs/usage.md#native-attachments-and-images) and the [manifest schema](../src/provider/manifest.rs).

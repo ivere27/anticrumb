@@ -138,6 +138,251 @@ fn atomic_file_tools_report_success_and_changes() {
 }
 
 #[test]
+fn grep_search_regex_smart_case_modes_and_fallback() {
+    let ws = temp_ws("grep_regex");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(
+        ws.join("src/a.rs"),
+        "fn alpha() {}\nlet x = 1;\nfn Beta() {}\nfoo(bar)\n",
+    )
+    .unwrap();
+    fs::write(ws.join("src/b.txt"), "fn gamma\r\nnothing\r\n").unwrap();
+    let ctx = ToolContext::new(ws.clone());
+    let reg = ToolRegistry::with_builtin_coding_tools();
+    let grep = |args: Value| {
+        let r = reg.execute_call(&call("grep_search", args), &ctx);
+        assert!(r.ok, "{}", r.output);
+        r.output
+    };
+
+    // Regex + anchors, grouped by file (CRLF-aware `$`).
+    let out = grep(json!({"pattern": r"^fn \w+$|^fn \w+\(\)"}));
+    assert!(out.contains("Found 3 match(es) in 2 file(s):"), "{out}");
+    assert!(
+        out.contains("src/a.rs\n1:fn alpha() {}\n3:fn Beta() {}"),
+        "{out}"
+    );
+    assert!(out.contains("src/b.txt\n1:fn gamma"), "{out}");
+
+    // Smart case: lowercase => insensitive; uppercase => sensitive; (?-i) forces.
+    assert!(grep(json!({"pattern": "beta"})).contains("3:fn Beta"));
+    assert!(grep(json!({"pattern": "BETA"})).starts_with("No matches"));
+    assert!(grep(json!({"pattern": "(?-i)beta"})).starts_with("No matches"));
+    assert!(grep(json!({"pattern": r"\w+eta"})).contains("3:fn Beta"));
+
+    // Invalid regex falls back to literal; fixed_strings is literal.
+    let out = grep(json!({"pattern": "foo(bar", "glob": "*.rs"}));
+    assert!(out.starts_with("[invalid regex"), "{out}");
+    assert!(grep(json!({"pattern": "foo(bar)", "fixed_strings": true})).contains("4:foo(bar)"));
+
+    // Context merges groups and marks context lines with '-'.
+    let out = grep(json!({"pattern": "alpha|Beta", "path": "src/a.rs", "context": 1}));
+    assert!(
+        out.contains("src/a.rs\n1:fn alpha() {}\n2-let x = 1;\n3:fn Beta() {}\n4-foo(bar)"),
+        "{out}"
+    );
+
+    // Output modes and head_limit.
+    let out = grep(json!({"pattern": "fn", "output_mode": "files_with_matches"}));
+    assert!(
+        out.contains("Found 2 file(s):\nsrc/a.rs\nsrc/b.txt"),
+        "{out}"
+    );
+    let out = grep(json!({"pattern": "fn", "output_mode": "count"}));
+    assert!(out.contains("src/a.rs:2\nsrc/b.txt:1"), "{out}");
+    let out = grep(json!({"pattern": "fn", "head_limit": 1}));
+    assert!(
+        out.contains("Found 1 match(es)") && out.contains("[stopped at head_limit=1"),
+        "{out}"
+    );
+
+    let bad = reg.execute_call(
+        &call(
+            "grep_search",
+            json!({"pattern": "x", "output_mode": "nope"}),
+        ),
+        &ctx,
+    );
+    assert!(!bad.ok);
+}
+
+#[cfg(feature = "tree-sitter")]
+#[test]
+fn ast_tools_outline_find_symbol_and_find_references() {
+    let ws = temp_ws("ast_tools");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(
+        ws.join("src/lib.rs"),
+        "/// Primary grep engine\npub struct Grep;\n\nimpl Grep {\n    /// Run grep with a multi-line signature\n    pub fn execute(\n        &self,\n        limit: usize,\n    ) -> u8 {\n        1\n    }\n}\n\nfn execute_all() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_runs() {\n        let g = super::Grep;\n        let _ = g.execute(1);\n    }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("src/caller.rs"),
+        "use crate::Grep;\n\nstruct Other;\nimpl Other {\n    fn execute(&self) {}\n}\n\n/// Calls Grep::execute\nfn run_caller(g: &Grep) -> u8 {\n    // g.execute(0) in comment must be ignored\n    let _s = \"execute(9) in string must be ignored\";\n    g.execute(42)\n}\n\nfn run_other() {\n    Other::execute(&Other);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("src/app.ts"),
+        "/** Render item */\nexport function render(g: { execute(n: number): number }) {\n  return g.execute(7);\n}\n",
+    )
+    .unwrap();
+    fs::write(ws.join("src/notes.txt"), "execute\n").unwrap();
+    let ctx = ToolContext::new(ws.clone());
+    let reg = ToolRegistry::with_builtin_coding_tools();
+    let run = |tool: &str, args: Value| {
+        let r = reg.execute_call(&call(tool, args), &ctx);
+        assert!(r.ok, "{}", r.output);
+        r.output
+    };
+
+    // File outline: full collapsed signature (no redundant parent prefix) + doc summary.
+    let out = run("code_outline", json!({"path": "src/lib.rs"}));
+    assert!(
+        out.starts_with("src/lib.rs (rust, 23 lines, 6 definitions)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("2  pub struct Grep;  // Primary grep engine\n4-12  impl Grep\n  6-11  pub fn execute(&self, limit: usize) -> u8  // Run grep with a multi-line signature"),
+        "{out}"
+    );
+
+    // Directory outline: top level only, nested members counted, JSDoc included, unsupported skipped.
+    let out = run("code_outline", json!({"path": "src"}));
+    assert!(
+        out.contains("src/lib.rs (23 lines)\n2  pub struct Grep;  // Primary grep engine\n4-12  impl Grep  (+1)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("export function render(g: { execute(n: number): number })  // Render item"),
+        "{out}"
+    );
+    assert!(!out.contains("notes.txt"), "{out}");
+
+    // find_symbol: exact name path match, signature + doc, substring fallback, and verbatim body.
+    let out = run("find_symbol", json!({"name": "Grep::execute"}));
+    assert!(out.contains("Found 1 definition(s)"), "{out}");
+    assert!(
+        out.contains("src/lib.rs:6-11  Grep/execute  pub fn execute(&self, limit: usize) -> u8  // Run grep with a multi-line signature"),
+        "{out}"
+    );
+    let out = run("find_symbol", json!({"name": "EXEC"}));
+    assert!(
+        out.starts_with("[no exact match") && out.contains("Found 3 definition(s)"),
+        "{out}"
+    );
+    let out = run(
+        "find_symbol",
+        json!({"name": "Grep/execute", "include_body": true}),
+    );
+    assert!(
+        out.contains("   6 |     pub fn execute(\n   7 |         &self,\n   8 |         limit: usize,\n   9 |     ) -> u8 {"),
+        "{out}"
+    );
+    assert!(run("find_symbol", json!({"name": "missing"})).starts_with("No definitions"));
+
+    // find_references: AST-verified (skips comments, strings, imports, definitions, #[cfg(test)]),
+    // includes TS property_identifier, shows enclosing function + call line, supports qualifier filter & include_tests.
+    let out = run("find_references", json!({"name": "Grep::execute"}));
+    assert!(
+        out.contains("Found 2 reference(s) to 'Grep::execute' in 2 file(s):"),
+        "{out}"
+    );
+    assert!(
+        out.contains("src/app.ts\n  3 [export function render(g: { execute(n: number): number })]  return g.execute(7);"),
+        "{out}"
+    );
+    assert!(
+        out.contains("src/caller.rs\n  12 [fn run_caller(g: &Grep) -> u8]  g.execute(42)"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Other::execute")
+            && !out.contains("in comment")
+            && !out.contains("in string")
+            && !out.contains("it_runs")
+            && !out.contains("src/lib.rs"),
+        "{out}"
+    );
+
+    // include_tests=true surfaces inline #[cfg(test)] references.
+    let out = run(
+        "find_references",
+        json!({"name": "execute", "path": "src/lib.rs", "include_tests": true}),
+    );
+    assert!(out.contains("21 [mod tests::fn it_runs()]"), "{out}");
+
+    let bad = reg.execute_call(
+        &call("code_outline", json!({"path": "src/notes.txt"})),
+        &ctx,
+    );
+    assert!(
+        !bad.ok && bad.output.contains("unsupported language"),
+        "{}",
+        bad.output
+    );
+}
+
+#[test]
+fn workspace_walk_honors_gitignore_and_keeps_dotfiles() {
+    let ws = temp_ws("gitignore_walk");
+    fs::create_dir_all(ws.join("gen")).unwrap();
+    fs::create_dir_all(ws.join("src/build")).unwrap();
+    fs::create_dir_all(ws.join(".github")).unwrap();
+    fs::create_dir_all(ws.join(".git")).unwrap();
+    fs::write(ws.join(".gitignore"), "gen/\n*.log\nbuild/\n").unwrap();
+    fs::write(ws.join("src/.gitignore"), "local.rs\n").unwrap();
+    for f in [
+        "gen/a.rs",
+        "x.log",
+        "src/build/b.rs",
+        "src/local.rs",
+        ".git/config",
+    ] {
+        fs::write(ws.join(f), "needle\n").unwrap();
+    }
+    fs::write(ws.join("src/main.rs"), "needle\n").unwrap();
+    fs::write(ws.join(".github/ci.yml"), "needle\n").unwrap();
+    let ctx = ToolContext::new(ws.clone());
+    let reg = ToolRegistry::with_builtin_coding_tools();
+
+    let g = reg.execute_call(
+        &call(
+            "grep_search",
+            json!({"pattern": "needle", "output_mode": "files_with_matches"}),
+        ),
+        &ctx,
+    );
+    assert!(g.ok, "{}", g.output);
+    assert!(
+        g.output
+            .contains("Found 2 file(s):\n.github/ci.yml\nsrc/main.rs"),
+        "{}",
+        g.output
+    );
+
+    // Parent .gitignore still applies when the search starts in a subdirectory.
+    let g = reg.execute_call(
+        &call(
+            "grep_search",
+            json!({"pattern": "needle", "path": "src", "output_mode": "files_with_matches"}),
+        ),
+        &ctx,
+    );
+    assert!(
+        g.output.contains("Found 1 file(s):\nsrc/main.rs"),
+        "{}",
+        g.output
+    );
+
+    let f = reg.execute_call(&call("find_files", json!({"pattern": "*.rs"})), &ctx);
+    assert!(
+        f.ok && f.output.contains("src/main.rs") && !f.output.contains("gen/"),
+        "{}",
+        f.output
+    );
+}
+
+#[test]
 fn coding_tools_find_grep_read_edit_write_and_shell() {
     let ws = temp_ws("tools");
     let ctx = ToolContext::new(ws.clone());
@@ -153,10 +398,14 @@ fn coding_tools_find_grep_read_edit_write_and_shell() {
     assert!(f.ok && f.output.contains("src/hello.rs"));
 
     let g = reg.execute_call(
-        &call("grep_search", json!({"query": "greet", "dir": "src"})),
+        &call("grep_search", json!({"pattern": "greet", "path": "src"})),
         &ctx,
     );
-    assert!(g.ok && g.output.contains("src/hello.rs:1:"), "{}", g.output);
+    assert!(
+        g.ok && g.output.contains("src/hello.rs\n1:pub fn greet"),
+        "{}",
+        g.output
+    );
 
     let e = reg.execute_call(
         &call(
@@ -1208,7 +1457,7 @@ fn runtime_prompts_tool_overrides_and_agents_md_reload_without_recompile() {
     let first = &prompts.lock().unwrap()[0];
     assert!(first.starts_with("Custom persona in "));
     assert!(first.contains("- read_file(path: str, start_line?: int, end_line?: int) \u{2014} Read file via CUSTOM description."));
-    assert!(first.contains("- grep_search(query: str"));
+    assert!(first.contains("- grep_search(pattern: str"));
     assert!(first.contains("\u{2014} Markdown override for grep_search."));
     assert!(first.contains("- edit_file(path: str, old_text: str, new_text: str, replace_all?: bool) \u{2014} Line 1 custom edit. Line 2 strict exact match."));
     assert!(first.contains("[PROJECT_INSTRUCTIONS source=\"AGENTS.md\"]\nAlways prefer zero-copy parsing.\n[/PROJECT_INSTRUCTIONS]"));
@@ -1258,9 +1507,9 @@ fn compact_tool_signatures_rendering_contract() {
         "actual: {block}"
     );
 
-    // 5. grep_search: query required, optional params
+    // 5. grep_search: pattern required, optional params
     assert!(
-        block.contains("- grep_search(query: str, case_sensitive?: bool, context_lines?: int, dir?: str, file_pattern?: str, max_matches?: int) \u{2014} Search literal text across workspace files (case-insensitive by default)."),
+        block.contains("- grep_search(pattern: str, path?: str, context?: int, fixed_strings?: bool, glob?: str, head_limit?: int, output_mode?: \"content\"|\"files_with_matches\"|\"count\") \u{2014} Regex search across workspace files (ripgrep syntax; smart case, force with (?i)/(?-i); invalid regex falls back to literal). Output is grouped by file as `N:line`."),
         "actual: {block}"
     );
 
@@ -1690,11 +1939,17 @@ fn permission_matchers_block_path_traversal_prefix_boundary_and_shell_chaining()
         PermissionDecision::Ask
     );
     assert!(matches!(
-        policy.evaluate_call(&call("run_shell", json!({"command": "echo ok && rm -rf ."}))),
+        policy.evaluate_call(&call(
+            "run_shell",
+            json!({"command": "echo ok && rm -rf ."})
+        )),
         PermissionDecision::Deny { .. }
     ));
     assert!(matches!(
-        policy.evaluate_call(&call("run_shell", json!({"command": "rm -rf . && echo hi"}))),
+        policy.evaluate_call(&call(
+            "run_shell",
+            json!({"command": "rm -rf . && echo hi"})
+        )),
         PermissionDecision::Deny { .. }
     ));
 

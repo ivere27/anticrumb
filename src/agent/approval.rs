@@ -373,9 +373,14 @@ fn strip_leading_env_assignments(mut segment: &str) -> &str {
 }
 
 fn command_any_segment_matches_prefix(cmd: &str, prefix: &str) -> bool {
-    cmd.split(|ch| matches!(ch, ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '`' | '{' | '}'))
-        .any(|segment| {
-            command_prefix_matches(segment, prefix)
-                || command_prefix_matches(strip_leading_env_assignments(segment), prefix)
-        })
+    cmd.split(|ch| {
+        matches!(
+            ch,
+            ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '`' | '{' | '}'
+        )
+    })
+    .any(|segment| {
+        command_prefix_matches(segment, prefix)
+            || command_prefix_matches(strip_leading_env_assignments(segment), prefix)
+    })
 }

@@ -413,9 +413,7 @@ impl<B: AgentBackend> CodingAgent<B> {
                         &exec_calls,
                         scope.ctx,
                         &|local_idx, call| emit_started(exec_indices[local_idx], call),
-                        &|local_idx, call, out| {
-                            emit_finished(exec_indices[local_idx], call, out)
-                        },
+                        &|local_idx, call, out| emit_finished(exec_indices[local_idx], call, out),
                     )
                 };
                 let mut exec_iter = exec_outputs.into_iter();

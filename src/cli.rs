@@ -1011,10 +1011,7 @@ pub(crate) fn describe_tool_approval_call(call: &Value) -> ToolCallPreview {
             let path = args["path"].as_str().unwrap_or("");
             let content = args["content"].as_str().unwrap_or("");
             let line_count = content.lines().count();
-            detail = format!(
-                ": {path} ({line_count} lines, {} bytes)",
-                content.len()
-            );
+            detail = format!(": {path} ({line_count} lines, {} bytes)", content.len());
             if !content.is_empty() {
                 blocks.push(ToolPreviewBlock {
                     prefix: "      | ",
@@ -1072,13 +1069,16 @@ pub(crate) fn describe_tool_approval_call(call: &Value) -> ToolCallPreview {
             detail = format!(": {pattern}{suffix}");
         }
         "grep_search" => {
-            let query = args["query"].as_str().unwrap_or("");
+            let query = args["pattern"].as_str().unwrap_or("");
             let mut meta = Vec::new();
-            if let Some(dir) = args["dir"].as_str().filter(|s| !s.is_empty()) {
-                meta.push(format!("dir={dir}"));
+            if let Some(dir) = args["path"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("path={dir}"));
             }
-            if let Some(pat) = args["file_pattern"].as_str().filter(|s| !s.is_empty()) {
-                meta.push(format!("file={pat}"));
+            if let Some(pat) = args["glob"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("glob={pat}"));
+            }
+            if let Some(mode) = args["output_mode"].as_str().filter(|s| *s != "content") {
+                meta.push(format!("mode={mode}"));
             }
             let suffix = if meta.is_empty() {
                 String::new()
@@ -1086,6 +1086,36 @@ pub(crate) fn describe_tool_approval_call(call: &Value) -> ToolCallPreview {
                 format!(" ({})", meta.join(", "))
             };
             detail = format!(": {:?}{suffix}", clip_preview_chars(query, 80));
+        }
+        "code_outline" => {
+            detail = format!(": {}", args["path"].as_str().unwrap_or(""));
+        }
+        "find_symbol" => {
+            let mut meta = Vec::new();
+            if let Some(path) = args["path"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("path={path}"));
+            }
+            if args["include_body"].as_bool() == Some(true) {
+                meta.push("body".to_string());
+            }
+            let suffix = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", meta.join(", "))
+            };
+            detail = format!(": {}{suffix}", args["name"].as_str().unwrap_or(""));
+        }
+        "find_references" => {
+            let mut meta = Vec::new();
+            if let Some(path) = args["path"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("path={path}"));
+            }
+            let suffix = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", meta.join(", "))
+            };
+            detail = format!(": {}{suffix}", args["name"].as_str().unwrap_or(""));
         }
         "process_output" | "stop_process" => {
             let proc_id = args["id"]
@@ -2217,7 +2247,10 @@ impl Client {
         }
         let _temp_files = TempFiles(temp_files);
         if files.len() > crate::input::MAX_FILES {
-            return Err(ServiceError::invalid("maximum 10 attachments"));
+            return Err(ServiceError::invalid(format!(
+                "maximum {} attachments",
+                crate::input::MAX_FILES
+            )));
         }
         let mut uploaded = Vec::with_capacity(files.len());
         {
@@ -2457,6 +2490,7 @@ mod tests {
                 shell: false,
                 browser: true,
                 subagent: false,
+                ast: true,
             })
             .unwrap();
 
@@ -2479,6 +2513,7 @@ mod tests {
                 shell: false,
                 browser: true,
                 subagent: false,
+                ast: true,
             })
         );
 

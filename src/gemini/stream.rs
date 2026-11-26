@@ -184,7 +184,7 @@ impl GeminiTab {
         let _ = self.human_click("editor", json!({}))?;
         self.human_pause(30, 75)?;
         self.cdp.call("Input.insertText", json!({"text":prompt}))?;
-        let input_ready = Instant::now() + Duration::from_secs(2);
+        let input_ready = Instant::now() + Duration::from_secs(5);
         loop {
             let checked = self.action("verify_input", json!({"text":prompt}))?;
             if checked["ok"] == true {

@@ -2856,7 +2856,7 @@ mod tests {
         let (mut tx, rx) = mpsc::sync_channel(4);
         state.editor.set("/permissions".into());
         state.submit(&mut tx);
-        assert_eq!(state.menu.as_ref().unwrap().choices.len(), 5);
+        assert_eq!(state.menu.as_ref().unwrap().choices.len(), 6);
         assert!(state.menu.as_ref().unwrap().choices[0]
             .label
             .starts_with("[x] read"));
@@ -2878,6 +2878,7 @@ mod tests {
                 shell: false,
                 browser: false,
                 subagent: false,
+                ast: true,
             }
         );
 
@@ -2905,6 +2906,7 @@ mod tests {
                 shell: false,
                 browser: false,
                 subagent: false,
+                ast: true,
             }
         );
         assert!(agent_state.status_text(120).contains(" · AGENT · "));
@@ -2926,6 +2928,7 @@ mod tests {
                 shell: false,
                 browser: false,
                 subagent: false,
+                ast: true,
             })
         );
 
@@ -2968,7 +2971,7 @@ mod tests {
         assert!(state.options.no_shell);
         assert_eq!(
             state.options.effective_permissions().summary(),
-            "read, edit"
+            "read, ast, edit"
         );
         assert!(state.status_text(120).contains(" · AGENT · "));
 

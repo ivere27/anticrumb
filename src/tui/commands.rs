@@ -82,6 +82,7 @@ pub(super) enum PermissionKind {
     Shell,
     Browser,
     Subagent,
+    Ast,
 }
 
 pub(super) enum Selection {
@@ -890,6 +891,11 @@ impl State {
                 perms.subagent,
                 "subagent  Parallel worker sub-agents (spawn_agent)",
             ),
+            (
+                PermissionKind::Ast,
+                perms.ast,
+                "ast       Code structure via tree-sitter (code_outline, find_symbol, find_references)",
+            ),
         ];
         let choices = items
             .into_iter()
@@ -901,7 +907,7 @@ impl State {
         self.menu = Some(Menu {
             title: "Permissions · ↑↓ move · Space/←→ toggle · Enter save · Esc cancel".into(),
             choices,
-            selected: selected.min(4),
+            selected: selected.min(5),
         });
     }
 
@@ -923,6 +929,7 @@ impl State {
             PermissionKind::Shell => perms.shell = !perms.shell,
             PermissionKind::Browser => perms.browser = !perms.browser,
             PermissionKind::Subagent => perms.subagent = !perms.subagent,
+            PermissionKind::Ast => perms.ast = !perms.ast,
         }
         self.open_permissions(perms, selected);
         true
@@ -1365,6 +1372,7 @@ impl State {
                                     };
                                     match name {
                                         "read" => perms.read = enable,
+                                        "ast" => perms.ast = enable,
                                         "edit" | "write" => perms.edit = enable,
                                         "shell" => perms.shell = enable,
                                         "browser" | "web" => perms.browser = enable,
@@ -1378,7 +1386,7 @@ impl State {
                                 if ok {
                                     self.apply_permissions(perms);
                                 } else {
-                                    self.log("Usage: /permissions [readonly|edit|all | +read|-read +edit|-edit +shell|-shell +browser|-browser +subagent|-subagent]");
+                                    self.log("Usage: /permissions [readonly|edit|all | +read|-read +ast|-ast +edit|-edit +shell|-shell +browser|-browser +subagent|-subagent]");
                                 }
                             }
                         }

@@ -62,6 +62,7 @@ fn build_coding_agent(
         shell: spec.allow_shell && !spec.read_only,
         browser: true,
         subagent: spec.allow_spawn_agent && !spec.read_only,
+        ast: true,
     });
     let effective_allow_shell =
         !spec.chat_only && perms.shell && spec.allow_shell && !spec.read_only;
@@ -91,6 +92,11 @@ fn build_coding_agent(
     let mut registry = ToolRegistry::with_builtin_coding_tools();
     if !perms.read {
         for name in ["find_files", "grep_search", "read_file"] {
+            registry.remove(name);
+        }
+    }
+    if !perms.read || !perms.ast {
+        for name in crate::agent::tools::AST_TOOLS {
             registry.remove(name);
         }
     }
@@ -1117,9 +1123,10 @@ impl AgentManager {
 
     fn validate_artifacts(&self, account: &str, artifacts: &[String]) -> Result<()> {
         if artifacts.len() > crate::input::MAX_FILES {
-            return Err(ServiceError::invalid(
-                "at most 10 attachments per conversation; use /new",
-            ));
+            return Err(ServiceError::invalid(format!(
+                "at most {} attachments per conversation; use /new",
+                crate::input::MAX_FILES
+            )));
         }
         for id in artifacts {
             self.store.artifact_path(account, id)?;

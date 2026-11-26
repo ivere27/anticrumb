@@ -130,6 +130,7 @@ pub fn tool_permissions_to(p: d::ToolPermissions) -> pb::ToolPermissions {
         shell: p.shell,
         browser: p.browser,
         subagent: p.subagent,
+        ast: p.ast,
     }
 }
 pub fn tool_permissions_from(p: pb::ToolPermissions) -> d::ToolPermissions {
@@ -139,6 +140,7 @@ pub fn tool_permissions_from(p: pb::ToolPermissions) -> d::ToolPermissions {
         shell: p.shell,
         browser: p.browser,
         subagent: p.subagent,
+        ast: p.ast,
     }
 }
 pub fn tool_approval_mode_from(raw: i32) -> Result<d::ToolApprovalMode> {
@@ -1341,6 +1343,7 @@ mod tests {
                 shell: false,
                 browser: true,
                 subagent: false,
+                ast: true,
             }),
             session_retention: d::SessionRetention::Ephemeral,
             tool_approval: d::ToolApprovalMode::Ask,

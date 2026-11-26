@@ -9,7 +9,10 @@ Paths are relative to the current project or `-C DIR`.
 | Tool | Purpose |
 |---|---|
 | `find_files` | Find files by glob or filename |
-| `grep_search` | Search literal text; case-insensitive by default |
+| `grep_search` | Regex search (ripgrep syntax, smart case); `fixed_strings`, `glob`, `output_mode` (content / files_with_matches / count), `context`, `head_limit` |
+| `code_outline` | Tree-sitter definitions of a file (nested) or directory (top level) with full signatures and doc comments; `ast` permission |
+| `find_symbol` | Find definitions by name / `Parent/child` path with signature + doc (`include_body` returns numbered source); `ast` permission |
+| `find_references` | AST-verified references to a symbol or `Parent/member` (skips comments, strings, imports, definitions, and tests unless `include_tests`); shows enclosing function and call line; `ast` permission |
 | `read_file` | Read UTF-8 text with 1-based inclusive line ranges, up to 2,000 lines |
 | `edit_file` | Replace exact text; requires a unique match unless `replace_all` is set |
 | `write_file` | Create or overwrite a text file |

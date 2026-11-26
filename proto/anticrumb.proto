@@ -932,6 +932,7 @@ message ToolPermissions {
   bool shell = 3;
   bool browser = 4;
   bool subagent = 5;
+  bool ast = 6;
 }
 
 message AgentRef {
