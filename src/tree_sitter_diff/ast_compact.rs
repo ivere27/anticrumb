@@ -362,7 +362,7 @@ fn is_explicit_rust_test_mod(node: &tree_sitter::Node, lines: &[&str]) -> bool {
 
 /// Walks backwards over preceding Rust `attribute_item` siblings (and comments sandwiched between them)
 /// to find the earliest 0-based start row attached to `node`.
-fn rust_start_row_with_attrs(node: &tree_sitter::Node) -> usize {
+pub(super) fn rust_start_row_with_attrs(node: &tree_sitter::Node) -> usize {
     let mut start_row = node.start_position().row;
     let mut prev = node.prev_named_sibling();
     while let Some(sib) = prev {

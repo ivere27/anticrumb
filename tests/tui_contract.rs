@@ -784,7 +784,7 @@ mod unix_pty {
         pty.send("\x1b[B\x1b[B ");
         pty.wait_for("[x] shell");
         pty.send("\r");
-        pty.wait_for("Tool permissions saved: read, shell.");
+        pty.wait_for("Tool permissions saved: read, ast, shell.");
         pty.send("Read @\"a b.txt\"\r");
         pty.wait_for("Attachment turn 1 completed.");
         let highlighted = pty.wait_for("let answer = 42;");

@@ -126,6 +126,7 @@ impl Preferences {
             shell: !no_shell,
             browser: false,
             subagent: false,
+            ast: true,
         })
     }
     pub fn set_permissions(&self, perms: ToolPermissions) -> Result<()> {

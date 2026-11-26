@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::approval::{ToolApprovalGate, ToolApprovalPolicy};
 use super::cancel::CancelToken;
 
 pub const DEFAULT_MAX_AGENT_STEPS: usize = usize::MAX;
@@ -108,6 +109,18 @@ pub enum AgentEvent {
     ModelResponse {
         step: usize,
         text: String,
+    },
+    ToolApprovalRequested {
+        id: String,
+        step: usize,
+        calls: Vec<ToolCallRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    ToolApprovalResolved {
+        id: String,
+        step: usize,
+        approved: bool,
     },
     ToolStarted {
         step: usize,
@@ -229,6 +242,7 @@ impl SteerInbox {
 pub struct RunControl {
     pub cancel: CancelToken,
     pub inbox: SteerInbox,
+    pub approvals: ToolApprovalGate,
     pub events: EventSink,
 }
 
@@ -261,6 +275,8 @@ pub struct AgentConfig {
     pub prompts_dir: Option<std::path::PathBuf>,
     /// Whether to inject global and workspace `AGENTS.md` instruction files into the initial prompt.
     pub load_instructions: bool,
+    /// Authorization policy applied to each step's tool batch before execution.
+    pub approval_policy: ToolApprovalPolicy,
 }
 
 impl Default for AgentConfig {
@@ -278,6 +294,7 @@ impl Default for AgentConfig {
             context_budget_chars: 60_000,
             prompts_dir: None,
             load_instructions: true,
+            approval_policy: ToolApprovalPolicy::auto(),
         }
     }
 }

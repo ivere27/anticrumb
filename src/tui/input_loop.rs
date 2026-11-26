@@ -155,7 +155,11 @@ fn render_stdout(state: &mut State) -> Result<()> {
     out.flush().map_err(ServiceError::storage)
 }
 
-fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> Result<bool> {
+pub(super) fn handle_input(
+    state: &mut State,
+    input: Input,
+    sink: &mut dyn EffectSink,
+) -> Result<bool> {
     match input {
         Input::Key(key) if key.kind != event::KeyEventKind::Release => {
             let had_selection = state.selection.is_some();
@@ -213,6 +217,22 @@ fn handle_input(state: &mut State, input: Input, sink: &mut dyn EffectSink) -> R
                     _ => {}
                 }
                 return Ok(false);
+            }
+            if !state.tool_approvals.is_empty()
+                && state.editor.text.is_empty()
+                && state.history_clear_confirmation.is_none()
+                && state.completion.is_none()
+                && state.mention.is_none()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                if let KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N')) = key.code {
+                    if key.kind == event::KeyEventKind::Press {
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                    }
+                    return Ok(false);
+                }
             }
             match key.code {
                 KeyCode::Char('c') if ctrl => {

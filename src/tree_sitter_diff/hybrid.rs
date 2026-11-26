@@ -700,7 +700,7 @@ fn leading_doc_comment_start_row(
 /// - Python: first-statement body docstring (`"""..."""` / `'''...'''`), falling back to `#` comments
 /// - Rust/C#/Go/TS/JS/Java/C/C++/Ruby: immediately preceding `///`, `//`, `#`, or `/** ... */` doc comment
 #[cfg(feature = "tree-sitter")]
-fn extract_short_doc_comment(
+pub(super) fn extract_short_doc_comment(
     lang: SupportedLanguage,
     node: &tree_sitter::Node,
     lines: &[&str],
@@ -4370,7 +4370,7 @@ fn is_ident_char(c: char) -> bool {
 
 /// UTF-8-aware whole-identifier check (handles Korean/Unicode identifiers and Ruby `?`/`!` suffixes).
 #[cfg(feature = "tree-sitter")]
-fn contains_utf8_ident(haystack: &str, needle: &str, ruby_suffix_mode: bool) -> bool {
+pub(super) fn contains_utf8_ident(haystack: &str, needle: &str, ruby_suffix_mode: bool) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }

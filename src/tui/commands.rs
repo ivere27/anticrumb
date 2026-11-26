@@ -17,7 +17,7 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Keyboard shortcuts and commands"),
     (
         "/mode",
-        "Switch between Chat mode (default) and Agent mode (--yolo)",
+        "Switch between Chat mode (default), Agent mode (Y/N review), and --yolo",
     ),
     (
         "/temp",
@@ -82,6 +82,7 @@ pub(super) enum PermissionKind {
     Shell,
     Browser,
     Subagent,
+    Ast,
 }
 
 pub(super) enum Selection {
@@ -726,7 +727,7 @@ impl State {
         } else if self.options.yolo {
             "Agent (--yolo · all tools & sub-agents allowed)".to_owned()
         } else {
-            format!("Agent (permissions: {})", perms.summary())
+            format!("Agent (Y/N approval · permissions: {})", perms.summary())
         };
         self.log_kv(
             "· ",
@@ -890,6 +891,11 @@ impl State {
                 perms.subagent,
                 "subagent  Parallel worker sub-agents (spawn_agent)",
             ),
+            (
+                PermissionKind::Ast,
+                perms.ast,
+                "ast       Code structure via tree-sitter (code_outline, find_symbol, find_references)",
+            ),
         ];
         let choices = items
             .into_iter()
@@ -901,7 +907,7 @@ impl State {
         self.menu = Some(Menu {
             title: "Permissions · ↑↓ move · Space/←→ toggle · Enter save · Esc cancel".into(),
             choices,
-            selected: selected.min(4),
+            selected: selected.min(5),
         });
     }
 
@@ -923,6 +929,7 @@ impl State {
             PermissionKind::Shell => perms.shell = !perms.shell,
             PermissionKind::Browser => perms.browser = !perms.browser,
             PermissionKind::Subagent => perms.subagent = !perms.subagent,
+            PermissionKind::Ast => perms.ast = !perms.ast,
         }
         self.open_permissions(perms, selected);
         true
@@ -967,7 +974,7 @@ impl State {
                 }
             }
             self.log(&format!(
-                "Mode set to Agent (permissions: {}).",
+                "Mode set to Agent (Y/N tool approval · permissions: {}).",
                 self.options.effective_permissions().summary()
             ));
         }
@@ -1094,7 +1101,7 @@ impl State {
                                     },
                                 },
                                 Choice {
-                                    label: "Agent · coding tools (respects /permissions)".into(),
+                                    label: "Agent · coding tools with Y/N review (respects /permissions)".into(),
                                     value: Selection::Mode {
                                         agent: true,
                                         yolo: false,
@@ -1322,6 +1329,8 @@ impl State {
                     self.phase = "ready".into();
                     self.copy_response.clear();
                     self.subagents.clear();
+                    self.tool_approvals.clear();
+                    self.answered_approvals.clear();
                     self.reset_scroll();
                     self.clear_selection();
                     self.clear_painted_regions();
@@ -1363,6 +1372,7 @@ impl State {
                                     };
                                     match name {
                                         "read" => perms.read = enable,
+                                        "ast" => perms.ast = enable,
                                         "edit" | "write" => perms.edit = enable,
                                         "shell" => perms.shell = enable,
                                         "browser" | "web" => perms.browser = enable,
@@ -1376,7 +1386,7 @@ impl State {
                                 if ok {
                                     self.apply_permissions(perms);
                                 } else {
-                                    self.log("Usage: /permissions [readonly|edit|all | +read|-read +edit|-edit +shell|-shell +browser|-browser +subagent|-subagent]");
+                                    self.log("Usage: /permissions [readonly|edit|all | +read|-read +ast|-ast +edit|-edit +shell|-shell +browser|-browser +subagent|-subagent]");
                                 }
                             }
                         }

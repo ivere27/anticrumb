@@ -4,6 +4,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
     fs,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -198,7 +199,7 @@ pub fn run(args: &[String]) -> Result<()> {
   exec resume [ID | --last] PROMPT         follow up without the TUI
 
   -m, --model ID      -C, --cd DIR          model and working directory
-  --agent             --yolo                agent mode (respects /permissions) or yolo (all permissions)
+  --agent             --yolo                agent mode (Y/N tool review, respects /permissions) or yolo (auto-execute)
   --temp                                    anonymous temporary chat for this run
   -p, --print                              noninteractive final answer
   -c, --continue     -r, --resume ID        reopen a conversation
@@ -624,6 +625,10 @@ impl PromptOptions {
         }
         if !self.overrides.contains("agent") {
             self.agent = !request.chat_only;
+            self.yolo = self.agent
+                && request.tool_approval == ToolApprovalMode::Auto
+                && !self.overrides.contains("permissions")
+                && !(self.overrides.contains("no_shell") && self.no_shell);
         }
         if !self.overrides.contains("permissions") {
             if let Some(perms) = request.permissions {
@@ -807,6 +812,13 @@ impl PromptOptions {
             chat_only: !self.agent,
             permissions: Some(perms),
             session_retention: SessionRetention::Unspecified,
+            tool_approval: if !self.agent {
+                ToolApprovalMode::Unspecified
+            } else if self.yolo {
+                ToolApprovalMode::Auto
+            } else {
+                ToolApprovalMode::Ask
+            },
         }
     }
 }
@@ -892,10 +904,10 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     let mode_desc = if !o.agent {
         "chat".to_owned()
     } else if o.yolo {
-        "agent (--yolo, all permissions)".to_owned()
+        "agent (--yolo, auto-execute, all permissions)".to_owned()
     } else {
         format!(
-            "agent (permissions: {})",
+            "agent (batch Y/N approval, permissions: {})",
             o.effective_permissions().summary()
         )
     };
@@ -908,12 +920,381 @@ fn run_agent(mut o: PromptOptions) -> Result<()> {
     follow_agent(&client, id, o.json, o.print)
         .map_err(|err| with_temporary_unsupported_hint(err, o.temporary, cli_temp_override))
 }
+
+fn clip_preview_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+fn push_multiline_preview(lines: &mut Vec<String>, prefix: &str, text: &str, max_lines: usize) {
+    let all_lines: Vec<&str> = text.lines().collect();
+    if all_lines.is_empty() {
+        lines.push(format!("{prefix}(empty)"));
+        return;
+    }
+    for line in all_lines.iter().take(max_lines) {
+        lines.push(format!("{prefix}{}", clip_preview_chars(line, 120)));
+    }
+    if all_lines.len() > max_lines {
+        lines.push(format!(
+            "{prefix}… ({} more line(s))",
+            all_lines.len() - max_lines
+        ));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPreviewKind {
+    Removed,
+    Added,
+    Code,
+    Command,
+    Muted,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolPreviewBlock {
+    pub(crate) prefix: &'static str,
+    pub(crate) text: String,
+    pub(crate) kind: ToolPreviewKind,
+    pub(crate) max_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCallPreview {
+    pub(crate) tool: String,
+    pub(crate) detail: String,
+    pub(crate) detail_muted: bool,
+    pub(crate) blocks: Vec<ToolPreviewBlock>,
+}
+
+pub(crate) fn describe_tool_approval_call(call: &Value) -> ToolCallPreview {
+    let tool = call["tool"].as_str().unwrap_or("tool").to_owned();
+    let args = &call["args"];
+    let mut detail = String::new();
+    let mut detail_muted = false;
+    let mut blocks = Vec::new();
+    match tool.as_str() {
+        "edit_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+            let suffix = if replace_all { " (replace_all)" } else { "" };
+            detail = format!(": {path}{suffix}");
+            if let Some(old_text) = args["old_text"].as_str() {
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      - ",
+                    text: old_text.to_owned(),
+                    kind: ToolPreviewKind::Removed,
+                    max_lines: 6,
+                });
+            }
+            if let Some(new_text) = args["new_text"].as_str() {
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      + ",
+                    text: new_text.to_owned(),
+                    kind: ToolPreviewKind::Added,
+                    max_lines: 6,
+                });
+            }
+        }
+        "write_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let content = args["content"].as_str().unwrap_or("");
+            let line_count = content.lines().count();
+            detail = format!(": {path} ({line_count} lines, {} bytes)", content.len());
+            if !content.is_empty() {
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      | ",
+                    text: content.to_owned(),
+                    kind: ToolPreviewKind::Code,
+                    max_lines: 6,
+                });
+            }
+        }
+        "run_shell" | "start_process" => {
+            let mut opts = Vec::new();
+            if let Some(cwd) = args["cwd"].as_str().filter(|s| !s.is_empty()) {
+                opts.push(format!("cwd={cwd}"));
+            }
+            if let Some(timeout) = args["timeout_secs"].as_u64() {
+                opts.push(format!("timeout={timeout}s"));
+            }
+            if !opts.is_empty() {
+                detail = format!(" ({})", opts.join(", "));
+                detail_muted = true;
+            }
+            if let Some(cmd) = args["command"].as_str() {
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      $ ",
+                    text: cmd.to_owned(),
+                    kind: ToolPreviewKind::Command,
+                    max_lines: 6,
+                });
+            }
+        }
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let range = match (args["start_line"].as_u64(), args["end_line"].as_u64()) {
+                (Some(s), Some(e)) => format!(" (lines {s}..{e})"),
+                (Some(s), None) => format!(" (from line {s})"),
+                (None, Some(e)) => format!(" (through line {e})"),
+                (None, None) => String::new(),
+            };
+            detail = format!(": {path}{range}");
+        }
+        "find_files" => {
+            let pattern = args["pattern"].as_str().unwrap_or("*");
+            let mut meta = Vec::new();
+            if let Some(dir) = args["dir"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("dir={dir}"));
+            }
+            if let Some(limit) = args["limit"].as_u64() {
+                meta.push(format!("limit={limit}"));
+            }
+            let suffix = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", meta.join(", "))
+            };
+            detail = format!(": {pattern}{suffix}");
+        }
+        "grep_search" => {
+            let query = args["pattern"].as_str().unwrap_or("");
+            let mut meta = Vec::new();
+            if let Some(dir) = args["path"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("path={dir}"));
+            }
+            if let Some(pat) = args["glob"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("glob={pat}"));
+            }
+            if let Some(mode) = args["output_mode"].as_str().filter(|s| *s != "content") {
+                meta.push(format!("mode={mode}"));
+            }
+            let suffix = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", meta.join(", "))
+            };
+            detail = format!(": {:?}{suffix}", clip_preview_chars(query, 80));
+        }
+        "code_outline" => {
+            detail = format!(": {}", args["path"].as_str().unwrap_or(""));
+        }
+        "find_symbol" => {
+            let mut meta = Vec::new();
+            if let Some(path) = args["path"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("path={path}"));
+            }
+            if args["include_body"].as_bool() == Some(true) {
+                meta.push("body".to_string());
+            }
+            let suffix = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", meta.join(", "))
+            };
+            detail = format!(": {}{suffix}", args["name"].as_str().unwrap_or(""));
+        }
+        "find_references" => {
+            let mut meta = Vec::new();
+            if let Some(path) = args["path"].as_str().filter(|s| !s.is_empty()) {
+                meta.push(format!("path={path}"));
+            }
+            let suffix = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", meta.join(", "))
+            };
+            detail = format!(": {}{suffix}", args["name"].as_str().unwrap_or(""));
+        }
+        "process_output" | "stop_process" => {
+            let proc_id = args["id"]
+                .as_u64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| args["id"].to_string());
+            let wait = args["wait_secs"]
+                .as_u64()
+                .map(|w| format!(" (wait={w}s)"))
+                .unwrap_or_default();
+            detail = format!(": #{proc_id}{wait}");
+        }
+        "web_fetch" | "browser_fetch" => {
+            let url = args["url"].as_str().unwrap_or("");
+            detail = format!(": {url}");
+        }
+        "browser_control" => {
+            let action = args["action"].as_str().unwrap_or("?");
+            detail = format!(": action={action}");
+            if args.as_object().is_some_and(|m| m.len() > 1) {
+                let compact =
+                    serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      ",
+                    text: compact,
+                    kind: ToolPreviewKind::Muted,
+                    max_lines: 6,
+                });
+            }
+        }
+        "spawn_agent" => {
+            let label = args["label"].as_str().unwrap_or("worker");
+            let ro = args["read_only"].as_bool().unwrap_or(true);
+            detail = format!(": [{label}] (read_only={ro})");
+            if let Some(task) = args["task"].as_str() {
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      ",
+                    text: task.to_owned(),
+                    kind: ToolPreviewKind::Muted,
+                    max_lines: 4,
+                });
+            }
+        }
+        _ => {
+            if !args.is_null() && args.as_object().is_none_or(|m| !m.is_empty()) {
+                let compact =
+                    serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+                blocks.push(ToolPreviewBlock {
+                    prefix: "      ",
+                    text: compact,
+                    kind: ToolPreviewKind::Muted,
+                    max_lines: 6,
+                });
+            }
+        }
+    }
+    ToolCallPreview {
+        tool,
+        detail,
+        detail_muted,
+        blocks,
+    }
+}
+
+fn format_tool_approval_call(index: usize, total: usize, call: &Value) -> Vec<String> {
+    let preview = describe_tool_approval_call(call);
+    let mut out = vec![format!(
+        "  [{index}/{total}] {}{}",
+        preview.tool, preview.detail
+    )];
+    for block in preview.blocks {
+        push_multiline_preview(&mut out, block.prefix, &block.text, block.max_lines);
+    }
+    out
+}
+
+pub(crate) fn format_tool_approval_batch(
+    step: &Value,
+    calls: &Value,
+    source: Option<&str>,
+) -> String {
+    let calls_slice = calls.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let total = calls_slice.len();
+    let step_label = step
+        .as_u64()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| step.to_string());
+    let mut lines = Vec::new();
+    let origin = source
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!(" · {s}"))
+        .unwrap_or_default();
+    lines.push(format!(
+        "[tool approval required{origin} · step {step_label} · {total} tool(s)]"
+    ));
+    for (idx, call) in calls_slice.iter().enumerate() {
+        lines.extend(format_tool_approval_call(idx + 1, total, call));
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn parse_approval_answer(answer: &str) -> Option<bool> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" | "" => Some(false),
+        _ => None,
+    }
+}
+
+enum StdinLine {
+    Line(String),
+    Eof,
+    Cancelled,
+}
+
+fn read_line_cancellable(cancel: &crate::agent::CancelToken) -> std::io::Result<StdinLine> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let res = std::io::stdin().read_line(&mut line).map(|n| (n, line));
+        let _ = tx.send(res);
+    });
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(StdinLine::Cancelled);
+        }
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok((0, _))) => return Ok(StdinLine::Eof),
+            Ok(Ok((_, line))) => return Ok(StdinLine::Line(line)),
+            Ok(Err(err)) => return Err(err),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(StdinLine::Eof),
+        }
+    }
+}
+
+fn prompt_approval_yn(call_count: usize, cancel: &crate::agent::CancelToken) -> Result<bool> {
+    let stderr = std::io::stderr();
+    let mut stderr_lock = stderr.lock();
+    let prompt = if call_count <= 1 {
+        "Approve tool? [y/N]: ".to_owned()
+    } else {
+        format!("Approve all {call_count} tool(s)? [y/N]: ")
+    };
+    write!(stderr_lock, "{prompt}").map_err(ServiceError::storage)?;
+    stderr_lock.flush().map_err(ServiceError::storage)?;
+    loop {
+        match read_line_cancellable(cancel) {
+            Ok(StdinLine::Eof | StdinLine::Cancelled) => {
+                let _ = writeln!(stderr_lock);
+                return Ok(false);
+            }
+            Ok(StdinLine::Line(line)) => {
+                if cancel.is_cancelled() {
+                    return Ok(false);
+                }
+                if let Some(approved) = parse_approval_answer(&line) {
+                    return Ok(approved);
+                }
+                write!(stderr_lock, "Please enter Y or N: ").map_err(ServiceError::storage)?;
+                stderr_lock.flush().map_err(ServiceError::storage)?;
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Ok(false);
+                }
+                return Err(ServiceError::storage(err));
+            }
+        }
+    }
+}
+
 fn follow_agent(client: &Client, id: &str, json: bool, quiet: bool) -> Result<()> {
     let cancel = crate::agent::CancelToken::new();
     let c = cancel.clone();
     let _ = ctrlc::set_handler(move || c.cancel());
     let mut after = 0;
     let mut cancelled = false;
+    let mut locally_resolved = std::collections::HashSet::new();
     poll_until(Duration::from_millis(25), Some(&cancel), || {
         if cancel.is_cancelled() && !cancelled {
             let _ = client.request(
@@ -931,10 +1312,67 @@ fn follow_agent(client: &Client, id: &str, json: bool, quiet: bool) -> Result<()
                     serde_json::to_string(&event).map_err(ServiceError::storage)?
                 );
             }
-            if quiet || json {
-                continue;
-            }
             match event.kind.as_str() {
+                "tool_approval_requested" => {
+                    if quiet || json || !std::io::stdin().is_terminal() {
+                        let _ = client.request(
+                            "POST",
+                            &format!("/api/agents/{id}/cancel"),
+                            Some(&json!({})),
+                        );
+                        return Err(ServiceError::invalid(
+                            "tool execution requires interactive [Y/N] approval in --agent mode; run interactively or pass --yolo to auto-execute tools",
+                        ));
+                    }
+                    let approval_id = event.data["id"]
+                        .as_str()
+                        .ok_or_else(|| ServiceError::invalid("approval event missing id"))?;
+                    let call_count = event.data["calls"].as_array().map_or(0, Vec::len);
+                    let preview = format_tool_approval_batch(
+                        &event.data["step"],
+                        &event.data["calls"],
+                        event.data["source"].as_str(),
+                    );
+                    eprintln!("\n{preview}");
+                    let approved = prompt_approval_yn(call_count, &cancel)?;
+                    if cancel.is_cancelled() {
+                        if !cancelled {
+                            let _ = client.request(
+                                "POST",
+                                &format!("/api/agents/{id}/cancel"),
+                                Some(&json!({})),
+                            );
+                            cancelled = true;
+                        }
+                        break;
+                    }
+                    client.request(
+                        "POST",
+                        &format!("/api/agents/{id}/approve-tool"),
+                        Some(&json!({"approval_id": approval_id, "approved": approved})),
+                    )?;
+                    locally_resolved.insert(approval_id.to_owned());
+                    eprintln!(
+                        "{}",
+                        if approved {
+                            format!("[approved {call_count} tool(s)]")
+                        } else {
+                            format!("[rejected {call_count} tool(s)]")
+                        }
+                    );
+                }
+                _ if quiet || json => {}
+                "tool_approval_resolved" => {
+                    let approval_id = event.data["id"].as_str().unwrap_or("");
+                    if !locally_resolved.remove(approval_id) {
+                        let decision = if event.data["approved"] == true {
+                            "approved"
+                        } else {
+                            "rejected"
+                        };
+                        eprintln!("\n[approval {approval_id}: {decision}]");
+                    }
+                }
                 "tool_started" => {
                     eprintln!("\n[{}]", event.data["tool"].as_str().unwrap_or("tool"))
                 }
@@ -1809,7 +2247,10 @@ impl Client {
         }
         let _temp_files = TempFiles(temp_files);
         if files.len() > crate::input::MAX_FILES {
-            return Err(ServiceError::invalid("maximum 10 attachments"));
+            return Err(ServiceError::invalid(format!(
+                "maximum {} attachments",
+                crate::input::MAX_FILES
+            )));
         }
         let mut uploaded = Vec::with_capacity(files.len());
         {
@@ -2049,6 +2490,7 @@ mod tests {
                 shell: false,
                 browser: true,
                 subagent: false,
+                ast: true,
             })
             .unwrap();
 
@@ -2071,6 +2513,7 @@ mod tests {
                 shell: false,
                 browser: true,
                 subagent: false,
+                ast: true,
             })
         );
 
@@ -2473,5 +2916,82 @@ mod tests {
         let id = client_identity();
         assert!(!id.is_empty());
         assert!(!id.contains('\n') && !id.contains('\r'));
+    }
+
+    #[test]
+    fn agent_approval_mode_and_batch_yn_helpers_work() {
+        let agent_opts = PromptOptions::parse(&["--agent".into(), "task".into()]).unwrap();
+        let ask_req = agent_opts.agent_request("task".into(), None);
+        assert_eq!(ask_req.tool_approval, ToolApprovalMode::Ask);
+        assert!(!ask_req.chat_only);
+
+        let yolo_opts = PromptOptions::parse(&["--yolo".into(), "task".into()]).unwrap();
+        let auto_req = yolo_opts.agent_request("task".into(), None);
+        assert_eq!(auto_req.tool_approval, ToolApprovalMode::Auto);
+
+        let chat_opts = PromptOptions::parse(&["task".into()]).unwrap();
+        let chat_req = chat_opts.agent_request("task".into(), None);
+        assert_eq!(chat_req.tool_approval, ToolApprovalMode::Unspecified);
+        assert!(chat_req.chat_only);
+
+        let mut resumed_yolo = PromptOptions::parse(&[]).unwrap();
+        resumed_yolo.inherit(&auto_req).unwrap();
+        assert!(resumed_yolo.agent && resumed_yolo.yolo);
+
+        let mut resumed_no_shell = PromptOptions::parse(&["--no-shell".into()]).unwrap();
+        resumed_no_shell.inherit(&auto_req).unwrap();
+        assert!(resumed_no_shell.agent);
+        assert!(
+            !resumed_no_shell.yolo,
+            "explicit --no-shell override must not inherit --yolo"
+        );
+
+        let mut resumed_perms = PromptOptions::parse(&[]).unwrap();
+        resumed_perms.overrides.insert("permissions".into());
+        resumed_perms.inherit(&auto_req).unwrap();
+        assert!(
+            !resumed_perms.yolo,
+            "explicit permissions override must not inherit --yolo"
+        );
+
+        let mut resumed_ask = PromptOptions::parse(&[]).unwrap();
+        resumed_ask.inherit(&ask_req).unwrap();
+        assert!(resumed_ask.agent && !resumed_ask.yolo);
+
+        assert_eq!(parse_approval_answer("y"), Some(true));
+        assert_eq!(parse_approval_answer(" Y\n"), Some(true));
+        assert_eq!(parse_approval_answer("Yes"), Some(true));
+        assert_eq!(parse_approval_answer("n"), Some(false));
+        assert_eq!(parse_approval_answer("NO"), Some(false));
+        assert_eq!(parse_approval_answer(""), Some(false));
+        assert_eq!(parse_approval_answer("   \r\n"), Some(false));
+        assert_eq!(parse_approval_answer("maybe"), None);
+        assert_eq!(parse_approval_answer("yy"), None);
+
+        let batch = format_tool_approval_batch(
+            &json!(2),
+            &json!([
+                {
+                    "tool": "edit_file",
+                    "args": {"path": "src/lib.rs", "old_text": "foo()", "new_text": "bar()"}
+                },
+                {
+                    "tool": "run_shell",
+                    "args": {"command": "cargo test --lib"}
+                },
+                {
+                    "tool": "write_file",
+                    "args": {"path": "README.md", "content": "hello\nworld"}
+                }
+            ]),
+            Some("worker: inspect"),
+        );
+        assert!(batch.contains("[tool approval required · worker: inspect · step 2 · 3 tool(s)]"));
+        assert!(batch.contains("[1/3] edit_file: src/lib.rs"));
+        assert!(batch.contains("- foo()"));
+        assert!(batch.contains("+ bar()"));
+        assert!(batch.contains("[2/3] run_shell"));
+        assert!(batch.contains("$ cargo test --lib"));
+        assert!(batch.contains("[3/3] write_file: README.md (2 lines, 11 bytes)"));
     }
 }

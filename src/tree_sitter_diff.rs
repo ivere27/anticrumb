@@ -15,6 +15,8 @@ mod language_registry;
 #[cfg(feature = "tree-sitter")]
 mod signature;
 #[cfg(feature = "tree-sitter")]
+mod symbols;
+#[cfg(feature = "tree-sitter")]
 mod test_scope;
 #[cfg(all(test, feature = "tree-sitter"))]
 mod tests;
@@ -26,6 +28,11 @@ pub use diff_expand::{
 };
 pub use hybrid::HybridConfig;
 pub use language_registry::{LanguageCandidates, LanguageRegistry};
+#[cfg(feature = "tree-sitter")]
+pub use symbols::{
+    extract_symbols, find_references_in_files, find_references_in_source, split_name_path,
+    symbol_matches, Reference, Symbol,
+};
 
 /// 1-based inclusive source line span `(start_line, end_line)` for a rendered diff line.
 type SourceLineSpan = (usize, usize);
@@ -87,7 +94,7 @@ fn resolve_patch_budget_bytes() -> usize {
 /// Maximum file size (in bytes) allowed for Tree-sitter in-memory parsing (1 MiB).
 /// Files exceeding this limit fall back to `git diff -W` to prevent memory and CPU spikes.
 #[cfg(feature = "tree-sitter")]
-const MAX_TREESITTER_FILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TREESITTER_FILE_BYTES: usize = 1024 * 1024;
 
 /// Timeout in microseconds for tree-sitter parsing (500ms).
 #[cfg(feature = "tree-sitter")]
@@ -476,7 +483,10 @@ fn is_module_level_container_node(lang: SupportedLanguage, node: &tree_sitter::N
 /// Safely extracts the text of a node if it is entirely contained on a single line.
 /// Protects against panics from multi-line nodes, error recovery, out-of-bounds, or invalid UTF-8 slice boundaries.
 #[cfg(feature = "tree-sitter")]
-fn get_node_text_same_line<'a>(node: &tree_sitter::Node, lines: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn get_node_text_same_line<'a>(
+    node: &tree_sitter::Node,
+    lines: &[&'a str],
+) -> Option<&'a str> {
     let sp = node.start_position();
     let ep = node.end_position();
     if sp.row != ep.row {
@@ -998,7 +1008,7 @@ fn has_camel_it_suffix(orig_p_str: &str, suffix: &str) -> bool {
 }
 
 /// Checks whether a file path matches standard test directory or test file naming conventions.
-pub(super) fn is_test_file_path(path: &Path) -> bool {
+pub(crate) fn is_test_file_path(path: &Path) -> bool {
     let orig_p_str = path.to_string_lossy().replace('\\', "/");
     let lower_p_str = orig_p_str.to_ascii_lowercase();
 

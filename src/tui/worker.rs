@@ -67,6 +67,11 @@ pub(super) enum Command {
         account: String,
     },
     Cancel(String),
+    ApproveTool {
+        id: String,
+        approval_id: String,
+        approved: bool,
+    },
     List(PathBuf, String),
     DeleteConversation(String, PromptOptions),
     ClearWebHistory(String),
@@ -257,6 +262,21 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                                     Some(&json!({})),
                                 )
                                 .await?;
+                        }
+                        Command::ApproveTool {
+                            id,
+                            approval_id,
+                            approved,
+                        } => {
+                            client
+                                .request_async(
+                                    "POST",
+                                    &format!("/api/agents/{id}/approve-tool"),
+                                    Some(&json!({"approval_id": approval_id, "approved": approved})),
+                                )
+                                .await?;
+                            active_interval = ACTIVE_POLL_MIN;
+                            next_active_at = Instant::now();
                         }
                         Command::BrowserControl(request) => {
                             let response = client.rpc.browser_control(request).await?;

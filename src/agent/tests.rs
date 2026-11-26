@@ -138,6 +138,251 @@ fn atomic_file_tools_report_success_and_changes() {
 }
 
 #[test]
+fn grep_search_regex_smart_case_modes_and_fallback() {
+    let ws = temp_ws("grep_regex");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(
+        ws.join("src/a.rs"),
+        "fn alpha() {}\nlet x = 1;\nfn Beta() {}\nfoo(bar)\n",
+    )
+    .unwrap();
+    fs::write(ws.join("src/b.txt"), "fn gamma\r\nnothing\r\n").unwrap();
+    let ctx = ToolContext::new(ws.clone());
+    let reg = ToolRegistry::with_builtin_coding_tools();
+    let grep = |args: Value| {
+        let r = reg.execute_call(&call("grep_search", args), &ctx);
+        assert!(r.ok, "{}", r.output);
+        r.output
+    };
+
+    // Regex + anchors, grouped by file (CRLF-aware `$`).
+    let out = grep(json!({"pattern": r"^fn \w+$|^fn \w+\(\)"}));
+    assert!(out.contains("Found 3 match(es) in 2 file(s):"), "{out}");
+    assert!(
+        out.contains("src/a.rs\n1:fn alpha() {}\n3:fn Beta() {}"),
+        "{out}"
+    );
+    assert!(out.contains("src/b.txt\n1:fn gamma"), "{out}");
+
+    // Smart case: lowercase => insensitive; uppercase => sensitive; (?-i) forces.
+    assert!(grep(json!({"pattern": "beta"})).contains("3:fn Beta"));
+    assert!(grep(json!({"pattern": "BETA"})).starts_with("No matches"));
+    assert!(grep(json!({"pattern": "(?-i)beta"})).starts_with("No matches"));
+    assert!(grep(json!({"pattern": r"\w+eta"})).contains("3:fn Beta"));
+
+    // Invalid regex falls back to literal; fixed_strings is literal.
+    let out = grep(json!({"pattern": "foo(bar", "glob": "*.rs"}));
+    assert!(out.starts_with("[invalid regex"), "{out}");
+    assert!(grep(json!({"pattern": "foo(bar)", "fixed_strings": true})).contains("4:foo(bar)"));
+
+    // Context merges groups and marks context lines with '-'.
+    let out = grep(json!({"pattern": "alpha|Beta", "path": "src/a.rs", "context": 1}));
+    assert!(
+        out.contains("src/a.rs\n1:fn alpha() {}\n2-let x = 1;\n3:fn Beta() {}\n4-foo(bar)"),
+        "{out}"
+    );
+
+    // Output modes and head_limit.
+    let out = grep(json!({"pattern": "fn", "output_mode": "files_with_matches"}));
+    assert!(
+        out.contains("Found 2 file(s):\nsrc/a.rs\nsrc/b.txt"),
+        "{out}"
+    );
+    let out = grep(json!({"pattern": "fn", "output_mode": "count"}));
+    assert!(out.contains("src/a.rs:2\nsrc/b.txt:1"), "{out}");
+    let out = grep(json!({"pattern": "fn", "head_limit": 1}));
+    assert!(
+        out.contains("Found 1 match(es)") && out.contains("[stopped at head_limit=1"),
+        "{out}"
+    );
+
+    let bad = reg.execute_call(
+        &call(
+            "grep_search",
+            json!({"pattern": "x", "output_mode": "nope"}),
+        ),
+        &ctx,
+    );
+    assert!(!bad.ok);
+}
+
+#[cfg(feature = "tree-sitter")]
+#[test]
+fn ast_tools_outline_find_symbol_and_find_references() {
+    let ws = temp_ws("ast_tools");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(
+        ws.join("src/lib.rs"),
+        "/// Primary grep engine\npub struct Grep;\n\nimpl Grep {\n    /// Run grep with a multi-line signature\n    pub fn execute(\n        &self,\n        limit: usize,\n    ) -> u8 {\n        1\n    }\n}\n\nfn execute_all() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_runs() {\n        let g = super::Grep;\n        let _ = g.execute(1);\n    }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("src/caller.rs"),
+        "use crate::Grep;\n\nstruct Other;\nimpl Other {\n    fn execute(&self) {}\n}\n\n/// Calls Grep::execute\nfn run_caller(g: &Grep) -> u8 {\n    // g.execute(0) in comment must be ignored\n    let _s = \"execute(9) in string must be ignored\";\n    g.execute(42)\n}\n\nfn run_other() {\n    Other::execute(&Other);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("src/app.ts"),
+        "/** Render item */\nexport function render(g: { execute(n: number): number }) {\n  return g.execute(7);\n}\n",
+    )
+    .unwrap();
+    fs::write(ws.join("src/notes.txt"), "execute\n").unwrap();
+    let ctx = ToolContext::new(ws.clone());
+    let reg = ToolRegistry::with_builtin_coding_tools();
+    let run = |tool: &str, args: Value| {
+        let r = reg.execute_call(&call(tool, args), &ctx);
+        assert!(r.ok, "{}", r.output);
+        r.output
+    };
+
+    // File outline: full collapsed signature (no redundant parent prefix) + doc summary.
+    let out = run("code_outline", json!({"path": "src/lib.rs"}));
+    assert!(
+        out.starts_with("src/lib.rs (rust, 23 lines, 6 definitions)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("2  pub struct Grep;  // Primary grep engine\n4-12  impl Grep\n  6-11  pub fn execute(&self, limit: usize) -> u8  // Run grep with a multi-line signature"),
+        "{out}"
+    );
+
+    // Directory outline: top level only, nested members counted, JSDoc included, unsupported skipped.
+    let out = run("code_outline", json!({"path": "src"}));
+    assert!(
+        out.contains("src/lib.rs (23 lines)\n2  pub struct Grep;  // Primary grep engine\n4-12  impl Grep  (+1)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("export function render(g: { execute(n: number): number })  // Render item"),
+        "{out}"
+    );
+    assert!(!out.contains("notes.txt"), "{out}");
+
+    // find_symbol: exact name path match, signature + doc, substring fallback, and verbatim body.
+    let out = run("find_symbol", json!({"name": "Grep::execute"}));
+    assert!(out.contains("Found 1 definition(s)"), "{out}");
+    assert!(
+        out.contains("src/lib.rs:6-11  Grep/execute  pub fn execute(&self, limit: usize) -> u8  // Run grep with a multi-line signature"),
+        "{out}"
+    );
+    let out = run("find_symbol", json!({"name": "EXEC"}));
+    assert!(
+        out.starts_with("[no exact match") && out.contains("Found 3 definition(s)"),
+        "{out}"
+    );
+    let out = run(
+        "find_symbol",
+        json!({"name": "Grep/execute", "include_body": true}),
+    );
+    assert!(
+        out.contains("   6 |     pub fn execute(\n   7 |         &self,\n   8 |         limit: usize,\n   9 |     ) -> u8 {"),
+        "{out}"
+    );
+    assert!(run("find_symbol", json!({"name": "missing"})).starts_with("No definitions"));
+
+    // find_references: AST-verified (skips comments, strings, imports, definitions, #[cfg(test)]),
+    // includes TS property_identifier, shows enclosing function + call line, supports qualifier filter & include_tests.
+    let out = run("find_references", json!({"name": "Grep::execute"}));
+    assert!(
+        out.contains("Found 2 reference(s) to 'Grep::execute' in 2 file(s):"),
+        "{out}"
+    );
+    assert!(
+        out.contains("src/app.ts\n  3 [export function render(g: { execute(n: number): number })]  return g.execute(7);"),
+        "{out}"
+    );
+    assert!(
+        out.contains("src/caller.rs\n  12 [fn run_caller(g: &Grep) -> u8]  g.execute(42)"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Other::execute")
+            && !out.contains("in comment")
+            && !out.contains("in string")
+            && !out.contains("it_runs")
+            && !out.contains("src/lib.rs"),
+        "{out}"
+    );
+
+    // include_tests=true surfaces inline #[cfg(test)] references.
+    let out = run(
+        "find_references",
+        json!({"name": "execute", "path": "src/lib.rs", "include_tests": true}),
+    );
+    assert!(out.contains("21 [mod tests::fn it_runs()]"), "{out}");
+
+    let bad = reg.execute_call(
+        &call("code_outline", json!({"path": "src/notes.txt"})),
+        &ctx,
+    );
+    assert!(
+        !bad.ok && bad.output.contains("unsupported language"),
+        "{}",
+        bad.output
+    );
+}
+
+#[test]
+fn workspace_walk_honors_gitignore_and_keeps_dotfiles() {
+    let ws = temp_ws("gitignore_walk");
+    fs::create_dir_all(ws.join("gen")).unwrap();
+    fs::create_dir_all(ws.join("src/build")).unwrap();
+    fs::create_dir_all(ws.join(".github")).unwrap();
+    fs::create_dir_all(ws.join(".git")).unwrap();
+    fs::write(ws.join(".gitignore"), "gen/\n*.log\nbuild/\n").unwrap();
+    fs::write(ws.join("src/.gitignore"), "local.rs\n").unwrap();
+    for f in [
+        "gen/a.rs",
+        "x.log",
+        "src/build/b.rs",
+        "src/local.rs",
+        ".git/config",
+    ] {
+        fs::write(ws.join(f), "needle\n").unwrap();
+    }
+    fs::write(ws.join("src/main.rs"), "needle\n").unwrap();
+    fs::write(ws.join(".github/ci.yml"), "needle\n").unwrap();
+    let ctx = ToolContext::new(ws.clone());
+    let reg = ToolRegistry::with_builtin_coding_tools();
+
+    let g = reg.execute_call(
+        &call(
+            "grep_search",
+            json!({"pattern": "needle", "output_mode": "files_with_matches"}),
+        ),
+        &ctx,
+    );
+    assert!(g.ok, "{}", g.output);
+    assert!(
+        g.output
+            .contains("Found 2 file(s):\n.github/ci.yml\nsrc/main.rs"),
+        "{}",
+        g.output
+    );
+
+    // Parent .gitignore still applies when the search starts in a subdirectory.
+    let g = reg.execute_call(
+        &call(
+            "grep_search",
+            json!({"pattern": "needle", "path": "src", "output_mode": "files_with_matches"}),
+        ),
+        &ctx,
+    );
+    assert!(
+        g.output.contains("Found 1 file(s):\nsrc/main.rs"),
+        "{}",
+        g.output
+    );
+
+    let f = reg.execute_call(&call("find_files", json!({"pattern": "*.rs"})), &ctx);
+    assert!(
+        f.ok && f.output.contains("src/main.rs") && !f.output.contains("gen/"),
+        "{}",
+        f.output
+    );
+}
+
+#[test]
 fn coding_tools_find_grep_read_edit_write_and_shell() {
     let ws = temp_ws("tools");
     let ctx = ToolContext::new(ws.clone());
@@ -153,10 +398,14 @@ fn coding_tools_find_grep_read_edit_write_and_shell() {
     assert!(f.ok && f.output.contains("src/hello.rs"));
 
     let g = reg.execute_call(
-        &call("grep_search", json!({"query": "greet", "dir": "src"})),
+        &call("grep_search", json!({"pattern": "greet", "path": "src"})),
         &ctx,
     );
-    assert!(g.ok && g.output.contains("src/hello.rs:1:"), "{}", g.output);
+    assert!(
+        g.ok && g.output.contains("src/hello.rs\n1:pub fn greet"),
+        "{}",
+        g.output
+    );
 
     let e = reg.execute_call(
         &call(
@@ -1208,7 +1457,7 @@ fn runtime_prompts_tool_overrides_and_agents_md_reload_without_recompile() {
     let first = &prompts.lock().unwrap()[0];
     assert!(first.starts_with("Custom persona in "));
     assert!(first.contains("- read_file(path: str, start_line?: int, end_line?: int) \u{2014} Read file via CUSTOM description."));
-    assert!(first.contains("- grep_search(query: str"));
+    assert!(first.contains("- grep_search(pattern: str"));
     assert!(first.contains("\u{2014} Markdown override for grep_search."));
     assert!(first.contains("- edit_file(path: str, old_text: str, new_text: str, replace_all?: bool) \u{2014} Line 1 custom edit. Line 2 strict exact match."));
     assert!(first.contains("[PROJECT_INSTRUCTIONS source=\"AGENTS.md\"]\nAlways prefer zero-copy parsing.\n[/PROJECT_INSTRUCTIONS]"));
@@ -1258,9 +1507,9 @@ fn compact_tool_signatures_rendering_contract() {
         "actual: {block}"
     );
 
-    // 5. grep_search: query required, optional params
+    // 5. grep_search: pattern required, optional params
     assert!(
-        block.contains("- grep_search(query: str, case_sensitive?: bool, context_lines?: int, dir?: str, file_pattern?: str, max_matches?: int) \u{2014} Search literal text across workspace files (case-insensitive by default)."),
+        block.contains("- grep_search(pattern: str, path?: str, context?: int, fixed_strings?: bool, glob?: str, head_limit?: int, output_mode?: \"content\"|\"files_with_matches\"|\"count\") \u{2014} Regex search across workspace files (ripgrep syntax; smart case, force with (?i)/(?-i); invalid regex falls back to literal). Output is grouped by file as `N:line`."),
         "actual: {block}"
     );
 
@@ -1335,4 +1584,381 @@ fn persistent_session_deduplicates_unchanged_read_file_and_invalidates_on_edit()
         p[4]
     );
     let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ask_all_prompts_entire_tool_batch_once_and_runs_all_on_approve() {
+    let ws = temp_ws("approval_batch_yes");
+    let (mock, _) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "write_file", "args": {"path": "a.txt", "content": "alpha"}},
+                    {"tool": "write_file", "args": {"path": "b.txt", "content": "beta"}}
+                ]
+            })
+        ),
+        "both written".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy::ask_all();
+    let mut agent = CodingAgent::new(mock, c);
+
+    let gate = ToolApprovalGate::default();
+    let gate_responder = gate.clone();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let events_log = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let events_ref = Arc::clone(&events_log);
+    let responder = std::thread::spawn(move || {
+        let approval_id = req_rx.recv().unwrap();
+        assert!(gate_responder.resolve(&approval_id, true));
+    });
+
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if let AgentEvent::ToolApprovalRequested { id, .. } = &ev {
+                let _ = req_tx.send(id.clone());
+            }
+            events_ref.lock().unwrap().push(ev);
+        }),
+    };
+    let res = agent.run("Create two files", &control).unwrap();
+    responder.join().unwrap();
+
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(res.final_response, "both written");
+    assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "alpha");
+    assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "beta");
+    assert_eq!(res.files_changed, vec!["a.txt", "b.txt"]);
+
+    let events = events_log.lock().unwrap();
+    let req_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolApprovalRequested { step: 1, calls, .. } if calls.len() == 2
+            )
+        })
+        .expect("single batch ToolApprovalRequested with 2 calls");
+    let resolved_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolApprovalResolved {
+                    step: 1,
+                    approved: true,
+                    ..
+                }
+            )
+        })
+        .expect("ToolApprovalResolved(true)");
+    let first_started_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+        .expect("ToolStarted after approval");
+    assert!(req_idx < resolved_idx && resolved_idx < first_started_idx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolApprovalRequested { .. }))
+            .count(),
+        1
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ask_all_skips_entire_batch_on_reject_and_returns_rejection_feedback() {
+    let ws = temp_ws("approval_batch_no");
+    fs::write(ws.join("keep.txt"), "original").unwrap();
+    let (mock, prompts) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "write_file", "args": {"path": "keep.txt", "content": "overwritten"}},
+                    {"tool": "run_shell", "args": {"command": "echo should-not-run"}}
+                ]
+            })
+        ),
+        "stopped safely".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy::ask_all();
+    let mut agent = CodingAgent::new(mock, c);
+
+    let gate = ToolApprovalGate::default();
+    let gate_responder = gate.clone();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let events_log = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let events_ref = Arc::clone(&events_log);
+    let responder = std::thread::spawn(move || {
+        let approval_id = req_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(gate_responder.resolve(&approval_id, false));
+    });
+
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if let AgentEvent::ToolApprovalRequested { id, .. } = &ev {
+                let _ = req_tx.send(id.clone());
+            }
+            events_ref.lock().unwrap().push(ev);
+        }),
+    };
+    let res = agent.run("Attempt overwrite", &control).unwrap();
+    responder.join().unwrap();
+
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(res.final_response, "stopped safely");
+    assert_eq!(fs::read_to_string(ws.join("keep.txt")).unwrap(), "original");
+    assert!(prompts.lock().unwrap()[1].contains("Tool execution rejected by user."));
+
+    let events = events_log.lock().unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolApprovalResolved {
+            step: 1,
+            approved: false,
+            ..
+        }
+    )));
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. }
+        )),
+        "rejected batch must never emit ToolStarted/ToolFinished"
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn approval_wait_cancels_cleanly_when_cancel_token_fires() {
+    let ws = temp_ws("approval_cancel");
+    let (mock, _) = MockBackend::replies(vec![
+        tool_block("write_file", json!({"path": "c.txt", "content": "x"})),
+        "never".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy::ask_all();
+    let mut agent = CodingAgent::new(mock, c);
+
+    let cancel = CancelToken::new();
+    let gate = ToolApprovalGate::default();
+    let cancel_trigger = cancel.clone();
+    let gate_trigger = gate.clone();
+    let events_log = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let events_ref = Arc::clone(&events_log);
+    let control = RunControl {
+        cancel,
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if matches!(ev, AgentEvent::ToolApprovalRequested { .. }) {
+                cancel_trigger.cancel();
+                gate_trigger.wake_all();
+            }
+            events_ref.lock().unwrap().push(ev);
+        }),
+    };
+    let res = agent.run("Write while cancelled", &control).unwrap();
+    assert_eq!(res.status, AgentStatus::Cancelled);
+    assert!(!ws.join("c.txt").exists());
+    assert!(!events_log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolStarted { .. })));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn structured_permission_rules_prompt_only_for_unapproved_calls_in_mixed_batch() {
+    let ws = temp_ws("approval_rules");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(ws.join("src/info.txt"), "hello-src").unwrap();
+    let (mock, prompts) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "read_file", "args": {"path": "src/info.txt"}},
+                    {"tool": "write_file", "args": {"path": "out.txt", "content": "new"}},
+                    {"tool": "run_shell", "args": {"command": "rm -rf ."}},
+                    {"tool": "run_shell", "args": {"command": "echo safe-ok"}}
+                ]
+            })
+        ),
+        "done after mixed policy".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy {
+        default_decision: PermissionDecision::Ask,
+        rules: vec![
+            ToolPermissionRule {
+                tool: "read_file".into(),
+                matcher: ToolArgMatcher::PathPrefix {
+                    prefix: "src/".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "rm ".into(),
+                },
+                decision: PermissionDecision::Deny {
+                    reason: "destructive command blocked by policy".into(),
+                },
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "echo ".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+        ],
+    };
+    let mut agent = CodingAgent::new(mock, c);
+
+    let gate = ToolApprovalGate::default();
+    let gate_responder = gate.clone();
+    let prompted_tools = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompted_ref = Arc::clone(&prompted_tools);
+    let started_tools = Arc::new(Mutex::new(Vec::<String>::new()));
+    let started_ref = Arc::clone(&started_tools);
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| match ev {
+            AgentEvent::ToolApprovalRequested { id, calls, .. } => {
+                *prompted_ref.lock().unwrap() = calls.iter().map(|c| c.tool.clone()).collect();
+                assert!(gate_responder.resolve(&id, false));
+            }
+            AgentEvent::ToolStarted { tool, .. } => {
+                started_ref.lock().unwrap().push(tool);
+            }
+            _ => {}
+        }),
+    };
+    let res = agent.run("Mixed permission rules batch", &control).unwrap();
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(
+        *prompted_tools.lock().unwrap(),
+        vec!["write_file".to_string()],
+        "only Ask calls should require user approval"
+    );
+    assert_eq!(
+        *started_tools.lock().unwrap(),
+        vec!["read_file".to_string(), "run_shell".to_string()]
+    );
+    assert!(!ws.join("out.txt").exists());
+    let step1_prompt = &prompts.lock().unwrap()[1];
+    assert!(step1_prompt.contains("hello-src"));
+    assert!(step1_prompt.contains("safe-ok"));
+    assert!(step1_prompt.contains("destructive command blocked by policy"));
+    assert!(step1_prompt.contains("Tool execution rejected by user."));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn permission_matchers_block_path_traversal_prefix_boundary_and_shell_chaining() {
+    let policy = ToolApprovalPolicy {
+        default_decision: PermissionDecision::Ask,
+        rules: vec![
+            ToolPermissionRule {
+                tool: "read_file".into(),
+                matcher: ToolArgMatcher::PathPrefix {
+                    prefix: "src".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "rm ".into(),
+                },
+                decision: PermissionDecision::Deny {
+                    reason: "blocked".into(),
+                },
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "echo".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+        ],
+    };
+
+    let call = |tool: &str, args: serde_json::Value| ToolCallRequest {
+        tool: tool.into(),
+        args,
+    };
+
+    assert_eq!(
+        policy.evaluate_call(&call("read_file", json!({"path": "./src/lib.rs"}))),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("read_file", json!({"path": "src/../.env"}))),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("read_file", json!({"path": "src_secrets/key.txt"}))),
+        PermissionDecision::Ask
+    );
+
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo hello"}))),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo_evil"}))),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo $(id)"}))),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo ok; ls"}))),
+        PermissionDecision::Ask
+    );
+    assert!(matches!(
+        policy.evaluate_call(&call(
+            "run_shell",
+            json!({"command": "echo ok && rm -rf ."})
+        )),
+        PermissionDecision::Deny { .. }
+    ));
+    assert!(matches!(
+        policy.evaluate_call(&call(
+            "run_shell",
+            json!({"command": "rm -rf . && echo hi"})
+        )),
+        PermissionDecision::Deny { .. }
+    ));
+
+    let gate = ToolApprovalGate::default();
+    {
+        let _guard = gate.register_guard("ap-drop");
+    }
+    assert!(
+        !gate.resolve("ap-drop", true),
+        "dropped ApprovalGuard must clean up unresolved approval_id"
+    );
 }

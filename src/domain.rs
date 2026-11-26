@@ -630,6 +630,9 @@ fn default_true() -> bool {
 pub struct ToolPermissions {
     #[serde(default = "default_true")]
     pub read: bool,
+    /// Tree-sitter code navigation (`code_outline`, `find_symbol`, `find_references`); also requires `read`.
+    #[serde(default = "default_true")]
+    pub ast: bool,
     #[serde(default)]
     pub edit: bool,
     #[serde(default)]
@@ -650,6 +653,7 @@ impl ToolPermissions {
     pub const fn read_only() -> Self {
         Self {
             read: true,
+            ast: true,
             edit: false,
             shell: false,
             browser: false,
@@ -660,6 +664,7 @@ impl ToolPermissions {
     pub const fn all() -> Self {
         Self {
             read: true,
+            ast: true,
             edit: true,
             shell: true,
             browser: true,
@@ -671,6 +676,9 @@ impl ToolPermissions {
         let mut enabled = Vec::new();
         if self.read {
             enabled.push("read");
+        }
+        if self.ast {
+            enabled.push("ast");
         }
         if self.edit {
             enabled.push("edit");
@@ -686,11 +694,29 @@ impl ToolPermissions {
         }
         if enabled.is_empty() {
             "none".into()
-        } else if enabled.len() == 5 {
-            "all (read, edit, shell, browser, subagent)".into()
+        } else if enabled.len() == 6 {
+            "all (read, ast, edit, shell, browser, subagent)".into()
         } else {
             enabled.join(", ")
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalMode {
+    /// Legacy or unspecified turns; treated conservatively when resuming interactively.
+    #[default]
+    Unspecified,
+    /// Prompt the user once per tool batch (`Y/N`) before executing tools.
+    Ask,
+    /// Auto-execute tools without prompting (`--yolo`).
+    Auto,
+}
+
+impl ToolApprovalMode {
+    pub const fn is_unspecified(&self) -> bool {
+        matches!(self, Self::Unspecified)
     }
 }
 
@@ -728,6 +754,8 @@ pub struct AgentRequest {
     pub permissions: Option<ToolPermissions>,
     #[serde(default, skip_serializing_if = "SessionRetention::is_unspecified")]
     pub session_retention: SessionRetention,
+    #[serde(default, skip_serializing_if = "ToolApprovalMode::is_unspecified")]
+    pub tool_approval: ToolApprovalMode,
 }
 
 impl AgentRequest {

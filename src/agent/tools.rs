@@ -19,6 +19,8 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 12_000;
 const MAX_WEB_TOOL_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_READ_LINES: usize = 500;
 const MAX_GREP_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_GREP_FILES: usize = 2000;
+const MAX_GREP_LINE_CHARS: usize = 300;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 const MAX_PROCESS_WAIT_SECS: u64 = 60;
 const MAX_TEXT_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -325,6 +327,12 @@ impl ToolRegistry {
         reg.register(Box::new(FindFilesTool));
         reg.register(Box::new(GrepSearchTool));
         reg.register(Box::new(ReadFileTool));
+        #[cfg(feature = "tree-sitter")]
+        reg.register(Box::new(CodeOutlineTool));
+        #[cfg(feature = "tree-sitter")]
+        reg.register(Box::new(FindSymbolTool));
+        #[cfg(feature = "tree-sitter")]
+        reg.register(Box::new(FindReferencesTool));
         reg.register(Box::new(EditFileTool));
         reg.register(Box::new(WriteFileTool));
         reg.register(Box::new(ShellTool));
@@ -705,6 +713,10 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p_bytes.len()
 }
 
+/// Walks `dir` like ripgrep `--hidden`: honors `.gitignore` (also outside git repos and from
+/// parent directories), `.ignore`, `.git/info/exclude` and the global git excludes file;
+/// includes dotfiles except `.git`. `is_ignored_dir` stays as a safety net for repos that do
+/// not ignore build output. Results are in sorted (deterministic) depth-first order.
 fn collect_workspace_files(
     root: &Path,
     dir: &Path,
@@ -713,37 +725,34 @@ fn collect_workspace_files(
     cancel: &CancelToken,
     out: &mut Vec<PathBuf>,
 ) {
-    if out.len() >= max_results || cancel.is_cancelled() {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut sorted: Vec<_> = entries.flatten().collect();
-    sorted.sort_by_key(|e| e.file_name());
-
-    for entry in sorted {
-        if out.len() >= max_results {
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            !(e.file_type().is_some_and(|t| t.is_dir())
+                && is_ignored_dir(&e.file_name().to_string_lossy()))
+        })
+        .build();
+    for entry in walker.flatten() {
+        if out.len() >= max_results || cancel.is_cancelled() {
             break;
         }
-        let path = entry.path();
-        let fname = entry.file_name().to_string_lossy().to_string();
-        let Ok(ft) = entry.file_type() else {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
-        };
-        if ft.is_dir() {
-            if !is_ignored_dir(&fname) {
-                collect_workspace_files(root, &path, pattern, max_results, cancel, out);
-            }
-        } else if ft.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if wildcard_match(pattern, &rel) || wildcard_match(pattern, &fname) {
-                out.push(path);
-            }
+        }
+        let path = entry.into_path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if wildcard_match(pattern, &rel) || wildcard_match(pattern, &fname) {
+            out.push(path);
         }
     }
 }
@@ -818,8 +827,83 @@ impl AgentTool for FindFilesTool {
     }
 }
 
-/// Tool: `grep_search` (literal, not regex)
+/// Tool: `grep_search` (regex by default, ripgrep-compatible syntax)
 pub struct GrepSearchTool;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrepMode {
+    Content,
+    Files,
+    Count,
+}
+
+/// ripgrep `--smart-case`: case-sensitive only when the pattern contains an uppercase
+/// literal. Escapes (`\S`, `\W`) and Unicode class names (`\p{Lu}`, `\pL`) are ignored.
+fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
+    if fixed {
+        return pattern.chars().any(char::is_uppercase);
+    }
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some('p' | 'P') = chars.next() {
+                if chars.peek() == Some(&'{') {
+                    for c2 in chars.by_ref() {
+                        if c2 == '}' {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+        } else if c.is_uppercase() {
+            return true;
+        }
+    }
+    false
+}
+
+fn clip_grep_line(line: &str) -> String {
+    if line.len() <= MAX_GREP_LINE_CHARS {
+        return line.to_string();
+    }
+    let total = line.chars().count();
+    if total <= MAX_GREP_LINE_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX_GREP_LINE_CHARS).collect();
+    format!("{head}…[+{} chars]", total - MAX_GREP_LINE_CHARS)
+}
+
+/// Renders `matches` (sorted 0-based line indices) like `rg --heading -n`:
+/// `N:text` for matches, `N-text` for context, `--` between non-adjacent groups.
+fn render_grep_matches(lines: &[&str], matches: &[usize], context: usize, out: &mut String) {
+    let last = lines.len().saturating_sub(1);
+    let mut i = 0;
+    while i < matches.len() {
+        let start = matches[i].saturating_sub(context);
+        let mut end = (matches[i] + context).min(last);
+        let mut j = i + 1;
+        while j < matches.len() && matches[j].saturating_sub(context) <= end + 1 {
+            end = (matches[j] + context).min(last);
+            j += 1;
+        }
+        if i > 0 && context > 0 {
+            out.push_str("--\n");
+        }
+        let group = &matches[i..j];
+        for (ln, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+            let sep = if group.binary_search(&ln).is_ok() {
+                ':'
+            } else {
+                '-'
+            };
+            out.push_str(&format!("{}{sep}{}\n", ln + 1, clip_grep_line(line)));
+        }
+        i = j;
+    }
+}
 
 impl AgentTool for GrepSearchTool {
     fn name(&self) -> &'static str {
@@ -827,7 +911,8 @@ impl AgentTool for GrepSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search literal text across workspace files (case-insensitive by default)."
+        "Regex search across workspace files (ripgrep syntax; smart case, force with (?i)/(?-i); \
+         invalid regex falls back to literal). Output is grouped by file as `N:line`."
     }
 
     fn is_read_only(&self) -> bool {
@@ -838,113 +923,661 @@ impl AgentTool for GrepSearchTool {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Literal text to search for." },
-                "dir": { "type": "string", "description": "Optional subdirectory inside workspace to limit the search." },
-                "file_pattern": { "type": "string", "description": "Optional filename/glob filter (e.g. '*.rs')." },
-                "case_sensitive": { "type": "boolean", "description": "Whether search is case-sensitive (default false)." },
-                "context_lines": { "type": "integer", "description": "Number of context lines before/after each match (default 0)." },
-                "max_matches": { "type": "integer", "description": "Maximum matches to return (default 50)." }
+                "pattern": { "type": "string", "description": "Regex (ripgrep/Rust syntax). Smart case: case-insensitive unless the pattern has an uppercase letter." },
+                "path": { "type": "string", "description": "File or directory to search (default: workspace root)." },
+                "glob": { "type": "string", "description": "Filename/path glob filter (e.g. '*.rs')." },
+                "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "description": "content (default): matching lines grouped by file; files_with_matches: paths only; count: per-file match counts." },
+                "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal text (rg -F)." },
+                "context": { "type": "integer", "description": "Context lines around each match (0-5, default 0)." },
+                "head_limit": { "type": "integer", "description": "Max matching lines (files for files_with_matches/count) to return (default 50, max 200)." }
             },
-            "required": ["query"]
+            "required": ["pattern"]
         })
     }
 
     fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let query = str_arg(args, "query")?;
-        if query.is_empty() {
-            return Err("'query' must not be empty".into());
+        let pattern = str_arg(args, "pattern")?;
+        if pattern.is_empty() {
+            return Err("'pattern' must not be empty".into());
         }
-        let file_pattern = args
-            .get("file_pattern")
-            .and_then(Value::as_str)
-            .unwrap_or("*");
-        let case_sensitive = args
-            .get("case_sensitive")
+        let fixed = args
+            .get("fixed_strings")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let context_lines = args
-            .get("context_lines")
+        let case_sensitive = pattern_has_uppercase(pattern, fixed);
+        let mode = match args
+            .get("output_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("content")
+        {
+            "content" => GrepMode::Content,
+            "files_with_matches" | "files" => GrepMode::Files,
+            "count" => GrepMode::Count,
+            other => {
+                return Err(format!(
+                    "invalid output_mode '{other}' (expected content|files_with_matches|count)"
+                ))
+            }
+        };
+        let context = args
+            .get("context")
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .min(5) as usize;
-        let max_matches = args
-            .get("max_matches")
+        let head_limit = args
+            .get("head_limit")
             .and_then(Value::as_u64)
             .unwrap_or(50)
             .clamp(1, 200) as usize;
-        let start_dir =
-            ctx.resolve_workspace_path(args.get("dir").and_then(Value::as_str).unwrap_or("."))?;
+        let glob = args.get("glob").and_then(Value::as_str).unwrap_or("*");
+        let start =
+            ctx.resolve_workspace_path(args.get("path").and_then(Value::as_str).unwrap_or("."))?;
 
-        let canon_root = ctx.canon_root();
-        let mut files = Vec::new();
-        collect_workspace_files(
-            &canon_root,
-            &start_dir,
-            file_pattern,
-            2000,
-            &ctx.cancel,
-            &mut files,
-        );
-
-        let needle = if case_sensitive {
-            query.to_string()
+        // multi_line + crlf keep `^`/`$` line-anchored, so a whole-file `is_match` is a
+        // sound prefilter for the per-line scan.
+        let build = |src: &str| {
+            regex::RegexBuilder::new(src)
+                .case_insensitive(!case_sensitive)
+                .multi_line(true)
+                .crlf(true)
+                .size_limit(8 << 20)
+                .build()
+        };
+        let mut note = String::new();
+        let re = match build(&if fixed {
+            regex::escape(pattern)
         } else {
-            query.to_lowercase()
+            pattern.to_string()
+        }) {
+            Ok(re) => re,
+            Err(e) if !fixed => {
+                let msg = e.to_string();
+                let reason = msg.lines().last().unwrap_or("parse error").trim();
+                note = format!("[invalid regex ({reason}); searched as literal text]\n");
+                build(&regex::escape(pattern)).map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
         };
 
-        let mut hits = Vec::new();
-        for file_path in files {
-            if hits.len() >= max_matches || ctx.cancel.is_cancelled() {
+        let mut files = Vec::new();
+        if start.is_file() {
+            files.push(start);
+        } else {
+            collect_workspace_files(
+                &ctx.canon_root(),
+                &start,
+                glob,
+                MAX_GREP_FILES,
+                &ctx.cancel,
+                &mut files,
+            );
+        }
+        let scan_capped = files.len() >= MAX_GREP_FILES;
+
+        let mut out = String::new();
+        let (mut emitted, mut total_matches, mut file_hits) = (0usize, 0usize, 0usize);
+        let mut limited = false;
+        for file_path in &files {
+            if ctx.cancel.is_cancelled() {
                 break;
             }
-            if fs::metadata(&file_path)
+            if emitted >= head_limit {
+                limited = true;
+                break;
+            }
+            if fs::metadata(file_path)
                 .map(|m| m.len() > MAX_GREP_FILE_BYTES)
                 .unwrap_or(true)
             {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(&file_path) else {
+            let Ok(content) = fs::read_to_string(file_path) else {
                 continue; // skip binary or unreadable files
             };
-            let rel = ctx.rel_to_root(&file_path);
-            let lines: Vec<&str> = content.lines().collect();
-            for (idx, &line) in lines.iter().enumerate() {
-                let matched = if case_sensitive {
-                    line.contains(&needle)
-                } else {
-                    line.to_lowercase().contains(&needle)
-                };
-                if !matched {
-                    continue;
+            if !re.is_match(&content) {
+                continue;
+            }
+            let rel = ctx.rel_to_root(file_path);
+            match mode {
+                GrepMode::Files => {
+                    out.push_str(&rel);
+                    out.push('\n');
+                    emitted += 1;
+                    file_hits += 1;
                 }
-                if context_lines == 0 {
-                    hits.push(format!("{rel}:{}: {line}", idx + 1));
-                } else {
-                    let start = idx.saturating_sub(context_lines);
-                    let end = (idx + context_lines + 1).min(lines.len());
-                    let mut block = Vec::new();
-                    for (ci, &cline) in lines[start..end].iter().enumerate() {
-                        let line_no = start + ci + 1;
-                        let sep = if start + ci == idx { ":" } else { "-" };
-                        block.push(format!("{rel}{sep}{line_no}{sep} {cline}"));
+                GrepMode::Count => {
+                    let n = content.lines().filter(|l| re.is_match(l)).count();
+                    if n == 0 {
+                        continue;
                     }
-                    hits.push(block.join("\n"));
+                    out.push_str(&format!("{rel}:{n}\n"));
+                    emitted += 1;
+                    file_hits += 1;
+                    total_matches += n;
                 }
-                if hits.len() >= max_matches {
-                    break;
+                GrepMode::Content => {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let mut matched = Vec::new();
+                    for (idx, line) in lines.iter().enumerate() {
+                        if re.is_match(line) {
+                            if emitted + matched.len() >= head_limit {
+                                limited = true;
+                                break;
+                            }
+                            matched.push(idx);
+                        }
+                    }
+                    if matched.is_empty() {
+                        continue;
+                    }
+                    emitted += matched.len();
+                    total_matches += matched.len();
+                    file_hits += 1;
+                    out.push_str(&rel);
+                    out.push('\n');
+                    render_grep_matches(&lines, &matched, context, &mut out);
                 }
             }
         }
 
-        if hits.is_empty() {
-            Ok(format!("No matches found for '{query}'."))
-        } else {
-            Ok(format!(
-                "Found {} match(es) for '{query}':\n{}",
-                hits.len(),
-                hits.join("\n")
-            ))
+        let mut footer = String::new();
+        if limited {
+            footer.push_str(&format!(
+                "[stopped at head_limit={head_limit}; more results may exist - narrow pattern/path/glob]\n"
+            ));
         }
+        if scan_capped {
+            footer.push_str(&format!(
+                "[only the first {MAX_GREP_FILES} files were scanned - narrow path/glob]\n"
+            ));
+        }
+        if file_hits == 0 {
+            return Ok(format!("{note}No matches for /{pattern}/.\n{footer}")
+                .trim_end()
+                .to_string());
+        }
+        let header = match mode {
+            GrepMode::Files => format!("Found {file_hits} file(s):"),
+            _ => format!("Found {total_matches} match(es) in {file_hits} file(s):"),
+        };
+        Ok(format!("{note}{header}\n{out}{footer}")
+            .trim_end()
+            .to_string())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// AST tools (tree-sitter). Gated by the `ast` permission so usage can be measured
+// (events: kind='tool_finished', data.tool) and switched off without code changes.
+// ----------------------------------------------------------------------------
+
+#[cfg(feature = "tree-sitter")]
+const AST_OUTPUT_BUDGET_CHARS: usize = 10_000;
+#[cfg(feature = "tree-sitter")]
+const AST_MAX_DIR_FILES: usize = 2000;
+#[cfg(feature = "tree-sitter")]
+const MAX_SYMBOL_MATCHES: usize = 20;
+#[cfg(feature = "tree-sitter")]
+const MAX_SYMBOL_BODY_LINES: usize = 300;
+#[cfg(feature = "tree-sitter")]
+const MAX_OUTLINE_LINE_CHARS: usize = 160;
+
+/// Names of the tree-sitter tools, removed together when the `ast` permission is off.
+pub const AST_TOOLS: [&str; 3] = ["code_outline", "find_symbol", "find_references"];
+
+#[cfg(feature = "tree-sitter")]
+fn clip_outline_line(line: &str) -> String {
+    let line = line.trim();
+    if line.chars().count() <= MAX_OUTLINE_LINE_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX_OUTLINE_LINE_CHARS).collect();
+    format!("{head}…")
+}
+
+#[cfg(feature = "tree-sitter")]
+fn line_span(start: usize, end: usize) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+/// Supported, size-bounded source files under `start` (or `start` itself).
+#[cfg(feature = "tree-sitter")]
+fn ast_source_files(ctx: &ToolContext, start: &Path) -> (Vec<PathBuf>, bool) {
+    use crate::tree_sitter_diff::{SupportedLanguage, MAX_TREESITTER_FILE_BYTES};
+    let max_bytes = MAX_TREESITTER_FILE_BYTES as u64;
+    let within_limit = |p: &Path| {
+        fs::metadata(p)
+            .map(|m| m.len() <= max_bytes)
+            .unwrap_or(false)
+    };
+    let mut files = Vec::new();
+    if start.is_file() {
+        return (vec![start.to_path_buf()], false);
+    }
+    collect_workspace_files(
+        &ctx.canon_root(),
+        start,
+        "*",
+        AST_MAX_DIR_FILES,
+        &ctx.cancel,
+        &mut files,
+    );
+    let capped = files.len() >= AST_MAX_DIR_FILES;
+    files.retain(|p| SupportedLanguage::from_path(p).is_some() && within_limit(p));
+    (files, capped)
+}
+
+/// Renders symbols as `start-end  <signature>  // <doc>`, indented by depth. Symbols deeper
+/// than `max_depth` are hidden and counted on their visible ancestor as `(+N)`.
+#[cfg(feature = "tree-sitter")]
+fn render_outline(
+    symbols: &[crate::tree_sitter_diff::Symbol],
+    lines: &[&str],
+    max_depth: usize,
+) -> String {
+    let mut out = String::new();
+    for (i, sym) in symbols.iter().enumerate() {
+        if sym.depth > max_depth {
+            continue;
+        }
+        let hidden = if sym.depth == max_depth {
+            symbols[i + 1..]
+                .iter()
+                .take_while(|s| s.depth > sym.depth)
+                .count()
+        } else {
+            0
+        };
+        let display = sym
+            .signature
+            .as_deref()
+            .map(clip_outline_line)
+            .unwrap_or_else(|| {
+                clip_outline_line(lines.get(sym.name_line - 1).copied().unwrap_or(""))
+            });
+        let hidden_note = if hidden > 0 {
+            format!("  (+{hidden})")
+        } else {
+            String::new()
+        };
+        let doc_note = sym
+            .doc
+            .as_deref()
+            .map(|d| format!("  // {d}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}{}  {}{}{}\n",
+            "  ".repeat(sym.depth),
+            line_span(sym.start_line, sym.end_line),
+            display,
+            hidden_note,
+            doc_note,
+        ));
+    }
+    out
+}
+
+/// Tool: `code_outline`
+#[cfg(feature = "tree-sitter")]
+pub struct CodeOutlineTool;
+
+#[cfg(feature = "tree-sitter")]
+impl AgentTool for CodeOutlineTool {
+    fn name(&self) -> &'static str {
+        "code_outline"
+    }
+
+    fn description(&self) -> &'static str {
+        "List definitions (tree-sitter) as `start-end  <signature>  // <doc>`: nested for a file, \
+         top-level per file for a directory. Normalized signatures only; call read_file or \
+         find_symbol(include_body=true) before edit_file."
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Source file or directory relative to workspace root." }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        use crate::tree_sitter_diff::extract_symbols;
+        let raw_path = str_arg(args, "path")?;
+        let start = ctx.resolve_workspace_path(raw_path)?;
+
+        if start.is_file() {
+            let source = read_text(&start)?;
+            let (lang, symbols) = extract_symbols(&start, &source)?;
+            let lines: Vec<&str> = source.lines().collect();
+            let header = format!(
+                "{} ({}, {} lines, {} definitions)",
+                ctx.rel_to_root(&start),
+                lang.as_str(),
+                lines.len(),
+                symbols.len()
+            );
+            if symbols.is_empty() {
+                return Ok(format!("{header}\nNo definitions found."));
+            }
+            // Fold nested levels until the outline fits, instead of a blind head/tail cut.
+            let deepest = symbols.iter().map(|s| s.depth).max().unwrap_or(0);
+            let mut max_depth = deepest;
+            let mut body = render_outline(&symbols, &lines, max_depth);
+            while body.len() > AST_OUTPUT_BUDGET_CHARS && max_depth > 0 {
+                max_depth -= 1;
+                body = render_outline(&symbols, &lines, max_depth);
+            }
+            let note = if max_depth < deepest {
+                "[nested definitions folded as (+N) to fit; use find_symbol for a member]\n"
+            } else {
+                ""
+            };
+            return Ok(format!("{header}\n{note}{}", body.trim_end()));
+        }
+
+        let (files, capped) = ast_source_files(ctx, &start);
+        let mut out = String::new();
+        let mut shown = 0usize;
+        for file in &files {
+            if ctx.cancel.is_cancelled() || out.len() > AST_OUTPUT_BUDGET_CHARS {
+                break;
+            }
+            let Ok(source) = read_text(file) else {
+                continue;
+            };
+            let Ok((_, symbols)) = extract_symbols(file, &source) else {
+                continue;
+            };
+            let lines: Vec<&str> = source.lines().collect();
+            out.push_str(&format!(
+                "{} ({} lines)\n",
+                ctx.rel_to_root(file),
+                lines.len()
+            ));
+            out.push_str(&render_outline(&symbols, &lines, 0));
+            shown += 1;
+        }
+        if shown == 0 {
+            return Ok(format!("No supported source files under '{raw_path}'."));
+        }
+        if shown < files.len() {
+            out.push_str(&format!(
+                "[{} more file(s) not shown; pass a narrower path]\n",
+                files.len() - shown
+            ));
+        }
+        if capped {
+            out.push_str(&format!(
+                "[only the first {AST_MAX_DIR_FILES} files were scanned]\n"
+            ));
+        }
+        Ok(out.trim_end().to_string())
+    }
+}
+
+/// Tool: `find_symbol`
+#[cfg(feature = "tree-sitter")]
+pub struct FindSymbolTool;
+
+#[cfg(feature = "tree-sitter")]
+impl AgentTool for FindSymbolTool {
+    fn name(&self) -> &'static str {
+        "find_symbol"
+    }
+
+    fn description(&self) -> &'static str {
+        "Find definitions by name or Parent/child name path (tree-sitter; exact match, else \
+         case-insensitive substring). include_body returns numbered source like read_file."
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Symbol name or name path, e.g. 'execute', 'GrepSearchTool/execute' ('::' and '.' also accepted)." },
+                "path": { "type": "string", "description": "File or directory to search (default: workspace root)." },
+                "include_body": { "type": "boolean", "description": "Return the full numbered source of each match (default false)." }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        use crate::tree_sitter_diff::{extract_symbols, split_name_path, Symbol};
+        let name = str_arg(args, "name")?;
+        let query = split_name_path(name);
+        let Some(last) = query.last() else {
+            return Err("'name' must contain a symbol name".into());
+        };
+        let include_body = args
+            .get("include_body")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let start =
+            ctx.resolve_workspace_path(args.get("path").and_then(Value::as_str).unwrap_or("."))?;
+        let (files, capped) = ast_source_files(ctx, &start);
+        let needle = last.to_lowercase();
+
+        // (file, source, symbols) for files that can contain the name at all.
+        let mut parsed: Vec<(PathBuf, String, Vec<Symbol>)> = Vec::new();
+        for file in files {
+            if ctx.cancel.is_cancelled() {
+                break;
+            }
+            let Ok(source) = read_text(&file) else {
+                continue;
+            };
+            if !source.to_lowercase().contains(&needle) {
+                continue;
+            }
+            if let Ok((_, symbols)) = extract_symbols(&file, &source) {
+                parsed.push((file, source, symbols));
+            }
+        }
+
+        let collect = |exact: bool| -> Vec<(usize, usize)> {
+            let mut hits = Vec::new();
+            for (fi, (_, _, symbols)) in parsed.iter().enumerate() {
+                for (si, sym) in symbols.iter().enumerate() {
+                    if crate::tree_sitter_diff::symbol_matches(&sym.path, &query, exact) {
+                        hits.push((fi, si));
+                    }
+                }
+            }
+            hits
+        };
+        let mut note = "";
+        let mut hits = collect(true);
+        if hits.is_empty() {
+            hits = collect(false);
+            note = "[no exact match; showing case-insensitive substring matches]\n";
+        }
+        if hits.is_empty() {
+            let mut msg = format!("No definitions matching '{name}'.");
+            if capped {
+                msg.push_str(&format!(
+                    " [only the first {AST_MAX_DIR_FILES} files were scanned; pass a narrower path]"
+                ));
+            }
+            return Ok(msg);
+        }
+
+        let total = hits.len();
+        let mut shown = 0usize;
+        let mut budget_stopped = false;
+        let mut out = format!("{note}Found {total} definition(s) of '{name}':\n");
+        for &(fi, si) in hits.iter().take(MAX_SYMBOL_MATCHES) {
+            if shown > 0 && out.len() >= AST_OUTPUT_BUDGET_CHARS {
+                budget_stopped = true;
+                break;
+            }
+            let (file, source, symbols) = &parsed[fi];
+            let sym = &symbols[si];
+            let lines: Vec<&str> = source.lines().collect();
+            let rel = ctx.rel_to_root(file);
+            let span = line_span(sym.start_line, sym.end_line);
+            let qualified = if sym.path.len() > 1 {
+                format!("  {}", sym.qualified_name())
+            } else {
+                String::new()
+            };
+            let doc_note = sym
+                .doc
+                .as_deref()
+                .map(|d| format!("  // {d}"))
+                .unwrap_or_default();
+            if include_body {
+                out.push_str(&format!("{rel}:{span}{qualified}{doc_note}\n"));
+                let end = sym
+                    .end_line
+                    .min(sym.start_line + MAX_SYMBOL_BODY_LINES - 1)
+                    .min(lines.len());
+                for ln in sym.start_line..=end {
+                    out.push_str(&format!("{ln:>4} | {}\n", lines[ln - 1]));
+                }
+                if end < sym.end_line {
+                    out.push_str(&format!(
+                        "... [{} more line(s); call read_file with start_line={}]\n",
+                        sym.end_line - end,
+                        end + 1
+                    ));
+                }
+            } else {
+                let display = sym
+                    .signature
+                    .as_deref()
+                    .map(clip_outline_line)
+                    .unwrap_or_else(|| {
+                        clip_outline_line(lines.get(sym.name_line - 1).copied().unwrap_or(""))
+                    });
+                out.push_str(&format!("{rel}:{span}{qualified}  {display}{doc_note}\n"));
+            }
+            shown += 1;
+        }
+        if budget_stopped || total > MAX_SYMBOL_MATCHES {
+            out.push_str(&format!(
+                "[{} more match(es) not shown; use a Parent/child name path or narrower path]\n",
+                total - shown
+            ));
+        }
+        Ok(out.trim_end().to_string())
+    }
+}
+
+/// Tool: `find_references`
+#[cfg(feature = "tree-sitter")]
+pub struct FindReferencesTool;
+
+#[cfg(feature = "tree-sitter")]
+impl AgentTool for FindReferencesTool {
+    fn name(&self) -> &'static str {
+        "find_references"
+    }
+
+    fn description(&self) -> &'static str {
+        "Find AST-verified references to a symbol or Parent/member (skips comments, strings, \
+         imports, definitions, and tests by default). Shows enclosing function and call line."
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Symbol name or Parent/member (e.g. 'execute' or 'Grep::execute')." },
+                "path": { "type": "string", "description": "File or directory to search (default: workspace root)." },
+                "include_tests": { "type": "boolean", "description": "Include references inside tests (default false)." },
+                "max_results": { "type": "integer", "description": "Max references to return (default 20, max 50)." }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        use crate::tree_sitter_diff::{find_references_in_files, split_name_path};
+        let name = str_arg(args, "name")?;
+        let parts = split_name_path(name);
+        let Some(&leaf) = parts.last() else {
+            return Err("'name' must not be empty".into());
+        };
+        let include_tests = args
+            .get("include_tests")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let start =
+            ctx.resolve_workspace_path(args.get("path").and_then(Value::as_str).unwrap_or("."))?;
+        let (file_paths, capped) = ast_source_files(ctx, &start);
+
+        let mut sources: Vec<(PathBuf, String)> = Vec::new();
+        for fp in file_paths {
+            if ctx.cancel.is_cancelled() {
+                break;
+            }
+            let Ok(src) = read_text(&fp) else { continue };
+            if !src.contains(leaf) {
+                continue;
+            }
+            sources.push((PathBuf::from(ctx.rel_to_root(&fp)), src));
+        }
+        let refs = find_references_in_files(name, &sources, include_tests, max);
+        if refs.is_empty() {
+            let mut msg = format!("No references to '{name}' found.");
+            if capped {
+                msg.push_str(" [file limit reached; narrow path]");
+            }
+            return Ok(msg);
+        }
+
+        // Group output by file (like grep_search) to minimize repeated paths.
+        let mut files_count = 0usize;
+        let mut body = String::new();
+        let mut cur_file: Option<&Path> = None;
+        for r in &refs {
+            if cur_file != Some(r.file.as_path()) {
+                files_count += 1;
+                cur_file = Some(r.file.as_path());
+                body.push_str(&r.file.to_string_lossy().replace('\\', "/"));
+                body.push('\n');
+            }
+            let scope = r.enclosing_sig.as_deref().unwrap_or("module");
+            body.push_str(&format!("  {} [{scope}]  {}\n", r.line, r.call_line));
+        }
+        let mut out = format!(
+            "Found {} reference(s) to '{name}' in {files_count} file(s):\n{body}",
+            refs.len()
+        );
+        if refs.len() >= max {
+            out.push_str("[limit reached; pass a narrower path or increase max_results]\n");
+        }
+        if capped {
+            out.push_str(&format!(
+                "[only the first {AST_MAX_DIR_FILES} files were scanned]\n"
+            ));
+        }
+        Ok(out.trim_end().to_string())
     }
 }
 

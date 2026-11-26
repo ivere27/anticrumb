@@ -58,6 +58,8 @@ tower = { version = "0.5", features = ["util"] }
 tree-sitter = { version = "0.25", optional = true }
 ts-grammars = { path = "ts-grammars", optional = true }
 rayon = { version = "1", optional = true }
+regex = "1"
+ignore = "0.4"
 
 [features]
 default = ["tree-sitter"]

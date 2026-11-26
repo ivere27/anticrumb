@@ -1242,6 +1242,14 @@ pub trait WorkspaceServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
 
 
+    fn approve_tool(&self, context: Context,
+
+        request: ApproveToolRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
+
+
     fn cancel_agent(&self, context: Context,
 
         request: AgentRef,
@@ -1404,6 +1412,28 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
 
 
                     let response = service.steer_agent(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/ApproveTool",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ApproveToolRequest>();
+                    let responses = responses.typed::<Empty>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.approve_tool(context,
                         request).await?;
                     responses.send(response).await
 

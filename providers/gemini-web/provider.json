@@ -1,5 +1,5 @@
 {
   "id": "gemini-web",
   "name": "Gemini Web",
-  "inline_prompt_chars": 4000
+  "inline_prompt_chars": 8000
 }

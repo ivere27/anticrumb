@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const MAX_FILES: usize = 10;
+pub const MAX_FILES: usize = 30;
 pub const MAX_FILE_BYTES: u64 = crate::domain::MAX_ARTIFACT_BYTES;
 
 #[derive(Clone, Debug, Default)]
@@ -559,9 +559,9 @@ fn add(files: &mut Vec<PathBuf>, path: PathBuf) -> Result<()> {
         files.push(path);
     }
     if files.len() > MAX_FILES {
-        return Err(ServiceError::invalid(
-            "at most 10 attachments per conversation; start /new to attach a different set",
-        ));
+        return Err(ServiceError::invalid(format!(
+            "at most {MAX_FILES} attachments per conversation; start /new to attach a different set"
+        )));
     }
     Ok(())
 }
@@ -814,7 +814,9 @@ mod tests {
             explicit.push(p);
         }
         let err = prepare("Check @git:diff", dir.path(), &explicit).unwrap_err();
-        assert!(err.to_string().contains("at most 10 attachments"));
+        assert!(err
+            .to_string()
+            .contains(&format!("at most {MAX_FILES} attachments")));
 
         let mut recorded_temps = Vec::new();
         let err = prepare_internal(
@@ -825,7 +827,9 @@ mod tests {
             &mut recorded_temps,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("at most 10 attachments"));
+        assert!(err
+            .to_string()
+            .contains(&format!("at most {MAX_FILES} attachments")));
         assert_eq!(recorded_temps.len(), 1);
         assert!(recorded_temps[0].exists());
         cleanup_temp_files(&recorded_temps);
@@ -1305,12 +1309,16 @@ fn other() -> i32 {
             explicit.push(p);
         }
         let err = prepare("@git:HEAD", dir.path(), &explicit).unwrap_err();
-        assert!(err.to_string().contains("at most 10 attachments"));
+        assert!(err
+            .to_string()
+            .contains(&format!("at most {MAX_FILES} attachments")));
 
         let mut recorded_temps = Vec::new();
         let err = prepare_internal("@git:HEAD", dir.path(), &explicit, &[], &mut recorded_temps)
             .unwrap_err();
-        assert!(err.to_string().contains("at most 10 attachments"));
+        assert!(err
+            .to_string()
+            .contains(&format!("at most {MAX_FILES} attachments")));
         assert_eq!(recorded_temps.len(), 1);
         assert!(recorded_temps[0].exists());
         cleanup_temp_files(&recorded_temps);

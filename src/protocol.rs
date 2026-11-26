@@ -17,7 +17,7 @@ pub fn validate(request: &TurnRequest) -> Result<()> {
     if request.timeout_secs == 0 || request.timeout_secs > 900 {
         return Err(ServiceError::invalid("timeout_secs must be 1..900"));
     }
-    if request.tools.len() > 128 || request.artifacts.len() > 10 {
+    if request.tools.len() > 128 || request.artifacts.len() > crate::input::MAX_FILES {
         return Err(ServiceError::invalid("too many tools or artifacts"));
     }
     if !request.tool_choice.is_supported() {

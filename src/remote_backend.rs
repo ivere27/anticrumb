@@ -147,9 +147,10 @@ impl RemoteBackend {
             return Ok(request);
         }
         if request.artifacts.len() >= crate::input::MAX_FILES {
-            return Err(ServiceError::invalid(
-                "the prompt attachment needs one file slot; send at most 9 user files in this turn and attach the rest in a follow-up",
-            ));
+            return Err(ServiceError::invalid(format!(
+                "the prompt attachment needs one file slot; send at most {} user files in this turn and attach the rest in a follow-up",
+                crate::input::MAX_FILES - 1
+            )));
         }
         if prompt.len() as u64 > crate::input::MAX_FILE_BYTES {
             return Err(ServiceError::invalid(format!(
@@ -319,7 +320,10 @@ impl AgentBackend for RemoteBackend {
             }
         }
         if unique.len() >= crate::input::MAX_FILES {
-            return Err("at most 9 tool images per model turn (one slot reserved for the prompt); use fewer screenshot actions per reply".into());
+            return Err(format!(
+                "at most {} tool images per model turn (one slot reserved for the prompt); use fewer screenshot actions per reply",
+                crate::input::MAX_FILES - 1
+            ));
         }
         self.step_artifacts = unique;
         Ok(())
@@ -332,7 +336,10 @@ impl AgentBackend for RemoteBackend {
             }
         }
         if all.len() > crate::input::MAX_FILES {
-            return Err("at most 10 attachments per conversation".into());
+            return Err(format!(
+                "at most {} attachments per conversation",
+                crate::input::MAX_FILES
+            ));
         }
         self.artifacts = all;
         Ok(())
@@ -608,8 +615,8 @@ mod tests {
             let session=backend.session.clone();
             eprintln!("LIVE {provider_id}: initial prompt attached and read correctly");
             let next_token=format!("FOLLOWUP_{}",uuid::Uuid::new_v4().simple());
-            let follow=format!("For this turn reply only with the NEW verification code at the end of this file.\n{}\nVerification code: {next_token}","Long prompt attachment verification context.\n".repeat(120));
-            assert!(follow.chars().count()>2_000);
+            let follow=format!("For this turn reply only with the NEW verification code at the end of this file.\n{}\nVerification code: {next_token}","Long prompt attachment verification context.\n".repeat(200));
+            assert!(follow.chars().count()>crate::provider::DEFAULT_INLINE_PROMPT_CHARS as usize);
             let response=backend.ask_step(&follow,false,&mut |_|{}).map_err(ServiceError::invalid)?;
             if !response.contains(&next_token){return Err(ServiceError::invalid("long follow-up attachment was not read correctly"));}
             assert_eq!(backend.session,session,"long prompt must keep the same conversation");
@@ -621,7 +628,7 @@ mod tests {
             assert_prompt_file(&test_store,&first.request,&initial);
             assert_prompt_file(&test_store,&second.request,&follow);
             assert_eq!(first.request.artifacts.len(),1);assert_eq!(second.request.artifacts.len(),1);
-            eprintln!("LIVE {provider_id}: >2,000-character follow-up attached; same session; exact UTF-8 bytes; inline prompt <1,000 chars");
+            eprintln!("LIVE {provider_id}: >{}-character follow-up attached; same session; exact UTF-8 bytes; inline prompt <1,000 chars", crate::provider::DEFAULT_INLINE_PROMPT_CHARS);
             Ok(())
         }).await;
         let mut cleanup_errors = Vec::new();
@@ -812,19 +819,20 @@ mod tests {
                 None,
                 SessionMode::Chat,
             );
+            let max_files = crate::input::MAX_FILES;
             limits
                 .add_artifacts(
-                    &(0..10)
+                    &(0..max_files)
                         .map(|n| format!("user-file-{n}"))
                         .collect::<Vec<_>>(),
                 )
                 .unwrap();
             let error = limits.prepare_turn_request("Initial prompt").unwrap_err();
             assert!(error.message.contains("one file slot"));
-            // One transport attachment plus nine user files fits the wire limit.
+            // One transport attachment plus MAX_FILES - 1 user files fits the wire limit.
             limits.artifacts.pop();
             let request = limits.prepare_turn_request("Initial prompt").unwrap();
-            assert_eq!(request.artifacts.len(), 10);
+            assert_eq!(request.artifacts.len(), max_files);
             crate::protocol::validate(&request).unwrap();
             let error = limits
                 .prepare_turn_request(&"x".repeat(crate::input::MAX_FILE_BYTES as usize + 1))
@@ -840,10 +848,14 @@ mod tests {
                 .contains("does not support screenshot"));
             limits.set_step_artifacts(&[]).unwrap();
             assert!(limits
-                .set_step_artifacts(&(0..10).map(|n| format!("shot-{n}")).collect::<Vec<_>>())
+                .set_step_artifacts(
+                    &(0..max_files)
+                        .map(|n| format!("shot-{n}"))
+                        .collect::<Vec<_>>()
+                )
                 .is_err());
             let request = limits.prepare_turn_request("Initial prompt").unwrap();
-            assert_eq!(request.artifacts.len(), 9);
+            assert_eq!(request.artifacts.len(), max_files - 1);
             assert!(crate::protocol::prompt(&request)
                 .unwrap()
                 .contains("Initial prompt"));

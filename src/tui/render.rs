@@ -4,7 +4,7 @@ use super::{
     debug_log::DebugLogger,
     layout::FrameLayout,
     markdown::{self, Face, Span},
-    reducer::{SelectionTarget, State, SubagentView},
+    reducer::{PendingToolApproval, SelectionTarget, State, SubagentView},
     transcript::clip,
     usage,
 };
@@ -489,6 +489,43 @@ impl State {
         Ok(())
     }
 
+    fn approval_hint_parts(
+        &self,
+        approval: &PendingToolApproval,
+        include_esc: bool,
+    ) -> Vec<(String, Face)> {
+        let mut parts = vec![
+            (" ".into(), Face::MUTED),
+            ("[Y] Approve".into(), Face::HIGHLIGHT_BOLD),
+            ("  ".into(), Face::MUTED),
+            ("[N] Reject".into(), Face::DANGER_BOLD),
+        ];
+        let count_text = if approval.call_count <= 1 {
+            " · 1 tool".to_owned()
+        } else {
+            format!(" · {} tools", approval.call_count)
+        };
+        let origin = approval
+            .source
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        let queued = if self.tool_approvals.len() > 1 {
+            format!(" (+{} queued)", self.tool_approvals.len() - 1)
+        } else {
+            String::new()
+        };
+        parts.push((
+            format!("{count_text}{origin} · step {}{queued}", approval.step),
+            Face::ACCENT,
+        ));
+        if include_esc {
+            parts.push((" · Esc: interrupt".into(), Face::MUTED));
+        }
+        parts
+    }
+
     fn hint_line(&self, layout: FrameLayout) -> (markdown::Line, Option<(u16, u16)>) {
         let w = usize::from(layout.width);
         let resume_notice = self.resume_notice.as_ref().filter(|_| {
@@ -525,12 +562,52 @@ impl State {
         {
             let badge = self.scroll_bottom_badge();
             let spinner = self.spinner();
+            let full_btn = badge.label(spinner);
+            let compact_btn = badge.compact_label(spinner);
+            if let Some(approval) = self.tool_approvals.front() {
+                let raw_btn = if safe_w >= full_btn.width() + 26 {
+                    full_btn.as_str()
+                } else {
+                    compact_btn.as_str()
+                };
+                let btn_text = clip(raw_btn, safe_w);
+                let btn_w = btn_text.width();
+                let left_budget = safe_w.saturating_sub(btn_w + 2);
+                if !btn_text.is_empty() && left_budget >= 23 {
+                    let left_parts =
+                        clip_spans(self.approval_hint_parts(approval, false), left_budget);
+                    let left_w = spans_width(&left_parts);
+                    let gap = safe_w.saturating_sub(left_w + btn_w);
+                    let mut line: markdown::Line = left_parts
+                        .into_iter()
+                        .map(|(text, face)| Span { text, face })
+                        .collect();
+                    if gap > 0 {
+                        line.push(Span {
+                            text: " ".repeat(gap),
+                            face: Face::MUTED,
+                        });
+                    }
+                    let btn_start = left_w + gap;
+                    line.push(Span {
+                        text: btn_text,
+                        face: Face::ACCENT_BOLD,
+                    });
+                    return (line, Some((btn_start as u16, (btn_start + btn_w) as u16)));
+                }
+                let line: markdown::Line =
+                    clip_spans(self.approval_hint_parts(approval, false), safe_w)
+                        .into_iter()
+                        .map(|(text, face)| Span { text, face })
+                        .collect();
+                return (line, None);
+            }
             let raw_btn = if safe_w >= 22 {
-                badge.label(spinner)
+                full_btn.as_str()
             } else {
-                badge.compact_label(spinner)
+                compact_btn.as_str()
             };
-            let btn_text = clip(&raw_btn, safe_w);
+            let btn_text = clip(raw_btn, safe_w);
             let btn_w = btn_text.width();
             if !btn_text.is_empty() {
                 if let Some((right_text, badge_face)) = right_badge.as_ref() {
@@ -584,6 +661,48 @@ impl State {
                     });
                     return (line, Some((start as u16, (start + btn_w) as u16)));
                 }
+            }
+        }
+
+        if self.history_clear_confirmation.is_none()
+            && self.selection.is_none()
+            && resume_notice.is_none()
+        {
+            if let Some(approval) = self.tool_approvals.front() {
+                let parts = self.approval_hint_parts(approval, true);
+                let mut line = Vec::new();
+                if let Some((badge, badge_face)) = right_badge {
+                    let badge_clipped = clip(&badge, safe_w);
+                    let badge_w = badge_clipped.width();
+                    let left_max = safe_w.saturating_sub(badge_w + 2);
+                    let left_parts = if left_max >= 8 {
+                        clip_spans(parts, left_max)
+                    } else {
+                        Vec::new()
+                    };
+                    let left_w = spans_width(&left_parts);
+                    let pad = safe_w.saturating_sub(left_w + badge_w);
+                    for (text, face) in left_parts {
+                        line.push(Span { text, face });
+                    }
+                    if pad > 0 {
+                        line.push(Span {
+                            text: " ".repeat(pad),
+                            face: Face::MUTED,
+                        });
+                    }
+                    if !badge_clipped.is_empty() {
+                        line.push(Span {
+                            text: badge_clipped,
+                            face: badge_face,
+                        });
+                    }
+                } else {
+                    for (text, face) in clip_spans(parts, safe_w) {
+                        line.push(Span { text, face });
+                    }
+                }
+                return (line, None);
             }
         }
 

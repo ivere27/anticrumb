@@ -626,8 +626,8 @@ impl WebChatTab {
         files: &[PathBuf],
         mut progress: Option<&mut F>,
     ) -> Result<(), String> {
-        if files.len() > 10 {
-            return Err("maximum 10 attachments".into());
+        if files.len() > crate::input::MAX_FILES {
+            return Err(format!("maximum {} attachments", crate::input::MAX_FILES));
         }
         for file in files {
             let file = std::fs::canonicalize(file).map_err(|e| e.to_string())?;
@@ -1137,7 +1137,7 @@ impl WebChatTab {
         let _ = self.human_click("editor", json!({}))?;
         self.human_pause(30, 75)?;
         self.cdp.call("Input.insertText", json!({"text": prompt}))?;
-        let input_ready = Instant::now() + Duration::from_secs(2);
+        let input_ready = Instant::now() + Duration::from_secs(5);
         loop {
             let checked = self.action("verify_input", json!({"text": prompt}))?;
             if checked["ok"] == true {
