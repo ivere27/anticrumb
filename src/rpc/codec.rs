@@ -141,6 +141,23 @@ pub fn tool_permissions_from(p: pb::ToolPermissions) -> d::ToolPermissions {
         subagent: p.subagent,
     }
 }
+pub fn tool_approval_mode_from(raw: i32) -> Result<d::ToolApprovalMode> {
+    match pb::ToolApprovalMode::try_from(raw) {
+        Ok(pb::ToolApprovalMode::Unspecified) => Ok(d::ToolApprovalMode::Unspecified),
+        Ok(pb::ToolApprovalMode::Ask) => Ok(d::ToolApprovalMode::Ask),
+        Ok(pb::ToolApprovalMode::Auto) => Ok(d::ToolApprovalMode::Auto),
+        Err(_) => Err(ServiceError::invalid(format!(
+            "invalid tool approval mode: {raw}"
+        ))),
+    }
+}
+pub fn tool_approval_mode_to(mode: d::ToolApprovalMode) -> i32 {
+    match mode {
+        d::ToolApprovalMode::Unspecified => pb::ToolApprovalMode::Unspecified as i32,
+        d::ToolApprovalMode::Ask => pb::ToolApprovalMode::Ask as i32,
+        d::ToolApprovalMode::Auto => pb::ToolApprovalMode::Auto as i32,
+    }
+}
 fn agent_status_str(status: AgentStatus) -> String {
     match status {
         AgentStatus::Completed => "completed",
@@ -910,6 +927,7 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
         chat_only: r.chat_only,
         permissions: r.permissions.map(tool_permissions_to),
         conversation_id: r.conversation_id,
+        tool_approval: tool_approval_mode_to(r.tool_approval),
     }
 }
 pub fn agent_request_from(r: pb::AgentRequest) -> Result<d::AgentRequest> {
@@ -941,6 +959,7 @@ pub fn agent_request_from(r: pb::AgentRequest) -> Result<d::AgentRequest> {
         chat_only: r.chat_only,
         permissions: r.permissions.map(tool_permissions_from),
         session_retention: session_retention_from(r.session_retention)?,
+        tool_approval: tool_approval_mode_from(r.tool_approval)?,
     })
 }
 pub fn agent_to(record: d::AgentRecord) -> pb::Agent {
@@ -1291,6 +1310,16 @@ mod tests {
         assert_eq!(back_req.mode, d::SessionMode::Temporary);
         assert_eq!(back_req.retention, d::SessionRetention::Retain);
 
+        for mode in [
+            d::ToolApprovalMode::Unspecified,
+            d::ToolApprovalMode::Ask,
+            d::ToolApprovalMode::Auto,
+        ] {
+            let wire = tool_approval_mode_to(mode);
+            assert_eq!(tool_approval_mode_from(wire).unwrap(), mode);
+        }
+        assert!(tool_approval_mode_from(999).is_err());
+
         let agent_req = d::AgentRequest {
             environment: None,
             task: "typed agent".into(),
@@ -1314,6 +1343,7 @@ mod tests {
                 subagent: false,
             }),
             session_retention: d::SessionRetention::Ephemeral,
+            tool_approval: d::ToolApprovalMode::Ask,
         };
         let wire_agent = agent_request_to(agent_req.clone());
         assert_eq!(wire_agent.session_mode, pb::SessionMode::Temporary as i32);
@@ -1321,11 +1351,13 @@ mod tests {
             wire_agent.session_retention,
             pb::SessionRetention::Ephemeral as i32
         );
+        assert_eq!(wire_agent.tool_approval, pb::ToolApprovalMode::Ask as i32);
         assert_eq!(wire_agent.max_steps, 42);
         assert!(wire_agent.chat_only);
         let back_agent = agent_request_from(wire_agent).unwrap();
         assert_eq!(back_agent.session_mode, d::SessionMode::Temporary);
         assert_eq!(back_agent.session_retention, d::SessionRetention::Ephemeral);
+        assert_eq!(back_agent.tool_approval, d::ToolApprovalMode::Ask);
         assert_eq!(back_agent.max_steps, 42);
         assert!(back_agent.chat_only);
         assert_eq!(back_agent.permissions, agent_req.permissions);

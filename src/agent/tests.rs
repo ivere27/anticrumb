@@ -1336,3 +1336,374 @@ fn persistent_session_deduplicates_unchanged_read_file_and_invalidates_on_edit()
     );
     let _ = fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn ask_all_prompts_entire_tool_batch_once_and_runs_all_on_approve() {
+    let ws = temp_ws("approval_batch_yes");
+    let (mock, _) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "write_file", "args": {"path": "a.txt", "content": "alpha"}},
+                    {"tool": "write_file", "args": {"path": "b.txt", "content": "beta"}}
+                ]
+            })
+        ),
+        "both written".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy::ask_all();
+    let mut agent = CodingAgent::new(mock, c);
+
+    let gate = ToolApprovalGate::default();
+    let gate_responder = gate.clone();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let events_log = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let events_ref = Arc::clone(&events_log);
+    let responder = std::thread::spawn(move || {
+        let approval_id = req_rx.recv().unwrap();
+        assert!(gate_responder.resolve(&approval_id, true));
+    });
+
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if let AgentEvent::ToolApprovalRequested { id, .. } = &ev {
+                let _ = req_tx.send(id.clone());
+            }
+            events_ref.lock().unwrap().push(ev);
+        }),
+    };
+    let res = agent.run("Create two files", &control).unwrap();
+    responder.join().unwrap();
+
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(res.final_response, "both written");
+    assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "alpha");
+    assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "beta");
+    assert_eq!(res.files_changed, vec!["a.txt", "b.txt"]);
+
+    let events = events_log.lock().unwrap();
+    let req_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolApprovalRequested { step: 1, calls, .. } if calls.len() == 2
+            )
+        })
+        .expect("single batch ToolApprovalRequested with 2 calls");
+    let resolved_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolApprovalResolved {
+                    step: 1,
+                    approved: true,
+                    ..
+                }
+            )
+        })
+        .expect("ToolApprovalResolved(true)");
+    let first_started_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+        .expect("ToolStarted after approval");
+    assert!(req_idx < resolved_idx && resolved_idx < first_started_idx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolApprovalRequested { .. }))
+            .count(),
+        1
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ask_all_skips_entire_batch_on_reject_and_returns_rejection_feedback() {
+    let ws = temp_ws("approval_batch_no");
+    fs::write(ws.join("keep.txt"), "original").unwrap();
+    let (mock, prompts) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "write_file", "args": {"path": "keep.txt", "content": "overwritten"}},
+                    {"tool": "run_shell", "args": {"command": "echo should-not-run"}}
+                ]
+            })
+        ),
+        "stopped safely".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy::ask_all();
+    let mut agent = CodingAgent::new(mock, c);
+
+    let gate = ToolApprovalGate::default();
+    let gate_responder = gate.clone();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let events_log = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let events_ref = Arc::clone(&events_log);
+    let responder = std::thread::spawn(move || {
+        let approval_id = req_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(gate_responder.resolve(&approval_id, false));
+    });
+
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if let AgentEvent::ToolApprovalRequested { id, .. } = &ev {
+                let _ = req_tx.send(id.clone());
+            }
+            events_ref.lock().unwrap().push(ev);
+        }),
+    };
+    let res = agent.run("Attempt overwrite", &control).unwrap();
+    responder.join().unwrap();
+
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(res.final_response, "stopped safely");
+    assert_eq!(fs::read_to_string(ws.join("keep.txt")).unwrap(), "original");
+    assert!(prompts.lock().unwrap()[1].contains("Tool execution rejected by user."));
+
+    let events = events_log.lock().unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolApprovalResolved {
+            step: 1,
+            approved: false,
+            ..
+        }
+    )));
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. }
+        )),
+        "rejected batch must never emit ToolStarted/ToolFinished"
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn approval_wait_cancels_cleanly_when_cancel_token_fires() {
+    let ws = temp_ws("approval_cancel");
+    let (mock, _) = MockBackend::replies(vec![
+        tool_block("write_file", json!({"path": "c.txt", "content": "x"})),
+        "never".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy::ask_all();
+    let mut agent = CodingAgent::new(mock, c);
+
+    let cancel = CancelToken::new();
+    let gate = ToolApprovalGate::default();
+    let cancel_trigger = cancel.clone();
+    let gate_trigger = gate.clone();
+    let events_log = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let events_ref = Arc::clone(&events_log);
+    let control = RunControl {
+        cancel,
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if matches!(ev, AgentEvent::ToolApprovalRequested { .. }) {
+                cancel_trigger.cancel();
+                gate_trigger.wake_all();
+            }
+            events_ref.lock().unwrap().push(ev);
+        }),
+    };
+    let res = agent.run("Write while cancelled", &control).unwrap();
+    assert_eq!(res.status, AgentStatus::Cancelled);
+    assert!(!ws.join("c.txt").exists());
+    assert!(!events_log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolStarted { .. })));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn structured_permission_rules_prompt_only_for_unapproved_calls_in_mixed_batch() {
+    let ws = temp_ws("approval_rules");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(ws.join("src/info.txt"), "hello-src").unwrap();
+    let (mock, prompts) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "read_file", "args": {"path": "src/info.txt"}},
+                    {"tool": "write_file", "args": {"path": "out.txt", "content": "new"}},
+                    {"tool": "run_shell", "args": {"command": "rm -rf ."}},
+                    {"tool": "run_shell", "args": {"command": "echo safe-ok"}}
+                ]
+            })
+        ),
+        "done after mixed policy".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy {
+        default_decision: PermissionDecision::Ask,
+        rules: vec![
+            ToolPermissionRule {
+                tool: "read_file".into(),
+                matcher: ToolArgMatcher::PathPrefix {
+                    prefix: "src/".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "rm ".into(),
+                },
+                decision: PermissionDecision::Deny {
+                    reason: "destructive command blocked by policy".into(),
+                },
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "echo ".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+        ],
+    };
+    let mut agent = CodingAgent::new(mock, c);
+
+    let gate = ToolApprovalGate::default();
+    let gate_responder = gate.clone();
+    let prompted_tools = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompted_ref = Arc::clone(&prompted_tools);
+    let started_tools = Arc::new(Mutex::new(Vec::<String>::new()));
+    let started_ref = Arc::clone(&started_tools);
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| match ev {
+            AgentEvent::ToolApprovalRequested { id, calls, .. } => {
+                *prompted_ref.lock().unwrap() = calls.iter().map(|c| c.tool.clone()).collect();
+                assert!(gate_responder.resolve(&id, false));
+            }
+            AgentEvent::ToolStarted { tool, .. } => {
+                started_ref.lock().unwrap().push(tool);
+            }
+            _ => {}
+        }),
+    };
+    let res = agent.run("Mixed permission rules batch", &control).unwrap();
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(
+        *prompted_tools.lock().unwrap(),
+        vec!["write_file".to_string()],
+        "only Ask calls should require user approval"
+    );
+    assert_eq!(
+        *started_tools.lock().unwrap(),
+        vec!["read_file".to_string(), "run_shell".to_string()]
+    );
+    assert!(!ws.join("out.txt").exists());
+    let step1_prompt = &prompts.lock().unwrap()[1];
+    assert!(step1_prompt.contains("hello-src"));
+    assert!(step1_prompt.contains("safe-ok"));
+    assert!(step1_prompt.contains("destructive command blocked by policy"));
+    assert!(step1_prompt.contains("Tool execution rejected by user."));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn permission_matchers_block_path_traversal_prefix_boundary_and_shell_chaining() {
+    let policy = ToolApprovalPolicy {
+        default_decision: PermissionDecision::Ask,
+        rules: vec![
+            ToolPermissionRule {
+                tool: "read_file".into(),
+                matcher: ToolArgMatcher::PathPrefix {
+                    prefix: "src".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "rm ".into(),
+                },
+                decision: PermissionDecision::Deny {
+                    reason: "blocked".into(),
+                },
+            },
+            ToolPermissionRule {
+                tool: "run_shell".into(),
+                matcher: ToolArgMatcher::CommandPrefix {
+                    prefix: "echo".into(),
+                },
+                decision: PermissionDecision::Allow,
+            },
+        ],
+    };
+
+    let call = |tool: &str, args: serde_json::Value| ToolCallRequest {
+        tool: tool.into(),
+        args,
+    };
+
+    assert_eq!(
+        policy.evaluate_call(&call("read_file", json!({"path": "./src/lib.rs"}))),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("read_file", json!({"path": "src/../.env"}))),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("read_file", json!({"path": "src_secrets/key.txt"}))),
+        PermissionDecision::Ask
+    );
+
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo hello"}))),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo_evil"}))),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo $(id)"}))),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo ok; ls"}))),
+        PermissionDecision::Ask
+    );
+    assert!(matches!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "echo ok && rm -rf ."}))),
+        PermissionDecision::Deny { .. }
+    ));
+    assert!(matches!(
+        policy.evaluate_call(&call("run_shell", json!({"command": "rm -rf . && echo hi"}))),
+        PermissionDecision::Deny { .. }
+    ));
+
+    let gate = ToolApprovalGate::default();
+    {
+        let _guard = gate.register_guard("ap-drop");
+    }
+    assert!(
+        !gate.resolve("ap-drop", true),
+        "dropped ApprovalGuard must clean up unresolved approval_id"
+    );
+}

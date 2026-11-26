@@ -5114,4 +5114,256 @@ mod tests {
         assert_eq!(state.painted_transcript, surviving_top);
         assert_eq!(state.painted_transcript_start, 0);
     }
+
+    #[test]
+    fn tool_approval_batch_review_hint_input_scroll_and_repeat_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            agent: true,
+            yolo: false,
+            ..Default::default()
+        };
+        opts.permissions.edit = true;
+        opts.permissions.shell = true;
+        assert_eq!(
+            opts.agent_request("task".into(), None).tool_approval,
+            crate::domain::ToolApprovalMode::Ask
+        );
+        opts.yolo = true;
+        assert_eq!(
+            opts.agent_request("task".into(), None).tool_approval,
+            crate::domain::ToolApprovalMode::Auto
+        );
+
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            agent: true,
+            yolo: false,
+            ..Default::default()
+        });
+        let (mut tx, rx) = mpsc::sync_channel(16);
+        state.update(Update::Started {
+            id: "agent-ap".into(),
+            conversation_id: "conv-ap".into(),
+        });
+
+        // 1. Batch tool_approval_requested displays every tool + diff/command preview in transcript.
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "agent-ap".into(),
+            kind: "tool_approval_requested".into(),
+            data: json!({
+                "event": "tool_approval_requested",
+                "id": "ap-1",
+                "step": 1,
+                "calls": [
+                    {
+                        "tool": "edit_file",
+                        "args": {"path": "src/main.rs", "old_text": "old_line()", "new_text": "new_line()"}
+                    },
+                    {
+                        "tool": "run_shell",
+                        "args": {"command": "cargo check"}
+                    }
+                ]
+            }),
+            at: 1,
+        }));
+        assert_eq!(state.tool_approvals.len(), 1);
+        assert_eq!(state.phase, "approval (Y/N)");
+        let logs = state.logs();
+        assert!(logs.contains("Review 2 tool(s)"));
+        assert!(logs.contains("[1/2] edit_file: src/main.rs"));
+        assert!(logs.contains("- old_line()"));
+        assert!(logs.contains("+ new_line()"));
+        assert!(logs.contains("[2/2] run_shell"));
+        assert!(logs.contains("$ cargo check"));
+        assert!(logs.contains("Press Y to approve all 2 tools, N to reject"));
+
+        // 2. Queued subagent approval shows queued count in hint bar; rendered frame displays [Y]/[N].
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 2,
+            run_id: "agent-ap".into(),
+            kind: "tool_approval_requested".into(),
+            data: json!({
+                "event": "tool_approval_requested",
+                "id": "ap-2",
+                "step": 2,
+                "source": "worker: scan",
+                "calls": [{"tool": "read_file", "args": {"path": "Cargo.toml"}}]
+            }),
+            at: 2,
+        }));
+        assert_eq!(state.tool_approvals.len(), 2);
+
+        let mut frame = Vec::new();
+        state.render_frame(&mut frame, 100, 24).unwrap();
+        let frame_str = String::from_utf8(frame).unwrap();
+        assert!(frame_str.contains("[Y] Approve"));
+        assert!(frame_str.contains("[N] Reject"));
+        assert!(frame_str.contains("2 tools"));
+        assert!(frame_str.contains("(+1 queued)"));
+
+        // 3. KeyEventKind::Repeat on 'y' must neither respond nor insert into editor.
+        let repeat_y = event::KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::NONE,
+            kind: event::KeyEventKind::Repeat,
+            state: event::KeyEventState::NONE,
+        };
+        assert!(
+            !super::input_loop::handle_input(&mut state, event::Event::Key(repeat_y), &mut tx)
+                .unwrap()
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(state.editor.text.is_empty());
+        assert_eq!(state.tool_approvals.len(), 2);
+
+        // 4. Press 'Y' approves only the front batch ("ap-1"), leaving "ap-2" queued; Press 'n' rejects "ap-2".
+        let press_upper_y = event::KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE);
+        super::input_loop::handle_input(&mut state, event::Event::Key(press_upper_y), &mut tx)
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            Command::ApproveTool {
+                id,
+                approval_id,
+                approved,
+            } => {
+                assert_eq!(id, "agent-ap");
+                assert_eq!(approval_id, "ap-1");
+                assert!(approved);
+            }
+            _ => panic!("expected ApproveTool true for ap-1"),
+        }
+        assert!(state.editor.text.is_empty());
+        assert_eq!(state.tool_approvals.len(), 1);
+        assert_eq!(state.phase, "approval (Y/N)");
+
+        // Replay of resolved event for ap-1 is suppressed via answered_approvals.
+        let logs_before_replay = state.logs();
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 3,
+            run_id: "agent-ap".into(),
+            kind: "tool_approval_resolved".into(),
+            data: json!({"event": "tool_approval_resolved", "id": "ap-1", "step": 1, "approved": true}),
+            at: 3,
+        }));
+        assert_eq!(state.logs(), logs_before_replay);
+
+        let press_n = event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        super::input_loop::handle_input(&mut state, event::Event::Key(press_n), &mut tx).unwrap();
+        match rx.try_recv().unwrap() {
+            Command::ApproveTool {
+                id,
+                approval_id,
+                approved,
+            } => {
+                assert_eq!(id, "agent-ap");
+                assert_eq!(approval_id, "ap-2");
+                assert!(!approved);
+            }
+            _ => panic!("expected ApproveTool false for ap-2"),
+        }
+        assert!(state.tool_approvals.is_empty());
+        assert_eq!(state.phase, "thinking");
+
+        // 5. While pending, scrolling up keeps BOTH [Y]/[N] and clickable scroll-bottom button, and Esc cancels.
+        for i in 1..=30 {
+            state.log(&format!("context line {i}"));
+        }
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 4,
+            run_id: "agent-ap".into(),
+            kind: "tool_approval_requested".into(),
+            data: json!({
+                "event": "tool_approval_requested",
+                "id": "ap-3",
+                "step": 3,
+                "calls": [{"tool": "write_file", "args": {"path": "x.txt", "content": "hi"}}]
+            }),
+            at: 4,
+        }));
+        state.scroll_transcript(true, 8, 100, 20);
+        let mut scrolled_frame = Vec::new();
+        state.render_frame(&mut scrolled_frame, 100, 20).unwrap();
+        let scrolled_str = String::from_utf8(scrolled_frame).unwrap();
+        assert!(scrolled_str.contains("[Y] Approve"));
+        assert!(scrolled_str.contains("[N] Reject"));
+        assert!(
+            scrolled_str.contains("[ ↓ "),
+            "expected scroll button alongside approval hint while scrolled up"
+        );
+        let (btn_row, btn_col, _) = state
+            .scroll_bottom_button
+            .expect("clickable bottom button must remain active while approval pending");
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: btn_col,
+            row: btn_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(state.scroll, 0);
+
+        let esc = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        super::input_loop::handle_input(&mut state, event::Event::Key(esc), &mut tx).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Cancel(id) if id == "agent-ap"));
+    }
+
+    #[test]
+    fn tool_approval_shortcut_ignored_while_typing_and_duplicate_or_narrow_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "default".into(),
+            agent: true,
+            yolo: false,
+            ..Default::default()
+        });
+        let (mut tx, rx) = mpsc::sync_channel(16);
+        state.update(Update::Started {
+            id: "agent-guard".into(),
+            conversation_id: "conv-guard".into(),
+        });
+
+        let req_event = crate::domain::Event {
+            sequence: 1,
+            run_id: "agent-guard".into(),
+            kind: "tool_approval_requested".into(),
+            data: json!({
+                "event": "tool_approval_requested",
+                "id": "ap-dup",
+                "step": 1,
+                "calls": [{"tool": "run_shell", "args": {"command": "cargo test"}}]
+            }),
+            at: 1,
+        };
+        state.update(Update::Event(req_event.clone()));
+        let logs_once = state.logs();
+        // Duplicate approval_id must not re-log or enqueue again.
+        state.update(Update::Event(req_event));
+        assert_eq!(state.tool_approvals.len(), 1);
+        assert_eq!(state.logs(), logs_once);
+
+        // Typing 'y' while composer already has draft text must not approve the tool batch.
+        state.editor.set("please check ".into());
+        let press_y = event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        super::input_loop::handle_input(&mut state, event::Event::Key(press_y), &mut tx).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.tool_approvals.len(), 1);
+        assert!(state.editor.text.ends_with('y'));
+
+        // Narrow scrolled frame must still show [Y] Approve / [N] Reject instead of hiding behind scroll badge.
+        for i in 1..=25 {
+            state.log(&format!("line {i}"));
+        }
+        state.scroll_transcript(true, 6, 36, 16);
+        let mut narrow_frame = Vec::new();
+        state.render_frame(&mut narrow_frame, 36, 16).unwrap();
+        let narrow_str = String::from_utf8(narrow_frame).unwrap();
+        assert!(narrow_str.contains("[Y] Approve"));
+        assert!(narrow_str.contains("[N] Reject"));
+    }
 }

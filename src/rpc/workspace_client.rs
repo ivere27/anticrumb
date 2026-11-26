@@ -628,6 +628,22 @@ pub async fn presentation(
             .await?;
             Ok(json!({"accepted":true}))
         }
+        ("POST", ["api", "agents", id, "approve-tool"]) => {
+            let approval_id = value["approval_id"]
+                .as_str()
+                .ok_or_else(|| ServiceError::invalid("missing approval_id"))?
+                .to_owned();
+            let approved = value["approved"]
+                .as_bool()
+                .ok_or_else(|| ServiceError::invalid("missing approved boolean"))?;
+            rpc.approve_tool(pb::ApproveToolRequest {
+                id: (*id).into(),
+                approval_id,
+                approved,
+            })
+            .await?;
+            Ok(json!({"resolved":true}))
+        }
         ("GET", ["api", "conversations"]) => {
             let mut workspace = None;
             let mut account_id = None;

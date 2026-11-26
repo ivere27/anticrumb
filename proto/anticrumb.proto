@@ -144,6 +144,7 @@ service WorkspaceService {
   rpc GetAgent(AgentRef) returns (Agent);
   rpc ListAgents(Empty) returns (AgentList);
   rpc SteerAgent(SteerRequest) returns (Empty);
+  rpc ApproveTool(ApproveToolRequest) returns (Empty);
   rpc CancelAgent(AgentRef) returns (Empty);
   rpc ReadAgentEvents(EventCursor) returns (EventPage);
   rpc GetConversation(ConversationRef) returns (Conversation);
@@ -220,6 +221,12 @@ enum SessionRetention {
   SESSION_RETENTION_UNSPECIFIED = 0;
   SESSION_RETENTION_EPHEMERAL = 1; // Close the browser session after this turn or agent run ends.
   SESSION_RETENTION_RETAIN = 2; // Keep the browser session open for follow-ups until closed or invalidated.
+}
+
+enum ToolApprovalMode {
+  TOOL_APPROVAL_MODE_UNSPECIFIED = 0;
+  TOOL_APPROVAL_MODE_ASK = 1;
+  TOOL_APPROVAL_MODE_AUTO = 2;
 }
 
 message EventCursor {
@@ -955,6 +962,7 @@ message AgentRequest {
   // Transient client environment for local shell/MCP execution. Never persisted
   // or included in Agent responses. Browser hosts do not expose WorkspaceService.
   map<string, string> environment = 16;
+  ToolApprovalMode tool_approval = 17;
 }
 
 message StartAgentResponse {
@@ -1012,6 +1020,12 @@ message SteerRequest {
   string id = 1;
   string message = 2;
   repeated string artifacts = 3;
+}
+
+message ApproveToolRequest {
+  string id = 1;
+  string approval_id = 2;
+  bool approved = 3;
 }
 
 message ConversationRef {

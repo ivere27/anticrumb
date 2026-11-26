@@ -901,6 +901,12 @@ impl Host {
                 self.agents()?.steer(&r.id, &r.message, r.artifacts)?;
                 reply!(pb::Empty {})
             }
+            "/anticrumb.v1.WorkspaceService/ApproveTool" => {
+                let r = decode!(pb::ApproveToolRequest);
+                self.agents()?
+                    .approve_tool(&r.id, &r.approval_id, r.approved)?;
+                reply!(pb::Empty {})
+            }
             "/anticrumb.v1.WorkspaceService/ResumeConversation" => {
                 let started = self.agents()?.resume(&decode!(pb::ConversationRef).id)?;
                 reply!(pb::StartAgentResponse {

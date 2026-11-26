@@ -4046,3 +4046,180 @@ async fn session_service_proto_api_and_retention_work_across_synurang_ffi_and_gr
     drop(browser_ffi);
     grpc_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_tool_approval_ask_mode_works_across_synurang_ffi_and_grpc() {
+    let browser_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+    let project = local_dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("sample.txt"), "before").unwrap();
+
+    let (browser, echo) = fixture(browser_dir.path());
+    *echo.replies.lock().unwrap() = [
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "write_file", "args": {"path": "a.txt", "content": "first"}},
+                    {"tool": "edit_file", "args": {"path": "sample.txt", "old_text": "before", "new_text": "after"}}
+                ]
+            })
+        ),
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "write_file", "args": {"path": "b.txt", "content": "second"}}
+                ]
+            })
+        ),
+        "all done".to_string(),
+    ]
+    .into();
+
+    let options = Options {
+        root: browser_dir.path().into(),
+        listen: "127.0.0.1:0".into(),
+        self_signed: true,
+        ..Default::default()
+    };
+    let identity = options.identity().unwrap();
+    let pin = certificate_fingerprint(
+        &std::fs::read(browser_dir.path().join("tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+    let (endpoint, grpc_task) = network(browser, identity).await;
+    let workspace = relay::workspace(
+        local_dir.path(),
+        Connection::Grpc {
+            endpoint,
+            token: TOKEN.into(),
+            ca_file: None,
+            server_name: None,
+            tls_pin: Some(pin),
+        },
+    )
+    .await
+    .unwrap();
+    let ws_ffi = RpcClient::embedded(workspace, tokio::runtime::Handle::current()).unwrap();
+    let job = ws_ffi
+        .start_agent(pb::AgentRequest {
+            task: "Apply first batch and reject second batch".into(),
+            workspace: project.to_string_lossy().into_owned(),
+            account_id: "default".into(),
+            chat_only: false,
+            no_shell: true,
+            permissions: Some(pb::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: false,
+                browser: false,
+                subagent: false,
+            }),
+            tool_approval: pb::ToolApprovalMode::Ask as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut after = 0;
+    let mut approval_batches = 0usize;
+    let finished = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let page = ws_ffi
+                .read_agent_events(pb::EventCursor {
+                    run_id: job.id.clone(),
+                    after,
+                })
+                .await
+                .unwrap();
+            for ev in page.events {
+                after = ev.sequence;
+                if ev.kind == "tool_approval_requested" {
+                    let data: serde_json::Value = serde_json::from_str(&ev.data_json).unwrap();
+                    let approval_id = data["id"].as_str().unwrap().to_owned();
+                    let calls = data["calls"].as_array().unwrap();
+                    let approve = match approval_batches {
+                        0 => {
+                            assert_eq!(calls.len(), 2);
+                            assert_eq!(calls[0]["tool"], "write_file");
+                            assert_eq!(calls[1]["tool"], "edit_file");
+                            true
+                        }
+                        1 => {
+                            assert_eq!(calls.len(), 1);
+                            assert_eq!(calls[0]["tool"], "write_file");
+                            false
+                        }
+                        other => panic!("unexpected approval batch #{other}"),
+                    };
+                    approval_batches += 1;
+                    ws_ffi
+                        .approve_tool(pb::ApproveToolRequest {
+                            id: job.id.clone(),
+                            approval_id,
+                            approved: approve,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            let value = ws_ffi
+                .get_agent(pb::AgentRef { id: job.id.clone() })
+                .await
+                .unwrap();
+            if value.state != "running" {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(approval_batches, 2);
+    assert_eq!(finished.state, "completed", "{finished:?}");
+    assert_eq!(finished.result.unwrap().final_response, "all done");
+    assert_eq!(
+        finished.request.unwrap().tool_approval,
+        pb::ToolApprovalMode::Ask as i32
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("a.txt")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("sample.txt")).unwrap(),
+        "after"
+    );
+    assert!(!project.join("b.txt").exists());
+
+    {
+        let requests = echo.requests.lock().unwrap();
+        let last_req = requests.last().unwrap();
+        let mut full_prompt = anticrumb::protocol::prompt(last_req).unwrap();
+        for art_id in &last_req.artifacts {
+            if let Ok((meta, bytes)) = echo.store.artifact_bytes(&last_req.account_id, art_id) {
+                if meta.name.starts_with("anticrumb-prompt-") {
+                    full_prompt.push('\n');
+                    full_prompt.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        assert!(full_prompt.contains("Tool execution rejected by user."));
+    }
+
+    let http_err = anticrumb::rpc::workspace_client::presentation(
+        &ws_ffi,
+        "POST",
+        &format!("/api/agents/{}/approve-tool", job.id),
+        Some(&json!({"approval_id": "missing", "approved": true})),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(http_err.code, ErrorCode::InvalidRequest);
+
+    drop(ws_ffi);
+    grpc_task.abort();
+}

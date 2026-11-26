@@ -17,6 +17,7 @@ use crate::cli::PromptOptions;
 use crossterm::event::{self, MouseButton, MouseEventKind};
 use serde_json::{json, Value};
 use std::{
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -75,6 +76,14 @@ pub(super) struct SelectionDrag {
     pub moved: bool,
     pub entered_top_at: Option<Instant>,
     pub last_autoscroll: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingToolApproval {
+    pub id: String,
+    pub step: usize,
+    pub source: Option<String>,
+    pub call_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +194,8 @@ pub(super) struct State {
     pub stream: String,
     pub thinking_preview: String,
     pub subagents: Vec<SubagentView>,
+    pub tool_approvals: VecDeque<PendingToolApproval>,
+    pub answered_approvals: HashSet<String>,
     pub debug: DebugLogger,
     pub exit_requested: bool,
     pub last_ctrl_c: Option<Instant>,
@@ -278,6 +289,8 @@ impl State {
             stream: String::new(),
             thinking_preview: String::new(),
             subagents: Vec::new(),
+            tool_approvals: VecDeque::new(),
+            answered_approvals: HashSet::new(),
             debug: DebugLogger::default(),
             exit_requested: false,
             last_ctrl_c: None,
@@ -512,6 +525,163 @@ impl State {
                 detail: detail.into(),
             },
         );
+    }
+
+    fn log_preview_lines(&mut self, prefix: &str, text: &str, face: Face, max_lines: usize) {
+        let all_lines: Vec<&str> = text.lines().collect();
+        if all_lines.is_empty() {
+            let plain = format!("{prefix}(empty)");
+            self.log_spans(
+                &plain,
+                vec![(prefix.to_owned(), face), ("(empty)".into(), Face::MUTED)],
+            );
+            return;
+        }
+        for line in all_lines.iter().take(max_lines) {
+            let body = clip(line, 110);
+            let plain = format!("{prefix}{body}");
+            self.log_spans(&plain, vec![(prefix.to_owned(), face), (body, face)]);
+        }
+        if all_lines.len() > max_lines {
+            let rem = format!("… ({} more line(s))", all_lines.len() - max_lines);
+            let plain = format!("{prefix}{rem}");
+            self.log_spans(&plain, vec![(prefix.to_owned(), face), (rem, Face::MUTED)]);
+        }
+    }
+
+    pub(super) fn log_tool_approval_request(
+        &mut self,
+        step: usize,
+        calls: &[Value],
+        source: Option<&str>,
+    ) {
+        let total = calls.len();
+        let origin = source
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
+        let header = format!("\n  ? Review {total} tool(s){origin} · step {step}");
+        self.log_spans(
+            &header,
+            vec![
+                ("\n  ? ".into(), Face::HEADING),
+                (format!("Review {total} tool(s)"), Face::BOLD),
+                (format!("{origin} · step {step}"), Face::MUTED),
+            ],
+        );
+        for (idx, call) in calls.iter().enumerate() {
+            let n = idx + 1;
+            let preview = crate::cli::describe_tool_approval_call(call);
+            let prefix = format!("    [{n}/{total}] ");
+            let detail = if matches!(preview.tool.as_str(), "web_fetch" | "browser_fetch") {
+                clip(&preview.detail, 102)
+            } else {
+                preview.detail
+            };
+            let detail_face = if preview.detail_muted {
+                Face::MUTED
+            } else {
+                Face::TEXT
+            };
+            if detail.is_empty() {
+                self.log_spans(
+                    &format!("{prefix}{}", preview.tool),
+                    vec![(prefix, Face::MUTED), (preview.tool, Face::CODE_BOLD)],
+                );
+            } else {
+                let plain = format!("{prefix}{}{detail}", preview.tool);
+                self.log_spans(
+                    &plain,
+                    vec![
+                        (prefix, Face::MUTED),
+                        (preview.tool, Face::CODE_BOLD),
+                        (detail, detail_face),
+                    ],
+                );
+            }
+            for block in preview.blocks {
+                let face = match block.kind {
+                    crate::cli::ToolPreviewKind::Removed => Face::DANGER,
+                    crate::cli::ToolPreviewKind::Added => Face::HIGHLIGHT,
+                    crate::cli::ToolPreviewKind::Code | crate::cli::ToolPreviewKind::Command => {
+                        Face::CODE
+                    }
+                    crate::cli::ToolPreviewKind::Muted => Face::MUTED,
+                };
+                self.log_preview_lines(block.prefix, &block.text, face, block.max_lines);
+            }
+        }
+        let action_hint = if total <= 1 {
+            "  Press Y to approve tool, N to reject (Esc interrupts).".to_owned()
+        } else {
+            format!("  Press Y to approve all {total} tools, N to reject (Esc interrupts).")
+        };
+        self.log_spans(
+            &action_hint,
+            vec![
+                ("  Press ".into(), Face::MUTED),
+                ("Y".into(), Face::HIGHLIGHT_BOLD),
+                (
+                    if total <= 1 {
+                        " to approve tool, ".into()
+                    } else {
+                        format!(" to approve all {total} tools, ")
+                    },
+                    Face::MUTED,
+                ),
+                ("N".into(), Face::DANGER_BOLD),
+                (" to reject (Esc interrupts).".into(), Face::MUTED),
+            ],
+        );
+    }
+
+    pub(super) fn respond_tool_approval(
+        &mut self,
+        approved: bool,
+        sink: &mut dyn EffectSink,
+    ) -> bool {
+        let Some(agent_id) = self.active.clone() else {
+            self.tool_approvals.clear();
+            return false;
+        };
+        let Some(approval) = self.tool_approvals.pop_front() else {
+            return false;
+        };
+        self.answered_approvals.insert(approval.id.clone());
+        let label = format!("{} tool(s)", approval.call_count.max(1));
+        if approved {
+            self.log_spans(
+                &format!("  ✓ Approved {label}"),
+                vec![
+                    ("  ✓ Approved ".into(), Face::HIGHLIGHT_BOLD),
+                    (label, Face::MUTED),
+                ],
+            );
+        } else {
+            self.log_spans(
+                &format!("  ✗ Rejected {label}"),
+                vec![
+                    ("  ✗ Rejected ".into(), Face::DANGER_BOLD),
+                    (label, Face::MUTED),
+                ],
+            );
+        }
+        self.phase = if !self.tool_approvals.is_empty() {
+            "approval (Y/N)".into()
+        } else if approved {
+            "working".into()
+        } else {
+            "thinking".into()
+        };
+        self.send(
+            sink,
+            Command::ApproveTool {
+                id: agent_id,
+                approval_id: approval.id,
+                approved,
+            },
+        );
+        true
     }
 
     pub(super) fn write_debug_log(&mut self, tag: &str, body: &str) {
@@ -851,6 +1021,8 @@ impl State {
         self.stream.clear();
         self.thinking_preview.clear();
         self.subagents.clear();
+        self.tool_approvals.clear();
+        self.answered_approvals.clear();
         self.reset_scroll();
         self.clear_selection();
         self.clear_painted_regions();
@@ -1724,6 +1896,8 @@ impl State {
         self.stream.clear();
         self.thinking_preview.clear();
         self.subagents.clear();
+        self.tool_approvals.clear();
+        self.answered_approvals.clear();
         self.reset_scroll();
         self.clear_selection();
         self.clear_painted_regions();
@@ -1989,6 +2163,8 @@ impl State {
                 self.stream.clear();
                 self.thinking_preview.clear();
                 self.subagents.clear();
+                self.tool_approvals.clear();
+                self.answered_approvals.clear();
                 self.started = Instant::now();
             }
             Update::Error(error) => self.error(&error),
@@ -2276,6 +2452,8 @@ impl State {
         self.stream.clear();
         self.thinking_preview.clear();
         self.subagents.clear();
+        self.tool_approvals.clear();
+        self.answered_approvals.clear();
         self.phase = job["state"].as_str().unwrap_or("finished").into();
         if let Some(text) = job["result"]["final_response"].as_str() {
             if text != self.last_response {
@@ -2488,6 +2666,77 @@ impl State {
                     }
                 }
                 self.last_response = response.into();
+            }
+            "tool_approval_requested" => {
+                let approval_id = event.data["id"].as_str().unwrap_or("").to_owned();
+                let step = event.data["step"].as_u64().unwrap_or(0) as usize;
+                let source = event.data["source"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned);
+                let calls = event.data["calls"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if !approval_id.is_empty()
+                    && !self.answered_approvals.contains(&approval_id)
+                    && !self
+                        .tool_approvals
+                        .iter()
+                        .any(|item| item.id == approval_id)
+                {
+                    self.tool_approvals.push_back(PendingToolApproval {
+                        id: approval_id,
+                        step,
+                        source: source.clone(),
+                        call_count: calls.len(),
+                    });
+                    self.log_tool_approval_request(step, calls, source.as_deref());
+                    self.phase = "approval (Y/N)".into();
+                    if self.debug.level >= 1 {
+                        self.log_debug(
+                            "approval",
+                            &format!("waiting Y/N for {} tool(s) at step {step}", calls.len()),
+                        );
+                    }
+                }
+            }
+            "tool_approval_resolved" => {
+                let approval_id = event.data["id"].as_str().unwrap_or("");
+                let approved = event.data["approved"] == true;
+                let removed = self
+                    .tool_approvals
+                    .iter()
+                    .position(|item| item.id == approval_id)
+                    .and_then(|idx| self.tool_approvals.remove(idx));
+                if !self.answered_approvals.remove(approval_id) {
+                    let count_label = removed
+                        .as_ref()
+                        .map(|item| format!("{} tool(s)", item.call_count.max(1)))
+                        .unwrap_or_else(|| "tool batch".into());
+                    if approved {
+                        let plain = format!("  ✓ Approved {count_label}");
+                        self.log_spans(
+                            &plain,
+                            vec![
+                                ("  ✓ Approved ".into(), Face::HIGHLIGHT_BOLD),
+                                (count_label, Face::MUTED),
+                            ],
+                        );
+                    } else {
+                        let plain = format!("  ✗ Rejected {count_label}");
+                        self.log_spans(
+                            &plain,
+                            vec![
+                                ("  ✗ Rejected ".into(), Face::DANGER_BOLD),
+                                (count_label, Face::MUTED),
+                            ],
+                        );
+                    }
+                    if self.active.is_some() && self.tool_approvals.is_empty() {
+                        self.phase = if approved { "working" } else { "thinking" }.into();
+                    }
+                }
             }
             "tool_started" => {
                 let tool = event.data["tool"].as_str().unwrap_or("tool");

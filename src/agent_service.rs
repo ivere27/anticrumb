@@ -25,6 +25,7 @@ struct AgentRuntimeSpec {
     allow_spawn_agent: bool,
     chat_only: bool,
     permissions: Option<ToolPermissions>,
+    approval_mode: ToolApprovalMode,
     max_steps: usize,
     artifacts: Vec<String>,
     continued_session: Option<(String, Option<String>, usize)>,
@@ -64,6 +65,14 @@ fn build_coding_agent(
     });
     let effective_allow_shell =
         !spec.chat_only && perms.shell && spec.allow_shell && !spec.read_only;
+    let approval_policy = if spec.chat_only {
+        ToolApprovalPolicy::auto()
+    } else {
+        match spec.approval_mode {
+            ToolApprovalMode::Ask => ToolApprovalPolicy::ask_all(),
+            ToolApprovalMode::Auto | ToolApprovalMode::Unspecified => ToolApprovalPolicy::auto(),
+        }
+    };
     let config = AgentConfig {
         environment: spec.environment.clone(),
         workspace_root: spec.workspace.clone(),
@@ -72,6 +81,7 @@ fn build_coding_agent(
         temp_chat: false,
         step_retries: 0,
         load_instructions: !spec.chat_only,
+        approval_policy,
         ..Default::default()
     };
     if spec.chat_only {
@@ -278,6 +288,46 @@ fn subagent_event_sink(
                 detail,
             });
         }
+        AgentEvent::ToolApprovalRequested {
+            id: approval_id,
+            step,
+            calls,
+            source,
+        } => {
+            parent_events.emit(AgentEvent::SubagentProgress {
+                id: id.clone(),
+                label: label.clone(),
+                phase: "approval".into(),
+                detail: format!("waiting Y/N for {} tool(s)", calls.len()),
+            });
+            parent_events.emit(AgentEvent::ToolApprovalRequested {
+                id: approval_id,
+                step,
+                calls,
+                source: source.or_else(|| Some(format!("worker: {label}"))),
+            });
+        }
+        AgentEvent::ToolApprovalResolved {
+            id: approval_id,
+            step,
+            approved,
+        } => {
+            parent_events.emit(AgentEvent::ToolApprovalResolved {
+                id: approval_id,
+                step,
+                approved,
+            });
+            parent_events.emit(AgentEvent::SubagentProgress {
+                id: id.clone(),
+                label: label.clone(),
+                phase: format!("step {step}"),
+                detail: if approved {
+                    "tools approved".into()
+                } else {
+                    "tools rejected".into()
+                },
+            });
+        }
         AgentEvent::Retrying { step, attempt, .. } => {
             parent_events.emit(AgentEvent::SubagentProgress {
                 id: id.clone(),
@@ -295,6 +345,7 @@ struct SubagentRunner {
     parent_job_id: String,
     base_spec: AgentRuntimeSpec,
     parent_events: EventSink,
+    parent_approvals: ToolApprovalGate,
     browser_fetch: BrowserFetchFn,
     browser_control: BrowserControlFn,
 }
@@ -365,6 +416,7 @@ impl SubagentRunner {
         let sub_control = RunControl {
             cancel: cancel.clone(),
             inbox: SteerInbox::default(),
+            approvals: self.parent_approvals.clone(),
             events: subagent_event_sink(
                 self.manager.store.clone(),
                 self.parent_job_id.clone(),
@@ -536,6 +588,7 @@ impl AgentManager {
         RunControl {
             cancel,
             inbox: SteerInbox::default(),
+            approvals: ToolApprovalGate::default(),
             events,
         }
     }
@@ -609,6 +662,7 @@ impl AgentManager {
             allow_spawn_agent: allow_subagent,
             chat_only: request.chat_only,
             permissions: request.permissions,
+            approval_mode: request.tool_approval,
             max_steps: request.max_steps,
             artifacts: request.artifacts.clone(),
             continued_session: continued,
@@ -626,6 +680,7 @@ impl AgentManager {
                 parent_job_id: job_id.to_owned(),
                 base_spec: spec,
                 parent_events: control.events.clone(),
+                parent_approvals: control.approvals.clone(),
                 browser_fetch,
                 browser_control,
             });
@@ -818,13 +873,16 @@ impl AgentManager {
     pub fn cancel_all(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        for control in self
+        let controls: Vec<_> = self
             .controls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-        {
-            control.cancel.cancel();
+            .map(|c| (c.cancel.clone(), c.approvals.clone()))
+            .collect();
+        for (cancel, approvals) in controls {
+            cancel.cancel();
+            approvals.wake_all();
         }
     }
     pub fn snapshot(&self, id: &str) -> Result<AgentRecord> {
@@ -962,11 +1020,32 @@ impl AgentManager {
         Ok(conv)
     }
     pub fn cancel(&self, id: &str) -> Result<()> {
-        let controls = self.controls.lock().map_err(ServiceError::storage)?;
-        let c = controls
-            .get(id)
-            .ok_or_else(|| ServiceError::invalid("agent is not running"))?;
-        c.cancel.cancel();
+        let (cancel, approvals) = {
+            let controls = self.controls.lock().map_err(ServiceError::storage)?;
+            let c = controls
+                .get(id)
+                .ok_or_else(|| ServiceError::invalid("agent is not running"))?;
+            (c.cancel.clone(), c.approvals.clone())
+        };
+        cancel.cancel();
+        approvals.wake_all();
+        Ok(())
+    }
+    pub fn approve_tool(&self, id: &str, approval_id: &str, approved: bool) -> Result<()> {
+        if approval_id.trim().is_empty() {
+            return Err(ServiceError::invalid("approval_id must not be empty"));
+        }
+        let approvals = {
+            let controls = self.controls.lock().map_err(ServiceError::storage)?;
+            controls
+                .get(id)
+                .ok_or_else(|| ServiceError::invalid("agent is not running"))?
+                .approvals
+                .clone()
+        };
+        if !approvals.resolve(approval_id, approved) {
+            return Err(ServiceError::invalid("approval request is not pending"));
+        }
         Ok(())
     }
     /// Remove an entire saved conversation (all turns and events) and queue
@@ -1518,6 +1597,7 @@ mod tests {
                 RunControl {
                     cancel: CancelToken::new(),
                     inbox: SteerInbox::default(),
+                    approvals: ToolApprovalGate::default(),
                     events: EventSink::new(|_| {}),
                 },
             );
@@ -1552,6 +1632,7 @@ mod tests {
                     chat_only: false,
                     permissions: None,
                     session_retention: SessionRetention::Unspecified,
+                    tool_approval: ToolApprovalMode::Unspecified,
                 },
                 result: None,
                 error: None,
@@ -2078,6 +2159,7 @@ mod tests {
                 chat_only: false,
                 permissions: None,
                 session_retention: SessionRetention::Retain,
+                tool_approval: ToolApprovalMode::Unspecified,
             };
             let lease = {
                 let mut controls = manager.controls.lock().unwrap();
@@ -2160,5 +2242,51 @@ mod tests {
                 .unwrap();
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn approve_tool_validates_job_and_resolves_or_wakes_pending_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store).unwrap();
+
+        let err_empty = manager.approve_tool("job-1", "  ", true).unwrap_err();
+        assert_eq!(err_empty.code, ErrorCode::InvalidRequest);
+        assert!(err_empty.message.contains("approval_id"));
+
+        let err_missing_job = manager
+            .approve_tool("missing-job", "approval-1", true)
+            .unwrap_err();
+        assert_eq!(err_missing_job.code, ErrorCode::InvalidRequest);
+        assert!(err_missing_job.message.contains("not running"));
+
+        let control = manager.new_run_control("job-1");
+        manager
+            .controls
+            .lock()
+            .unwrap()
+            .insert("job-1".into(), control.clone());
+
+        let err_not_pending = manager
+            .approve_tool("job-1", "nonexistent", true)
+            .unwrap_err();
+        assert_eq!(err_not_pending.code, ErrorCode::InvalidRequest);
+        assert!(err_not_pending.message.contains("not pending"));
+
+        control.approvals.register("approval-1");
+        let gate1 = control.approvals.clone();
+        let cancel1 = control.cancel.clone();
+        let waiter1 = std::thread::spawn(move || gate1.wait("approval-1", &cancel1));
+        manager.approve_tool("job-1", "approval-1", true).unwrap();
+        assert_eq!(waiter1.join().unwrap(), Some(true));
+
+        assert!(manager.approve_tool("job-1", "approval-1", false).is_err());
+
+        control.approvals.register("approval-2");
+        let gate2 = control.approvals.clone();
+        let cancel2 = control.cancel.clone();
+        let waiter2 = std::thread::spawn(move || gate2.wait("approval-2", &cancel2));
+        manager.cancel("job-1").unwrap();
+        assert_eq!(waiter2.join().unwrap(), None);
     }
 }

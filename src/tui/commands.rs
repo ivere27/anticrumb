@@ -17,7 +17,7 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Keyboard shortcuts and commands"),
     (
         "/mode",
-        "Switch between Chat mode (default) and Agent mode (--yolo)",
+        "Switch between Chat mode (default), Agent mode (Y/N review), and --yolo",
     ),
     (
         "/temp",
@@ -726,7 +726,7 @@ impl State {
         } else if self.options.yolo {
             "Agent (--yolo · all tools & sub-agents allowed)".to_owned()
         } else {
-            format!("Agent (permissions: {})", perms.summary())
+            format!("Agent (Y/N approval · permissions: {})", perms.summary())
         };
         self.log_kv(
             "· ",
@@ -967,7 +967,7 @@ impl State {
                 }
             }
             self.log(&format!(
-                "Mode set to Agent (permissions: {}).",
+                "Mode set to Agent (Y/N tool approval · permissions: {}).",
                 self.options.effective_permissions().summary()
             ));
         }
@@ -1094,7 +1094,7 @@ impl State {
                                     },
                                 },
                                 Choice {
-                                    label: "Agent · coding tools (respects /permissions)".into(),
+                                    label: "Agent · coding tools with Y/N review (respects /permissions)".into(),
                                     value: Selection::Mode {
                                         agent: true,
                                         yolo: false,
@@ -1322,6 +1322,8 @@ impl State {
                     self.phase = "ready".into();
                     self.copy_response.clear();
                     self.subagents.clear();
+                    self.tool_approvals.clear();
+                    self.answered_approvals.clear();
                     self.reset_scroll();
                     self.clear_selection();
                     self.clear_painted_regions();

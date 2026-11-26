@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod backend;
 pub mod cancel;
 pub mod engine;
@@ -8,6 +9,10 @@ pub mod prompts;
 pub mod tools;
 pub mod transcript;
 
+pub use approval::{
+    ApprovalGuard, BatchApprovalPlan, PermissionDecision, ToolApprovalGate, ToolApprovalPolicy,
+    ToolArgMatcher, ToolPermissionRule,
+};
 pub use backend::AgentBackend;
 pub use cancel::CancelToken;
 pub use engine::CodingAgent;

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const MAX_FILES: usize = 10;
+pub const MAX_FILES: usize = 30;
 pub const MAX_FILE_BYTES: u64 = crate::domain::MAX_ARTIFACT_BYTES;
 
 #[derive(Clone, Debug, Default)]
@@ -560,7 +560,7 @@ fn add(files: &mut Vec<PathBuf>, path: PathBuf) -> Result<()> {
     }
     if files.len() > MAX_FILES {
         return Err(ServiceError::invalid(
-            "at most 10 attachments per conversation; start /new to attach a different set",
+            "at most 30 attachments per conversation; start /new to attach a different set",
         ));
     }
     Ok(())

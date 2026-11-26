@@ -694,6 +694,24 @@ impl ToolPermissions {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalMode {
+    /// Legacy or unspecified turns; treated conservatively when resuming interactively.
+    #[default]
+    Unspecified,
+    /// Prompt the user once per tool batch (`Y/N`) before executing tools.
+    Ask,
+    /// Auto-execute tools without prompting (`--yolo`).
+    Auto,
+}
+
+impl ToolApprovalMode {
+    pub const fn is_unspecified(&self) -> bool {
+        matches!(self, Self::Unspecified)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     #[serde(skip)]
@@ -728,6 +746,8 @@ pub struct AgentRequest {
     pub permissions: Option<ToolPermissions>,
     #[serde(default, skip_serializing_if = "SessionRetention::is_unspecified")]
     pub session_retention: SessionRetention,
+    #[serde(default, skip_serializing_if = "ToolApprovalMode::is_unspecified")]
+    pub tool_approval: ToolApprovalMode,
 }
 
 impl AgentRequest {

@@ -624,6 +624,9 @@ impl WorkspaceService for Fixture {
     async fn steer_agent(&self, _: Request<pb::SteerRequest>) -> Reply<pb::Empty> {
         Err(Status::unimplemented("fixture"))
     }
+    async fn approve_tool(&self, _: Request<pb::ApproveToolRequest>) -> Reply<pb::Empty> {
+        Err(Status::unimplemented("fixture"))
+    }
     async fn resume_conversation(
         &self,
         _: Request<pb::ConversationRef>,

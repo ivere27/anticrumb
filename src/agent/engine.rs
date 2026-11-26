@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use super::approval::PermissionDecision;
 use super::backend::AgentBackend;
 use super::events::{
     AgentConfig, AgentEvent, AgentRunResult, AgentStatus, AgentStepRecord, RunControl,
@@ -330,28 +331,117 @@ impl<B: AgentBackend> CodingAgent<B> {
                 ));
             }
 
-            let observations = self.registry.execute_batch(
-                &calls,
-                scope.ctx,
-                &|index, call| {
-                    ev.emit(AgentEvent::ToolStarted {
-                        step,
-                        index,
-                        tool: call.tool.clone(),
-                        args: call.args.clone(),
+            let plan = self.config.approval_policy.evaluate_batch(&calls);
+            let mut user_approved = true;
+            if plan.needs_user_approval() {
+                let prompt_calls = plan.prompt_calls(&calls);
+                let approval_id = crate::domain::id("approval");
+                let _approval_guard = control.approvals.register_guard(&approval_id);
+                ev.emit(AgentEvent::ToolApprovalRequested {
+                    id: approval_id.clone(),
+                    step,
+                    calls: prompt_calls,
+                    source: None,
+                });
+                match control.approvals.wait(&approval_id, &control.cancel) {
+                    Some(approved) => {
+                        user_approved = approved;
+                        ev.emit(AgentEvent::ToolApprovalResolved {
+                            id: approval_id,
+                            step,
+                            approved,
+                        });
+                        if !approved {
+                            notes.push(format!(
+                                "user rejected {} requested tool call(s) in step {step}",
+                                plan.prompt_indices.len()
+                            ));
+                        }
+                    }
+                    None => {
+                        steps.push(record(step, response, calls, vec![], notes));
+                        return Ok(self.result(
+                            &scope,
+                            AgentStatus::Cancelled,
+                            last_response,
+                            steps,
+                        ));
+                    }
+                }
+            }
+
+            let exec_indices: Vec<usize> = plan
+                .decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, decision)| match decision {
+                    PermissionDecision::Allow => Some(i),
+                    PermissionDecision::Ask if user_approved => Some(i),
+                    PermissionDecision::Ask | PermissionDecision::Deny { .. } => None,
+                })
+                .collect();
+
+            let emit_started = |index: usize, call: &ToolCallRequest| {
+                ev.emit(AgentEvent::ToolStarted {
+                    step,
+                    index,
+                    tool: call.tool.clone(),
+                    args: call.args.clone(),
+                })
+            };
+            let emit_finished = |index: usize, call: &ToolCallRequest, out: &ToolOutput| {
+                ev.emit(AgentEvent::ToolFinished {
+                    step,
+                    index,
+                    tool: call.tool.clone(),
+                    ok: out.ok,
+                    output: out.output.clone(),
+                    elapsed_ms: out.elapsed_ms,
+                })
+            };
+
+            let observations = if exec_indices.len() == calls.len() {
+                self.registry
+                    .execute_batch(&calls, scope.ctx, &emit_started, &emit_finished)
+            } else {
+                let exec_calls: Vec<ToolCallRequest> =
+                    exec_indices.iter().map(|&i| calls[i].clone()).collect();
+                let exec_outputs = if exec_calls.is_empty() {
+                    Vec::new()
+                } else {
+                    self.registry.execute_batch(
+                        &exec_calls,
+                        scope.ctx,
+                        &|local_idx, call| emit_started(exec_indices[local_idx], call),
+                        &|local_idx, call, out| {
+                            emit_finished(exec_indices[local_idx], call, out)
+                        },
+                    )
+                };
+                let mut exec_iter = exec_outputs.into_iter();
+                calls
+                    .iter()
+                    .zip(plan.decisions.iter())
+                    .map(|(call, decision)| match (decision, user_approved) {
+                        (PermissionDecision::Allow, _) | (PermissionDecision::Ask, true) => {
+                            exec_iter.next().unwrap_or_else(|| {
+                                rejected_output(&call.tool, "Tool execution missing.")
+                            })
+                        }
+                        (PermissionDecision::Ask, false) => {
+                            rejected_output(&call.tool, "Tool execution rejected by user.")
+                        }
+                        (PermissionDecision::Deny { reason }, _) => {
+                            let msg = if reason.trim().is_empty() {
+                                "Tool execution denied by policy.".to_owned()
+                            } else {
+                                format!("Tool execution denied by policy: {}", reason.trim())
+                            };
+                            rejected_output(&call.tool, &msg)
+                        }
                     })
-                },
-                &|index, call, out| {
-                    ev.emit(AgentEvent::ToolFinished {
-                        step,
-                        index,
-                        tool: call.tool.clone(),
-                        ok: out.ok,
-                        output: out.output.clone(),
-                        elapsed_ms: out.elapsed_ms,
-                    })
-                },
-            );
+                    .collect()
+            };
             // Help must reach the model before an action can use it. A help call
             // cannot unlock browser actions from the same model response.
             if calls.iter().zip(&observations).any(|(call, out)| {
@@ -450,4 +540,14 @@ fn format_observations(observations: &[ToolOutput]) -> String {
         })
         .collect();
     format!("[TOOL_RESULTS]\n{}", body.join("\n\n"))
+}
+
+fn rejected_output(tool: &str, message: &str) -> ToolOutput {
+    ToolOutput {
+        tool: tool.to_string(),
+        ok: false,
+        output: message.to_string(),
+        artifacts: Vec::new(),
+        elapsed_ms: 0,
+    }
 }
