@@ -648,7 +648,6 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         Command::WebHistoryStatus(state.options.account.clone(), false),
     );
     state.log_startup_banner();
-    state.log("Describe a task to begin. Follow-up messages stay in this conversation.\n");
     state.init_debug_session();
     if auto_created {
         state.log(&format!(

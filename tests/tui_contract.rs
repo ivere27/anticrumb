@@ -1471,7 +1471,7 @@ mod unix_pty {
         } else {
             pty2.wait_for("W:project")
         };
-        assert!(frame(&relaunched_out).contains("Temp (anonymous, no server history)"));
+        assert!(!frame(&relaunched_out).contains("Describe a task to begin."));
         assert!(screen_row(&relaunched_out, 26).contains("CHAT · TEMP"));
 
         pty2.send("second persisted temporary prompt\r");

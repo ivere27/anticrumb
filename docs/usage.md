@@ -158,6 +158,7 @@ The gateway exposes OpenAI Chat/Responses, Anthropic Messages, and Gemini APIs o
 | `CHROME_BIN` | Chrome/Chromium executable |
 | `ANTICRUMB_ALLOW_PRIVATE_FETCH` | `1` enables [private/local browsing](tools.md#web-and-browser-tools) |
 | `ANTICRUMB_PATCH_BUDGET_KIB` | Advisory KiB warning threshold for `@git:diff+`/`@git:staged+`/`@git:<commit>+` (default `512`, clamped `16`–`16384`; warns without truncating) |
+| `ANTICRUMB_NO_NOTICE` | `1` or `true` disables optional startup tips and author project notices in the interactive TUI |
 
 Set browser environment variables on the browser host before starting its daemon. Client-side changes do not reconfigure a running browser host.
 

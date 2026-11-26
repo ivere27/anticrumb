@@ -45,6 +45,8 @@ Avoid long multi-turn sessions—keep turns short and use `/new` for each new ta
 - [Architecture](docs/architecture.md) · [Remote connections](docs/rpc.md)
 - [Building](docs/building.md) · [Testing](docs/testing.md) · [Releasing](docs/releasing.md)
 
+In-process daemon services are bridged with [Synurang](https://github.com/ivere27/synurang) (Protobuf/gRPC over FFI).
+
 ## License
 
 [Apache-2.0](LICENSE).

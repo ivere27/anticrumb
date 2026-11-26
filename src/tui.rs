@@ -10,6 +10,7 @@ mod layout;
 mod markdown;
 mod mentions;
 mod model_picker;
+mod notices;
 mod platform;
 pub(crate) mod preferences;
 mod reducer;
@@ -2846,7 +2847,7 @@ mod tests {
         assert!(!state.options.agent);
         assert!(!state.options.yolo);
         state.log_startup_banner();
-        assert!(state.logs().contains("Mode: Chat"));
+        assert!(!state.logs().contains("Mode: Chat"));
         assert!(state.status_text(120).contains(" · CHAT · "));
 
         // 1. Default permissions are read-only (`read` only). Open `/permissions`, toggle `edit` ON, and save.
@@ -3287,7 +3288,7 @@ mod tests {
         assert!(!relaunched.options.overrides.contains("temporary"));
         assert!(relaunched.status_text(120).contains(" · CHAT · TEMP · "));
         relaunched.log_startup_banner();
-        assert!(relaunched
+        assert!(!relaunched
             .logs()
             .contains("Temp (anonymous, no server history)"));
 
@@ -6685,5 +6686,135 @@ mod tests {
         super::input_loop::handle_input(&mut resumed, backtab, &mut tx).unwrap();
         assert!(resumed.options.agent && !resumed.options.yolo);
         assert_eq!(resumed.options.effective_permissions(), saved_edit);
+    }
+
+    #[test]
+    fn startup_banner_with_notice_renders_spacing_and_none_noop() {
+        let make_state = || {
+            State::new(PromptOptions {
+                workspace: std::path::PathBuf::from("/tmp/fixture-proj"),
+                account: "default".into(),
+                ..Default::default()
+            })
+        };
+
+        let mut baseline = make_state();
+        baseline.log_startup_banner_with_notice(None);
+        let base_logs = baseline.logs();
+        let base_lines: Vec<&str> = base_logs.split('\n').collect();
+        // Leading empty line, 5 banner rows (row0..row4), trailing empty line, plus final '\n'.
+        assert_eq!(base_lines.len(), 8);
+        assert_eq!(base_lines[0], "");
+        assert_eq!(base_lines[4], "/tmp/fixture-proj");
+        assert_eq!(base_lines[5], "");
+        assert_eq!(base_lines[6], "");
+        assert_eq!(base_lines[7], "");
+        let base_rendered_80 = baseline.transcript_lines(80).to_vec();
+        assert_eq!(base_rendered_80.len(), 7);
+        let base_prefix_len = base_rendered_80.len() - 1;
+        assert!(base_rendered_80[base_prefix_len].is_empty());
+        assert_eq!(baseline.transcript_lines(100).len(), 7);
+
+        let tip = super::notices::NoticeEntry {
+            id: "tip-test".into(),
+            kind: super::notices::NoticeKind::Tip,
+            title: None,
+            text: "Use /new for each task to keep context sharp; revisit via /resume.".into(),
+            url: None,
+            probability: 0.05,
+            starts_at: None,
+            expires_at: None,
+        };
+        let mut with_tip = make_state();
+        with_tip.log_startup_banner_with_notice(Some(&tip));
+        let tip_logs = with_tip.logs();
+        let tip_lines: Vec<&str> = tip_logs.split('\n').collect();
+        // row0..row4 -> blank line -> tip line -> trailing blank line.
+        assert_eq!(tip_lines.len(), 10);
+        assert_eq!(&tip_lines[..6], &base_lines[..6]);
+        assert_eq!(tip_lines[6], "");
+        assert_eq!(
+            tip_lines[7],
+            "  Tip · Use /new for each task to keep context sharp; revisit via /resume."
+        );
+        assert_eq!(tip_lines[8], "");
+        assert_eq!(tip_lines[9], "");
+        // On an 80-column terminal, the tip adds exactly 1 blank line + 1 unwrapped line.
+        let tip_rendered = with_tip.transcript_lines(80).to_vec();
+        assert_eq!(tip_rendered.len(), base_rendered_80.len() + 2);
+        assert_eq!(
+            &tip_rendered[..base_prefix_len],
+            &base_rendered_80[..base_prefix_len]
+        );
+        assert!(tip_rendered[base_prefix_len].is_empty());
+        assert_eq!(tip_rendered[base_prefix_len + 1][0].text, "  Tip · ");
+        assert_eq!(
+            tip_rendered[base_prefix_len + 1][0].face,
+            markdown::Face::ACCENT
+        );
+        assert_eq!(
+            tip_rendered[base_prefix_len + 1][1].face,
+            markdown::Face::MUTED
+        );
+        assert!(tip_rendered[base_prefix_len + 2].is_empty());
+
+        let author = super::notices::NoticeEntry {
+            id: "author-test".into(),
+            kind: super::notices::NoticeKind::Author,
+            title: Some("Synurang".into()),
+            text: "In-process gRPC/FFI bridge powering anticrumb".into(),
+            url: Some("https://github.com/ivere27/synurang".into()),
+            probability: 0.01,
+            starts_at: None,
+            expires_at: None,
+        };
+        let mut with_author = make_state();
+        with_author.log_startup_banner_with_notice(Some(&author));
+        let author_logs = with_author.logs();
+        let author_lines: Vec<&str> = author_logs.split('\n').collect();
+        // row0..row4 -> blank line -> headline -> indented URL -> trailing blank line.
+        assert_eq!(author_lines.len(), 11);
+        assert_eq!(&author_lines[..6], &base_lines[..6]);
+        assert_eq!(author_lines[6], "");
+        assert_eq!(
+            author_lines[7],
+            "  Also by author · Synurang — In-process gRPC/FFI bridge powering anticrumb"
+        );
+        assert_eq!(
+            author_lines[8],
+            "                   https://github.com/ivere27/synurang"
+        );
+        assert_eq!(author_lines[9], "");
+        assert_eq!(author_lines[10], "");
+        // On an 80-column terminal, the author notice adds 1 blank line + 2 unwrapped lines.
+        let author_rendered = with_author.transcript_lines(80).to_vec();
+        assert_eq!(author_rendered.len(), base_rendered_80.len() + 3);
+        assert_eq!(
+            &author_rendered[..base_prefix_len],
+            &base_rendered_80[..base_prefix_len]
+        );
+        assert!(author_rendered[base_prefix_len].is_empty());
+        assert_eq!(
+            author_rendered[base_prefix_len + 1][0].face,
+            markdown::Face::MUTED
+        );
+        assert_eq!(author_rendered[base_prefix_len + 1][1].text, "Synurang");
+        assert_eq!(
+            author_rendered[base_prefix_len + 1][1].face,
+            markdown::Face::TEXT
+        );
+        assert_eq!(
+            author_rendered[base_prefix_len + 1][2].face,
+            markdown::Face::MUTED
+        );
+        assert_eq!(
+            author_rendered[base_prefix_len + 2][0].text,
+            "                   https://github.com/ivere27/synurang"
+        );
+        assert_eq!(
+            author_rendered[base_prefix_len + 2][0].face,
+            markdown::Face::MUTED
+        );
+        assert!(author_rendered[base_prefix_len + 3].is_empty());
     }
 }

@@ -454,6 +454,14 @@ impl State {
     }
 
     pub(super) fn log_startup_banner(&mut self) {
+        let notice = super::notices::pick_startup_notice();
+        self.log_startup_banner_with_notice(notice.as_ref());
+    }
+
+    pub(super) fn log_startup_banner_with_notice(
+        &mut self,
+        notice: Option<&super::notices::NoticeEntry>,
+    ) {
         let version = crate::build_info::display_version();
         let commit = crate::build_info::commit_head();
         let version_label = crate::build_info::format_tui_title(&version, commit.as_deref());
@@ -501,32 +509,6 @@ impl State {
             (workspace_label.clone(), Face::MUTED),
         ];
 
-        let temp_suffix = if self.options.temporary {
-            " · Temp (anonymous, no server history)"
-        } else {
-            ""
-        };
-        let mode_summary = if !self.options.agent {
-            if self.options.temporary {
-                format!(
-                    "Mode: Chat{temp_suffix} (Shift+Tab or /mode for Agent · /temp off for normal)"
-                )
-            } else {
-                "Mode: Chat (Shift+Tab or /mode for Agent · --yolo for auto-execute)".to_owned()
-            }
-        } else if self.options.yolo {
-            format!("Mode: Agent (--yolo · all tools & sub-agents allowed){temp_suffix}")
-        } else {
-            format!(
-                "Mode: Agent (permissions: {}){temp_suffix}",
-                self.options.effective_permissions().summary()
-            )
-        };
-        let mode_face = if self.options.agent {
-            Face::HIGHLIGHT_BOLD
-        } else {
-            Face::ACCENT
-        };
         let row4 = vec![
             ("      ".into(), Face::TEXT),
             ("·".into(), Face::MUTED),
@@ -534,8 +516,6 @@ impl State {
             ("▪".into(), Face::ACCENT_BOLD),
             ("   ".into(), Face::TEXT),
             ("▪".into(), Face::CODE),
-            ("    ".into(), Face::TEXT),
-            (mode_summary.clone(), mode_face),
         ];
 
         self.log_spans("", Vec::new());
@@ -543,7 +523,16 @@ impl State {
         self.log_spans(&account_label, row1);
         self.log_spans(&model_label, row2);
         self.log_spans(&workspace_label, row3);
-        self.log_spans(&mode_summary, row4);
+        self.log_spans("", row4);
+        if let Some(entry) = notice {
+            let lines = super::notices::format_notice_lines(entry);
+            if !lines.is_empty() {
+                self.log_spans("", Vec::new());
+                for line in lines {
+                    self.log_spans(&line.plain, line.spans);
+                }
+            }
+        }
         self.log_spans("", Vec::new());
     }
 
