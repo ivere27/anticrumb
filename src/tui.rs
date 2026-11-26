@@ -6359,4 +6359,331 @@ mod tests {
         assert!(state.has_unread_below, "new tool arrival must mark unread below across width change");
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
     }
+
+    #[test]
+    fn shift_tab_toggles_chat_and_agent_only_and_preserves_draft_and_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = Preferences::open(dir.path()).unwrap();
+        prefs
+            .set_permissions(crate::domain::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: true,
+                browser: false,
+                subagent: false,
+                ast: true,
+            })
+            .unwrap();
+
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+        let (mut tx, rx) = mpsc::sync_channel(8);
+
+        let backtab = event::Event::Key(event::KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        ));
+        let shift_tab = event::Event::Key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        let repeat_backtab = event::Event::Key(event::KeyEvent::new_with_kind(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+            event::KeyEventKind::Repeat,
+        ));
+
+        // 1. Default CHAT -> Shift+Tab -> AGENT -> Shift+Tab -> CHAT (never YOLO), keeping draft intact.
+        assert!(!state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(!state.yolo_toggle_armed);
+        state.editor.set("keep this draft".into());
+        let logs_before = state.logs();
+
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(state.status_text(120).contains(" · AGENT · "));
+        assert_eq!(state.editor.text, "keep this draft");
+        assert_eq!(
+            state.logs(),
+            logs_before,
+            "Shift+Tab must not spam the transcript"
+        );
+
+        // Repeat events must not rapid-flip the mode.
+        super::input_loop::handle_input(&mut state, repeat_backtab, &mut tx).unwrap();
+        assert!(state.options.agent && !state.options.yolo);
+
+        // Ctrl+Shift+Tab / Alt+Shift+Tab are ignored.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            )),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.options.agent);
+
+        // Kitty-style KeyCode::Tab + SHIFT also toggles back to CHAT.
+        super::input_loop::handle_input(&mut state, shift_tab.clone(), &mut tx).unwrap();
+        assert!(!state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(state.status_text(120).contains(" · CHAT · "));
+        assert_eq!(state.editor.text, "keep this draft");
+
+        // 2. Active tool block is not sealed when toggling mode mid-turn.
+        state.update(Update::Started {
+            id: "run-toggle".into(),
+            conversation_id: "conv-toggle".into(),
+        });
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-toggle".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "args": {"path": "a.rs"}}),
+            at: 1,
+        }));
+        assert!(state.tool_blocks.active_block().is_some());
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent && !state.options.yolo);
+        assert!(
+            state.tool_blocks.active_block().is_some(),
+            "Shift+Tab must not prematurely seal an active tool block"
+        );
+        state.active = None;
+        state.phase = "ready".into();
+
+        // 3. Modals (open menu, history clear confirmation, inspector zoom) do not toggle mode;
+        //    menus use Shift+Tab to move selection upward.
+        state.menu = Some(Menu {
+            title: "Test menu".into(),
+            choices: vec![
+                Choice {
+                    label: "first".into(),
+                    value: Selection::Shell(false),
+                },
+                Choice {
+                    label: "second".into(),
+                    value: Selection::Shell(true),
+                },
+            ],
+            selected: 1,
+        });
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+        assert!(state.options.agent);
+        state.close_menu();
+
+        state.open_history_clear();
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent);
+        state.history_clear_confirmation = None;
+
+        state.inspector_zoom = true;
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent);
+        state.inspector_zoom = false;
+
+        // 4. `--agent --no-shell` preserves CLI `--no-shell` across AGENT <-> CHAT toggles.
+        let opts = PromptOptions::parse(&[
+            "-C".into(),
+            dir.path().display().to_string(),
+            "--agent".into(),
+            "--no-shell".into(),
+        ])
+        .unwrap();
+        let mut no_shell_state = State::new(opts);
+        no_shell_state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        no_shell_state.load_model_preference();
+        assert!(no_shell_state.options.agent);
+        assert!(!no_shell_state.options.yolo);
+        assert!(no_shell_state.options.no_shell);
+        assert!(!no_shell_state.options.effective_permissions().shell);
+
+        super::input_loop::handle_input(&mut no_shell_state, backtab.clone(), &mut tx).unwrap();
+        assert!(!no_shell_state.options.agent);
+        super::input_loop::handle_input(&mut no_shell_state, shift_tab, &mut tx).unwrap();
+        assert!(no_shell_state.options.agent);
+        assert!(!no_shell_state.options.yolo);
+        assert!(no_shell_state.options.no_shell);
+        assert!(!no_shell_state.options.effective_permissions().shell);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shift_tab_toggles_chat_and_yolo_only_when_explicitly_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, rx) = mpsc::sync_channel(8);
+        let backtab = event::Event::Key(event::KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        ));
+
+        // 1. Explicit CLI `--yolo` arms CHAT <-> YOLO toggle.
+        let yolo_opts = PromptOptions::parse(&[
+            "-C".into(),
+            dir.path().display().to_string(),
+            "--yolo".into(),
+        ])
+        .unwrap();
+        let mut cli_yolo = State::new(yolo_opts);
+        cli_yolo.preferences = Some(Preferences::open(dir.path()).unwrap());
+        cli_yolo.load_model_preference();
+        assert!(cli_yolo.options.agent && cli_yolo.options.yolo);
+        assert!(cli_yolo.yolo_toggle_armed);
+
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(!cli_yolo.options.agent && !cli_yolo.options.yolo);
+        assert!(cli_yolo.status_text(120).contains(" · CHAT · "));
+        cli_yolo.editor.set("quick chat".into());
+        cli_yolo.submit(&mut tx);
+        let Command::Start(chat_req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(chat_req.chat_only);
+        assert_eq!(chat_req.tool_approval, crate::domain::ToolApprovalMode::Unspecified);
+        cli_yolo.active = None;
+        cli_yolo.pending = None;
+        cli_yolo.phase = "ready".into();
+
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(cli_yolo.options.agent && cli_yolo.options.yolo);
+        assert!(cli_yolo.status_text(120).contains(" · YOLO · "));
+        assert_eq!(
+            cli_yolo.options.effective_permissions(),
+            crate::domain::ToolPermissions::all()
+        );
+        cli_yolo.editor.set("back to yolo".into());
+        cli_yolo.submit(&mut tx);
+        let Command::Start(yolo_req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(!yolo_req.chat_only);
+        assert_eq!(yolo_req.tool_approval, crate::domain::ToolApprovalMode::Auto);
+        cli_yolo.active = None;
+        cli_yolo.pending = None;
+        cli_yolo.phase = "ready".into();
+
+        // Explicit `/mode agent` disarms YOLO and resets to safe read-only default when no saved prefs exist.
+        cli_yolo.editor.set("/mode agent".into());
+        cli_yolo.submit(&mut tx);
+        assert!(cli_yolo.options.agent && !cli_yolo.options.yolo);
+        assert!(!cli_yolo.yolo_toggle_armed);
+        assert_eq!(
+            cli_yolo.options.effective_permissions(),
+            crate::domain::ToolPermissions::read_only()
+        );
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(!cli_yolo.options.agent);
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(cli_yolo.options.agent && !cli_yolo.options.yolo);
+        assert!(cli_yolo.status_text(120).contains(" · AGENT · "));
+
+        // 2. Explicit `--yolo --no-shell` does NOT arm YOLO toggle (CLI already disabled yolo).
+        let yolo_no_shell = PromptOptions::parse(&[
+            "-C".into(),
+            dir.path().display().to_string(),
+            "--yolo".into(),
+            "--no-shell".into(),
+        ])
+        .unwrap();
+        let mut constrained = State::new(yolo_no_shell);
+        assert!(constrained.options.agent && !constrained.options.yolo);
+        assert!(!constrained.yolo_toggle_armed);
+        super::input_loop::handle_input(&mut constrained, backtab.clone(), &mut tx).unwrap();
+        assert!(!constrained.options.agent);
+        super::input_loop::handle_input(&mut constrained, backtab.clone(), &mut tx).unwrap();
+        assert!(constrained.options.agent && !constrained.options.yolo);
+
+        // 3. Explicit `/mode yolo` (and `/mode` menu) arms CHAT <-> YOLO; restricting `/permissions` disarms it.
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+        state.editor.set("/mode yolo".into());
+        state.submit(&mut tx);
+        assert!(state.options.agent && state.options.yolo && state.yolo_toggle_armed);
+
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(!state.options.agent && !state.options.yolo);
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent && state.options.yolo);
+
+        // Toggle to CHAT, then restrict `/permissions readonly` -> disarms YOLO!
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(!state.options.agent);
+        state.editor.set("/permissions readonly".into());
+        state.submit(&mut tx);
+        assert!(!state.yolo_toggle_armed);
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent && !state.options.yolo);
+        assert_eq!(
+            state.options.effective_permissions(),
+            crate::domain::ToolPermissions::read_only()
+        );
+
+        // 4. Implicit `/resume` of a prior YOLO conversation does NOT arm YOLO toggle:
+        //    Shift+Tab leaves YOLO -> CHAT -> safe AGENT (with saved permissions restored).
+        let prefs = Preferences::open(dir.path()).unwrap();
+        let saved_edit = crate::domain::ToolPermissions {
+            read: true,
+            edit: true,
+            shell: false,
+            browser: false,
+            subagent: false,
+            ast: true,
+        };
+        prefs.set_permissions(saved_edit).unwrap();
+
+        let mut resumed = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        resumed.preferences = Some(Preferences::open(dir.path()).unwrap());
+        resumed.load_model_preference();
+
+        let yolo_turn = crate::domain::AgentRecord {
+            id: "turn-yolo".into(),
+            conversation_id: "conv-yolo".into(),
+            state: "completed".into(),
+            request: PromptOptions::parse(&[
+                "-C".into(),
+                dir.path().display().to_string(),
+                "--yolo".into(),
+            ])
+            .unwrap()
+            .agent_request("old yolo task".into(), Some("conv-yolo".into())),
+            result: Some(crate::agent::AgentRunResult {
+                status: crate::agent::AgentStatus::Completed,
+                final_response: "done".into(),
+                ..Default::default()
+            }),
+            error: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let conv =
+            crate::domain::ConversationRecord::from_turns("conv-yolo", vec![yolo_turn]).unwrap();
+        resumed.update(Update::Loaded(conv));
+        assert!(resumed.options.agent && resumed.options.yolo);
+        assert!(
+            !resumed.yolo_toggle_armed,
+            "resuming a YOLO conversation must not implicitly arm Shift+Tab YOLO toggle"
+        );
+
+        super::input_loop::handle_input(&mut resumed, backtab.clone(), &mut tx).unwrap();
+        assert!(!resumed.options.agent && !resumed.options.yolo);
+        super::input_loop::handle_input(&mut resumed, backtab, &mut tx).unwrap();
+        assert!(resumed.options.agent && !resumed.options.yolo);
+        assert_eq!(resumed.options.effective_permissions(), saved_edit);
+    }
 }

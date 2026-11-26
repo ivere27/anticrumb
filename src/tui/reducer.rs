@@ -130,6 +130,10 @@ impl ScrollBottomBadge {
 
 pub(super) struct State {
     pub options: PromptOptions,
+    /// Whether `Shift+Tab` toggles `CHAT <-> YOLO` instead of `CHAT <-> AGENT`.
+    /// Armed only by explicit CLI `--yolo` or `/mode yolo` (and disarmed by
+    /// `/mode agent` or narrowing `/permissions`). Never armed implicitly by `/resume`.
+    pub yolo_toggle_armed: bool,
     pub preferences: Option<Preferences>,
     pub theme: theme::Theme,
     pub theme_preview_origin: Option<theme::Theme>,
@@ -230,11 +234,13 @@ fn status_visible_changed(prev: &Value, next: &Value) -> bool {
 impl State {
     pub(super) fn new(mut options: PromptOptions) -> Self {
         options.no_shell = !options.effective_permissions().shell;
+        let yolo_toggle_armed = options.yolo;
         let files = std::mem::take(&mut options.files);
         let mut editor = Editor::default();
         editor.set(options.words.join(" "));
         Self {
             options,
+            yolo_toggle_armed,
             preferences: None,
             theme: theme::THEMES[0],
             theme_preview_origin: None,
@@ -502,9 +508,11 @@ impl State {
         };
         let mode_summary = if !self.options.agent {
             if self.options.temporary {
-                format!("Mode: Chat{temp_suffix} (use /temp off for normal or /mode for Agent)")
+                format!(
+                    "Mode: Chat{temp_suffix} (Shift+Tab or /mode for Agent · /temp off for normal)"
+                )
             } else {
-                "Mode: Chat (use /mode or --agent / --yolo for Agent mode)".to_owned()
+                "Mode: Chat (Shift+Tab or /mode for Agent · --yolo for auto-execute)".to_owned()
             }
         } else if self.options.yolo {
             format!("Mode: Agent (--yolo · all tools & sub-agents allowed){temp_suffix}")

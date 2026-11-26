@@ -211,7 +211,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 Type @path or @"path with spaces" to upload a file, never inline its contents.
 Interactive: /help /mode /temp /provider /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
-Enter sends; Esc interrupts; Tab completes; Alt+Enter inserts a newline.
+Enter sends; Esc interrupts; Tab completes; Shift+Tab switches mode; Alt+Enter inserts a newline.
 
 Service and integration commands:
   update [--check] [--nightly] [--force]  install or check stable or nightly releases

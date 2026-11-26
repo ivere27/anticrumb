@@ -693,6 +693,10 @@ impl State {
             ),
             ("Tab", "Complete slash commands or @path"),
             (
+                "Shift+Tab",
+                "Toggle Chat / Agent mode (Chat / YOLO when explicitly in --yolo)",
+            ),
+            (
                 "Up / Down",
                 "Move within input, or recall history at top/bottom row",
             ),
@@ -1102,6 +1106,7 @@ impl State {
         self.options.no_shell = !perms.shell;
         if perms != crate::domain::ToolPermissions::all() {
             self.options.yolo = false;
+            self.yolo_toggle_armed = false;
         }
         if let Some(data) = &self.preferences {
             if let Err(e) = data.set_permissions(perms) {
@@ -1111,32 +1116,71 @@ impl State {
         self.log(&format!("Tool permissions saved: {}.", perms.summary()));
     }
 
+    fn restore_standard_agent_permissions(&mut self, reset_if_unsaved: bool) {
+        if let Some(data) = &self.preferences {
+            if let Some(saved_perms) = data.permissions() {
+                self.options.permissions = saved_perms;
+                self.options.no_shell = !saved_perms.shell;
+                return;
+            }
+            if let Some(saved_no_shell) = data.no_shell() {
+                self.options.no_shell = saved_no_shell;
+                self.options.permissions.shell = !saved_no_shell;
+                return;
+            }
+        }
+        if reset_if_unsaved {
+            self.options.permissions = crate::domain::ToolPermissions::read_only();
+            self.options.no_shell = true;
+        }
+    }
+
     pub(super) fn set_agent_mode(&mut self, agent: bool, yolo: bool) {
+        let was_yolo = self.options.yolo;
+        let was_yolo_state = was_yolo || self.yolo_toggle_armed;
         self.options.overrides.insert("agent".into());
         self.options.agent = agent;
         self.options.yolo = agent && yolo;
         if !agent {
+            if was_yolo && !self.yolo_toggle_armed {
+                self.restore_standard_agent_permissions(true);
+            }
             self.log("Mode set to Chat: direct conversation without tools for the next turn.");
         } else if yolo {
+            self.yolo_toggle_armed = true;
             self.options.overrides.insert("no_shell".into());
             self.options.no_shell = false;
             self.log(
                 "Mode set to Agent (--yolo): all file, shell, browser, and sub-agent tools allowed for the next turn.",
             );
         } else {
-            if let Some(data) = &self.preferences {
-                if let Some(saved_perms) = data.permissions() {
-                    self.options.permissions = saved_perms;
-                    self.options.no_shell = !saved_perms.shell;
-                } else if let Some(saved_no_shell) = data.no_shell() {
-                    self.options.no_shell = saved_no_shell;
-                    self.options.permissions.shell = !saved_no_shell;
-                }
+            self.yolo_toggle_armed = false;
+            if was_yolo_state {
+                self.restore_standard_agent_permissions(true);
             }
             self.log(&format!(
                 "Mode set to Agent (Y/N tool approval · permissions: {}).",
                 self.options.effective_permissions().summary()
             ));
+        }
+    }
+
+    pub(super) fn toggle_agent_mode(&mut self) {
+        self.options.overrides.insert("agent".into());
+        if self.options.agent {
+            let was_unarmed_yolo = self.options.yolo && !self.yolo_toggle_armed;
+            self.options.agent = false;
+            self.options.yolo = false;
+            if was_unarmed_yolo {
+                self.restore_standard_agent_permissions(true);
+            }
+        } else {
+            self.options.agent = true;
+            self.options.yolo = self.yolo_toggle_armed;
+            if self.options.yolo {
+                self.options.overrides.insert("no_shell".into());
+                self.options.no_shell = false;
+            }
         }
     }
 

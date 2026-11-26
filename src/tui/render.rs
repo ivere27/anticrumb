@@ -1333,7 +1333,7 @@ impl State {
                 format!(" {spinner} {live_text}")
             }
         } else {
-            " Alt+Enter newline · ↑↓ edit/history · Alt+E expand paste · Wheel/PgUp scroll · /help"
+            " Shift+Tab mode · Alt+Enter newline · ↑↓ edit/history · Alt+E expand paste · Wheel/PgUp scroll · /help"
                 .into()
         };
         let hint_face = if hint_is_live {

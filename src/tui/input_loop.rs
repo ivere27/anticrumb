@@ -163,6 +163,13 @@ fn render_stdout(state: &mut State, buf: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+fn is_shift_tab(key: &event::KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && (key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)))
+}
+
 pub(super) fn handle_input(
     state: &mut State,
     input: Input,
@@ -203,6 +210,7 @@ pub(super) fn handle_input(
                         state.clear_resume_web_history();
                     }
                     KeyCode::Up => state.move_menu(true),
+                    _ if is_shift_tab(&key) => state.move_menu(true),
                     KeyCode::Down | KeyCode::Tab => state.move_menu(false),
                     KeyCode::Char(' ')
                         if key.modifiers.is_empty() && key.kind == event::KeyEventKind::Press =>
@@ -321,6 +329,12 @@ pub(super) fn handle_input(
                     }
                     _ => {}
                 }
+            }
+            if is_shift_tab(&key) {
+                if key.kind == event::KeyEventKind::Press {
+                    state.toggle_agent_mode();
+                }
+                return Ok(false);
             }
             match key.code {
                 KeyCode::Char('c') if ctrl => {

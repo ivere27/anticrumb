@@ -11,7 +11,7 @@ anticrumb --agent  # Agent mode (coding tools, respects /permissions)
 anticrumb --yolo   # Agent mode with all permissions (file, shell & sub-agents)
 ```
 
-Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) and `/temp` (`/temp on` / `/temp off`, persisted across launches) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
+Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Press `Shift+Tab` to toggle between Chat and Agent mode (or Chat and Agent `--yolo` when explicitly launched with `--yolo` or switched via `/mode yolo`), or use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) and `/temp` (`/temp on` / `/temp off`, persisted across launches) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
 
 ## CLI & Non-Interactive Commands
 
@@ -52,6 +52,7 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 | Enter while running | Queue a steering message, optionally with `@file` |
 | Esc / Ctrl-C | Cancel work or selection; Ctrl-C clears an idle draft, then exits on a second press |
 | Tab | Complete commands and file paths |
+| Shift-Tab | Toggle Chat / Agent mode (Chat / Agent `--yolo` only when explicitly launched with `--yolo` or set via `/mode yolo`) |
 | Ctrl/Alt-Left or Right, Alt-B/F | Move by word or path component |
 | Alt-Enter / Shift-Enter / Ctrl-J | Insert a newline |
 | Alt-E | Expand folded pasted text |

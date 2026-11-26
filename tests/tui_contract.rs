@@ -1523,6 +1523,106 @@ mod unix_pty {
         );
     }
 
+    #[test]
+    fn shift_tab_toggles_chat_agent_by_default_and_chat_yolo_only_when_explicitly_yolo() {
+        let binary = fixture_binary();
+        let _pty_guard = lock_pty_test();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+
+        let home_str = home.to_string_lossy().into_owned();
+        let env = [
+            ("HOME", Some(home_str.as_str())),
+            ("TERM", Some("xterm-256color")),
+            ("NO_COLOR", None),
+        ];
+
+        // Session 1: default CHAT mode toggles CHAT <-> AGENT via Shift+Tab (CSI Z = `\x1b[Z`).
+        let mut pty1 = PtyHarness::spawn(&binary, &state, &workspace, &env);
+        let init1 = pty1.wait_for("W:project");
+        assert!(screen_row(&init1, 26).contains("CHAT"));
+
+        pty1.send("\x1b[Z");
+        let agent_out = pty1.wait_for("AGENT");
+        assert!(screen_row(&agent_out, 26).contains(" · AGENT · "));
+        pty1.send("agent turn\r");
+        pty1.wait_for("Attachment turn 1 completed.");
+
+        pty1.send("\x1b[Z");
+        let chat_out = pty1.wait_for("CHAT");
+        assert!(screen_row(&chat_out, 26).contains(" · CHAT · "));
+        pty1.send("chat turn\r");
+        pty1.wait_for("Attachment turn 2 completed.");
+
+        // Explicit `/mode yolo` arms CHAT <-> YOLO for Shift+Tab.
+        pty1.send("/mode yolo\r");
+        let yolo_out = pty1.wait_for("YOLO");
+        assert!(screen_row(&yolo_out, 26).contains(" · YOLO · "));
+        pty1.send("\x1b[Z");
+        let yolo_chat = pty1.wait_for("CHAT");
+        assert!(screen_row(&yolo_chat, 26).contains(" · CHAT · "));
+        pty1.send("\x1b[Z");
+        let yolo_back = pty1.wait_for("YOLO");
+        assert!(screen_row(&yolo_back, 26).contains(" · YOLO · "));
+        pty1.send("yolo after mode\r");
+        pty1.wait_for("Attachment turn 3 completed.");
+
+        // Explicit `/mode agent` disarms YOLO so Shift+Tab returns to CHAT <-> AGENT.
+        pty1.send("/mode agent\r");
+        let disarmed_out = pty1.wait_for("AGENT");
+        assert!(screen_row(&disarmed_out, 26).contains(" · AGENT · "));
+        pty1.send("\x1b[Z");
+        let disarmed_chat = pty1.wait_for("CHAT");
+        assert!(screen_row(&disarmed_chat, 26).contains(" · CHAT · "));
+        pty1.send("\x1b[Z");
+        let safe_agent_out = pty1.wait_for("AGENT");
+        assert!(screen_row(&safe_agent_out, 26).contains(" · AGENT · "));
+        pty1.send("agent after disarm\r");
+        pty1.wait_for("Attachment turn 4 completed.");
+        pty1.send("/exit\r");
+        assert_eq!(pty1.wait_exit(), 0);
+
+        let tasks1 = observations_at(&state)["tasks"].as_array().unwrap().clone();
+        assert_eq!(tasks1.len(), 4);
+        assert_eq!(tasks1[0]["chat_only"], false);
+        assert_eq!(tasks1[0]["tool_approval"], "ask");
+        assert_eq!(tasks1[1]["chat_only"], true);
+        assert_eq!(tasks1[2]["chat_only"], false);
+        assert_eq!(tasks1[2]["tool_approval"], "auto");
+        assert_eq!(tasks1[3]["chat_only"], false);
+        assert_eq!(tasks1[3]["tool_approval"], "ask");
+
+        // Session 2: explicit `--yolo` CLI launch arms CHAT <-> YOLO immediately.
+        let mut pty2 = PtyHarness::spawn_with_args(&binary, &state, &workspace, &["--yolo"], &env);
+        let init2 = pty2.wait_for("W:project");
+        assert!(screen_row(&init2, 26).contains(" · YOLO · "));
+
+        pty2.send("\x1b[Z");
+        let chat2 = pty2.wait_for("CHAT");
+        assert!(screen_row(&chat2, 26).contains(" · CHAT · "));
+        pty2.send("yolo cli chat turn\r");
+        pty2.wait_for("Attachment turn 5 completed.");
+
+        pty2.send("\x1b[Z");
+        let yolo2 = pty2.wait_for("YOLO");
+        assert!(screen_row(&yolo2, 26).contains(" · YOLO · "));
+        pty2.send("yolo cli back turn\r");
+        pty2.wait_for("Attachment turn 6 completed.");
+        pty2.send("/exit\r");
+        assert_eq!(pty2.wait_exit(), 0);
+
+        let tasks2 = observations_at(&state)["tasks"].as_array().unwrap().clone();
+        assert_eq!(tasks2.len(), 6);
+        assert_eq!(tasks2[4]["chat_only"], true);
+        assert_eq!(tasks2[5]["chat_only"], false);
+        assert_eq!(tasks2[5]["tool_approval"], "auto");
+    }
+
     fn observations_at(state: &Path) -> serde_json::Value {
         let raw = std::fs::read(state.join("observations.json")).unwrap();
         serde_json::from_slice(&raw).unwrap()
