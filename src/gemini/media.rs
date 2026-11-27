@@ -18,6 +18,19 @@ pub fn read_web_usage(
     cancel: CancelToken,
     deadline: Instant,
 ) -> Result<Value, String> {
+    read_web_usage_checked(port, target, None, None, cancel, deadline)
+}
+
+/// Read an owned usage page and optionally verify that the loaded Gemini page's
+/// URL scope and Google account identity match the expected account.
+pub fn read_web_usage_checked(
+    port: u16,
+    target: TargetInfo,
+    expected_scope: Option<&str>,
+    expected_identity: Option<&str>,
+    cancel: CancelToken,
+    deadline: Instant,
+) -> Result<Value, String> {
     let mut cdp = CdpClient::connect(port, &browser_host::ws_path_from_url(&target.ws_url)?)?;
     cdp.set_control(cancel.clone(), deadline);
     cdp.call("Runtime.enable", json!({}))?;
@@ -27,7 +40,7 @@ pub fn read_web_usage(
     );
     let script = crate::adapter::script("usage.js")?;
     let expression = format!(
-        "location.origin === 'https://gemini.google.com' ? ({script}) : {{state: location.hostname === 'accounts.google.com' ? 'auth_required' : 'loading'}}"
+        "(() => {{ if (location.origin !== 'https://gemini.google.com') return {{state: location.hostname === 'accounts.google.com' ? 'auth_required' : 'loading', url: location.href}}; const out = ({script}); let identity = null; try {{ const wiz = window.WIZ_global_data; if (wiz && typeof wiz.oPEP7c === 'string' && wiz.oPEP7c.includes('@')) identity = wiz.oPEP7c.trim().toLowerCase(); if (!identity) {{ const btn = document.querySelector('a[aria-label*=\"Google Account\"], a[aria-label*=\"Google 계정\"], button[aria-label*=\"Google Account\"], button[aria-label*=\"Google 계정\"], a[href*=\"accounts.google.com/SignOutOptions\"]'); const m = (btn?.getAttribute('aria-label') || '').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}/); if (m) identity = m[0].toLowerCase(); }} }} catch (_) {{}} return Object.assign({{}}, out, {{url: location.href, identity}}); }})()"
     );
     let mut page_present = false;
     loop {
@@ -52,7 +65,29 @@ pub fn read_web_usage(
         let value = &result["result"]["value"];
         page_present |= value["page_present"] == true;
         match value["state"].as_str() {
-            Some("ready") => return Ok(value["usage"].clone()),
+            Some("ready") => {
+                if let Some(expected_id) =
+                    expected_identity.map(str::trim).filter(|s| !s.is_empty())
+                {
+                    if let Some(observed_id) = value["identity"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !observed_id.eq_ignore_ascii_case(expected_id) {
+                            return Err("identity_mismatch".into());
+                        }
+                    }
+                }
+                if let Some(scope) = expected_scope.map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Some(url) = value["url"].as_str().filter(|s| !s.is_empty()) {
+                        if !super::url::is_gemini_usage_url_for(url, Some(scope)) {
+                            return Err("identity_mismatch".into());
+                        }
+                    }
+                }
+                return Ok(value["usage"].clone());
+            }
             Some("auth_required") => {
                 return Err("sign in required: use /browser login, then try /usage again".into());
             }

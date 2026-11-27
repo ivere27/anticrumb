@@ -609,15 +609,32 @@ pub fn module_error(e: ServiceError) -> synurang_call::RpcError {
         details: detail.encode_to_vec(),
     }
 }
+pub fn browser_profile_to(b: d::BrowserProfile) -> pb::BrowserProfile {
+    pb::BrowserProfile {
+        provider_id: b.provider_id,
+        profile: b.profile.to_string_lossy().into_owned(),
+        subprofile: b.subprofile,
+        port: u32::from(b.port),
+        headless: b.headless,
+    }
+}
+pub fn browser_profile_from(b: pb::BrowserProfile) -> Result<d::BrowserProfile> {
+    Ok(d::BrowserProfile {
+        provider_id: b.provider_id,
+        profile: PathBuf::from(b.profile),
+        subprofile: b.subprofile,
+        port: u16::try_from(b.port).map_err(|_| ServiceError::invalid("invalid browser port"))?,
+        headless: b.headless,
+    })
+}
 pub fn account_to(a: d::Account) -> pb::Account {
     pb::Account {
         id: a.id,
         provider: a.provider,
         state: a.state,
-        profile: a.profile.to_string_lossy().into_owned(),
-        subprofile: a.subprofile,
-        port: u32::from(a.port),
-        headless: a.headless,
+        identity: a.identity,
+        label: a.label,
+        slot: a.slot,
     }
 }
 pub fn account_from(a: pb::Account) -> Result<d::Account> {
@@ -628,11 +645,10 @@ pub fn account_from(a: pb::Account) -> Result<d::Account> {
         } else {
             a.provider
         },
-        profile: PathBuf::from(a.profile),
-        subprofile: a.subprofile,
-        port: u16::try_from(a.port).map_err(|_| ServiceError::invalid("invalid account port"))?,
-        headless: a.headless,
         state: a.state,
+        identity: a.identity.filter(|s| !s.trim().is_empty()),
+        label: a.label.filter(|s| !s.trim().is_empty()),
+        slot: a.slot.filter(|s| !s.trim().is_empty()),
     })
 }
 pub fn provider_caps_to(c: ProviderCapabilities) -> pb::ProviderCapabilities {
@@ -644,6 +660,7 @@ pub fn provider_caps_to(c: ProviderCapabilities) -> pb::ProviderCapabilities {
         web_usage: c.web_usage,
         web_history_cleanup: c.web_history_cleanup,
         native_tools: c.native_tools,
+        multi_account: c.multi_account,
     }
 }
 pub fn provider_caps_from(c: pb::ProviderCapabilities) -> ProviderCapabilities {
@@ -655,6 +672,7 @@ pub fn provider_caps_from(c: pb::ProviderCapabilities) -> ProviderCapabilities {
         web_usage: c.web_usage,
         web_history_cleanup: c.web_history_cleanup,
         native_tools: c.native_tools,
+        multi_account: c.multi_account,
     }
 }
 pub fn provider_info_to(info: ProviderInfo) -> pb::ProviderInfo {
@@ -704,6 +722,8 @@ pub fn register_provider_request_to(m: ProviderManifest) -> pb::RegisterProvider
         chat_url_prefixes: m.chat_url_prefixes,
         reusable_path_prefixes: m.reusable_path_prefixes,
         usage_url: m.usage_url,
+        entry_url_template: m.entry_url_template,
+        usage_url_template: m.usage_url_template,
         observer_binding: m.observer_binding,
         requires_models_control: m.requires_models_control,
         inline_prompt_chars: m.inline_prompt_chars,
@@ -729,6 +749,8 @@ pub fn provider_manifest_from(r: pb::RegisterProviderRequest) -> ProviderManifes
         chat_url_prefixes: r.chat_url_prefixes,
         reusable_path_prefixes: r.reusable_path_prefixes,
         usage_url: r.usage_url,
+        entry_url_template: r.entry_url_template,
+        usage_url_template: r.usage_url_template,
         observer_binding: r.observer_binding,
         requires_models_control: r.requires_models_control,
         default_model: r.default_model,
@@ -877,8 +899,7 @@ pub fn login_status_from(l: pb::LoginStatus) -> d::LoginStatus {
 }
 pub fn browser_status_to(b: d::BrowserStatusRecord) -> pb::BrowserStatus {
     pb::BrowserStatus {
-        account_id: b.account_id,
-        account_state: b.account_state,
+        provider_id: b.provider_id,
         connected: b.connected,
         endpoint: b.endpoint,
         browser: b.browser,
@@ -886,6 +907,8 @@ pub fn browser_status_to(b: d::BrowserStatusRecord) -> pb::BrowserStatus {
         profile_matches: b.profile_matches,
         headless: b.headless,
         owned_sessions: b.owned_sessions,
+        account_count: b.account_count,
+        ready_accounts: b.ready_accounts,
         last_verified_sign_in: b.last_verified_sign_in,
         checked_at: b.checked_at,
         login: b.login.map(login_status_to),
@@ -933,11 +956,7 @@ pub fn agent_request_to(r: d::AgentRequest) -> pb::AgentRequest {
     }
 }
 pub fn agent_request_from(r: pb::AgentRequest) -> Result<d::AgentRequest> {
-    let account_id = if r.account_id.trim().is_empty() {
-        "default".into()
-    } else {
-        r.account_id
-    };
+    let account_id = r.account_id.trim().to_owned();
     let conversation_id = r
         .conversation_id
         .as_deref()
@@ -1138,6 +1157,10 @@ pub fn status_from(status: pb::HostStatus) -> Value {
                 "id": a.id,
                 "provider": a.provider,
                 "state": a.state,
+                "identity": a.identity,
+                "label": a.label,
+                "slot": a.slot,
+                "active": a.active,
                 "selected_model": a.selected_model,
                 "models": c.models,
                 "thinking": c.thinking,
@@ -1156,7 +1179,9 @@ pub fn status_from(status: pb::HostStatus) -> Value {
         "server_id": status.server_id,
         "runtime": status.runtime,
         "active_agents": status.active_agents,
+        "browsers": status.browsers,
         "accounts": accounts,
+        "active_account_id": status.active_account_id,
         "queued": usage.queued,
         "running": usage.running,
         "usage": usage,

@@ -148,6 +148,7 @@ pub struct WebChatTab {
     cdp: CdpClient,
     target: TargetInfo,
     config: Arc<WebChatConfig>,
+    input_lock: Option<Arc<std::sync::Mutex<()>>>,
     cancel: CancelToken,
     deadline: Instant,
     network: tokio::sync::broadcast::Receiver<Value>,
@@ -190,6 +191,10 @@ impl WebChatTab {
 
     pub fn set_pace(&mut self, pace: HumanPace) {
         self.pace = pace;
+    }
+
+    pub fn set_input_lock(&mut self, lock: Option<Arc<std::sync::Mutex<()>>>) {
+        self.input_lock = lock;
     }
 
     pub fn initial_probe(&self) -> &Value {
@@ -411,6 +416,7 @@ impl WebChatTab {
             cdp,
             target,
             config,
+            input_lock: None,
             cancel,
             deadline,
             network,
@@ -881,7 +887,7 @@ impl WebChatTab {
         }
     }
 
-    pub fn list_models_and_thinking(
+    fn list_models_and_thinking_unlocked(
         &mut self,
     ) -> Result<(Vec<ModelOption>, Vec<ThinkingOption>), String> {
         let models = self.menu()?;
@@ -901,6 +907,16 @@ impl WebChatTab {
             .collect();
         self.close_overlays();
         Ok((models, thinking))
+    }
+
+    pub fn list_models_and_thinking(
+        &mut self,
+    ) -> Result<(Vec<ModelOption>, Vec<ThinkingOption>), String> {
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        self.list_models_and_thinking_unlocked()
     }
 
     fn select_model_from_menu(
@@ -1038,7 +1054,7 @@ impl WebChatTab {
             }
         }
         self.close_overlays();
-        let (_, thinking) = self.list_models_and_thinking()?;
+        let (_, thinking) = self.list_models_and_thinking_unlocked()?;
         if !thinking
             .iter()
             .any(|level| level.level == selected.mode_id && level.selected)
@@ -1048,15 +1064,31 @@ impl WebChatTab {
         Ok(())
     }
 
-    pub fn select_model(&mut self, query: &str) -> Result<ModelOption, String> {
+    fn select_model_unlocked(&mut self, query: &str) -> Result<ModelOption, String> {
         let menu = self.menu()?;
         self.select_model_from_menu(menu, query, false)
             .map(|(option, _)| option)
     }
 
-    pub fn select_thinking(&mut self, query: &str) -> Result<(), String> {
+    fn select_thinking_unlocked(&mut self, query: &str) -> Result<(), String> {
         self.menu()?;
         self.select_thinking_from_open_menu(query)
+    }
+
+    pub fn select_model(&mut self, query: &str) -> Result<ModelOption, String> {
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        self.select_model_unlocked(query)
+    }
+
+    pub fn select_thinking(&mut self, query: &str) -> Result<(), String> {
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        self.select_thinking_unlocked(query)
     }
 
     pub fn select_model_and_thinking(
@@ -1064,10 +1096,17 @@ impl WebChatTab {
         model: Option<&str>,
         thinking: Option<&str>,
     ) -> Result<(), String> {
+        if model.is_none() && thinking.is_none() {
+            return Ok(());
+        }
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         match (model, thinking) {
             (None, None) => Ok(()),
-            (Some(model), None) => self.select_model(model).map(|_| ()),
-            (None, Some(thinking)) => self.select_thinking(thinking),
+            (Some(model), None) => self.select_model_unlocked(model).map(|_| ()),
+            (None, Some(thinking)) => self.select_thinking_unlocked(thinking),
             (Some(model), Some(thinking)) => {
                 let menu = self.menu()?;
                 let (selected_model, mut menu_open) =
@@ -1092,7 +1131,11 @@ impl WebChatTab {
     }
 
     pub fn model_catalog(&mut self) -> Result<ModelCatalog, String> {
-        let (models, thinking) = self.list_models_and_thinking()?;
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let (models, thinking) = self.list_models_and_thinking_unlocked()?;
         let original = models
             .iter()
             .find(|m| m.selected)
@@ -1106,13 +1149,13 @@ impl WebChatTab {
         if !thinking.is_empty() {
             let result = (|| {
                 for model in models.iter().filter(|m| !m.locked && m.mode_id != original) {
-                    self.select_model(&model.mode_id)?;
-                    let (_, levels) = self.list_models_and_thinking()?;
+                    self.select_model_unlocked(&model.mode_id)?;
+                    let (_, levels) = self.list_models_and_thinking_unlocked()?;
                     model_thinking.insert(model.mode_id.clone(), levels);
                 }
                 Ok::<_, String>(())
             })();
-            let restore = self.select_model(&original);
+            let restore = self.select_model_unlocked(&original);
             result?;
             restore?;
         }
@@ -1129,56 +1172,63 @@ impl WebChatTab {
         mut updates: Option<&mut F>,
     ) -> Result<AskResult, String> {
         self.check()?;
-        self.cdp.call("Page.bringToFront", json!({}))?;
-        let initial = self.probe()?["response_count"].as_u64().unwrap_or(0);
-        if self.action("prepare", json!({}))?["ok"] != true {
-            return Err("UI contract changed: composer is not empty or ready".into());
-        }
-        let _ = self.human_click("editor", json!({}))?;
-        self.human_pause(30, 75)?;
-        self.cdp.call("Input.insertText", json!({"text": prompt}))?;
-        let input_ready = Instant::now() + Duration::from_secs(5);
-        loop {
-            let checked = self.action("verify_input", json!({"text": prompt}))?;
-            if checked["ok"] == true {
-                break;
+        let (initial, extract_js, mut events) = {
+            let input_lock = self.input_lock.clone();
+            let _input_guard = input_lock
+                .as_ref()
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+            self.cdp.call("Page.bringToFront", json!({}))?;
+            let initial = self.probe()?["response_count"].as_u64().unwrap_or(0);
+            if self.action("prepare", json!({}))?["ok"] != true {
+                return Err("UI contract changed: composer is not empty or ready".into());
             }
-            if Instant::now() >= input_ready {
-                return Err(format!(
-                    "UI contract changed: inserted prompt differs (expected {} chars, observed {})",
-                    prompt.chars().count(),
-                    checked["actual_length"]
-                ));
+            let _ = self.human_click("editor", json!({}))?;
+            self.human_pause(30, 75)?;
+            self.cdp.call("Input.insertText", json!({"text": prompt}))?;
+            let input_ready = Instant::now() + Duration::from_secs(5);
+            loop {
+                let checked = self.action("verify_input", json!({"text": prompt}))?;
+                if checked["ok"] == true {
+                    break;
+                }
+                if Instant::now() >= input_ready {
+                    return Err(format!(
+                        "UI contract changed: inserted prompt differs (expected {} chars, observed {})",
+                        prompt.chars().count(),
+                        checked["actual_length"]
+                    ));
+                }
+                self.pause_jitter(25, 55)?;
             }
-            self.pause_jitter(25, 55)?;
-        }
-        self.cdp.call(
-            "Runtime.addBinding",
-            json!({"name": self.config.observer_binding}),
-        )?;
-        let observer_js = self.script("observer.js")?;
-        if observer_js.contains("geminiCdpChanged")
-            && self.config.observer_binding != "geminiCdpChanged"
-        {
-            let _ = self
-                .cdp
-                .call("Runtime.addBinding", json!({"name": "geminiCdpChanged"}));
-        }
-        self.eval(&observer_js)?;
-        let extract_js = self.script("extract-response.js")?.into_owned();
-        let mut events = self.cdp.subscribe();
-        self.human_pause(70, 160)?;
-        let mut sent = false;
-        for _ in 0..20 {
-            if self.human_click("send", json!({}))?["ok"] == true {
-                sent = true;
-                break;
+            self.cdp.call(
+                "Runtime.addBinding",
+                json!({"name": self.config.observer_binding}),
+            )?;
+            let observer_js = self.script("observer.js")?;
+            if observer_js.contains("geminiCdpChanged")
+                && self.config.observer_binding != "geminiCdpChanged"
+            {
+                let _ = self
+                    .cdp
+                    .call("Runtime.addBinding", json!({"name": "geminiCdpChanged"}));
             }
-            self.pause_jitter(50, 95)?;
-        }
-        if !sent {
-            return Err("UI contract changed: send control is disabled".into());
-        }
+            self.eval(&observer_js)?;
+            let extract_js = self.script("extract-response.js")?.into_owned();
+            let events = self.cdp.subscribe();
+            self.human_pause(70, 160)?;
+            let mut sent = false;
+            for _ in 0..20 {
+                if self.human_click("send", json!({}))?["ok"] == true {
+                    sent = true;
+                    break;
+                }
+                self.pause_jitter(50, 95)?;
+            }
+            if !sent {
+                return Err("UI contract changed: send control is disabled".into());
+            }
+            (initial, extract_js, events)
+        };
         let mut emitted = String::new();
         let mut stable = String::new();
         let mut since = Instant::now();

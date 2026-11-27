@@ -35,6 +35,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
         "/provider",
         "Choose the provider / account for the next turn",
     ),
+    (
+        "/account",
+        "Choose, switch, or refresh signed-in accounts (/account [target|refresh])",
+    ),
     ("/model", "Choose the model for the next turn"),
     ("/usage", "Check web account usage limits and reset times"),
     (
@@ -181,6 +185,12 @@ pub(super) enum Selection {
         provider_id: String,
         provider_name: String,
     },
+    Account {
+        account_id: String,
+        provider_id: String,
+        provider_name: String,
+    },
+    RefreshAccounts(String),
     SetupProvider {
         provider_id: String,
         provider_name: String,
@@ -517,9 +527,10 @@ impl State {
                 if account_id == self.options.account {
                     selected = choices.len();
                 }
+                let display = Self::format_account_entry(acct);
                 choices.push(Choice {
                     label: format!(
-                        "{provider_name} ({provider_id}) · account {account_id} · {state_str}"
+                        "{provider_name} ({provider_id}) · account {display} · {state_str}"
                     ),
                     value: Selection::Provider {
                         account_id: account_id.to_owned(),
@@ -591,7 +602,7 @@ impl State {
         }) {
             let (account_id, provider_id) = account_id;
             let provider_name = self.provider_display_name(&provider_id).to_owned();
-            self.switch_provider(&account_id, &provider_id, &provider_name);
+            self.switch_provider_with_sink(&account_id, &provider_id, &provider_name, sink);
             return;
         }
         if let Some((provider_id, provider_name)) =
@@ -632,6 +643,124 @@ impl State {
         } else {
             self.log(&format!(
                 "Unknown provider or account '{arg}'. Run /provider to choose or set up a provider."
+            ));
+        }
+    }
+
+    pub(super) fn open_accounts(&mut self) {
+        let provider_id = self.provider_id().to_owned();
+        let provider_name = self.provider_name().to_owned();
+        if !self.provider_multi_account(&provider_id) {
+            let current = self.account_display_label();
+            self.log(&format!(
+                "{provider_name} ({provider_id}) supports a single account per Chrome profile (current: {current}). Use /provider to switch providers or /browser login to sign in."
+            ));
+            return;
+        }
+        let mut choices = Vec::new();
+        let mut selected = 0;
+        if let Some(accounts) = self.status["accounts"].as_array() {
+            for acct in accounts
+                .iter()
+                .filter(|a| a["provider"].as_str() == Some(provider_id.as_str()))
+            {
+                let Some(account_id) = acct["id"].as_str() else {
+                    continue;
+                };
+                let current = account_id == self.options.account;
+                if current {
+                    selected = choices.len();
+                }
+                let marker = if current { "●" } else { "○" };
+                let display = Self::format_account_entry(acct);
+                let state = acct["state"].as_str().unwrap_or("unknown");
+                choices.push(Choice {
+                    label: format!("{marker} {display} · {state}"),
+                    value: Selection::Account {
+                        account_id: account_id.to_owned(),
+                        provider_id: provider_id.clone(),
+                        provider_name: provider_name.clone(),
+                    },
+                });
+            }
+        }
+        choices.push(Choice {
+            label: "↻ Refresh accounts from Chrome".into(),
+            value: Selection::RefreshAccounts(provider_id),
+        });
+        self.menu = Some(Menu {
+            title: format!("Accounts · {provider_name} · Enter switch · Esc cancel"),
+            choices,
+            selected,
+        });
+    }
+
+    pub(super) fn apply_account_arg(&mut self, arg: &str, sink: Option<&mut dyn EffectSink>) {
+        let provider_id = self.provider_id().to_owned();
+        let provider_name = self.provider_name().to_owned();
+        if !self.provider_multi_account(&provider_id) {
+            let current = self.account_display_label();
+            self.log(&format!(
+                "{provider_name} ({provider_id}) supports a single account per Chrome profile (current: {current}). Use /provider to switch providers or /browser login to sign in."
+            ));
+            return;
+        }
+        let accounts = self.status["accounts"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let q = arg.trim();
+        let q_lower = q.to_ascii_lowercase();
+        let slot_query = q_lower
+            .strip_prefix("/u/")
+            .or_else(|| q_lower.strip_prefix("u/"))
+            .unwrap_or(&q_lower);
+        let provider_accts: Vec<&Value> = accounts
+            .iter()
+            .filter(|a| a["provider"].as_str() == Some(provider_id.as_str()))
+            .collect();
+        let matched = provider_accts
+            .iter()
+            .copied()
+            .find(|a| a["id"].as_str() == Some(q))
+            .or_else(|| {
+                provider_accts.iter().copied().find(|a| {
+                    a["identity"]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(q))
+                })
+            })
+            .or_else(|| {
+                provider_accts.iter().copied().find(|a| {
+                    a["label"]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(q))
+                })
+            })
+            .or_else(|| {
+                provider_accts
+                    .iter()
+                    .copied()
+                    .find(|a| a["slot"].as_str() == Some(slot_query))
+            })
+            .or_else(|| {
+                let prefix_matches: Vec<&Value> = provider_accts
+                    .iter()
+                    .copied()
+                    .filter(|a| {
+                        a["identity"]
+                            .as_str()
+                            .and_then(|e| e.split('@').next())
+                            .is_some_and(|local| local.eq_ignore_ascii_case(q))
+                    })
+                    .collect();
+                (prefix_matches.len() == 1).then(|| prefix_matches[0])
+            });
+        if let Some(account_id) = matched.and_then(|a| a["id"].as_str()).map(str::to_owned) {
+            self.switch_provider_with_sink(&account_id, &provider_id, &provider_name, sink);
+        } else {
+            self.log(&format!(
+                "No account matching '{arg}' for {provider_name}. Run /account to choose or /account refresh to scan Chrome."
             ));
         }
     }
@@ -756,7 +885,12 @@ impl State {
         let thinking = self.thinking_label().to_owned();
         let theme_name = self.theme.name.to_owned();
         let workspace = self.options.workspace.display().to_string();
-        let account = self.options.account.clone();
+        let account_display = self.account_display_label();
+        let account = if account_display == self.options.account {
+            self.options.account.clone()
+        } else {
+            format!("{account_display} ({})", self.options.account)
+        };
         let conversation = self.conversation_id.as_deref().unwrap_or("new").to_owned();
         let active_turn = self.active.clone();
         let perms = self.options.effective_permissions();
@@ -1416,6 +1550,29 @@ impl State {
                         self.apply_provider_arg(arg, Some(sink));
                     }
                 }
+                "/account" => {
+                    if self.busy() {
+                        self.log(
+                            "Interrupt the current task before switching or refreshing accounts.",
+                        );
+                    } else if arg.eq_ignore_ascii_case("refresh") {
+                        let provider_id = self.provider_id().to_owned();
+                        let provider_name = self.provider_name().to_owned();
+                        self.phase = "loading".into();
+                        self.log(&format!(
+                            "Scanning Chrome for signed-in {provider_name} accounts…"
+                        ));
+                        self.send(sink, Command::RefreshAccounts(provider_id));
+                    } else if self.status["accounts"].as_array().is_none_or(Vec::is_empty) {
+                        self.phase = "loading".into();
+                        let target = (!arg.is_empty()).then(|| arg.to_owned());
+                        self.send(sink, Command::Accounts(target));
+                    } else if arg.is_empty() {
+                        self.open_accounts();
+                    } else {
+                        self.apply_account_arg(arg, Some(sink));
+                    }
+                }
                 "/model" => {
                     if arg.is_empty() || arg == "refresh" {
                         let refresh = arg == "refresh";
@@ -1559,7 +1716,11 @@ impl State {
                     } else {
                         self.send(
                             sink,
-                            Command::Browser(self.options.account.clone(), arg.into()),
+                            Command::Browser {
+                                provider_id: self.provider_id().to_owned(),
+                                account_id: self.options.account.clone(),
+                                action: arg.into(),
+                            },
                         );
                     }
                 }
@@ -2024,8 +2185,26 @@ impl State {
                 account_id,
                 provider_id,
                 provider_name,
+            }
+            | Selection::Account {
+                account_id,
+                provider_id,
+                provider_name,
             } => {
-                self.switch_provider(&account_id, &provider_id, &provider_name);
+                self.switch_provider_with_sink(
+                    &account_id,
+                    &provider_id,
+                    &provider_name,
+                    Some(sink),
+                );
+            }
+            Selection::RefreshAccounts(provider_id) => {
+                let provider_name = self.provider_display_name(&provider_id).to_owned();
+                self.phase = "loading".into();
+                self.log(&format!(
+                    "Scanning Chrome for signed-in {provider_name} accounts…"
+                ));
+                self.send(sink, Command::RefreshAccounts(provider_id));
             }
             Selection::SetupProvider {
                 provider_id,

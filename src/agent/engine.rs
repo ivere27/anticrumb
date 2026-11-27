@@ -11,7 +11,7 @@ use super::prompts::{LoadedPrompts, PromptContext, DEFAULT_AST_NOTE, DEFAULT_SUB
 use super::tools::{BrowserControlFn, BrowserFetchFn, SpawnAgentFn, ToolContext, ToolRegistry};
 use super::transcript::Transcript;
 
-/// Consecutive replies with an unparsable tool envelope before the run is aborted.
+/// Consecutive replies with an unparsable tool envelope before the feedback adds a stronger hint.
 const MAX_MALFORMED_STREAK: u32 = 3;
 /// Identical consecutive tool-call sets before the model gets an explicit "you are looping" hint.
 const REPEAT_WARN_THRESHOLD: u32 = 3;
@@ -287,19 +287,33 @@ impl<B: AgentBackend> CodingAgent<B> {
                             message: format!("step {step}: {m}"),
                         });
                     }
-                    if malformed_streak > MAX_MALFORMED_STREAK {
-                        steps.push(record(step, response, vec![], vec![], notes));
-                        return Err(format!(
-                            "model emitted malformed tool calls {malformed_streak} times in a row: {}",
-                            parsed.malformed.join("; ")
-                        ));
-                    }
+                    // Never abort on malformed envelopes: keep feeding the parse error back so the
+                    // model can correct itself. The step budget and cancellation still bound the run.
+                    let hint = if malformed_streak > MAX_MALFORMED_STREAK {
+                        format!(
+                            "\nThis is malformed attempt {malformed_streak} in a row. Escape every newline inside JSON strings as \\n (never emit a raw line break inside a string), escape quotes as \\\", and split large edits into several smaller tool calls."
+                        )
+                    } else {
+                        String::new()
+                    };
                     let fb = format!(
-                        "[TOOL_ERROR]\n{}\nRe-send the call as valid JSON between [TOOL_CALL] and [/TOOL_CALL] markers, enclosing the JSON in a ```json code block:\n[TOOL_CALL]\n```json\n{{\"tool\": \"<name>\", \"args\": {{...}}}}\n```\n[/TOOL_CALL]",
+                        "[TOOL_ERROR]\n{}\nRe-send the call as valid JSON between [TOOL_CALL] and [/TOOL_CALL] markers, enclosing the JSON in a ```json code block:\n[TOOL_CALL]\n```json\n{{\"tool\": \"<name>\", \"args\": {{...}}}}\n```\n[/TOOL_CALL]{hint}",
                         parsed.malformed.join("\n")
                     );
                     transcript.push_user(fb.clone(), false);
                     outgoing.push(fb);
+                    // Deliver user messages typed while the model was failing instead of dropping them.
+                    for msg in control.inbox.drain() {
+                        self.backend.add_artifacts(&msg.artifacts)?;
+                        let msg = msg.message;
+                        ev.emit(AgentEvent::Steered {
+                            message: msg.clone(),
+                        });
+                        notes.push(format!("user message: {msg}"));
+                        let part = format!("[USER_MESSAGE]\n{msg}");
+                        transcript.push_user(part.clone(), false);
+                        outgoing.push(part);
+                    }
                     steps.push(record(step, response, vec![], vec![], notes));
                     continue;
                 }

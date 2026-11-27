@@ -65,17 +65,13 @@ service ProviderService {
 }
 
 service AccountService {
+  // --- Account operations ---
   rpc ListAccounts(Empty) returns (AccountList);
-  rpc CreateAccount(CreateAccountRequest) returns (Account);
+  // Idempotently ensures a provider's managed browser profile and initial account exist.
+  rpc EnsureProviderAccount(ProviderRef) returns (Account);
+  // Switches the runtime default active account (matches id, identity, localpart, or slot).
+  rpc SetActiveAccount(AccountRef) returns (Account);
   rpc PauseAccount(AccountRef) returns (Account);
-  // Connectivity/profile diagnostics. Authentication is last-verified evidence.
-  rpc GetBrowserStatus(AccountRef) returns (BrowserStatus);
-  // Explicitly attaches a running, verified Chrome profile on the daemon host.
-  rpc AttachBrowser(AttachBrowserRequest) returns (BrowserStatus);
-  // Switches the managed account browser between headless and visible window mode.
-  rpc SetBrowserMode(SetBrowserModeRequest) returns (BrowserStatus);
-  // Opens a visible managed profile on the daemon host, never the TUI host.
-  rpc OpenLogin(AccountRef) returns (Empty);
   // Explicit live read of the signed-in account's usage page. Does not submit a
   // model turn, refresh the model catalog, or infer exact quota from local use.
   rpc GetWebUsage(AccountRef) returns (WebUsage);
@@ -83,6 +79,21 @@ service AccountService {
   // outside anticrumb. Starts a durable asynchronous job, never auto-repeated.
   rpc ClearWebHistory(AccountRef) returns (WebHistoryCleanupStatus);
   rpc GetWebHistoryCleanup(AccountRef) returns (WebHistoryCleanupStatus);
+
+  // --- Provider browser operations (1 Provider = 1 Chrome Profile) ---
+  rpc ListBrowsers(Empty) returns (BrowserProfileList);
+  // Discovers and synchronizes signed-in accounts/slots from the provider's Chrome profile.
+  rpc RefreshAccounts(ProviderRef) returns (AccountList);
+  // Connectivity/profile diagnostics for the provider's Chrome profile.
+  rpc GetBrowserStatus(ProviderRef) returns (BrowserStatus);
+  // Explicitly attaches a running, verified Chrome profile on the daemon host.
+  rpc AttachBrowser(AttachBrowserRequest) returns (BrowserStatus);
+  // Switches the managed provider browser between headless and visible window mode.
+  rpc SetBrowserMode(SetBrowserModeRequest) returns (BrowserStatus);
+  // Opens a visible managed profile on the daemon host, never the TUI host.
+  rpc OpenLogin(ProviderRef) returns (Empty);
+
+  // --- External browsing tools ---
   // Render an HTTP/HTTPS URL in an isolated temporary browser tab on the Chrome host.
   rpc BrowserFetch(BrowserFetchRequest) returns (BrowserFetchResponse);
   // Stateful interactive Chrome tab control (open, snapshot, click, type, press, select, scroll, wait, close, list).
@@ -286,9 +297,13 @@ message AccountStatus {
   string id = 1;
   string provider = 2;
   string state = 3;
-  optional string selected_model = 4;
-  LoginStatus login = 5;
-  ModelCatalog catalog = 6;
+  optional string identity = 4;
+  optional string label = 5;
+  optional string slot = 6;
+  bool active = 7;
+  optional string selected_model = 8;
+  LoginStatus login = 9;
+  ModelCatalog catalog = 10;
 }
 
 message Usage {
@@ -319,10 +334,12 @@ message HostStatus {
   // Actual browser connection owned by a workspace host.
   BrowserConnection browser_connection = 3;
   repeated ProviderInfo providers = 4;
-  repeated AccountStatus accounts = 5;
-  Usage usage = 6;
-  uint32 active_agents = 7; // Active agents in the selected workspace store.
-  ChatCleanupStatus chat_cleanup = 8;
+  repeated BrowserProfile browsers = 5;
+  repeated AccountStatus accounts = 6;
+  optional string active_account_id = 7;
+  Usage usage = 8;
+  uint32 active_agents = 9; // Active agents in the selected workspace store.
+  ChatCleanupStatus chat_cleanup = 10;
 }
 
 message PruneRequest {
@@ -386,6 +403,7 @@ message ProviderCapabilities {
   bool web_usage = 5;
   bool web_history_cleanup = 6;
   bool native_tools = 7;
+  bool multi_account = 8; // Supports multiple signed-in accounts/slots inside one browser profile.
 }
 
 message ProviderInfo {
@@ -417,13 +435,15 @@ message RegisterProviderRequest {
   repeated string chat_url_prefixes = 8;
   repeated string reusable_path_prefixes = 9;
   optional string usage_url = 10;
-  optional string default_model = 11;
-  bool requires_models_control = 12;
-  optional uint32 inline_prompt_chars = 13;
-  optional string observer_binding = 14;
-  optional string scripts_dir = 15;
-  map<string, string> scripts = 16;
-  ProviderCapabilities capabilities = 17;
+  optional string entry_url_template = 11;
+  optional string usage_url_template = 12;
+  optional string default_model = 13;
+  bool requires_models_control = 14;
+  optional uint32 inline_prompt_chars = 15;
+  optional string observer_binding = 16;
+  optional string scripts_dir = 17;
+  map<string, string> scripts = 18;
+  ProviderCapabilities capabilities = 19;
 }
 
 // =============================================================================
@@ -434,33 +454,40 @@ message AccountRef {
   string account_id = 1;
 }
 
+// One managed or attached Chrome profile per provider.
+message BrowserProfile {
+  string provider_id = 1;
+  string profile = 2; // Diagnostic path on the browser host, not a client path.
+  optional string subprofile = 3;
+  uint32 port = 4;
+  bool headless = 5;
+}
+
+message BrowserProfileList {
+  repeated BrowserProfile browsers = 1;
+}
+
+// One signed-in user account/slot inside a provider's browser profile.
 message Account {
   string id = 1;
   string provider = 2;
   string state = 3;
-  string profile = 4; // Diagnostic path on the browser host, not a client path.
-  optional string subprofile = 5;
-  uint32 port = 6;
-  bool headless = 7;
+  optional string identity = 4; // Stable external identity (e.g. normalized email, user/org ID).
+  optional string label = 5;    // Human-readable display name.
+  optional string slot = 6;     // Volatile browser routing key (e.g. Gemini "0", "1").
 }
 
 message AccountList {
   repeated Account accounts = 1;
 }
 
-message CreateAccountRequest {
-  string id = 1;
-  string provider = 2;
-  uint32 port = 3; // 0 = auto-assign next free CDP port
-}
-
 message AttachBrowserRequest {
-  string account_id = 1;
+  string provider_id = 1;
   uint32 port = 2;
 }
 
 message SetBrowserModeRequest {
-  string account_id = 1;
+  string provider_id = 1;
   bool headless = 2;
 }
 
@@ -470,18 +497,19 @@ message LoginStatus {
 }
 
 message BrowserStatus {
-  string account_id = 1;
-  string account_state = 2;
-  bool connected = 3;
-  string endpoint = 4;
-  optional string browser = 5;
-  optional bool headless = 6;
-  string profile = 7;
-  optional bool profile_matches = 8;
-  uint64 owned_sessions = 9;
-  optional bool last_verified_sign_in = 10;
-  optional int64 checked_at = 11; // Unix milliseconds; absent means never checked.
-  LoginStatus login = 12;
+  string provider_id = 1;
+  bool connected = 2;
+  string endpoint = 3;
+  optional string browser = 4;
+  string profile = 5;
+  optional bool profile_matches = 6;
+  optional bool headless = 7;
+  uint64 owned_sessions = 8;
+  uint32 account_count = 9;
+  uint32 ready_accounts = 10;
+  optional bool last_verified_sign_in = 11;
+  optional int64 checked_at = 12; // Unix milliseconds; absent means never checked.
+  LoginStatus login = 13;
 }
 
 message WebUsageLimit {

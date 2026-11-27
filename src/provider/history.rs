@@ -25,6 +25,7 @@ impl Tab {
     fn acquire(
         provider: &ManifestWebProvider,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: &CancelToken,
     ) -> Result<Self> {
@@ -37,9 +38,9 @@ impl Tab {
         provider.script("delete-conversation.js")?;
         provider.script("read-history.js")?;
         cancel.check().map_err(failure)?;
-        let config = provider.web_chat_config()?;
-        let host = browser::ensure_browser(&browser::LaunchOptions::headless_account(
-            account,
+        let config = provider.web_chat_config_for(Some(account))?;
+        let host = browser::ensure_browser(&browser::LaunchOptions::headless_browser(
+            browser_profile,
             &config.entry_url,
         ))
         .map_err(failure)?;
@@ -56,9 +57,9 @@ impl Tab {
                 (target, lease, true)
             }
         };
-        let persistent = ctx
-            .store
-            .is_some_and(|store| tab_pool::record_system_tab_id(store, &account.id, &target.id));
+        let persistent = ctx.store.is_some_and(|store| {
+            tab_pool::record_system_tab_id(store, &account.id, host.port, &target.id)
+        });
         let tab = Self {
             port: host.port,
             target,
@@ -254,6 +255,7 @@ fn delete_in_tab(
 pub(super) fn delete(
     provider: &ManifestWebProvider,
     ctx: &ProviderContext<'_>,
+    browser_profile: &BrowserProfile,
     account: &Account,
     session: &Session,
     cancel: CancelToken,
@@ -275,7 +277,7 @@ pub(super) fn delete(
             .as_deref()
             .ok_or_else(|| ServiceError::invalid("recorded web conversation URL missing"))?,
     )?;
-    let tab = Tab::acquire(provider, ctx, account, &cancel)?;
+    let tab = Tab::acquire(provider, ctx, browser_profile, account, &cancel)?;
     let (scope, urls) = snapshot(provider, &tab, &cancel, None)?;
     if !urls.contains(&url) {
         return Ok(());
@@ -286,11 +288,12 @@ pub(super) fn delete(
 pub(super) fn clear(
     provider: &ManifestWebProvider,
     ctx: &ProviderContext<'_>,
+    browser_profile: &BrowserProfile,
     account: &Account,
     cancel: CancelToken,
     progress: &mut dyn FnMut(&str, u32) -> Result<()>,
 ) -> Result<u32> {
-    let tab = Tab::acquire(provider, ctx, account, &cancel)?;
+    let tab = Tab::acquire(provider, ctx, browser_profile, account, &cancel)?;
     let (scope, urls) = snapshot(provider, &tab, &cancel, None)?;
     let mut deleted = 0;
     for url in urls {

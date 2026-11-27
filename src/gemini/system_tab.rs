@@ -98,14 +98,16 @@ impl SystemGeminiTab {
         Self::acquire_inner(port, reusable, None, initial_url, true)
     }
 
-    pub fn acquire_for_store(
+    pub fn acquire_for_route(
         store: Option<&Store>,
         account_id: &str,
         port: u16,
+        route: &crate::provider::AccountRoute,
         initial_url: &str,
     ) -> Result<Self, String> {
-        let reserved =
-            store.and_then(|s| crate::tab_pool::reserve_system_gemini_target(s, account_id, port));
+        let reserved = store.and_then(|s| {
+            crate::tab_pool::reserve_system_gemini_target_for_route(s, account_id, port, route)
+        });
         let (reusable, lease) = match reserved {
             Some((target, lease)) => (Some(target), Some(lease)),
             None => (None, None),
@@ -117,7 +119,7 @@ impl SystemGeminiTab {
         };
         if let Some(s) = store {
             tab.keep_persistent =
-                crate::service::record_system_tab_id(s, account_id, &tab.target.id);
+                crate::service::record_system_tab_id(s, account_id, port, &tab.target.id);
         }
         Ok(tab)
     }

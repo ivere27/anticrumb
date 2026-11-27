@@ -39,6 +39,16 @@ pub(super) enum Update {
     BrowserControl(String),
     LoginOpened(Value),
     Providers(Value, Option<String>),
+    Accounts(Value, Option<String>),
+    AccountsRefreshed {
+        status: Value,
+        provider_id: String,
+        count: usize,
+    },
+    ActiveAccountSet {
+        status: Value,
+        account_id: String,
+    },
     ProviderSetup {
         status: Value,
         account_id: String,
@@ -86,12 +96,19 @@ pub(super) enum Command {
     Load(String, PromptOptions),
     Models(String, bool),
     Providers(Option<String>),
+    Accounts(Option<String>),
+    SetActiveAccount(String),
+    RefreshAccounts(String),
     SetupProvider {
         provider_id: String,
         provider_name: String,
     },
     WebUsage(String),
-    Browser(String, String),
+    Browser {
+        provider_id: String,
+        account_id: String,
+        action: String,
+    },
     BrowserControl(crate::rpc::pb::BrowserControlRequest),
     SearchMentions {
         id: u64,
@@ -329,26 +346,33 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                                 ))
                                 .await;
                         }
-                        Command::Browser(account, action) => {
+                        Command::Browser {
+                            provider_id,
+                            account_id,
+                            action,
+                        } => {
                             let value = if action == "show" || action == "hide" {
                                 client
                                     .request_async(
                                         "POST",
-                                        &format!("/api/accounts/{account}/browser-mode"),
+                                        &format!("/api/providers/{provider_id}/browser-mode"),
                                         Some(&json!({"headless": action == "hide"})),
                                     )
                                     .await?
                             } else {
-                                if action == "refresh" || action == "login" {
-                                    let route = if action == "refresh" {
-                                        "resolve"
-                                    } else {
-                                        "login"
-                                    };
+                                if action == "refresh" {
                                     client
                                         .request_async(
                                             "POST",
-                                            &format!("/api/accounts/{account}/{route}"),
+                                            &format!("/api/accounts/{account_id}/resolve"),
+                                            Some(&json!({})),
+                                        )
+                                        .await?;
+                                } else if action == "login" {
+                                    client
+                                        .request_async(
+                                            "POST",
+                                            &format!("/api/providers/{provider_id}/login"),
                                             Some(&json!({})),
                                         )
                                         .await?;
@@ -356,7 +380,7 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                                 client
                                     .request_async(
                                         "GET",
-                                        &format!("/api/accounts/{account}/browser"),
+                                        &format!("/api/providers/{provider_id}/browser"),
                                         None,
                                     )
                                     .await?
@@ -414,35 +438,107 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             let value = client.request_async("GET", "/api/status", None).await?;
                             let _ = tx.send(Update::Providers(value, target)).await;
                         }
+                        Command::Accounts(target) => {
+                            if let Some(target_query) = target {
+                                let active = client
+                                    .request_async(
+                                        "POST",
+                                        "/api/accounts/active",
+                                        Some(&json!({"account_id": target_query})),
+                                    )
+                                    .await?;
+                                let account_id = active["id"]
+                                    .as_str()
+                                    .unwrap_or(&target_query)
+                                    .to_owned();
+                                let status =
+                                    client.request_async("GET", "/api/status", None).await?;
+                                let _ = tx
+                                    .send(Update::ActiveAccountSet { status, account_id })
+                                    .await;
+                            } else {
+                                let value =
+                                    client.request_async("GET", "/api/status", None).await?;
+                                let _ = tx.send(Update::Accounts(value, None)).await;
+                            }
+                        }
+                        Command::SetActiveAccount(account_id) => {
+                            let active = client
+                                .request_async(
+                                    "POST",
+                                    "/api/accounts/active",
+                                    Some(&json!({"account_id": account_id})),
+                                )
+                                .await?;
+                            let resolved_id = active["id"]
+                                .as_str()
+                                .unwrap_or(&account_id)
+                                .to_owned();
+                            let status = client.request_async("GET", "/api/status", None).await?;
+                            let _ = tx
+                                .send(Update::ActiveAccountSet {
+                                    status,
+                                    account_id: resolved_id,
+                                })
+                                .await;
+                        }
+                        Command::RefreshAccounts(provider_id) => {
+                            let client = client.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let update = match client
+                                    .request_async(
+                                        "POST",
+                                        &format!("/api/providers/{provider_id}/refresh-accounts"),
+                                        Some(&json!({})),
+                                    )
+                                    .await
+                                {
+                                    Ok(discovered) => {
+                                        let count =
+                                            discovered.as_array().map(Vec::len).unwrap_or(0);
+                                        let status = client
+                                            .request_async("GET", "/api/status", None)
+                                            .await
+                                            .unwrap_or_else(|_| json!({}));
+                                        Update::AccountsRefreshed {
+                                            status,
+                                            provider_id,
+                                            count,
+                                        }
+                                    }
+                                    Err(error) => Update::Error(error.to_string()),
+                                };
+                                let _ = tx.send(update).await;
+                            });
+                        }
                         Command::SetupProvider {
                             provider_id,
                             provider_name,
                         } => {
-                            let accounts_val =
-                                client.request_async("GET", "/api/accounts", None).await?;
-                            let accounts =
-                                accounts_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
-                            let existing_ids: Vec<&str> =
-                                accounts.iter().filter_map(|a| a["id"].as_str()).collect();
-                            let desired_id =
-                                crate::provider::suggest_account_id(&provider_id, &existing_ids);
                             let created = client
                                 .request_async(
                                     "POST",
-                                    "/api/accounts",
-                                    Some(&json!({
-                                        "id": desired_id,
-                                        "port": 0,
-                                        "provider": provider_id
-                                    })),
+                                    &format!("/api/providers/{provider_id}/ensure-account"),
+                                    Some(&json!({})),
                                 )
                                 .await?;
-                            let account_id =
-                                created["id"].as_str().unwrap_or(&desired_id).to_owned();
+                            let account_id = created["id"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| ServiceError::invalid("created account missing id"))?
+                                .to_owned();
+                            let _ = client
+                                .request_async(
+                                    "POST",
+                                    "/api/accounts/active",
+                                    Some(&json!({"account_id": account_id})),
+                                )
+                                .await;
                             let login_error = client
                                 .request_async(
                                     "POST",
-                                    &format!("/api/accounts/{account_id}/login"),
+                                    &format!("/api/providers/{provider_id}/login"),
                                     Some(&json!({})),
                                 )
                                 .await

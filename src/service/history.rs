@@ -53,6 +53,17 @@ impl Service {
             return Err(ServiceError::invalid("host is stopping"));
         }
         self.ensure_no_active_agents(account_id)?;
+        let initial_account: Account = self.store.get("local", "account", account_id)?;
+        let browser_permit = self
+            .browser_gate(&initial_account.provider)
+            .try_read_owned()
+            .map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::QueueFull,
+                    "web_history",
+                    "provider browser is busy; finish login or browser changes before clearing web history",
+                )
+            })?;
         let permit = self.account_gate(account_id).try_acquire_owned().map_err(|_| ServiceError::new(
             ErrorCode::QueueFull, "web_history", "account is busy; finish its current request or login before clearing web history"))?;
         // Account attachment/login can change its profile under this gate.
@@ -92,6 +103,7 @@ impl Service {
         let response = status.clone();
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _browser_permit = browser_permit;
             let _permit = permit;
             status.state = "running".into();
             status.updated_at = now_ms();
@@ -292,12 +304,26 @@ mod tests {
         }
     }
     fn fixture(store: &Store) {
-        for account in ["default", "separate"] {
-            store.put("local","account",account,&json!({"id":account,"provider":"gemini-web","profile":"fixture/profile","port":0,"headless":true,"state":"ready"})).unwrap();
+        for account in [DEFAULT_ACCOUNT_ID, "separate"] {
+            store
+                .put(
+                    "local",
+                    "account",
+                    account,
+                    &Account {
+                        id: account.into(),
+                        provider: "gemini-web".into(),
+                        state: "ready".into(),
+                        identity: None,
+                        label: None,
+                        slot: None,
+                    },
+                )
+                .unwrap();
         }
         for (id, account) in [
-            ("owned", "default"),
-            ("other", "default"),
+            ("owned", DEFAULT_ACCOUNT_ID),
+            ("other", DEFAULT_ACCOUNT_ID),
             ("unrelated", "separate"),
         ] {
             store.put("local","session",id,&json!({"id":id,"provider":"gemini-web","account_id":account,"mode":"chat","target_id":null,"remote_url":format!("https://gemini.google.com/app/{id}"),"history":[],"state":"ready","model":null,"thinking":null,"tool_digest":""})).unwrap();
@@ -307,14 +333,14 @@ mod tests {
                 "local",
                 "agent",
                 "saved",
-                &json!({"id":"saved","state":"completed","request":{"account_id":"default"}}),
+                &json!({"id":"saved","state":"completed","request":{"account_id":DEFAULT_ACCOUNT_ID}}),
             )
             .unwrap();
     }
     async fn finished(service: &Service) -> Status {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let status = service.history_status("default").unwrap();
+                let status = service.history_status(DEFAULT_ACCOUNT_ID).unwrap();
                 if !status.is_active() {
                     break status;
                 }
@@ -332,7 +358,7 @@ mod tests {
         let backend = Arc::new(Fixture::default());
         backend.fail.store(true, Ordering::SeqCst);
         let service = Service::new(store.clone(), backend.clone()).unwrap();
-        let ack = service.clear_web_history("default").unwrap();
+        let ack = service.clear_web_history(DEFAULT_ACCOUNT_ID).unwrap();
         assert_eq!(ack.state, "pending");
         let failed = finished(&service).await;
         assert_eq!(failed.state, "failed");
@@ -354,9 +380,12 @@ mod tests {
         );
         let restarted =
             Service::new(Store::open(directory.path()).unwrap(), backend.clone()).unwrap();
-        assert_eq!(restarted.history_status("default").unwrap().state, "failed");
+        assert_eq!(
+            restarted.history_status(DEFAULT_ACCOUNT_ID).unwrap().state,
+            "failed"
+        );
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-        let retry = restarted.clear_web_history("default").unwrap();
+        let retry = restarted.clear_web_history(DEFAULT_ACCOUNT_ID).unwrap();
         assert!(retry.started_at > failed.started_at);
         assert_eq!(finished(&restarted).await.state, "completed");
         assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
@@ -390,32 +419,35 @@ mod tests {
         backend.hold.store(true, Ordering::SeqCst);
         let service = Service::new(store.clone(), backend.clone()).unwrap();
         let permit = service
-            .account_gate("default")
+            .account_gate(DEFAULT_ACCOUNT_ID)
             .acquire_owned()
             .await
             .unwrap();
         assert!(service
-            .clear_web_history("default")
+            .clear_web_history(DEFAULT_ACCOUNT_ID)
             .unwrap_err()
             .message
             .contains("busy"));
         drop(permit);
-        service.clear_web_history("default").unwrap();
+        service.clear_web_history(DEFAULT_ACCOUNT_ID).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while service.history_status("default").unwrap().deleted == 0 {
+            while service.history_status(DEFAULT_ACCOUNT_ID).unwrap().deleted == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .unwrap();
-        assert!(service.account_gate("default").try_acquire_owned().is_err());
+        assert!(service
+            .account_gate(DEFAULT_ACCOUNT_ID)
+            .try_acquire_owned()
+            .is_err());
         assert!(service
             .submit_async(TurnRequest::text("cannot race cleanup"))
             .await
             .unwrap_err()
             .message
             .contains("cleanup is active"));
-        assert!(service.clear_web_history("default").is_err());
+        assert!(service.clear_web_history(DEFAULT_ACCOUNT_ID).is_err());
         service.begin_shutdown();
         let stopped = finished(&service).await;
         assert_eq!(stopped.state, "interrupted");
@@ -423,11 +455,11 @@ mod tests {
         let mut crash = stopped.clone();
         crash.state = "running".into();
         store
-            .put("local", "web_history_cleanup", "default", &crash)
+            .put("local", "web_history_cleanup", DEFAULT_ACCOUNT_ID, &crash)
             .unwrap();
         let restarted = Service::new(store.clone(), backend.clone()).unwrap();
         assert_eq!(
-            restarted.history_status("default").unwrap().state,
+            restarted.history_status(DEFAULT_ACCOUNT_ID).unwrap().state,
             "interrupted"
         );
         assert_eq!(

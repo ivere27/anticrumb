@@ -121,6 +121,9 @@ fn unary_timeout(path: &str) -> Duration {
         "/anticrumb.v1.ModelService/RefreshCatalog" => {
             crate::account::MODEL_DISCOVERY_TIMEOUT + Duration::from_secs(30)
         }
+        "/anticrumb.v1.AccountService/RefreshAccounts" => {
+            crate::account::ACCOUNT_DISCOVERY_TIMEOUT + Duration::from_secs(30)
+        }
         "/anticrumb.v1.AccountService/GetWebUsage" => {
             crate::account::WEB_USAGE_TIMEOUT + Duration::from_secs(30)
         }

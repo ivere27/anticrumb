@@ -117,45 +117,78 @@ impl Store {
               PRIMARY KEY(scope,key)
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge USING fts5(source UNINDEXED,path UNINDEXED,hash UNINDEXED,line UNINDEXED,body);
+            CREATE TABLE IF NOT EXISTS browsers(
+              provider_id TEXT PRIMARY KEY,
+              port INTEGER NOT NULL,
+              profile TEXT NOT NULL,
+              headless INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS browsers_insert AFTER INSERT ON objects WHEN NEW.kind='browser' BEGIN
+              INSERT INTO browsers(provider_id,port,profile,headless) VALUES(
+                NEW.id,
+                coalesce(json_extract(NEW.payload,'$.port'),0),
+                coalesce(json_extract(NEW.payload,'$.profile'),''),
+                coalesce(json_extract(NEW.payload,'$.headless'),1)
+              )
+              ON CONFLICT(provider_id) DO UPDATE SET
+                port=excluded.port,
+                profile=excluded.profile,
+                headless=excluded.headless;
+            END;
+            CREATE TRIGGER IF NOT EXISTS browsers_update AFTER UPDATE ON objects WHEN NEW.kind='browser' BEGIN
+              INSERT INTO browsers(provider_id,port,profile,headless) VALUES(
+                NEW.id,
+                coalesce(json_extract(NEW.payload,'$.port'),0),
+                coalesce(json_extract(NEW.payload,'$.profile'),''),
+                coalesce(json_extract(NEW.payload,'$.headless'),1)
+              )
+              ON CONFLICT(provider_id) DO UPDATE SET
+                port=excluded.port,
+                profile=excluded.profile,
+                headless=excluded.headless;
+            END;
+            CREATE TRIGGER IF NOT EXISTS browsers_delete AFTER DELETE ON objects WHEN OLD.kind='browser' BEGIN
+              DELETE FROM browsers WHERE provider_id=OLD.id;
+            END;
             CREATE TABLE IF NOT EXISTS accounts(
               id TEXT PRIMARY KEY,
               provider TEXT NOT NULL,
-              port INTEGER NOT NULL,
-              profile TEXT NOT NULL,
-              headless INTEGER NOT NULL,
+              identity TEXT,
+              label TEXT,
+              slot TEXT,
               state TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS accounts_provider ON accounts(provider, state);
             CREATE TRIGGER IF NOT EXISTS accounts_insert AFTER INSERT ON objects WHEN NEW.kind='account' BEGIN
-              INSERT INTO accounts(id,provider,port,profile,headless,state) VALUES(
+              INSERT INTO accounts(id,provider,identity,label,slot,state) VALUES(
                 NEW.id,
                 json_extract(NEW.payload,'$.provider'),
-                coalesce(json_extract(NEW.payload,'$.port'),0),
-                coalesce(json_extract(NEW.payload,'$.profile'),''),
-                coalesce(json_extract(NEW.payload,'$.headless'),1),
+                nullif(json_extract(NEW.payload,'$.identity'),''),
+                nullif(json_extract(NEW.payload,'$.label'),''),
+                nullif(json_extract(NEW.payload,'$.slot'),''),
                 coalesce(json_extract(NEW.payload,'$.state'),'auth_required')
               )
               ON CONFLICT(id) DO UPDATE SET
                 provider=excluded.provider,
-                port=excluded.port,
-                profile=excluded.profile,
-                headless=excluded.headless,
+                identity=excluded.identity,
+                label=excluded.label,
+                slot=excluded.slot,
                 state=excluded.state;
             END;
             CREATE TRIGGER IF NOT EXISTS accounts_update AFTER UPDATE ON objects WHEN NEW.kind='account' BEGIN
-              INSERT INTO accounts(id,provider,port,profile,headless,state) VALUES(
+              INSERT INTO accounts(id,provider,identity,label,slot,state) VALUES(
                 NEW.id,
                 json_extract(NEW.payload,'$.provider'),
-                coalesce(json_extract(NEW.payload,'$.port'),0),
-                coalesce(json_extract(NEW.payload,'$.profile'),''),
-                coalesce(json_extract(NEW.payload,'$.headless'),1),
+                nullif(json_extract(NEW.payload,'$.identity'),''),
+                nullif(json_extract(NEW.payload,'$.label'),''),
+                nullif(json_extract(NEW.payload,'$.slot'),''),
                 coalesce(json_extract(NEW.payload,'$.state'),'auth_required')
               )
               ON CONFLICT(id) DO UPDATE SET
                 provider=excluded.provider,
-                port=excluded.port,
-                profile=excluded.profile,
-                headless=excluded.headless,
+                identity=excluded.identity,
+                label=excluded.label,
+                slot=excluded.slot,
                 state=excluded.state;
             END;
             CREATE TRIGGER IF NOT EXISTS accounts_delete AFTER DELETE ON objects WHEN OLD.kind='account' BEGIN
@@ -321,7 +354,7 @@ impl Store {
                 NEW.id,
                 coalesce(nullif(json_extract(NEW.payload,'$.conversation_id'),''), nullif(json_extract(NEW.payload,'$.request.conversation_id'),''), NEW.id),
                 coalesce(json_extract(NEW.payload,'$.request.workspace'),''),
-                coalesce(nullif(json_extract(NEW.payload,'$.request.account_id'),''),'default'),
+                coalesce(nullif(json_extract(NEW.payload,'$.request.account_id'),''),'gemini'),
                 coalesce(json_extract(NEW.payload,'$.state'),''),
                 coalesce(nullif(json_extract(NEW.payload,'$.request.session_mode'),''),'chat'),
                 CASE WHEN coalesce(json_extract(NEW.payload,'$.request.chat_only'),0) THEN 1 ELSE 0 END,
@@ -351,7 +384,7 @@ impl Store {
                 NEW.id,
                 coalesce(nullif(json_extract(NEW.payload,'$.conversation_id'),''), nullif(json_extract(NEW.payload,'$.request.conversation_id'),''), NEW.id),
                 coalesce(json_extract(NEW.payload,'$.request.workspace'),''),
-                coalesce(nullif(json_extract(NEW.payload,'$.request.account_id'),''),'default'),
+                coalesce(nullif(json_extract(NEW.payload,'$.request.account_id'),''),'gemini'),
                 coalesce(json_extract(NEW.payload,'$.state'),''),
                 coalesce(nullif(json_extract(NEW.payload,'$.request.session_mode'),''),'chat'),
                 CASE WHEN coalesce(json_extract(NEW.payload,'$.request.chat_only'),0) THEN 1 ELSE 0 END,
@@ -1182,6 +1215,165 @@ impl Store {
         rows.collect::<std::result::Result<_, _>>()
             .map_err(ServiceError::storage)
     }
+    pub fn browser_profile(&self, provider_id: &str) -> Result<BrowserProfile> {
+        self.get("local", "browser", provider_id)
+    }
+    pub fn put_browser_profile(&self, browser: &BrowserProfile) -> Result<()> {
+        self.put("local", "browser", &browser.provider_id, browser)
+    }
+    pub fn list_browser_profiles(&self) -> Result<Vec<BrowserProfile>> {
+        self.list("local", "browser")
+    }
+    pub fn browser_for_account(&self, account: &Account) -> Result<BrowserProfile> {
+        self.browser_profile(&account.provider)
+    }
+    pub fn active_account_id(&self) -> Result<Option<String>> {
+        match self.get::<Option<String>>("local", "runtime", "active_account") {
+            Ok(id) => Ok(id.filter(|s| !s.trim().is_empty())),
+            Err(error) if error.code == ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    pub fn set_active_account_id(&self, account_id: &str) -> Result<()> {
+        let _: Account = self.get("local", "account", account_id)?;
+        self.put(
+            "local",
+            "runtime",
+            "active_account",
+            &Some(account_id.to_owned()),
+        )
+    }
+    pub fn resolve_active_account_id(&self) -> Result<String> {
+        if let Some(active) = self.active_account_id()? {
+            if self.get::<Account>("local", "account", &active).is_ok() {
+                return Ok(active);
+            }
+        }
+        let accounts = self.list::<Account>("local", "account")?;
+        if let Some(ready) = accounts.iter().find(|a| a.state == "ready") {
+            return Ok(ready.id.clone());
+        }
+        accounts.into_iter().next().map(|a| a.id).ok_or_else(|| {
+            ServiceError::new(ErrorCode::NotFound, "store", "no accounts configured")
+        })
+    }
+    pub fn resolve_account_query(
+        &self,
+        query: &str,
+        provider_filter: Option<&str>,
+    ) -> Result<Account> {
+        let q = query.trim();
+        let candidates: Vec<Account> = match provider_filter {
+            Some(provider) => self.accounts_for_provider(provider)?,
+            None => self.list::<Account>("local", "account")?,
+        };
+        if q.is_empty() {
+            if let Ok(active_id) = self.resolve_active_account_id() {
+                if let Some(active) = candidates.iter().find(|a| a.id == active_id) {
+                    return Ok(active.clone());
+                }
+            }
+            if let Some(ready) = candidates.iter().find(|a| a.state == "ready") {
+                return Ok(ready.clone());
+            }
+            return candidates.into_iter().next().ok_or_else(|| {
+                ServiceError::new(ErrorCode::NotFound, "account", "no matching account found")
+            });
+        }
+        // 1. Exact internal account ID
+        if let Some(found) = candidates.iter().find(|a| a.id == q) {
+            return Ok(found.clone());
+        }
+        let lower = q.to_ascii_lowercase();
+        // 2. Exact case-insensitive identity (e.g. email)
+        let by_identity: Vec<&Account> = candidates
+            .iter()
+            .filter(|a| {
+                a.identity
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(q))
+            })
+            .collect();
+        if by_identity.len() == 1 {
+            return Ok(by_identity[0].clone());
+        }
+        if by_identity.len() > 1 {
+            let ids = by_identity
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ServiceError::invalid(format!(
+                "ambiguous account '{q}'; specify one of: {ids}"
+            )));
+        }
+        // 3. Exact case-insensitive label
+        let by_label: Vec<&Account> = candidates
+            .iter()
+            .filter(|a| {
+                a.label
+                    .as_deref()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(q))
+            })
+            .collect();
+        if by_label.len() == 1 {
+            return Ok(by_label[0].clone());
+        }
+        // 4. Slot match ("0", "1", "u/0", "/u/1")
+        let normalized_slot = lower
+            .trim_start_matches('/')
+            .strip_prefix("u/")
+            .unwrap_or(lower.as_str());
+        let by_slot: Vec<&Account> = candidates
+            .iter()
+            .filter(|a| {
+                a.slot
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(normalized_slot))
+            })
+            .collect();
+        if by_slot.len() == 1 {
+            return Ok(by_slot[0].clone());
+        }
+        if by_slot.len() > 1 {
+            let ids = by_slot
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ServiceError::invalid(format!(
+                "slot '{q}' matches multiple accounts ({ids}); specify an account ID or identity"
+            )));
+        }
+        // 5. Unique email localpart match (e.g. "alice" -> "alice@gmail.com")
+        let by_localpart: Vec<&Account> = candidates
+            .iter()
+            .filter(|a| {
+                a.identity
+                    .as_deref()
+                    .and_then(|id| id.split('@').next())
+                    .is_some_and(|local| local.eq_ignore_ascii_case(q))
+            })
+            .collect();
+        if by_localpart.len() == 1 {
+            return Ok(by_localpart[0].clone());
+        }
+        if by_localpart.len() > 1 {
+            let labels = by_localpart
+                .iter()
+                .map(|a| format!("{} ({})", a.display_label(), a.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ServiceError::invalid(format!(
+                "ambiguous account '{q}'; matches: {labels}"
+            )));
+        }
+        Err(ServiceError::new(
+            ErrorCode::NotFound,
+            "account",
+            format!("account '{q}' not found"),
+        ))
+    }
     pub fn accounts_for_provider(&self, provider: &str) -> Result<Vec<Account>> {
         let conn = self.conn.lock().map_err(ServiceError::storage)?;
         let mut stmt = conn
@@ -1494,7 +1686,7 @@ impl Store {
             }
             if let Some(expected_acct) = account_id {
                 let job_acct = if job.request.account_id.is_empty() {
-                    "default"
+                    DEFAULT_ACCOUNT_ID
                 } else {
                     job.request.account_id.as_str()
                 };
@@ -1507,7 +1699,7 @@ impl Store {
             turns.push(job);
         }
         let cleanup_account = if turns[0].request.account_id.is_empty() {
-            "default".into()
+            default_account()
         } else {
             turns[0].request.account_id.clone()
         };
@@ -2174,21 +2366,37 @@ mod tests {
         let claude_acct = Account {
             id: "claude-work".into(),
             provider: "claude-web".into(),
-            profile: root.path().join("accounts/claude-work/profile"),
-            subprofile: None,
-            port: 9223,
-            headless: true,
             state: "ready".into(),
+            identity: Some("work@example.com".into()),
+            label: Some("work@example.com".into()),
+            slot: None,
         };
         let chatgpt_acct = Account {
             id: "chatgpt-personal".into(),
             provider: "chatgpt-web".into(),
-            profile: root.path().join("accounts/chatgpt-personal/profile"),
-            subprofile: None,
-            port: 9224,
-            headless: true,
             state: "ready".into(),
+            identity: Some("personal@example.com".into()),
+            label: Some("personal@example.com".into()),
+            slot: None,
         };
+        store
+            .put_browser_profile(&BrowserProfile {
+                provider_id: "claude-web".into(),
+                profile: root.path().join("profiles/claude-web"),
+                subprofile: None,
+                port: 9223,
+                headless: true,
+            })
+            .unwrap();
+        store
+            .put_browser_profile(&BrowserProfile {
+                provider_id: "chatgpt-web".into(),
+                profile: root.path().join("profiles/chatgpt-web"),
+                subprofile: None,
+                port: 9224,
+                headless: true,
+            })
+            .unwrap();
         store
             .put("local", "account", &claude_acct.id, &claude_acct)
             .unwrap();

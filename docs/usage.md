@@ -35,11 +35,12 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 | `/temp [on\|off]` | Enable or disable anonymous temporary chat (no server history; saved across restarts) |
 | `/model` | Pick a cached model (Up/Down) and thinking level (Left/Right) |
 | `/model refresh` | Discover models through Chrome |
-| `/provider` | Select or set up a provider account |
-| `/browser` | Inspect browser and sign-in state |
-| `/browser login`, `/browser refresh` | Open sign-in or verify the current session |
+| `/provider` | Select or set up a provider |
+| `/account [TARGET\|refresh]` | Switch between signed-in accounts on a multi-account provider (e.g. Gemini Multi-Login) or rescan Chrome |
+| `/browser` | Inspect provider browser and sign-in state |
+| `/browser login`, `/browser refresh` | Open provider sign-in (discovers accounts) or verify the current account |
 | `/browse COMMAND` | Control web pages; `/browse help` lists commands |
-| `/usage` | Read Gemini account limits and reset times |
+| `/usage` | Read web usage limits and reset times for the active account |
 | `/cache` | Show workspace and browser cache usage, reclaimable space, and last cleanup |
 | `/cache prune [DAYS] [--dry-run]` | Clean eligible cache files; default retention is 7 days |
 | `/status` | Refresh daemon and browser health |
@@ -69,7 +70,10 @@ anticrumb exec -C ./project 'Review @git:diff+ and suggest tests'
 anticrumb exec -C ./project 'Review @git:HEAD~1 and check for regressions'
 anticrumb exec -C ./project 'Review @git:HEAD~1+ with AST context'
 anticrumb image 'Draw a minimalist rust gear icon'
-anticrumb artifact get default ARTIFACT_ID ./result.webp
+anticrumb artifact get gemini ARTIFACT_ID ./result.webp
+anticrumb accounts list
+anticrumb accounts use alice@gmail.com
+anticrumb accounts refresh
 ```
 
 - `@path`, `@git:diff`, `@git:diff+`, `@git:staged`, `@git:staged+`, `@git:<commit>`, `@git:<commit>+`, `--file PATH`, and `-i/--image PATH` upload through the provider: 100 MiB per file, 10 files per conversation. `@git:diff`, `@git:staged`, and `@git:<commit>` (commit SHA, `HEAD`, `HEAD~1`, branch, or tag) generate temporary patch attachments (`git-diff.patch` / `git-staged.patch` / `git-<sha>.patch`) directly from the workspace git repository. `@git:diff+`, `@git:staged+`, and `@git:<commit>+` run the **[3-Layer Hybrid Git+AST Diff pipeline](git-diff-hybrid.md)** (`git-diff+.patch`, `git-staged+.patch`, or `git-<sha>+.patch`) without truncating production code (logging an advisory warning when output exceeds `512 KiB`, or `ANTICRUMB_PATCH_BUDGET_KIB`):

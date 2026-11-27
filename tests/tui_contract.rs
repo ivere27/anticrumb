@@ -747,8 +747,8 @@ mod unix_pty {
         assert_eq!(
             observations()["browser_mode_requests"],
             serde_json::json!([
-                {"account_id": "default", "headless": false},
-                {"account_id": "default", "headless": true}
+                {"provider_id": "gemini-web", "headless": false},
+                {"provider_id": "gemini-web", "headless": true}
             ])
         );
         pty.send("/usage\r");

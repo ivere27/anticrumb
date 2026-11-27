@@ -2,7 +2,11 @@ use crate::{
     agent::CancelToken,
     browser_host as browser,
     cdp::CdpClient,
-    domain::{Account, ErrorCode, Result, ServiceError, Session, SessionMode, SessionState},
+    domain::{
+        Account, BrowserProfile, ErrorCode, Result, ServiceError, Session, SessionMode,
+        SessionState,
+    },
+    provider::AccountRoute,
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -24,6 +28,99 @@ fn recorded_url(session: &Session) -> Result<crate::url_lite::Url> {
     })
 }
 
+fn rebased_recorded_url(session: &Session, slot: Option<&str>) -> Result<crate::url_lite::Url> {
+    let parsed = recorded_url(session)?;
+    if slot.is_some() {
+        let rebased = super::url::rebase_gemini_chat_url(parsed.as_str(), slot).map_err(|_| {
+            ServiceError::invalid("web cleanup requires an exact recorded Gemini conversation URL")
+        })?;
+        return crate::url_lite::Url::parse(&rebased).map_err(ServiceError::storage);
+    }
+    Ok(parsed)
+}
+
+fn account_route(account: &Account) -> AccountRoute {
+    let slot = super::url::normalized_slot(account.slot.as_deref());
+    AccountRoute {
+        entry_url: super::url::gemini_app_url(Some(slot)),
+        usage_url: Some(super::url::gemini_usage_url(Some(slot))),
+        scope: Some(slot.to_owned()),
+    }
+}
+
+fn verify_target_identity(
+    port: u16,
+    target: &browser::TargetInfo,
+    account: &Account,
+    cancel: &CancelToken,
+) -> Result<()> {
+    let expected_identity = account
+        .identity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let expected_slot = account
+        .slot
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if expected_identity.is_none() && expected_slot.is_none() {
+        return Ok(());
+    }
+    let mut cdp = CdpClient::connect(
+        port,
+        &browser::ws_path_from_url(&target.ws_url).map_err(ServiceError::storage)?,
+    )
+    .map_err(|e| ServiceError::backend(e, false))?;
+    cdp.set_control(cancel.clone(), Instant::now() + Duration::from_secs(5));
+    let script = crate::adapter::script("driver.js").map_err(ServiceError::storage)?;
+    let result = cdp
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("({script})({})", json!({"op": "probe"})),
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+        .map_err(|e| ServiceError::backend(e, false))?;
+    if result.get("exceptionDetails").is_some() {
+        return Ok(());
+    }
+    let probe = &result["result"]["value"];
+    if let Some(expected) = expected_identity {
+        if let Some(observed) = probe["identity"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !observed.eq_ignore_ascii_case(expected) {
+                return Err(ServiceError::new(
+                    ErrorCode::AuthRequired,
+                    "identity_mismatch",
+                    "browser tab switched to a different account; rescanning accounts",
+                ));
+            }
+        }
+    }
+    if let Some(slot) = expected_slot {
+        let observed_slot = probe["slot"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| probe["url"].as_str().and_then(super::url::gemini_url_scope));
+        if observed_slot.as_deref().is_some_and(|obs| obs != slot) {
+            return Err(ServiceError::new(
+                ErrorCode::AuthRequired,
+                "identity_mismatch",
+                "browser tab switched to a different account; rescanning accounts",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_absence(url: &crate::url_lite::Url, remaining: &[String]) -> Result<()> {
     let conversation = url.path_segments().and_then(|mut s| s.next_back());
     if remaining.iter().any(|raw| {
@@ -43,17 +140,19 @@ fn verify_absence(url: &crate::url_lite::Url, remaining: &[String]) -> Result<()
 /// Snapshot the complete account history before deletion, then independently
 /// enumerate it again. Never call an incomplete sidebar view "all deleted".
 pub fn clear_web_history(
+    browser_profile: &BrowserProfile,
     account: &Account,
     cancel: CancelToken,
     progress: &mut dyn FnMut(&str, u32) -> Result<()>,
 ) -> Result<u32> {
-    clear_web_history_with_store(None, account, cancel, progress)
+    clear_web_history_with_store(None, browser_profile, account, cancel, progress)
 }
 
 /// Snapshot and delete all account web conversations inside one serialized
 /// system Gemini tab when `store` provides an unowned target.
 pub fn clear_web_history_with_store(
     store: Option<&crate::store::Store>,
+    browser_profile: &BrowserProfile,
     account: &Account,
     cancel: CancelToken,
     progress: &mut dyn FnMut(&str, u32) -> Result<()>,
@@ -61,20 +160,27 @@ pub fn clear_web_history_with_store(
     cancel
         .check()
         .map_err(|e| ServiceError::backend(e, false))?;
-    let host = browser::ensure_browser(&browser::LaunchOptions::headless_account(
-        account,
-        browser::GEMINI_APP_URL,
+    let route = account_route(account);
+    let host = browser::ensure_browser(&browser::LaunchOptions::headless_browser(
+        browser_profile,
+        &route.entry_url,
     ))
     .map_err(|e| ServiceError::backend(e, false))?;
-    let tab =
-        super::SystemGeminiTab::acquire_for_store(store, &account.id, host.port, "about:blank")
-            .map_err(|e| ServiceError::backend(e, false))?;
+    let tab = super::SystemGeminiTab::acquire_for_route(
+        store,
+        &account.id,
+        host.port,
+        &route,
+        "about:blank",
+    )
+    .map_err(|e| ServiceError::backend(e, false))?;
     let urls = super::history::list_web_conversations_in_target(
         host.port,
         &tab.target,
         cancel.clone(),
-        browser::GEMINI_APP_URL,
+        &route.entry_url,
     )?;
+    verify_target_identity(host.port, &tab.target, account, &cancel)?;
     let mut deleted = 0;
     for (index, url) in urls.into_iter().enumerate() {
         cancel
@@ -116,7 +222,7 @@ pub fn clear_web_history_with_store(
         host.port,
         &tab.target,
         cancel,
-        browser::GEMINI_APP_URL,
+        &route.entry_url,
     )?;
     if !remaining.is_empty() {
         return Err(ServiceError::backend(format!(
@@ -129,17 +235,19 @@ pub fn clear_web_history_with_store(
 /// Delete only the recorded web conversation.
 /// The caller serializes this operation through the account gate.
 pub fn delete_web_conversation(
+    browser_profile: &BrowserProfile,
     account: &Account,
     session: &Session,
     cancel: CancelToken,
 ) -> Result<()> {
-    delete_web_conversation_with_store(None, account, session, cancel)
+    delete_web_conversation_with_store(None, browser_profile, account, session, cancel)
 }
 
 /// Delete the recorded web conversation inside an existing unowned Gemini tab
 /// when available, avoiding repeated Chrome tab open/close churn.
 pub fn delete_web_conversation_with_store(
     store: Option<&crate::store::Store>,
+    browser_profile: &BrowserProfile,
     account: &Account,
     session: &Session,
     cancel: CancelToken,
@@ -154,21 +262,27 @@ pub fn delete_web_conversation_with_store(
     {
         return Ok(());
     }
-    let url = recorded_url(session)?;
+    let url = rebased_recorded_url(session, account.slot.as_deref())?;
     let mut home = url.clone();
     home.set_path(url.path().rsplit_once('/').unwrap().0);
     home.set_fragment(None);
     cancel
         .check()
         .map_err(|e| ServiceError::backend(e, false))?;
-    let host = browser::ensure_browser(&browser::LaunchOptions::headless_account(
-        account,
+    let route = account_route(account);
+    let host = browser::ensure_browser(&browser::LaunchOptions::headless_browser(
+        browser_profile,
         home.as_str(),
     ))
     .map_err(|e| ServiceError::backend(e, false))?;
-    let tab =
-        super::SystemGeminiTab::acquire_for_store(store, &account.id, host.port, "about:blank")
-            .map_err(|e| ServiceError::backend(e, false))?;
+    let tab = super::SystemGeminiTab::acquire_for_route(
+        store,
+        &account.id,
+        host.port,
+        &route,
+        "about:blank",
+    )
+    .map_err(|e| ServiceError::backend(e, false))?;
     delete_web_conversation_in_target(account, host.port, &tab.target, session, cancel)
 }
 
@@ -189,7 +303,7 @@ fn delete_web_conversation_in_target(
     {
         return Ok(());
     }
-    let url = recorded_url(session)?;
+    let url = rebased_recorded_url(session, account.slot.as_deref())?;
     cancel
         .check()
         .map_err(|e| ServiceError::backend(e, false))?;
@@ -202,6 +316,7 @@ fn delete_web_conversation_in_target(
         cancel.clone(),
         base.as_str(),
     )?;
+    verify_target_identity(host_port, target, account, &cancel)?;
     let deadline = Instant::now() + Duration::from_secs(25);
     let mut cdp = CdpClient::connect(
         host_port,

@@ -284,53 +284,86 @@ impl Service {
             return Err(ServiceError::invalid("host is stopping"));
         }
         let session: Session = self.store.get("local", "session", id)?;
-        let gate = self.account_gate(&session.account_id);
-        let permit = tokio::select! {
-            result = gate.acquire_owned() => result.map_err(ServiceError::storage)?,
-            _ = self.shutdown.notified() => return Err(ServiceError::invalid("host is stopping")),
-        };
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut session: Session = service.store.get("local", "session", &session.id)?;
-            if session.state == SessionState::Deleted {
-                return Ok(());
-            }
-            // Recheck after acquiring the account gate: another saved turn
-            // may have acquired this session while cleanup was waiting.
-            if service.shared_session(&session.id, &[])? {
-                return Err(ServiceError::invalid(
-                    "web chat is referenced by another saved entry; cleanup retained it",
-                ));
-            }
-            if session.state == SessionState::Running {
-                return Err(ServiceError::invalid("web conversation is still running"));
-            }
-            let account: Account = service.store.get("local", "account", &session.account_id)?;
-            if session.mode != SessionMode::Temporary {
-                if account.state != "ready" {
+        for attempt in 0..2 {
+            let browser_gate = self.browser_gate(&session.provider);
+            let browser_permit = tokio::select! {
+                guard = browser_gate.read_owned() => guard,
+                _ = self.shutdown.notified() => return Err(ServiceError::invalid("host is stopping")),
+            };
+            let gate = self.account_gate(&session.account_id);
+            let permit = tokio::select! {
+                result = gate.acquire_owned() => result.map_err(ServiceError::storage)?,
+                _ = self.shutdown.notified() => return Err(ServiceError::invalid("host is stopping")),
+            };
+            let service = self.clone();
+            let session_id = session.id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _browser_permit = browser_permit;
+                let _permit = permit;
+                let mut session: Session = service.store.get("local", "session", &session_id)?;
+                if session.state == SessionState::Deleted {
+                    return Ok(());
+                }
+                // Recheck after acquiring the account gate: another saved turn
+                // may have acquired this session while cleanup was waiting.
+                if service.shared_session(&session.id, &[])? {
                     return Err(ServiceError::invalid(
-                        "sign in and resolve the account before deleting web chats",
+                        "web chat is referenced by another saved entry; cleanup retained it",
                     ));
                 }
-                service.backend.delete_conversation(
-                    &account,
-                    &session,
-                    service.cleanup_cancel.clone(),
-                )?;
-            } else if !session.is_inactive() {
-                if let Err(err) = service.backend.close(&account, &session) {
-                    if err.code != ErrorCode::NotFound {
-                        return Err(err);
-                    }
+                if session.state == SessionState::Running {
+                    return Err(ServiceError::invalid("web conversation is still running"));
                 }
-                session.target_id = None;
+                let account: Account =
+                    service.store.get("local", "account", &session.account_id)?;
+                if session.mode != SessionMode::Temporary {
+                    if account.state != "ready" {
+                        return Err(ServiceError::invalid(
+                            "sign in and resolve the account before deleting web chats",
+                        ));
+                    }
+                    service.backend.delete_conversation(
+                        &account,
+                        &session,
+                        service.cleanup_cancel.clone(),
+                    )?;
+                } else if !session.is_inactive() {
+                    if let Err(err) = service.backend.close(&account, &session) {
+                        if err.code != ErrorCode::NotFound {
+                            return Err(err);
+                        }
+                    }
+                    session.target_id = None;
+                }
+                session.state = SessionState::Deleted;
+                service.store.put("local", "session", &session.id, &session)
+            })
+            .await
+            .map_err(ServiceError::storage)?;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt == 0 && err.stage == "identity_mismatch" => {
+                    let _write = self.browser_gate(&session.provider).write_owned().await;
+                    let refresh_service = self.clone();
+                    let provider_id = session.provider.clone();
+                    let cancel = self.cleanup_cancel.clone();
+                    tokio::task::spawn_blocking(move || {
+                        refresh_service
+                            .backend
+                            .refresh_accounts(&provider_id, cancel)
+                    })
+                    .await
+                    .map_err(ServiceError::storage)??;
+                    continue;
+                }
+                Err(err) => return Err(err),
             }
-            session.state = SessionState::Deleted;
-            service.store.put("local", "session", &session.id, &session)
-        })
-        .await
-        .map_err(ServiceError::storage)?
+        }
+        Err(ServiceError::new(
+            ErrorCode::AuthRequired,
+            "identity_mismatch",
+            "account identity could not be verified after rescan",
+        ))
     }
 }
 
@@ -530,7 +563,8 @@ mod tests {
         fixture(&store, "chat");
         let backend = Arc::new(DeleteBackend::default());
         let service = Service::new(store.clone(), backend.clone()).unwrap();
-        let request = TurnRequest::text("fixture request");
+        let mut request = TurnRequest::text("fixture request");
+        request.account_id = "default".into();
         store
             .put(
                 "local",
@@ -596,7 +630,11 @@ mod tests {
                     id: "unmapped".into(),
                     provider: default_provider(),
                     state: "cancelled".into(),
-                    request: TurnRequest::text("fixture"),
+                    request: {
+                        let mut r = TurnRequest::text("fixture");
+                        r.account_id = "default".into();
+                        r
+                    },
                     result: None,
                     error: None,
                     created_at: 0,

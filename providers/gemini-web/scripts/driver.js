@@ -22,6 +22,44 @@
   };
   const verification = () => location.pathname.startsWith('/sorry') || !!one('iframe[src*="recaptcha"][src*="bframe"], iframe[src*="challenge"], #captcha, form[action*="/sorry"]');
   const auth = () => !!document.querySelector('[data-test-id="profile-avatar"], a[href*="SignOutOptions"]');
+  const emailRe = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+  const extractEmail = text => {
+    if (typeof text !== 'string') return null;
+    const match = text.match(emailRe);
+    return match ? match[0].toLowerCase() : null;
+  };
+  const accountIdentity = () => {
+    try {
+      const wiz = window.WIZ_global_data && window.WIZ_global_data.oPEP7c;
+      const fromWiz = extractEmail(wiz);
+      if (fromWiz) return fromWiz;
+    } catch (_) {}
+    for (const selector of [
+      'a[href*="SignOutOptions"]',
+      '[data-test-id="profile-avatar"]',
+      '[data-test-id="profile-avatar"] button',
+      'a[aria-label*="@"]',
+      'button[aria-label*="@"]',
+      '[aria-label*="Google Account"]'
+    ]) {
+      for (const el of document.querySelectorAll(selector)) {
+        for (const attr of ['aria-label', 'title', 'data-email']) {
+          const email = extractEmail(el.getAttribute(attr));
+          if (email) return email;
+        }
+      }
+    }
+    return null;
+  };
+  const accountSlot = () => {
+    const m = location.pathname.match(/^\/u\/(\d+)(?:\/|$)/);
+    if (m) return m[1];
+    try {
+      const q = new URLSearchParams(location.search).get('authuser');
+      if (q && /^\d+$/.test(q)) return q;
+    } catch (_) {}
+    return '0';
+  };
   const menuFor = thinking => {
     const root=one('gem-menu[data-test-id="gem-mode-menu"]');
     if(!thinking)return root;
@@ -48,7 +86,7 @@
     failed:!!el.querySelector('.gem-attachment-loading-error,'+icon('error')+','+icon('warning'))
   }));
   const sendBtn = () => one('[data-test-id="send-button"],button.send-button,'+buttonIcon('arrow_upward'));
-  const newChatBtn = () => one('[data-test-id="new-chat-button"] a, [data-test-id="new-chat-button"] button') || one('[data-test-id="new-chat-button"], a[href="/app"][mat-list-item]');
+  const newChatBtn = () => one('[data-test-id="new-chat-button"] a, [data-test-id="new-chat-button"] button') || one('[data-test-id="new-chat-button"], a[href="/app"][mat-list-item], a[href^="/u/"][href$="/app"][mat-list-item]');
   const modelsBtn = () => one('[data-test-id="bard-mode-menu-button"],button.input-area-switch');
   const thinkingTrigger = () => menuItems(menuFor(false)).find(el=>el.getAttribute('value')==='thinking_level');
   const uploadBtn = () => one('[data-test-id="upload-button"],button:has(mat-icon[fonticon="add_2"]),button:has(mat-icon[fonticon="add"]),button:has(mat-icon[fonticon="plus"])');
@@ -60,7 +98,10 @@
     return {ok:true, x:r.left, y:r.top, width:r.width, height:r.height, ...extra};
   };
   switch(args.op) {
-    case 'probe': return {editor:!!editor(),has_draft:!!editorText().trim(),signed_in:auth(),verification:verification(),temporary:temporary(),generating:!!stop(),url:location.origin+location.pathname,model:one('[data-test-id="logo-pill-label-container"]')?.textContent?.trim()||null,model_button:modelsBtn()?.textContent?.trim()||null,uploads:!!document.querySelector('input[type="file"]'),models:!!modelsBtn(),response_count:document.querySelectorAll('model-response').length};
+    case 'probe': {
+      const identity = accountIdentity();
+      return {editor:!!editor(),has_draft:!!editorText().trim(),signed_in:auth(),identity,label:identity,slot:accountSlot(),verification:verification(),temporary:temporary(),generating:!!stop(),url:location.origin+location.pathname,model:one('[data-test-id="logo-pill-label-container"]')?.textContent?.trim()||null,model_button:modelsBtn()?.textContent?.trim()||null,uploads:!!document.querySelector('input[type="file"]'),models:!!modelsBtn(),response_count:document.querySelectorAll('model-response').length};
+    }
     case 'target_rect': {
       switch(args.target) {
         case 'editor': return rectOf(editor());

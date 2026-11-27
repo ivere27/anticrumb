@@ -709,7 +709,11 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         ));
         state.send(
             &mut sink,
-            Command::Browser(state.options.account.clone(), "login".into()),
+            Command::Browser {
+                provider_id: state.provider_id().to_owned(),
+                account_id: state.options.account.clone(),
+                action: "login".into(),
+            },
         );
     }
     let mut initial = !state.editor.text.is_empty();

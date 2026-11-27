@@ -3,7 +3,7 @@ use anticrumb::{
     agent::CancelToken,
     browser_control::{self, BrowserControlRegistry},
     browser_host as browser,
-    domain::Account,
+    domain::{Account, BrowserProfile},
 };
 use serde_json::{json, Value};
 use std::{
@@ -96,22 +96,28 @@ fn browser_sessions_forms_refs_history_popups_and_cleanup() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let account = Account {
-        id: "fixture".into(),
-        provider: "gemini-web".into(),
+    let browser_profile = BrowserProfile {
+        provider_id: "gemini-web".into(),
         profile: temp.path().join("profile"),
         subprofile: None,
         port,
         headless: true,
-        state: "ready".into(),
     };
-    let mut options = browser::LaunchOptions::headless_account(&account, "about:blank");
+    let account = Account {
+        id: "fixture".into(),
+        provider: "gemini-web".into(),
+        state: "ready".into(),
+        identity: None,
+        label: None,
+        slot: None,
+    };
+    let mut options = browser::LaunchOptions::headless_browser(&browser_profile, "about:blank");
     options.detached = false;
     let _chrome = browser::ensure_browser(&options).unwrap();
     let registry = BrowserControlRegistry::default();
     let call = |session: &str, args: Value| {
         let req = browser_control::request(&args, &account.id, session).unwrap();
-        registry.execute(&account, &req, CancelToken::new())
+        registry.execute(&browser_profile, &account, &req, CancelToken::new())
     };
     let url = format!("http://127.0.0.1:{}/", fixture.port);
     let opened = call("one", json!({"action":"open","url":url})).unwrap();

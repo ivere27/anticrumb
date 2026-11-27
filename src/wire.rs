@@ -152,7 +152,7 @@ fn content(value: &Value, request: &mut TurnRequest, store: &Store) -> Result<Ve
     Ok(blocks)
 }
 
-fn base(value: &Value) -> Result<TurnRequest> {
+fn base(value: &Value, store: &Store) -> Result<TurnRequest> {
     for field in [
         "logprobs",
         "top_logprobs",
@@ -179,8 +179,15 @@ fn base(value: &Value) -> Result<TurnRequest> {
     }
     let mut request = TurnRequest::text("");
     request.messages.clear();
-    if let Some(account) = value["account_id"].as_str() {
+    if let Some(account) = value["account_id"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+    {
         request.account_id = account.into();
+    } else {
+        request.account_id = store
+            .resolve_active_account_id()
+            .unwrap_or_else(|_| default_account());
     }
     request.parallel_tool_calls = value["parallel_tool_calls"].as_bool().unwrap_or(true);
     request.output_token_hint = value["max_output_tokens"]
@@ -197,7 +204,7 @@ fn base(value: &Value) -> Result<TurnRequest> {
 }
 
 pub fn chat_request(value: &Value, store: &Store) -> Result<TurnRequest> {
-    let mut request = base(value)?;
+    let mut request = base(value, store)?;
     for message in value["messages"]
         .as_array()
         .ok_or_else(|| ServiceError::invalid("messages must be an array"))?
@@ -246,7 +253,7 @@ pub fn chat_request(value: &Value, store: &Store) -> Result<TurnRequest> {
 }
 
 pub fn responses_request(value: &Value, store: &Store) -> Result<TurnRequest> {
-    let mut request = base(value)?;
+    let mut request = base(value, store)?;
     if let Some(previous) = value["previous_response_id"].as_str() {
         let prior: Run = store.get("local", "run", previous)?;
         if prior.request.account_id != request.account_id || prior.state != "completed" {
@@ -394,7 +401,7 @@ pub fn responses_result(id: &str, result: &TurnResult) -> Value {
 }
 
 pub fn messages_request(value: &Value, store: &Store) -> Result<TurnRequest> {
-    let mut request = base(value)?;
+    let mut request = base(value, store)?;
     if !value["system"].is_null() {
         let blocks = content(&value["system"], &mut request, store)?;
         request.messages.push(Message {
@@ -474,7 +481,7 @@ pub fn gemini_request(value: &Value, model: &str, store: &Store) -> Result<TurnR
             ));
         }
     }
-    let mut request = base(&normalized)?;
+    let mut request = base(&normalized, store)?;
     for item in value.get("systemInstruction").into_iter().chain(
         value["contents"]
             .as_array()

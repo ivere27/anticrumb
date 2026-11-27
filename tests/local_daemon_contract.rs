@@ -338,7 +338,7 @@ fn concurrent_startup_uses_one_daemon_and_crashed_clients_do_not_keep_it_alive()
 fn explicit_local_daemon_survives_its_last_client() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let profile = root.join("accounts/work-claude/profile");
+    let profile = root.join("profiles/claude-web");
     fs::create_dir_all(&profile).unwrap();
     let cdp = MockCdpServer::start("persistent-test");
     let meta_path = cdp.write_metadata(root, &profile);
@@ -572,7 +572,7 @@ impl RemoteServer {
 fn automatic_daemon_gracefully_shuts_down_managed_chrome_on_idle_exit() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let profile = root.join("accounts/work-claude/profile");
+    let profile = root.join("profiles/claude-web");
     fs::create_dir_all(&profile).unwrap();
 
     let cdp = MockCdpServer::start("local-test");
@@ -599,7 +599,7 @@ fn local_managed_chrome_shuts_down_when_local_clients_exit_while_remote_connect_
     let remote_dir = tempfile::tempdir().unwrap();
     let client_dir = tempfile::tempdir().unwrap();
     let client_root = client_dir.path();
-    let profile = client_root.join("accounts/work-claude/profile");
+    let profile = client_root.join("profiles/claude-web");
     fs::create_dir_all(&profile).unwrap();
 
     let _server_guard = RemoteServer::start(remote_dir.path(), TOKEN);
@@ -740,7 +740,7 @@ fn multiple_remote_and_local_clients_keep_chrome_alive_until_last_local_exits() 
     let remote_dir2 = tempfile::tempdir().unwrap();
     let client_dir = tempfile::tempdir().unwrap();
     let client_root = client_dir.path();
-    let profile = client_root.join("accounts/work-claude/profile");
+    let profile = client_root.join("profiles/claude-web");
     fs::create_dir_all(&profile).unwrap();
 
     let server1 = RemoteServer::start(remote_dir1.path(), TOKEN1);
@@ -894,7 +894,7 @@ fn platform_shutdown_on_grpc_binding_preserves_shared_daemon_and_local_chrome() 
     let remote_dir2 = tempfile::tempdir().unwrap();
     let client_dir = tempfile::tempdir().unwrap();
     let client_root = client_dir.path();
-    let profile = client_root.join("accounts/work-claude/profile");
+    let profile = client_root.join("profiles/claude-web");
     fs::create_dir_all(&profile).unwrap();
 
     let server1 = RemoteServer::start(remote_dir1.path(), TOKEN1);

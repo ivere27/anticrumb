@@ -95,6 +95,15 @@ fn fixture() -> (tempfile::TempDir, Arc<Service>, Arc<Fake>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     store
+        .put_browser_profile(&BrowserProfile {
+            provider_id: default_provider(),
+            profile: dir.path().join("profile"),
+            subprofile: None,
+            port: 9222,
+            headless: true,
+        })
+        .unwrap();
+    store
         .put(
             "local",
             "account",
@@ -102,11 +111,10 @@ fn fixture() -> (tempfile::TempDir, Arc<Service>, Arc<Fake>) {
             &Account {
                 id: "default".into(),
                 provider: default_provider(),
-                profile: dir.path().join("profile"),
-                subprofile: None,
-                port: 9222,
-                headless: true,
                 state: "ready".into(),
+                identity: None,
+                label: None,
+                slot: None,
             },
         )
         .unwrap();
@@ -485,7 +493,7 @@ async fn independent_accounts_execute_concurrently_and_sessions_cannot_cross_acc
     backend.wait_for_peer.store(true, Ordering::SeqCst);
     let mut second: Account = service.store.get("local", "account", "default").unwrap();
     second.id = "other".into();
-    second.port = 9223;
+    second.slot = Some("1".into());
     service
         .store
         .put("local", "account", "other", &second)
@@ -805,6 +813,7 @@ async fn web_backend_routes_turns_by_account_provider_and_rejects_unregistered_p
         fn discover_models(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             _: &Account,
             _: CancelToken,
         ) -> Result<ModelCatalogRecord> {
@@ -813,6 +822,7 @@ async fn web_backend_routes_turns_by_account_provider_and_rejects_unregistered_p
         fn generate(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             _: &Account,
             session: &mut Session,
             request: &TurnRequest,
@@ -832,7 +842,13 @@ async fn web_backend_routes_turns_by_account_provider_and_rejects_unregistered_p
                 elapsed_ms: 1,
             })
         }
-        fn close_session(&self, _: &ProviderContext<'_>, _: &Account, _: &Session) -> Result<()> {
+        fn close_session(
+            &self,
+            _: &ProviderContext<'_>,
+            _: &BrowserProfile,
+            _: &Account,
+            _: &Session,
+        ) -> Result<()> {
             Ok(())
         }
     }
@@ -849,6 +865,15 @@ async fn web_backend_routes_turns_by_account_provider_and_rejects_unregistered_p
 
     for (acct_id, prov_id, port) in [("acct_a", "alpha", 9222), ("acct_b", "beta", 9223)] {
         store
+            .put_browser_profile(&BrowserProfile {
+                provider_id: prov_id.into(),
+                profile: dir.path().join(acct_id),
+                subprofile: None,
+                port,
+                headless: true,
+            })
+            .unwrap();
+        store
             .put(
                 "local",
                 "account",
@@ -856,11 +881,10 @@ async fn web_backend_routes_turns_by_account_provider_and_rejects_unregistered_p
                 &Account {
                     id: acct_id.into(),
                     provider: prov_id.into(),
-                    profile: dir.path().join(acct_id),
-                    subprofile: None,
-                    port,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();

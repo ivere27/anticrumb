@@ -194,8 +194,12 @@ pub fn router(service: Arc<Service>, token: String) -> Result<Router> {
         .with_state(state))
 }
 
-async fn models(State(s): State<HttpState>) -> Result<Json<Value>> {
-    let catalog = s.service.store.model_catalog("default")?;
+async fn models(State(s): State<HttpState>, headers: HeaderMap) -> Result<Json<Value>> {
+    let account_id = match extract_account_header(&headers)? {
+        Some(id) => id,
+        None => s.service.store.resolve_active_account_id()?,
+    };
+    let catalog = s.service.store.model_catalog(&account_id)?;
     let provider = catalog["provider"]
         .as_str()
         .filter(|p| !p.is_empty())
@@ -203,7 +207,7 @@ async fn models(State(s): State<HttpState>) -> Result<Json<Value>> {
         .or_else(|| {
             s.service
                 .store
-                .get::<Account>("local", "account", "default")
+                .get::<Account>("local", "account", &account_id)
                 .ok()
                 .map(|a| a.provider)
                 .filter(|p| !p.is_empty())
@@ -428,18 +432,25 @@ async fn count_tokens(Json(v): Json<Value>) -> Response {
         .into_response()
 }
 
+fn extract_account_header(headers: &HeaderMap) -> Result<Option<String>> {
+    let Some(id) = headers.get("x-anticrumb-account") else {
+        return Ok(None);
+    };
+    let id = id
+        .to_str()
+        .map_err(|e| ServiceError::invalid(e.to_string()))?;
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ServiceError::invalid("invalid account header"));
+    }
+    Ok(Some(id.to_owned()))
+}
+
 fn account_header(headers: &HeaderMap, v: &mut Value) -> Result<()> {
-    if let Some(id) = headers.get("x-anticrumb-account") {
-        let id = id
-            .to_str()
-            .map_err(|e| ServiceError::invalid(e.to_string()))?;
-        if id.is_empty()
-            || !id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(ServiceError::invalid("invalid account header"));
-        }
+    if let Some(id) = extract_account_header(headers)? {
         v["account_id"] = json!(id);
     }
     Ok(())

@@ -819,13 +819,16 @@ fn malformed_tool_block_is_fed_back_instead_of_ending_the_run() {
     assert!(prompts.lock().unwrap()[1].starts_with("[TOOL_ERROR]"));
     assert_eq!(fs::read_to_string(ws.join("ok.txt")).unwrap(), "fine");
 
-    // endless garbage aborts
-    let (mock, _) = MockBackend::scripted(Box::new(|_, _| {
+    // endless garbage never aborts the run: errors keep being fed back (with a stronger hint
+    // after repeated failures) until the step budget ends it.
+    let (mock, prompts) = MockBackend::scripted(Box::new(|_, _| {
         Ok("[TOOL_CALL]\nnot json\n[/TOOL_CALL]".to_string())
     }));
     let mut agent = CodingAgent::new(mock, cfg(&ws));
-    let err = agent.run("x", &RunControl::default()).unwrap_err();
-    assert!(err.contains("malformed"), "{err}");
+    let res = agent.run("x", &RunControl::default()).unwrap();
+    assert_eq!(res.status, AgentStatus::MaxSteps);
+    let p = prompts.lock().unwrap();
+    assert!(p.last().unwrap().contains("malformed attempt"));
     let _ = fs::remove_dir_all(&ws);
 }
 

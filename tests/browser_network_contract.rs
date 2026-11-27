@@ -201,7 +201,7 @@ fn restricted_target_cannot_send_private_requests_after_guard_drop() {
 fn account_browser_tools_use_proxy_for_public_pages_and_popups() {
     use anticrumb::{
         account,
-        domain::{default_provider, Account},
+        domain::{default_provider, Account, BrowserProfile},
     };
     use std::collections::HashSet;
     assert!(!anticrumb::web::allow_private_env());
@@ -210,17 +210,23 @@ fn account_browser_tools_use_proxy_for_public_pages_and_popups() {
         .parse()
         .unwrap();
     let meta = browser::inspect_running_cdp(port).expect("verified running Chrome profile");
-    let account = Account {
-        id: "network-contract-only".into(),
-        provider: default_provider(),
+    let browser_profile = BrowserProfile {
+        provider_id: default_provider(),
         profile: meta.user_data_dir.into(),
         subprofile: Some(meta.profile_dir),
         port,
         headless: meta.headless,
+    };
+    let account = Account {
+        id: "network-contract-only".into(),
+        provider: default_provider(),
         state: "ready".into(),
+        identity: None,
+        label: None,
+        slot: None,
     };
     let fetched = account::browser_fetch(
-        &account,
+        &browser_profile,
         "https://example.com/",
         0,
         2000,
@@ -242,7 +248,7 @@ fn account_browser_tools_use_proxy_for_public_pages_and_popups() {
     )
     .unwrap();
     let opened = registry
-        .execute(&account, &request, CancelToken::new())
+        .execute(&browser_profile, &account, &request, CancelToken::new())
         .unwrap();
     assert!(opened.page.unwrap().title.contains("Example Domain"));
     registry.close_all();

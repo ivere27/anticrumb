@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use crate::{
         agent::CancelToken,
-        domain::{Account, ModelCatalogRecord, Session, TurnRequest, TurnResult},
+        domain::{Account, BrowserProfile, ModelCatalogRecord, Session, TurnRequest, TurnResult},
         provider::{ProviderCapabilities, ProviderContext},
         service::Emit,
     };
@@ -238,6 +238,7 @@ mod tests {
         fn discover_models(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             _: &Account,
             _: CancelToken,
         ) -> Result<ModelCatalogRecord> {
@@ -247,6 +248,7 @@ mod tests {
         fn generate(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             _: &Account,
             session: &mut Session,
             _: &TurnRequest,
@@ -263,7 +265,13 @@ mod tests {
             })
         }
 
-        fn close_session(&self, _: &ProviderContext<'_>, _: &Account, _: &Session) -> Result<()> {
+        fn close_session(
+            &self,
+            _: &ProviderContext<'_>,
+            _: &BrowserProfile,
+            _: &Account,
+            _: &Session,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -471,14 +479,20 @@ mod tests {
         let registry = ProviderRegistry::new();
         registry.load_providers_dir(dir.path()).unwrap();
         let provider = registry.resolve("relative-test-web").unwrap();
-        let account = Account {
-            id: "relative-test".into(),
-            provider: "relative-test-web".into(),
+        let browser = BrowserProfile {
+            provider_id: "relative-test-web".into(),
             profile: dir.path().join("profile"),
             subprofile: None,
             port: 0,
             headless: true,
+        };
+        let account = Account {
+            id: "relative-test".into(),
+            provider: "relative-test-web".into(),
             state: "ready".into(),
+            identity: None,
+            label: None,
+            slot: None,
         };
         let cancel = CancelToken::new();
         cancel.cancel();
@@ -486,7 +500,7 @@ mod tests {
         // Missing driver.js returns a static catalog. Reaching cancellation proves
         // the registered provider found its script, without accessing a browser.
         let error = provider
-            .discover_models(&ProviderContext::stateless(), &account, cancel)
+            .discover_models(&ProviderContext::stateless(), &browser, &account, cancel)
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Cancelled);
     }

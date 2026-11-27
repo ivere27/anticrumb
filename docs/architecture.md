@@ -32,13 +32,18 @@ Only local IPC exposes workspace execution. File, shell, and external MCP tools 
 
 ## Browser Sessions
 
-Gemini reuses tabs per account to avoid repeated setup:
+Each provider owns a single managed Chrome profile (`BrowserProfile` under `<ANTICRUMB_HOME>/profiles/<provider_id>/`). Multi-account providers such as `gemini-web` run Google Multi-Login (`/u/0/app`, `/u/1/app`, …) inside that shared browser while anchoring each `Account` to its verified identity (normalized email) rather than a volatile slot index:
+
+- **Per-account tab pools**: Every account owns an isolated `TabPool` (`Master` + `Worker`) inside the provider's Chrome instance. A global shared-browser cap (`MAX_SHARED_BROWSER_TABS = 12`) evicts only the oldest idle `Worker` tab across accounts when full.
+- **Provider concurrency gate (`BrowserGate`)**: Sibling accounts on the same provider run concurrently under a shared read lock (with short-lived per-provider `input_lock` around focus/send/dropdown interactions), while browser-wide operations (`OpenLogin`, `SetBrowserMode`, `AttachBrowser`, `RefreshAccounts`) take an exclusive write lock.
+- **Identity verification & slot-shift recovery**: Before mutating actions, the runtime checks the page's active identity; on `identity_mismatch` (e.g., Google Multi-Login slot reorder), it triggers a 1-shot account rescan and rebases conversation URLs automatically.
+- **Active account**: The daemon persists a single `active_account_id` used by CLI (`usage`, `models`, `exec`, `chat`), HTTP (`/v1/*`), MCP, and new TUI launches when no explicit account is passed; already-open TUI instances keep their own selected account.
 
 | Role | Lifetime and use |
 |---|---|
-| Master | Persistent conversation per workspace/session; no fixed workspace count limit |
-| Worker | Shared temporary chats for delegated tasks and stateless requests; bounded by `--workers N` |
-| System operation | Reuses an idle worker or opens a temporary overflow tab when workers are busy |
+| Master | Persistent conversation per workspace/session (scoped to one account); no fixed workspace count limit |
+| Worker | Shared temporary chats for delegated tasks and stateless requests (scoped to one account); bounded by `--workers N` and global browser tab cap |
+| System operation | Reuses an idle worker for that account's slot or opens a temporary overflow tab when workers are busy |
 
 External browsing uses separate cookie contexts and bypasses provider model slots. Worker permissions and browser session limits are documented in [Tools](tools.md). Provider manifests and scripts are bundled; [overrides](../providers/README.md#updating-dom-scripts-without-rebuilding) allow website fixes without recompilation. Gemini models and thinking levels are discovered at runtime.
 

@@ -71,10 +71,20 @@ pub(super) fn footer(value: &Value) -> String {
         .join(" ")
 }
 
+#[allow(dead_code)]
 pub(super) fn report(value: &Value) -> String {
+    report_with_label(value, None)
+}
+
+pub(super) fn report_with_label(value: &Value, account_label: Option<&str>) -> String {
+    let acct = account_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| field(value, "account_id"))
+        .unwrap_or_default();
     let mut lines = vec![format!(
-        "**Web account usage** · {}{}",
-        field(value, "account_id").unwrap_or_default(),
+        "**Web account usage** · {acct}{}",
         field(value, "plan")
             .map(|plan| format!(" · **{plan}**"))
             .unwrap_or_default()

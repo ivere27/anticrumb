@@ -65,6 +65,48 @@ pub fn suggest_account_id(provider_id: &str, existing_ids: &[&str]) -> String {
     unreachable!()
 }
 
+pub fn suggest_account_id_for_identity(
+    provider_id: &str,
+    identity: &str,
+    existing_ids: &[&str],
+) -> String {
+    let provider_short = provider_id
+        .strip_suffix("-web")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(provider_id);
+    let localpart = identity.trim().split('@').next().unwrap_or("");
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in localpart.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !slug.is_empty() && !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let base = if slug.is_empty() {
+        provider_short.to_owned()
+    } else {
+        format!("{provider_short}-{slug}")
+    };
+    if !existing_ids.contains(&base.as_str()) {
+        return base;
+    }
+    for index in 2usize.. {
+        let candidate = format!("{base}-{index}");
+        if !existing_ids.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ProviderCapabilities {
@@ -75,6 +117,27 @@ pub struct ProviderCapabilities {
     pub web_usage: bool,
     pub web_history_cleanup: bool,
     pub native_tools: bool,
+    pub multi_account: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredAccount {
+    /// Stable external identity (e.g. normalized email or org/user ID), if exposed by the provider.
+    pub identity: Option<String>,
+    /// Human-readable display label.
+    pub label: Option<String>,
+    /// Volatile browser session routing slot (e.g. Gemini "0", "1").
+    pub slot: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRoute {
+    /// Entry URL for creating new tabs and resetting to home.
+    pub entry_url: String,
+    /// Usage page URL, if supported.
+    pub usage_url: Option<String>,
+    /// Optional account routing scope key (e.g. Some("0"), Some("1")).
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,15 +166,32 @@ impl ProviderInfo {
 
 pub struct ProviderContext<'a> {
     pub store: Option<&'a Store>,
+    pub input_lock: Option<&'a std::sync::Arc<std::sync::Mutex<()>>>,
 }
 
 impl<'a> ProviderContext<'a> {
     pub fn with_store(store: &'a Store) -> Self {
-        Self { store: Some(store) }
+        Self {
+            store: Some(store),
+            input_lock: None,
+        }
+    }
+
+    pub fn with_store_and_input_lock(
+        store: &'a Store,
+        input_lock: &'a std::sync::Arc<std::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            store: Some(store),
+            input_lock: Some(input_lock),
+        }
     }
 
     pub fn stateless() -> Self {
-        Self { store: None }
+        Self {
+            store: None,
+            input_lock: None,
+        }
     }
 }
 
@@ -126,20 +206,50 @@ pub trait Provider: Send + Sync + 'static {
         None
     }
 
-    fn is_login_ready(&self, _account: &Account, _cancel: CancelToken) -> Result<bool> {
+    /// Compute the current routing URLs and scope for an account.
+    fn account_route(&self, account: &Account) -> AccountRoute {
+        AccountRoute {
+            entry_url: self
+                .info()
+                .entry_url
+                .unwrap_or_else(|| "about:blank".into()),
+            usage_url: None,
+            scope: account.slot.clone(),
+        }
+    }
+
+    /// Rebase a saved remote conversation URL onto the account's current slot.
+    fn rebase_chat_url(&self, _account: &Account, remote_url: &str) -> Result<String> {
+        Ok(remote_url.to_owned())
+    }
+
+    fn is_login_ready(&self, _browser: &BrowserProfile, _cancel: CancelToken) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Discover signed-in accounts/slots inside this provider's Chrome profile.
+    fn discover_accounts(
+        &self,
+        _ctx: &ProviderContext<'_>,
+        _browser: &BrowserProfile,
+        _cancel: CancelToken,
+    ) -> Result<Vec<DiscoveredAccount>> {
+        Ok(Vec::new())
     }
 
     fn discover_models(
         &self,
         ctx: &ProviderContext<'_>,
+        browser: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
     ) -> Result<ModelCatalogRecord>;
 
+    #[allow(clippy::too_many_arguments)]
     fn generate(
         &self,
         ctx: &ProviderContext<'_>,
+        browser: &BrowserProfile,
         account: &Account,
         session: &mut Session,
         request: &TurnRequest,
@@ -150,6 +260,7 @@ pub trait Provider: Send + Sync + 'static {
     fn close_session(
         &self,
         ctx: &ProviderContext<'_>,
+        browser: &BrowserProfile,
         account: &Account,
         session: &Session,
     ) -> Result<()>;
@@ -157,6 +268,7 @@ pub trait Provider: Send + Sync + 'static {
     fn delete_conversation(
         &self,
         _ctx: &ProviderContext<'_>,
+        _browser: &BrowserProfile,
         _account: &Account,
         _session: &Session,
         _cancel: CancelToken,
@@ -174,6 +286,7 @@ pub trait Provider: Send + Sync + 'static {
     fn recover_media(
         &self,
         _ctx: &ProviderContext<'_>,
+        _browser: &BrowserProfile,
         _account: &Account,
         _session: &Session,
     ) -> Result<Vec<String>> {
@@ -190,6 +303,7 @@ pub trait Provider: Send + Sync + 'static {
     fn clear_web_history(
         &self,
         _ctx: &ProviderContext<'_>,
+        _browser: &BrowserProfile,
         _account: &Account,
         _cancel: CancelToken,
         _progress: &mut dyn FnMut(&str, u32) -> Result<()>,
@@ -204,6 +318,7 @@ pub trait Provider: Send + Sync + 'static {
     fn read_usage(
         &self,
         _ctx: &ProviderContext<'_>,
+        _browser: &BrowserProfile,
         _account: &Account,
         _cancel: CancelToken,
     ) -> Result<WebUsageReport> {

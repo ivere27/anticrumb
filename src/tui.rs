@@ -2001,13 +2001,23 @@ mod tests {
         menu.selected = 1;
         state.select(&mut tx);
 
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::SetActiveAccount(id) if id == "claude"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::WebHistoryStatus(id, false) if id == "claude"
+        ));
+
         assert_eq!(state.options.account, "claude");
         assert_eq!(state.options.provider.as_deref(), Some("claude-web"));
         assert_eq!(state.provider_name(), "Claude Web");
         assert!(state.conversation_id.is_none());
         assert!(state.active_model.is_none());
         assert_eq!(state.catalog["models"][0]["mode_id"], "Sonnet 5.5");
-        assert!(state.status_text(120).contains("claude-web/claude:ready"));
+        assert!(state.status_text(120).contains("claude-web:ready"));
+        assert!(!state.status_text(120).contains("claude-web/claude:ready"));
 
         // Direct `/provider chatgpt-web` on an unconfigured provider triggers automatic account + login setup.
         state.editor.set("/provider chatgpt-web".into());
@@ -2049,6 +2059,67 @@ mod tests {
         assert!(!state.submit(&mut tx));
         assert_eq!(state.options.account, "default");
         assert!(state.logs().contains("Interrupt the current task"));
+    }
+
+    #[test]
+    fn status_bar_omits_email_and_shows_slot_or_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "gemini-alice".into(),
+            ..Default::default()
+        });
+        state.update(Update::Status(json!({
+            "providers": [
+                {"id": "gemini-web", "name": "Gemini Web"},
+                {"id": "claude-web", "name": "Claude Web"}
+            ],
+            "accounts": [
+                {
+                    "id": "gemini-alice",
+                    "provider": "gemini-web",
+                    "state": "ready",
+                    "identity": "alice@gmail.com",
+                    "label": "alice@gmail.com",
+                    "slot": "0"
+                },
+                {
+                    "id": "gemini-plain",
+                    "provider": "gemini-web",
+                    "state": "ready",
+                    "identity": "bob@gmail.com"
+                },
+                {
+                    "id": "claude",
+                    "provider": "claude-web",
+                    "state": "ready",
+                    "identity": "carol@example.com"
+                }
+            ]
+        })));
+        let with_slot = state.status_text(120);
+        assert!(with_slot.contains(" · gemini-web/u/0:ready"), "{with_slot}");
+        assert!(!with_slot.contains("alice@gmail.com"), "{with_slot}");
+
+        state.options.account = "gemini-plain".into();
+        let without_slot = state.status_text(120);
+        assert!(
+            without_slot.contains(" · gemini-web:ready"),
+            "{without_slot}"
+        );
+        assert!(!without_slot.contains("bob@gmail.com"), "{without_slot}");
+
+        state.options.account = "claude".into();
+        state.options.provider = Some("claude-web".into());
+        let other_provider = state.status_text(120);
+        assert!(
+            other_provider.contains(" · claude-web:ready"),
+            "{other_provider}"
+        );
+        assert!(
+            !other_provider.contains("carol@example.com"),
+            "{other_provider}"
+        );
     }
 
     #[test]

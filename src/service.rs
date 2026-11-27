@@ -58,6 +58,9 @@ pub trait Backend: Send + Sync + 'static {
             "backend cannot clear web history",
         ))
     }
+    fn refresh_accounts(&self, _provider_id: &str, _cancel: CancelToken) -> Result<Vec<Account>> {
+        Ok(Vec::new())
+    }
 }
 
 pub(crate) use crate::tab_pool::{clear_system_tab_id, record_system_tab_id};
@@ -95,6 +98,7 @@ impl Drop for TempDirGuard {
 pub struct WebBackend {
     pub store: Store,
     pub providers: Arc<ProviderRegistry>,
+    input_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl WebBackend {
@@ -103,7 +107,20 @@ impl WebBackend {
     }
 
     pub fn with_providers(store: Store, providers: Arc<ProviderRegistry>) -> Self {
-        Self { store, providers }
+        Self {
+            store,
+            providers,
+            input_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn input_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
+        self.input_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(provider_id.into())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -115,8 +132,11 @@ impl Backend for WebBackend {
         progress: &mut dyn FnMut(&str, u32) -> Result<()>,
     ) -> Result<u32> {
         let provider = self.providers.resolve(&account.provider)?;
+        let browser = self.store.browser_for_account(account)?;
+        let input_lock = self.input_lock(&account.provider);
         provider.clear_web_history(
-            &ProviderContext::with_store(&self.store),
+            &ProviderContext::with_store_and_input_lock(&self.store, &input_lock),
+            &browser,
             account,
             cancel,
             progress,
@@ -130,8 +150,11 @@ impl Backend for WebBackend {
         cancel: CancelToken,
     ) -> Result<()> {
         let provider = self.providers.resolve(&account.provider)?;
+        let browser = self.store.browser_for_account(account)?;
+        let input_lock = self.input_lock(&account.provider);
         provider.delete_conversation(
-            &ProviderContext::with_store(&self.store),
+            &ProviderContext::with_store_and_input_lock(&self.store, &input_lock),
+            &browser,
             account,
             session,
             cancel,
@@ -147,8 +170,11 @@ impl Backend for WebBackend {
         emit: Emit<'_>,
     ) -> Result<TurnResult> {
         let provider = self.providers.resolve(&account.provider)?;
+        let browser = self.store.browser_for_account(account)?;
+        let input_lock = self.input_lock(&account.provider);
         provider.generate(
-            &ProviderContext::with_store(&self.store),
+            &ProviderContext::with_store_and_input_lock(&self.store, &input_lock),
+            &browser,
             account,
             session,
             request,
@@ -159,12 +185,29 @@ impl Backend for WebBackend {
 
     fn media(&self, account: &Account, session: &Session) -> Result<Vec<String>> {
         let provider = self.providers.resolve(&account.provider)?;
-        provider.recover_media(&ProviderContext::with_store(&self.store), account, session)
+        let browser = self.store.browser_for_account(account)?;
+        provider.recover_media(
+            &ProviderContext::with_store(&self.store),
+            &browser,
+            account,
+            session,
+        )
     }
 
     fn close(&self, account: &Account, session: &Session) -> Result<()> {
         let provider = self.providers.resolve(&account.provider)?;
-        provider.close_session(&ProviderContext::with_store(&self.store), account, session)
+        let browser = self.store.browser_for_account(account)?;
+        provider.close_session(
+            &ProviderContext::with_store(&self.store),
+            &browser,
+            account,
+            session,
+        )
+    }
+
+    fn refresh_accounts(&self, provider_id: &str, cancel: CancelToken) -> Result<Vec<Account>> {
+        let provider = self.providers.resolve(provider_id)?;
+        crate::account::refresh_accounts(&self.store, provider_id, provider.as_ref(), cancel)
     }
 }
 
@@ -247,8 +290,42 @@ impl RunEventBus {
     }
 }
 
-/// Exclusive account operations (login, history deletion, media recovery) wait
-/// for all model turns; independent conversations hold shared turn ownership.
+/// Provider-level browser coordination gate (1 Chrome profile per provider).
+///
+/// - `lifecycle` write lock serializes browser-wide operations (`OpenLogin`, `SetBrowserMode`,
+///   `AttachBrowser`, `RefreshAccounts`, `shutdown_managed_browsers`) across all accounts
+///   sharing this provider's Chrome profile.
+/// - `lifecycle` read lock allows turns, usage reads, catalog discovery, and cleanup to run
+///   concurrently across different accounts in the same browser.
+#[derive(Default)]
+pub struct BrowserGate {
+    lifecycle: Arc<RwLock<()>>,
+}
+
+impl BrowserGate {
+    pub async fn read_owned(self: Arc<Self>) -> OwnedRwLockReadGuard<()> {
+        self.lifecycle.clone().read_owned().await
+    }
+
+    pub fn try_read_owned(
+        self: Arc<Self>,
+    ) -> std::result::Result<OwnedRwLockReadGuard<()>, tokio::sync::TryLockError> {
+        self.lifecycle.clone().try_read_owned()
+    }
+
+    pub async fn write_owned(self: Arc<Self>) -> OwnedRwLockWriteGuard<()> {
+        self.lifecycle.clone().write_owned().await
+    }
+
+    pub fn try_write_owned(
+        self: Arc<Self>,
+    ) -> std::result::Result<OwnedRwLockWriteGuard<()>, tokio::sync::TryLockError> {
+        self.lifecycle.clone().try_write_owned()
+    }
+}
+
+/// Exclusive account operations (history deletion, media recovery, model refresh) wait
+/// for all model turns on that account; independent conversations hold shared turn ownership.
 #[derive(Default)]
 pub struct AccountGate {
     lock: Arc<RwLock<()>>,
@@ -270,6 +347,7 @@ impl AccountGate {
 }
 
 struct TurnPermits {
+    _browser: OwnedRwLockReadGuard<()>,
     _account: OwnedRwLockReadGuard<()>,
     _session: Option<OwnedSemaphorePermit>,
     _worker: Option<OwnedSemaphorePermit>,
@@ -281,6 +359,7 @@ pub struct Service {
     stopping: std::sync::atomic::AtomicBool,
     backend: Arc<dyn Backend>,
     admission: Arc<Semaphore>,
+    browsers: Mutex<HashMap<String, Arc<BrowserGate>>>,
     accounts: Mutex<HashMap<String, Arc<AccountGate>>>,
     sessions: Mutex<HashMap<String, std::sync::Weak<Semaphore>>>,
     workers: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -311,6 +390,7 @@ impl Service {
             stopping: false.into(),
             backend,
             admission: Arc::new(Semaphore::new(32)),
+            browsers: Mutex::new(HashMap::new()),
             accounts: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
@@ -377,6 +457,14 @@ impl Service {
         self.shutdown.notify_waiters();
         self.shutdown.notify_one();
     }
+    pub fn browser_gate(&self, provider_id: &str) -> Arc<BrowserGate> {
+        self.browsers
+            .lock()
+            .unwrap()
+            .entry(provider_id.into())
+            .or_insert_with(|| Arc::new(BrowserGate::default()))
+            .clone()
+    }
     pub fn account_gate(&self, id: &str) -> Arc<AccountGate> {
         self.accounts
             .lock()
@@ -391,7 +479,7 @@ impl Service {
             .await
             .map_err(ServiceError::storage)?
     }
-    pub fn submit(self: &Arc<Self>, request: TurnRequest) -> Result<String> {
+    pub fn submit(self: &Arc<Self>, mut request: TurnRequest) -> Result<String> {
         if !self
             .persistence_failures
             .lock()
@@ -406,6 +494,12 @@ impl Service {
         }
         if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ServiceError::invalid("host is stopping"));
+        }
+        if request.account_id.trim().is_empty() {
+            request.account_id = self
+                .store
+                .resolve_active_account_id()
+                .unwrap_or_else(|_| default_account());
         }
         crate::protocol::validate(&request)?;
         if let Some(id) = self.store.accepted(&request)? {
@@ -485,6 +579,7 @@ impl Service {
 
     async fn acquire_turn_permits(
         &self,
+        provider_id: &str,
         account_id: &str,
         request: &TurnRequest,
         cancel: &CancelToken,
@@ -518,6 +613,7 @@ impl Service {
             } else {
                 None
             };
+            let browser = self.browser_gate(provider_id).read_owned().await;
             let account = self
                 .account_gate(account_id)
                 .lock
@@ -525,6 +621,7 @@ impl Service {
                 .read_owned()
                 .await;
             Ok(TurnPermits {
+                _browser: browser,
                 _account: account,
                 _session: session,
                 _worker: worker,
@@ -817,83 +914,184 @@ impl Service {
     async fn execute(
         self: Arc<Self>,
         mut run: Run,
-        account: Account,
+        mut account: Account,
         cancel: CancelToken,
         _admission: OwnedSemaphorePermit,
     ) {
         let deadline = Instant::now() + Duration::from_secs(run.request.timeout_secs);
-        let permit = match self
-            .acquire_turn_permits(&account.id, &run.request, &cancel, deadline)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                self.finish(&mut run, Err(error));
-                return;
-            }
-        };
-        let service = self.clone();
-        let mut worker_run = run.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut permits = permit;
-            let current: Account = service.store.get("local", "account", &account.id)?;
-            if current.state != "ready" {
-                return Err(ServiceError::new(
-                    ErrorCode::VerificationRequired,
-                    "account",
-                    "account paused while queued",
-                ));
-            }
-            crate::protocol::validate(&worker_run.request)?;
-            let mut request = worker_run.request.clone();
-            let mut session = service.prepare_run_session(
-                &account,
-                &mut worker_run,
-                &mut request,
-                &mut permits._session,
-            )?;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            request.timeout_secs = remaining.as_secs().max(1);
-            let mut emit = |kind: &str, data: Value| -> Result<()> {
-                if kind == "submitted" {
-                    worker_run.state = "submitted".into();
-                    service
-                        .store
-                        .put("local", "run", &worker_run.id, &worker_run)?;
-                }
-                service.record_run_event(&worker_run.id, kind, data)?;
-                Ok(())
-            };
-            let result = if cancel.is_cancelled() {
-                Err(ServiceError::new(
-                    ErrorCode::Cancelled,
-                    "queue",
-                    "request cancelled during preparation",
-                ))
-            } else if remaining.is_zero() {
-                Err(ServiceError::new(
-                    ErrorCode::DeadlineExceeded,
-                    "queue",
-                    "deadline exceeded during preparation",
-                ))
-            } else {
-                service.backend.generate(
-                    &current,
-                    &mut session,
-                    &request,
-                    cancel.clone(),
-                    &mut emit,
+        enum AttemptOutcome {
+            Done(Result<TurnResult>),
+            IdentityDrift,
+        }
+        let mut final_result = None;
+        for attempt in 0..2 {
+            let permit = match self
+                .acquire_turn_permits(
+                    &account.provider,
+                    &account.id,
+                    &run.request,
+                    &cancel,
+                    deadline,
                 )
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    final_result = Some(Err(error));
+                    break;
+                }
             };
-            service.finalize_run_session(&account, &worker_run, &request, &mut session, &result)?;
-            result
-        })
-        .await
-        .unwrap_or_else(|e| {
+            let service = self.clone();
+            let mut worker_run = run.clone();
+            let attempt_account = account.clone();
+            let attempt_cancel = cancel.clone();
+            let outcome = tokio::task::spawn_blocking(move || -> Result<AttemptOutcome> {
+                let mut permits = permit;
+                let current: Account =
+                    service.store.get("local", "account", &attempt_account.id)?;
+                if current.state != "ready" {
+                    return Err(ServiceError::new(
+                        ErrorCode::VerificationRequired,
+                        "account",
+                        "account paused while queued",
+                    ));
+                }
+                crate::protocol::validate(&worker_run.request)?;
+                let mut request = worker_run.request.clone();
+                let mut session = service.prepare_run_session(
+                    &current,
+                    &mut worker_run,
+                    &mut request,
+                    &mut permits._session,
+                )?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                request.timeout_secs = remaining.as_secs().max(1);
+                let mut emit = |kind: &str, data: Value| -> Result<()> {
+                    if kind == "submitted" {
+                        worker_run.state = "submitted".into();
+                        service
+                            .store
+                            .put("local", "run", &worker_run.id, &worker_run)?;
+                    }
+                    service.record_run_event(&worker_run.id, kind, data)?;
+                    Ok(())
+                };
+                let result = if attempt_cancel.is_cancelled() {
+                    Err(ServiceError::new(
+                        ErrorCode::Cancelled,
+                        "queue",
+                        "request cancelled during preparation",
+                    ))
+                } else if remaining.is_zero() {
+                    Err(ServiceError::new(
+                        ErrorCode::DeadlineExceeded,
+                        "queue",
+                        "deadline exceeded during preparation",
+                    ))
+                } else {
+                    service.backend.generate(
+                        &current,
+                        &mut session,
+                        &request,
+                        attempt_cancel.clone(),
+                        &mut emit,
+                    )
+                };
+                if attempt == 0
+                    && worker_run.state != "submitted"
+                    && result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| e.stage == "identity_mismatch")
+                {
+                    session.target_id = None;
+                    session.state = if session.remote_turns > 0 {
+                        SessionState::Closed
+                    } else {
+                        SessionState::Invalidated
+                    };
+                    let _ = service.store.put("local", "session", &session.id, &session);
+                    return Ok(AttemptOutcome::IdentityDrift);
+                }
+                service.finalize_run_session(
+                    &current,
+                    &worker_run,
+                    &request,
+                    &mut session,
+                    &result,
+                )?;
+                Ok(AttemptOutcome::Done(result))
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(ServiceError::new(
+                    ErrorCode::Internal,
+                    "worker",
+                    e.to_string(),
+                ))
+            });
+            match outcome {
+                Ok(AttemptOutcome::Done(res)) => {
+                    final_result = Some(res);
+                    break;
+                }
+                Err(err) => {
+                    final_result = Some(Err(err));
+                    break;
+                }
+                Ok(AttemptOutcome::IdentityDrift) => {
+                    // Browser read permit has been dropped; take exclusive browser write lock to rescan.
+                    let _browser_write = self.browser_gate(&account.provider).write_owned().await;
+                    let refresh_service = self.clone();
+                    let provider_id = account.provider.clone();
+                    let refresh_cancel = cancel.clone();
+                    let refresh_res = tokio::task::spawn_blocking(move || {
+                        refresh_service
+                            .backend
+                            .refresh_accounts(&provider_id, refresh_cancel)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(ServiceError::new(
+                            ErrorCode::Internal,
+                            "refresh_accounts",
+                            e.to_string(),
+                        ))
+                    });
+                    drop(_browser_write);
+                    if let Err(err) = refresh_res {
+                        final_result = Some(Err(err));
+                        break;
+                    }
+                    match self.store.get::<Account>("local", "account", &account.id) {
+                        Ok(updated) if updated.state == "ready" => {
+                            account = updated;
+                            continue;
+                        }
+                        Ok(updated) => {
+                            final_result = Some(Err(ServiceError::new(
+                                ErrorCode::AuthRequired,
+                                "identity_mismatch",
+                                format!(
+                                    "account '{}' is no longer signed in to Chrome; sign in via /browser login or switch with /account",
+                                    updated.id
+                                ),
+                            )));
+                            break;
+                        }
+                        Err(err) => {
+                            final_result = Some(Err(err));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let result = final_result.unwrap_or_else(|| {
             Err(ServiceError::new(
-                ErrorCode::Internal,
-                "worker",
-                e.to_string(),
+                ErrorCode::AuthRequired,
+                "identity_mismatch",
+                "account identity could not be verified after rescan",
             ))
         });
         self.finish(&mut run, result);
@@ -970,6 +1168,7 @@ impl Service {
             .store
             .blocking(move |store| store.get("local", "session", &key))
             .await?;
+        let browser_permit = self.browser_gate(&session.provider).read_owned().await;
         let permit = self
             .account_gate(&session.account_id)
             .acquire_owned()
@@ -977,6 +1176,7 @@ impl Service {
             .map_err(ServiceError::storage)?;
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _browser_permit = browser_permit;
             let _permit = permit;
             let session: Session = service.store.get("local", "session", &session.id)?;
             let account: Account = service.store.get("local", "account", &session.account_id)?;
@@ -1002,6 +1202,7 @@ impl Service {
             .store
             .blocking(move |store| store.get("local", "session", &key))
             .await?;
+        let browser_permit = self.browser_gate(&session.provider).read_owned().await;
         let permit = self
             .account_gate(&session.account_id)
             .acquire_owned()
@@ -1010,6 +1211,7 @@ impl Service {
         let store = self.store.clone();
         let backend = self.backend.clone();
         tokio::task::spawn_blocking(move || {
+            let _browser_permit = browser_permit;
             let _permit = permit;
             let mut session: Session = store.get("local", "session", &session.id)?;
             let account: Account = store.get("local", "account", &session.account_id)?;
@@ -1126,13 +1328,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let account = Account {
-            id: "default".into(),
+            id: default_account(),
             provider: default_provider(),
-            profile: directory.path().join("profile"),
-            subprofile: None,
-            port: 9222,
-            headless: true,
             state: "ready".into(),
+            identity: None,
+            label: None,
+            slot: Some("0".into()),
         };
         let service = Service::new(
             store.clone(),
@@ -1223,18 +1424,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let account = Account {
-            id: "default".into(),
+            id: default_account(),
             provider: default_provider(),
-            profile: directory.path().join("profile"),
-            subprofile: None,
-            port: 9222,
-            headless: true,
             state: "ready".into(),
+            identity: None,
+            label: None,
+            slot: Some("0".into()),
         };
-        store.put("local", "account", "default", &account).unwrap();
+        store
+            .put("local", "account", &account.id, &account)
+            .unwrap();
         let backend = Arc::new(UnexpectedBackend(AtomicUsize::new(0)));
         let service = Service::new(store.clone(), backend.clone()).unwrap();
-        let gate = service.account_gate("default");
+        let gate = service.account_gate(&account.id);
         let blocked_gate = gate.clone();
         let (started, ready) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
@@ -1260,7 +1462,7 @@ mod tests {
         let run = service.wait(&id).await.unwrap();
         assert_eq!(run.error.unwrap().code, ErrorCode::DeadlineExceeded);
         assert_eq!(backend.0.load(Ordering::SeqCst), 0);
-        let sessions = store.sessions_for_account("default").unwrap();
+        let sessions = store.sessions_for_account(&account.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].state, SessionState::Closed);
     }
@@ -1273,15 +1475,14 @@ mod tests {
             .put(
                 "local",
                 "account",
-                "default",
+                DEFAULT_ACCOUNT_ID,
                 &Account {
-                    id: "default".into(),
+                    id: default_account(),
                     provider: default_provider(),
-                    profile: directory.path().join("profile"),
-                    subprofile: None,
-                    port: 9222,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: Some("0".into()),
                 },
             )
             .unwrap();
@@ -1361,7 +1562,7 @@ mod tests {
         // find_system_gemini_target MUST return None instead of hijacking it.
         assert!(find_system_gemini_target(&store, "default", port).is_none());
         assert_eq!(
-            find_reusable_gemini_target(&store, port)
+            find_reusable_gemini_target(&store, "default", port)
                 .map(|t| t.id)
                 .as_deref(),
             Some("tab-chat")
@@ -1374,15 +1575,15 @@ mod tests {
             {"id":"tab-sys","type":"page","title":"Usage","url":"https://gemini.google.com/usage","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/tab-sys"}
         ])
         .to_string();
-        record_system_tab_id(&store, "default", "tab-sys");
+        record_system_tab_id(&store, "gemini", port, "tab-sys");
         assert_eq!(
-            find_system_gemini_target(&store, "default", port)
+            find_system_gemini_target(&store, "gemini", port)
                 .map(|t| t.id)
                 .as_deref(),
             Some("tab-sys")
         );
         assert_eq!(
-            find_reusable_gemini_target(&store, port)
+            find_reusable_gemini_target(&store, "gemini", port)
                 .map(|t| t.id)
                 .as_deref(),
             Some("tab-chat")
@@ -1393,7 +1594,7 @@ mod tests {
             {"id":"tab-sys","type":"page","title":"Gemini","url":"https://gemini.google.com/app","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/tab-sys"}
         ])
         .to_string();
-        assert!(find_reusable_gemini_target(&store, port).is_none());
+        assert!(find_reusable_gemini_target(&store, "gemini", port).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1435,11 +1636,10 @@ mod tests {
                 &Account {
                     id: "claude".into(),
                     provider: "claude-web".into(),
-                    profile: directory.path().join("profile"),
-                    subprofile: None,
-                    port: 9223,
-                    headless: false,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();
@@ -1508,15 +1708,14 @@ mod tests {
             .put(
                 "local",
                 "account",
-                "default",
+                DEFAULT_ACCOUNT_ID,
                 &Account {
-                    id: "default".into(),
+                    id: default_account(),
                     provider: default_provider(),
-                    profile: directory.path().join("profile"),
-                    subprofile: None,
-                    port: 9222,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: Some("0".into()),
                 },
             )
             .unwrap();
@@ -1528,7 +1727,7 @@ mod tests {
                 &Session {
                     id: "chat-sess".into(),
                     provider: default_provider(),
-                    account_id: "default".into(),
+                    account_id: default_account(),
                     mode: SessionMode::Chat,
                     target_id: Some("tab-1".into()),
                     remote_url: Some("https://gemini.google.com/app/c1".into()),

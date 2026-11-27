@@ -165,6 +165,7 @@ impl BrowserControlRegistry {
 
     pub fn execute(
         &self,
+        browser_profile: &BrowserProfile,
         account: &Account,
         req: &pb::BrowserControlRequest,
         cancel: CancelToken,
@@ -218,7 +219,8 @@ impl BrowserControlRegistry {
                         return Err(error("tab limit (8) reached; close an unused tab first"));
                     }
                     let target = if session.port == 0 {
-                        let (port, target, context) = crate::account::browser_tool_tab(account)?;
+                        let (port, target, context) =
+                            crate::account::browser_tool_tab(browser_profile)?;
                         session.port = port;
                         session.context = context;
                         target

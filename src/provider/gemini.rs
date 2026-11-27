@@ -1,6 +1,9 @@
-use super::{Provider, ProviderCapabilities, ProviderContext, ProviderInfo, DEFAULT_PROVIDER_ID};
+use super::{
+    AccountRoute, DiscoveredAccount, Provider, ProviderCapabilities, ProviderContext, ProviderInfo,
+    DEFAULT_PROVIDER_ID,
+};
 use crate::{
-    account::{MODEL_DISCOVERY_TIMEOUT, WEB_USAGE_TIMEOUT},
+    account::{ACCOUNT_DISCOVERY_TIMEOUT, MODEL_DISCOVERY_TIMEOUT, WEB_USAGE_TIMEOUT},
     agent::CancelToken,
     browser_host as browser,
     cdp::CdpClient,
@@ -11,7 +14,9 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     path::Path,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -50,6 +55,7 @@ impl Provider for GeminiWebProvider {
                 web_usage: true,
                 web_history_cleanup: true,
                 native_tools: false,
+                multi_account: true,
             },
         }
     }
@@ -58,18 +64,36 @@ impl Provider for GeminiWebProvider {
         Some(browser::GEMINI_APP_URL)
     }
 
-    fn is_login_ready(&self, account: &Account, cancel: CancelToken) -> Result<bool> {
+    fn account_route(&self, account: &Account) -> AccountRoute {
+        let slot = crate::gemini::normalized_slot(account.slot.as_deref());
+        AccountRoute {
+            entry_url: crate::gemini::gemini_app_url(Some(slot)),
+            usage_url: Some(crate::gemini::gemini_usage_url(Some(slot))),
+            scope: Some(slot.to_owned()),
+        }
+    }
+
+    fn rebase_chat_url(&self, account: &Account, remote_url: &str) -> Result<String> {
+        crate::gemini::rebase_gemini_chat_url(remote_url, account.slot.as_deref())
+            .map_err(|_| ServiceError::invalid("invalid recorded Gemini conversation URL"))
+    }
+
+    fn is_login_ready(
+        &self,
+        browser_profile: &BrowserProfile,
+        cancel: CancelToken,
+    ) -> Result<bool> {
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let Some(meta) = browser::inspect_running_cdp(account.port) else {
+        let Some(meta) = browser::inspect_running_cdp(browser_profile.port) else {
             return Ok(false);
         };
-        if !meta.matches_account(account) {
+        if !meta.matches_browser(browser_profile) {
             return Ok(false);
         }
-        let targets =
-            browser::list_targets(account.port).map_err(|e| ServiceError::backend(e, false))?;
+        let targets = browser::list_targets(browser_profile.port)
+            .map_err(|e| ServiceError::backend(e, false))?;
         // The tab opened for login may navigate through accounts.google.com. Wait
         // until it returns to Gemini; never inject a script into the sign-in form.
         for target in targets
@@ -83,7 +107,7 @@ impl Provider for GeminiWebProvider {
                 .check()
                 .map_err(|e| ServiceError::backend(e, false))?;
             let path = browser::ws_path_from_url(&target.ws_url).map_err(ServiceError::invalid)?;
-            let mut cdp = CdpClient::connect(account.port, &path)
+            let mut cdp = CdpClient::connect(browser_profile.port, &path)
                 .map_err(|e| ServiceError::backend(e, false))?;
             cdp.set_control(cancel.clone(), Instant::now() + Duration::from_secs(2));
             let result = cdp
@@ -110,51 +134,81 @@ impl Provider for GeminiWebProvider {
         Ok(false)
     }
 
+    fn discover_accounts(
+        &self,
+        _ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
+        cancel: CancelToken,
+    ) -> Result<Vec<DiscoveredAccount>> {
+        cancel
+            .check()
+            .map_err(|e| ServiceError::backend(e, false))?;
+        let opts = browser::LaunchOptions::headless_browser(
+            browser_profile,
+            "https://gemini.google.com/u/0/app",
+        );
+        let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
+        discover_accounts_on_port(host.port, cancel, Duration::from_secs(8))
+    }
+
     fn discover_models(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
     ) -> Result<ModelCatalogRecord> {
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let opts = browser::LaunchOptions::headless_account(account, browser::GEMINI_APP_URL);
+        let route = self.account_route(account);
+        let opts = browser::LaunchOptions::headless_browser(browser_profile, &route.entry_url);
         let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
-        let reused_target = ctx
-            .store
-            .and_then(|s| crate::tab_pool::find_system_gemini_target(s, &account.id, host.port));
+        let reused_target = ctx.store.and_then(|s| {
+            crate::tab_pool::find_system_gemini_target_for_route(s, &account.id, host.port, &route)
+        });
         let (target, mode, created_new) = if let Some(target) = reused_target {
             (target, ChatSessionMode::Continue, false)
         } else {
             (
-                browser::create_tab(host.port, browser::GEMINI_APP_URL)
+                browser::create_tab(host.port, &route.entry_url)
                     .map_err(|e| ServiceError::backend(e, false))?,
                 ChatSessionMode::NewChat,
                 true,
             )
         };
-        let keep_in_pool = ctx
-            .store
-            .is_some_and(|s| crate::tab_pool::record_system_tab_id(s, &account.id, &target.id));
+        let keep_in_pool = ctx.store.is_some_and(|s| {
+            crate::tab_pool::record_system_tab_id(s, &account.id, host.port, &target.id)
+        });
         let id = target.id.clone();
         // A cold page can expose the editor well before its model controls. Page
         // preparation and the full model scan share this budget without restarting it.
         let deadline = Instant::now() + MODEL_DISCOVERY_TIMEOUT;
-        if !created_new && !crate::gemini::is_reusable_gemini_url(&target.url) {
+        if !created_new
+            && !crate::gemini::is_reusable_gemini_url_for(&target.url, route.scope.as_deref())
+        {
             crate::gemini::navigate_tab_commit(
                 host.port,
                 &target,
-                browser::GEMINI_APP_URL,
+                &route.entry_url,
                 &cancel,
                 deadline,
             )
             .map_err(|e| model_discovery_error(e, "prepare", deadline))?;
         }
         let result = (|| {
-            let mut tab =
-                GeminiTab::attach(host.port, target, mode, cancel.clone(), deadline, false)
-                    .map_err(|e| model_discovery_error(e, "prepare", deadline))?;
+            let mut tab = GeminiTab::attach_with_home_url(
+                host.port,
+                target,
+                &route.entry_url,
+                mode,
+                cancel.clone(),
+                deadline,
+                false,
+            )
+            .map_err(|e| model_discovery_error(e, "prepare", deadline))?;
+            tab.set_input_lock(ctx.input_lock.cloned());
+            verify_probe_identity(account, tab.initial_probe())?;
             let auth = tab
                 .check_auth_status()
                 .map_err(|e| ServiceError::backend(e, false))?;
@@ -162,7 +216,7 @@ impl Provider for GeminiWebProvider {
                 return Err(ServiceError::new(
                     ErrorCode::AuthRequired,
                     "probe",
-                    format!("Sign in with /browser login or `anticrumb accounts login {}`. Model choices load automatically after sign-in.", account.id),
+                    "Sign in with /browser login or `anticrumb login`. Model choices load automatically after sign-in.",
                 ));
             }
             let catalog = tab
@@ -199,7 +253,11 @@ impl Provider for GeminiWebProvider {
                 let gemini_count = targets
                     .iter()
                     .filter(|t| {
-                        t.target_type == "page" && crate::gemini::is_reusable_gemini_url(&t.url)
+                        t.target_type == "page"
+                            && crate::gemini::is_reusable_gemini_url_for(
+                                &t.url,
+                                route.scope.as_deref(),
+                            )
                     })
                     .count();
                 if gemini_count > 1 {
@@ -213,19 +271,26 @@ impl Provider for GeminiWebProvider {
     fn read_usage(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
     ) -> Result<WebUsageReport> {
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let opts = browser::LaunchOptions::headless_account(account, browser::GEMINI_APP_URL);
+        let route = self.account_route(account);
+        let usage_url = route
+            .usage_url
+            .as_deref()
+            .unwrap_or("https://gemini.google.com/u/0/usage");
+        let opts = browser::LaunchOptions::headless_browser(browser_profile, &route.entry_url);
         let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
-        let mut tab = crate::gemini::SystemGeminiTab::acquire_for_store(
+        let mut tab = crate::gemini::SystemGeminiTab::acquire_for_route(
             ctx.store,
             &account.id,
             host.port,
-            "https://gemini.google.com/usage",
+            &route,
+            usage_url,
         )
         .map_err(|e| ServiceError::backend(e, false))?;
         let deadline = Instant::now() + WEB_USAGE_TIMEOUT;
@@ -233,7 +298,7 @@ impl Provider for GeminiWebProvider {
             crate::gemini::navigate_tab_commit(
                 host.port,
                 &tab.target,
-                "https://gemini.google.com/usage",
+                usage_url,
                 &cancel,
                 deadline,
             )
@@ -243,8 +308,14 @@ impl Provider for GeminiWebProvider {
                 error
             })?;
         }
-        let result =
-            crate::gemini::read_web_usage(host.port, tab.target.clone(), cancel.clone(), deadline);
+        let result = crate::gemini::read_web_usage_checked(
+            host.port,
+            tab.target.clone(),
+            route.scope.as_deref(),
+            account.identity.as_deref(),
+            cancel.clone(),
+            deadline,
+        );
         let keep_warm = if tab.keep_persistent || !tab.created_new {
             true
         } else {
@@ -252,7 +323,7 @@ impl Provider for GeminiWebProvider {
                 !targets.iter().any(|t| {
                     t.id != tab.target.id
                         && t.target_type == "page"
-                        && crate::gemini::is_reusable_gemini_url(&t.url)
+                        && crate::gemini::is_reusable_gemini_url_for(&t.url, route.scope.as_deref())
                 })
             })
         };
@@ -262,13 +333,16 @@ impl Provider for GeminiWebProvider {
             let _ = crate::gemini::navigate_tab_commit(
                 host.port,
                 &tab.target,
-                browser::GEMINI_APP_URL,
+                &route.entry_url,
                 &cancel,
                 return_deadline,
             );
         }
         drop(tab);
         let value = result.map_err(|message| {
+            if message == "identity_mismatch" {
+                return identity_mismatch_error();
+            }
             let mut error = ServiceError::backend(message, false);
             error.stage = "usage".into();
             error
@@ -290,26 +364,41 @@ impl Provider for GeminiWebProvider {
     fn clear_web_history(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
         progress: &mut dyn FnMut(&str, u32) -> Result<()>,
     ) -> Result<u32> {
-        crate::gemini::clear_web_history_with_store(ctx.store, account, cancel, progress)
+        crate::gemini::clear_web_history_with_store(
+            ctx.store,
+            browser_profile,
+            account,
+            cancel,
+            progress,
+        )
     }
 
     fn delete_conversation(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &Session,
         cancel: CancelToken,
     ) -> Result<()> {
-        crate::gemini::delete_web_conversation_with_store(ctx.store, account, session, cancel)
+        crate::gemini::delete_web_conversation_with_store(
+            ctx.store,
+            browser_profile,
+            account,
+            session,
+            cancel,
+        )
     }
 
     fn generate(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &mut Session,
         request: &TurnRequest,
@@ -317,14 +406,26 @@ impl Provider for GeminiWebProvider {
         emit: Emit<'_>,
     ) -> Result<TurnResult> {
         let store = require_store(ctx)?;
+        let route = self.account_route(account);
         let start = Instant::now();
         let deadline = start + Duration::from_secs(request.timeout_secs);
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let (mut tab, is_continue, same_warm_tab) =
-            acquire_tab(store, account, session, request, &cancel, deadline, emit)?;
+        let (mut tab, is_continue, same_warm_tab) = acquire_tab(
+            store,
+            browser_profile,
+            account,
+            &route,
+            ctx.input_lock.cloned(),
+            session,
+            request,
+            &cancel,
+            deadline,
+            emit,
+        )?;
         tab.set_pace(crate::gemini::load_human_pace(Some(store)));
+        verify_probe_identity(account, tab.initial_probe())?;
         if tab.initial_probe()["signed_in"] != true
             && !tab
                 .check_auth_status()
@@ -334,7 +435,7 @@ impl Provider for GeminiWebProvider {
             return Err(ServiceError::new(
                 ErrorCode::AuthRequired,
                 "prepare",
-                "account is signed out; use accounts login and accounts resolve",
+                "account is signed out; use /browser login or `anticrumb login`",
             ));
         }
         if is_continue {
@@ -344,7 +445,7 @@ impl Provider for GeminiWebProvider {
                 probe_count,
                 session,
                 |expected| tab.verify_owned_turns(expected),
-                |s| self.close_session(ctx, account, s),
+                |s| self.close_session(ctx, browser_profile, account, s),
             )?;
         }
         prepare_tab(
@@ -368,7 +469,7 @@ impl Provider for GeminiWebProvider {
             "submitted",
             json!({"session_id":session.id,"chars":prompt.chars().count()}),
         )?;
-        let result = stream_turn(&mut tab, account, session, &prompt, emit)?;
+        let result = stream_turn(&mut tab, browser_profile.port, session, &prompt, emit)?;
         session.remote_url = Some(result.chat_url.clone());
         session.remote_turns += 1;
         let (text, tool_calls) = crate::protocol::decode(&result.response, request)?;
@@ -396,47 +497,54 @@ impl Provider for GeminiWebProvider {
     fn recover_media(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &Session,
     ) -> Result<Vec<String>> {
         let store = require_store(ctx)?;
+        let route = self.account_route(account);
         let owned = crate::tab_pool::owned_media_target(
             store,
             session,
-            browser::list_targets(account.port).unwrap_or_default(),
+            browser::list_targets(browser_profile.port).unwrap_or_default(),
         )?;
         let (target, created) = if let Some(target) = owned {
             (target, false)
         } else {
-            let url = session
+            let raw_url = session
                 .remote_url
                 .as_deref()
                 .ok_or_else(|| ServiceError::invalid("no saved remote conversation"))?;
-            let parsed = crate::url_lite::Url::parse(url).map_err(ServiceError::storage)?;
-            if !crate::gemini::is_gemini_origin(&parsed) || !crate::gemini::url_has_chat_id(url) {
+            let parsed = crate::url_lite::Url::parse(raw_url).map_err(ServiceError::storage)?;
+            if !crate::gemini::is_gemini_origin(&parsed) || !crate::gemini::url_has_chat_id(raw_url)
+            {
                 return Err(ServiceError::invalid(
                     "this temporary or unsaved conversation cannot be reopened",
                 ));
             }
+            let url = self.rebase_chat_url(account, raw_url)?;
             (
-                browser::create_tab(account.port, url)
+                browser::create_tab(browser_profile.port, &url)
                     .map_err(|e| ServiceError::backend(e, false))?,
                 true,
             )
         };
         let _close = browser::CloseTabGuard {
-            port: account.port,
+            port: browser_profile.port,
             target_id: created.then(|| target.id.clone()),
         };
-        let mut tab = GeminiTab::attach(
-            account.port,
+        let mut tab = GeminiTab::attach_with_home_url(
+            browser_profile.port,
             target,
+            &route.entry_url,
             ChatSessionMode::Continue,
             CancelToken::new(),
             Instant::now() + Duration::from_secs(30),
             true,
         )
         .map_err(|e| ServiceError::backend(e, false))?;
+        tab.set_input_lock(ctx.input_lock.cloned());
+        verify_probe_identity(account, tab.initial_probe())?;
         tab.wait_owned_response(session.remote_turns)
             .map_err(|e| ServiceError::backend(e, false))?;
         capture_media(store, &mut tab, &account.id)
@@ -445,12 +553,259 @@ impl Provider for GeminiWebProvider {
     fn close_session(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &Session,
     ) -> Result<()> {
         let store = require_store(ctx)?;
-        crate::tab_pool::release_session_tab(store, account, session)
+        let route = self.account_route(account);
+        crate::tab_pool::release_session_tab_for_route(
+            store,
+            &account.id,
+            browser_profile.port,
+            session,
+            &route,
+        )
     }
+}
+
+pub(crate) fn identity_mismatch_error() -> ServiceError {
+    ServiceError::new(
+        ErrorCode::AuthRequired,
+        "identity_mismatch",
+        "browser tab switched to a different account; rescanning accounts",
+    )
+}
+
+pub(crate) fn verify_probe_identity(account: &Account, probe: &Value) -> Result<()> {
+    if let Some(expected) = account
+        .identity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(observed) = probe["identity"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !observed.eq_ignore_ascii_case(expected) {
+                return Err(identity_mismatch_error());
+            }
+        }
+    }
+    if let Some(expected_slot) = account
+        .slot
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let observed_slot = probe["slot"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                probe["url"]
+                    .as_str()
+                    .and_then(crate::gemini::gemini_url_scope)
+            });
+        if observed_slot
+            .as_deref()
+            .is_some_and(|obs| obs != expected_slot)
+        {
+            return Err(identity_mismatch_error());
+        }
+    }
+    Ok(())
+}
+
+/// Sequentially probe `/u/0/app`, `/u/1/app`, ... in one temporary tab to discover
+/// all signed-in Google accounts in the Gemini Chrome profile.
+pub(crate) fn discover_accounts_on_port(
+    port: u16,
+    cancel: CancelToken,
+    per_slot_timeout: Duration,
+) -> Result<Vec<DiscoveredAccount>> {
+    cancel
+        .check()
+        .map_err(|e| ServiceError::backend(e, false))?;
+    let target =
+        browser::create_tab(port, "about:blank").map_err(|e| ServiceError::backend(e, false))?;
+    let _close = browser::CloseTabGuard::new(port, target.id.clone());
+    let driver = crate::adapter::script_for(DEFAULT_PROVIDER_ID, "driver.js")
+        .map_err(ServiceError::invalid)?;
+    let probe_expr = format!("({})({})", driver, json!({"op": "probe"}));
+    let overall_deadline = Instant::now() + ACCOUNT_DISCOVERY_TIMEOUT;
+    let mut discovered = Vec::new();
+    let mut seen_identities = HashSet::new();
+
+    for idx in 0usize..10 {
+        cancel
+            .check()
+            .map_err(|e| ServiceError::backend(e, false))?;
+        let now = Instant::now();
+        if now >= overall_deadline {
+            break;
+        }
+        let slot_str = idx.to_string();
+        let url = crate::gemini::gemini_app_url(Some(&slot_str));
+        let slot_deadline = overall_deadline.min(now + per_slot_timeout);
+        if let Err(err) =
+            crate::gemini::navigate_tab_commit(port, &target, &url, &cancel, slot_deadline)
+        {
+            if idx == 0 {
+                return Err(ServiceError::backend(err, false));
+            }
+            break;
+        }
+        let path = browser::ws_path_from_url(&target.ws_url).map_err(ServiceError::invalid)?;
+        let mut cdp =
+            CdpClient::connect(port, &path).map_err(|e| ServiceError::backend(e, false))?;
+        cdp.set_control(cancel.clone(), slot_deadline);
+        let _ = cdp.call("Runtime.enable", json!({}));
+
+        let mut last_probe = Value::Null;
+        let mut identity_wait_polls = 0u8;
+        let mut resolved_slot = None;
+        let mut stop_scanning = false;
+        while Instant::now() < slot_deadline {
+            cancel
+                .check()
+                .map_err(|e| ServiceError::backend(e, false))?;
+            let eval = match cdp.call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": &probe_expr,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                    "timeout": 2000
+                }),
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    if cancel.sleep_or_cancelled(Duration::from_millis(120)) {
+                        return Err(ServiceError::backend("cancelled".into(), false));
+                    }
+                    continue;
+                }
+            };
+            if eval.get("exceptionDetails").is_some() {
+                if cancel.sleep_or_cancelled(Duration::from_millis(120)) {
+                    return Err(ServiceError::backend("cancelled".into(), false));
+                }
+                continue;
+            }
+            let probe = eval["result"]["value"].clone();
+            last_probe = probe.clone();
+            if probe["verification"] == true {
+                return Err(ServiceError::new(
+                    ErrorCode::VerificationRequired,
+                    "account_discovery",
+                    "complete Google's human verification in Chrome, then refresh accounts",
+                ));
+            }
+            if probe["url"]
+                .as_str()
+                .is_some_and(|u| u.contains("accounts.google.com"))
+            {
+                if idx == 0 {
+                    return Err(ServiceError::new(
+                        ErrorCode::AuthRequired,
+                        "account_discovery",
+                        "Sign in with /browser login or `anticrumb login` before discovering accounts.",
+                    ));
+                }
+                stop_scanning = true;
+                break;
+            }
+            if authenticated(&probe) {
+                let observed_scope = probe["slot"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        probe["url"]
+                            .as_str()
+                            .and_then(crate::gemini::gemini_url_scope)
+                    });
+                if idx > 0 && observed_scope.as_deref() != Some(slot_str.as_str()) {
+                    // Out-of-range `/u/{idx}/app` redirected back to `/u/0/app` (or another slot).
+                    stop_scanning = true;
+                    break;
+                }
+                let identity = probe["identity"]
+                    .as_str()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty());
+                if identity.is_none() && identity_wait_polls < 3 {
+                    identity_wait_polls += 1;
+                    if cancel.sleep_or_cancelled(Duration::from_millis(100)) {
+                        return Err(ServiceError::backend("cancelled".into(), false));
+                    }
+                    continue;
+                }
+                let label = probe["label"]
+                    .as_str()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| identity.clone());
+                if idx > 0 {
+                    match &identity {
+                        Some(id_str) if !seen_identities.contains(id_str) => {}
+                        _ => {
+                            stop_scanning = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(ref id_str) = identity {
+                    seen_identities.insert(id_str.clone());
+                }
+                resolved_slot = Some(DiscoveredAccount {
+                    identity: identity.clone(),
+                    label,
+                    slot: Some(slot_str.clone()),
+                });
+                if idx == 0 && identity.is_none() {
+                    // Graceful single-account fallback when page does not expose email.
+                    stop_scanning = true;
+                }
+                break;
+            }
+            if cancel.sleep_or_cancelled(Duration::from_millis(120)) {
+                return Err(ServiceError::backend("cancelled".into(), false));
+            }
+        }
+        if let Some(found) = resolved_slot {
+            discovered.push(found);
+            if stop_scanning {
+                break;
+            }
+            continue;
+        }
+        if stop_scanning {
+            break;
+        }
+        if idx == 0 {
+            if last_probe["signed_in"] == false {
+                return Err(ServiceError::new(
+                    ErrorCode::AuthRequired,
+                    "account_discovery",
+                    "Sign in with /browser login or `anticrumb login` before discovering accounts.",
+                ));
+            }
+            return Err(ServiceError::new(
+                ErrorCode::DeadlineExceeded,
+                "account_discovery",
+                "Gemini page did not become ready while scanning accounts; verify login in Chrome and retry",
+            ));
+        }
+        break;
+    }
+
+    Ok(discovered)
 }
 
 fn require_store<'a>(ctx: &ProviderContext<'a>) -> Result<&'a Store> {
@@ -543,16 +898,20 @@ pub(crate) fn unique_model_aliases(catalog: Option<&Value>, query: &str) -> Vec<
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_tab(
     store: &Store,
+    browser_profile: &BrowserProfile,
     account: &Account,
+    route: &AccountRoute,
+    input_lock: Option<Arc<Mutex<()>>>,
     session: &mut Session,
     request: &TurnRequest,
     cancel: &CancelToken,
     deadline: Instant,
     emit: Emit<'_>,
 ) -> Result<(GeminiTab, bool, bool)> {
-    let opts = browser::LaunchOptions::headless_account(account, browser::GEMINI_APP_URL);
+    let opts = browser::LaunchOptions::headless_browser(browser_profile, &route.entry_url);
     let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
     let other_owned: std::collections::HashSet<String> = store
         .list::<Session>("local", "session")
@@ -579,9 +938,12 @@ fn acquire_tab(
             json!({"stage":"checking_tab","detail":format!("verifying owned tab {}", target.id)}),
         )?;
         let mut navigated = false;
-        if let Some(expected) = &session.remote_url {
+        if let Some(expected_raw) = &session.remote_url {
+            let expected =
+                crate::gemini::rebase_gemini_chat_url(expected_raw, account.slot.as_deref())
+                    .unwrap_or_else(|_| expected_raw.clone());
             let expected_url =
-                crate::url_lite::Url::parse(expected).map_err(ServiceError::storage)?;
+                crate::url_lite::Url::parse(&expected).map_err(ServiceError::storage)?;
             let current_url =
                 crate::url_lite::Url::parse(&target.url).map_err(ServiceError::storage)?;
             if expected_url.host_str() != current_url.host_str()
@@ -593,7 +955,7 @@ fn acquire_tab(
                         json!({"stage":"navigating_tab","detail":"restoring saved Gemini conversation URL"}),
                     )?;
                     crate::gemini::navigate_tab_commit(
-                        host.port, &target, expected, cancel, deadline,
+                        host.port, &target, &expected, cancel, deadline,
                     )
                     .map_err(|e| ServiceError::backend(e, false))?;
                     navigated = true;
@@ -611,17 +973,21 @@ fn acquire_tab(
         (target, ChatSessionMode::Continue, false)
     } else if continuing {
         if session.mode == SessionMode::Chat {
-            if let Some(remote_url) = session.remote_url.clone() {
+            if let Some(remote_url_raw) = session.remote_url.clone() {
+                let remote_url =
+                    crate::gemini::rebase_gemini_chat_url(&remote_url_raw, account.slot.as_deref())
+                        .unwrap_or(remote_url_raw);
                 emit(
                     "browser_stage",
                     json!({"stage":"navigating_tab","detail":"acquiring tab & opening saved Gemini chat"}),
                 )?;
-                let (target, _) = crate::tab_pool::acquire_session_tab(
+                let (target, _) = crate::tab_pool::acquire_session_tab_for_route(
                     store,
                     &account.id,
                     host.port,
                     &session.id,
                     &SessionMode::Chat,
+                    route,
                 )?;
                 crate::gemini::navigate_tab_commit(
                     host.port,
@@ -658,30 +1024,33 @@ fn acquire_tab(
         } else {
             ChatSessionMode::NewChat
         };
-        let (target, reused) = crate::tab_pool::acquire_session_tab(
+        let (target, reused) = crate::tab_pool::acquire_session_tab_for_route(
             store,
             &account.id,
             host.port,
             &session.id,
             &request.mode,
+            route,
         )?;
         (target, mode, reused)
     };
     session.target_id = Some(target.id.clone());
     store.put("local", "session", &session.id, session)?;
     let mut tab = if reused {
-        GeminiTab::attach_reused(
+        GeminiTab::attach_reused_with_home_url(
             host.port,
             target,
+            &route.entry_url,
             mode,
             cancel.clone(),
             deadline,
             request.generate_image,
         )
     } else {
-        GeminiTab::attach(
+        GeminiTab::attach_with_home_url(
             host.port,
             target,
+            &route.entry_url,
             mode,
             cancel.clone(),
             deadline,
@@ -690,6 +1059,7 @@ fn acquire_tab(
     }
     .map_err(|e| ServiceError::backend(e, false))?;
     tab.set_control(cancel.clone(), deadline);
+    tab.set_input_lock(input_lock);
     let is_continue = mode == ChatSessionMode::Continue;
     Ok((tab, is_continue, is_continue && same_warm_tab))
 }
@@ -777,7 +1147,7 @@ fn prepare_tab(
 
 fn stream_turn(
     tab: &mut GeminiTab,
-    account: &Account,
+    browser_port: u16,
     session: &mut Session,
     prompt: &str,
     emit: Emit<'_>,
@@ -841,7 +1211,7 @@ fn stream_turn(
                     | ErrorCode::SubmissionOutcomeUnknown
             ) {
                 if let Some(target) = &session.target_id {
-                    let _ = GeminiTab::stop_owned(account.port, target);
+                    let _ = GeminiTab::stop_owned(browser_port, target);
                 }
             }
             return Err(err);

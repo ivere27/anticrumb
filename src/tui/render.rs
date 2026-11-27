@@ -398,14 +398,9 @@ impl State {
             "awaiting_human" | "auth_required" => Face::DANGER_BOLD,
             _ => Face::MUTED,
         };
-        let acct_label = if self.provider_id() == crate::provider::DEFAULT_PROVIDER_ID {
-            format!("{}:{acct_state}", self.options.account)
-        } else {
-            format!(
-                "{}/{}:{acct_state}",
-                self.provider_id(),
-                self.options.account
-            )
+        let acct_label = match self.account_slot() {
+            Some(slot) => format!("{}/u/{slot}:{acct_state}", self.provider_id()),
+            None => format!("{}:{acct_state}", self.provider_id()),
         };
         parts.push((" · ".into(), Face::MUTED));
         parts.push((acct_label, acct_face));

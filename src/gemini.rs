@@ -26,7 +26,7 @@ pub use input::AttachmentProgress;
 pub(crate) use input::{
     evaluate_chip_poll, ChipPollState, CHIP_APPEAR_TIMEOUT, CHIP_UPLOAD_TIMEOUT,
 };
-pub use media::read_web_usage;
+pub use media::{read_web_usage, read_web_usage_checked};
 pub use models::ModelCatalog;
 pub(crate) use models::{
     model_probe_confirmed, normalize_model_label, probe_matches_model_aliases,
@@ -37,7 +37,11 @@ pub(crate) use stream::{emit_observed, is_stream_finished, StreamWaitTracker};
 pub use stream::{AskResult, StreamUpdate};
 pub(crate) use system_tab::{navigate_tab_commit, SystemGeminiTab};
 pub use url::is_reusable_gemini_url;
-pub(crate) use url::{is_gemini_origin, is_gemini_page_url, url_has_chat_id};
+pub(crate) use url::{
+    gemini_app_url, gemini_url_scope, gemini_usage_url, is_gemini_origin, is_gemini_page_url,
+    is_gemini_usage_url_for, is_reusable_gemini_url_for, normalized_slot, rebase_gemini_chat_url,
+    url_has_chat_id,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,7 +49,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -189,6 +193,8 @@ pub struct GeminiTab {
     pub(super) port: u16,
     pub(super) cdp: CdpClient,
     target: TargetInfo,
+    pub(super) home_url: String,
+    pub(super) input_lock: Option<Arc<Mutex<()>>>,
     pub(super) cancel: CancelToken,
     pub(super) deadline: Instant,
     pub(super) network: tokio::sync::broadcast::Receiver<Value>,
@@ -231,6 +237,10 @@ impl GeminiTab {
 
     pub fn set_pace(&mut self, pace: HumanPace) {
         self.pace = pace;
+    }
+
+    pub fn set_input_lock(&mut self, lock: Option<Arc<Mutex<()>>>) {
+        self.input_lock = lock;
     }
 
     pub fn initial_probe(&self) -> &Value {
@@ -330,7 +340,36 @@ impl GeminiTab {
         deadline: Instant,
         capture_media: bool,
     ) -> Result<Self, String> {
-        Self::attach_inner(port, target, mode, false, cancel, deadline, capture_media)
+        Self::attach_with_home_url(
+            port,
+            target,
+            browser_host::GEMINI_APP_URL,
+            mode,
+            cancel,
+            deadline,
+            capture_media,
+        )
+    }
+
+    pub fn attach_with_home_url(
+        port: u16,
+        target: TargetInfo,
+        home_url: &str,
+        mode: ChatSessionMode,
+        cancel: CancelToken,
+        deadline: Instant,
+        capture_media: bool,
+    ) -> Result<Self, String> {
+        Self::attach_inner(
+            port,
+            target,
+            home_url.to_owned(),
+            mode,
+            false,
+            cancel,
+            deadline,
+            capture_media,
+        )
     }
 
     /// Attach to an already-open Gemini tab, starting a fresh chat in-tab when requested
@@ -343,7 +382,36 @@ impl GeminiTab {
         deadline: Instant,
         capture_media: bool,
     ) -> Result<Self, String> {
-        Self::attach_inner(port, target, mode, true, cancel, deadline, capture_media)
+        Self::attach_reused_with_home_url(
+            port,
+            target,
+            browser_host::GEMINI_APP_URL,
+            mode,
+            cancel,
+            deadline,
+            capture_media,
+        )
+    }
+
+    pub fn attach_reused_with_home_url(
+        port: u16,
+        target: TargetInfo,
+        home_url: &str,
+        mode: ChatSessionMode,
+        cancel: CancelToken,
+        deadline: Instant,
+        capture_media: bool,
+    ) -> Result<Self, String> {
+        Self::attach_inner(
+            port,
+            target,
+            home_url.to_owned(),
+            mode,
+            true,
+            cancel,
+            deadline,
+            capture_media,
+        )
     }
 
     fn wait_ready(&mut self) -> Result<Value, String> {
@@ -405,10 +473,8 @@ impl GeminiTab {
             self.pause_jitter(60, 110)?;
         }
         // Fallback: navigate within the exact same existing tab rather than opening a new tab.
-        self.cdp.call(
-            "Page.navigate",
-            json!({"url": browser_host::GEMINI_APP_URL}),
-        )?;
+        self.cdp
+            .call("Page.navigate", json!({"url": self.home_url}))?;
         self.wait_ready()?;
         let settle_deadline = Instant::now() + Duration::from_secs(6);
         loop {
@@ -426,9 +492,11 @@ impl GeminiTab {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attach_inner(
         port: u16,
         target: TargetInfo,
+        home_url: String,
         mode: ChatSessionMode,
         reset_reused: bool,
         cancel: CancelToken,
@@ -443,6 +511,8 @@ impl GeminiTab {
             network,
             image_requests: std::collections::HashMap::new(),
             target,
+            home_url,
+            input_lock: None,
             cancel,
             deadline,
             cursor: None,

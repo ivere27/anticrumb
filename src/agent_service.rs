@@ -885,7 +885,10 @@ impl AgentManager {
             return Err(ServiceError::invalid("workspace must be a directory"));
         }
         if request.account_id.trim().is_empty() {
-            request.account_id = "default".into();
+            request.account_id = self
+                .store
+                .resolve_active_account_id()
+                .unwrap_or_else(|_| default_account());
         }
         let mut controls = self.controls.lock().map_err(ServiceError::storage)?;
         // cancel_all sets stopping before taking this lock, so a job cannot

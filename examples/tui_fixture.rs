@@ -57,27 +57,29 @@ impl Fixture {
     }
     fn browser_status_reply(
         &self,
-        account_id: String,
+        provider_id: String,
         headless: Option<bool>,
     ) -> pb::BrowserStatus {
+        let login = self
+            .host
+            .service
+            .store
+            .get::<Value>("local", "provider_login", &provider_id)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok());
         pb::BrowserStatus {
-            account_id,
-            account_state: "ready".into(),
+            provider_id,
             connected: true,
             endpoint: "http://127.0.0.1:9222".into(),
             browser: Some("Chrome/fixture".into()),
             profile: "fixture/profile".into(),
             profile_matches: Some(true),
             headless,
+            account_count: 1,
+            ready_accounts: 1,
             last_verified_sign_in: Some(true),
             checked_at: Some(1),
-            login: self
-                .host
-                .service
-                .store
-                .get::<Value>("default", "login", "current")
-                .ok()
-                .and_then(|value| serde_json::from_value(value).ok()),
+            login,
             ..Default::default()
         }
     }
@@ -233,8 +235,17 @@ impl AccountService for Fixture {
     async fn list_accounts(&self, r: Request<pb::Empty>) -> Reply<pb::AccountList> {
         self.api.list_accounts(r).await
     }
-    async fn create_account(&self, r: Request<pb::CreateAccountRequest>) -> Reply<pb::Account> {
-        self.api.create_account(r).await
+    async fn list_browsers(&self, r: Request<pb::Empty>) -> Reply<pb::BrowserProfileList> {
+        self.api.list_browsers(r).await
+    }
+    async fn ensure_provider_account(&self, r: Request<pb::ProviderRef>) -> Reply<pb::Account> {
+        self.api.ensure_provider_account(r).await
+    }
+    async fn set_active_account(&self, r: Request<pb::AccountRef>) -> Reply<pb::Account> {
+        self.api.set_active_account(r).await
+    }
+    async fn refresh_accounts(&self, r: Request<pb::ProviderRef>) -> Reply<pb::AccountList> {
+        self.api.refresh_accounts(r).await
     }
     async fn attach_browser(
         &self,
@@ -242,18 +253,23 @@ impl AccountService for Fixture {
     ) -> Reply<pb::BrowserStatus> {
         Err(Status::unimplemented("fixture"))
     }
-    async fn open_login(&self, r: Request<pb::AccountRef>) -> Reply<pb::Empty> {
+    async fn open_login(&self, r: Request<pb::ProviderRef>) -> Reply<pb::Empty> {
         self.api.authorize(r.metadata())?;
-        assert_eq!(r.into_inner().account_id, "default");
+        let provider_id = r.into_inner().id;
+        let provider_id = if provider_id.is_empty() {
+            default_provider()
+        } else {
+            provider_id
+        };
         let store = &self.host.service.store;
         let mut account: Account = store.get("local", "account", "default").unwrap();
         account.state = "awaiting_human".into();
         store.put("local", "account", "default", &account).unwrap();
         store
             .put(
-                "default",
-                "login",
-                "current",
+                "local",
+                "provider_login",
+                &provider_id,
                 &json!({"state":"waiting","error":""}),
             )
             .unwrap();
@@ -272,9 +288,9 @@ impl AccountService for Fixture {
                     store.put("local", "account", "default", &account).unwrap();
                     store
                         .put(
-                            "default",
-                            "login",
-                            "current",
+                            "local",
+                            "provider_login",
+                            &provider_id,
                             &json!({"state":"ready","error":""}),
                         )
                         .unwrap();
@@ -299,18 +315,18 @@ impl AccountService for Fixture {
         state.observations["browser_mode_requests"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"account_id": req.account_id, "headless": req.headless}));
+            .push(json!({"provider_id": req.provider_id, "headless": req.headless}));
         self.save(&state);
         Ok(Response::new(self.browser_status_reply(
-            req.account_id,
+            req.provider_id,
             state.browser_headless,
         )))
     }
-    async fn get_browser_status(&self, r: Request<pb::AccountRef>) -> Reply<pb::BrowserStatus> {
+    async fn get_browser_status(&self, r: Request<pb::ProviderRef>) -> Reply<pb::BrowserStatus> {
         self.api.authorize(r.metadata())?;
         let headless = self.state.lock().unwrap().browser_headless;
         Ok(Response::new(
-            self.browser_status_reply(r.into_inner().account_id, headless),
+            self.browser_status_reply(r.into_inner().id, headless),
         ))
     }
 }
@@ -679,6 +695,15 @@ const FIXTURE_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 async fn start(root: PathBuf) -> (Arc<Host>, String, tokio::task::JoinHandle<()>) {
     let store = Store::open(&root).unwrap();
     store
+        .put_browser_profile(&BrowserProfile {
+            provider_id: default_provider(),
+            profile: root.join("profile"),
+            subprofile: None,
+            port: 9222,
+            headless: true,
+        })
+        .unwrap();
+    store
         .put(
             "local",
             "account",
@@ -687,13 +712,13 @@ async fn start(root: PathBuf) -> (Arc<Host>, String, tokio::task::JoinHandle<()>
                 id: "default".into(),
                 provider: default_provider(),
                 state: "ready".into(),
-                profile: root.join("profile"),
-                subprofile: None,
-                port: 9222,
-                headless: true,
+                identity: None,
+                label: None,
+                slot: None,
             },
         )
         .unwrap();
+    store.set_active_account_id("default").unwrap();
     let host = Host::with_service(
         Service::new(store, Arc::new(NoBrowser)).unwrap(),
         None,

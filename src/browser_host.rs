@@ -26,15 +26,15 @@ pub struct LaunchOptions {
 }
 
 impl LaunchOptions {
-    pub fn for_account(
-        account: &crate::domain::Account,
+    pub fn for_browser(
+        browser: &crate::domain::BrowserProfile,
         headless: bool,
         initial_url: impl Into<String>,
     ) -> Self {
         Self {
-            port: account.port,
-            profile_dir: account.profile.clone(),
-            profile_sub_dir: account.subprofile.clone(),
+            port: browser.port,
+            profile_dir: browser.profile.clone(),
+            profile_sub_dir: browser.subprofile.clone(),
             headless,
             xvfb: false,
             window_size: Some((1280, 900)),
@@ -43,11 +43,11 @@ impl LaunchOptions {
         }
     }
 
-    pub fn headless_account(
-        account: &crate::domain::Account,
+    pub fn headless_browser(
+        browser: &crate::domain::BrowserProfile,
         initial_url: impl Into<String>,
     ) -> Self {
-        Self::for_account(account, true, initial_url)
+        Self::for_browser(browser, true, initial_url)
     }
 }
 
@@ -63,13 +63,13 @@ pub struct RunningCdpMeta {
 }
 
 impl RunningCdpMeta {
-    pub fn matches_account(&self, account: &crate::domain::Account) -> bool {
-        let expected_sub = account
+    pub fn matches_browser(&self, browser: &crate::domain::BrowserProfile) -> bool {
+        let expected_sub = browser
             .subprofile
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or("Default");
-        let same_root = fs::canonicalize(&account.profile)
+        let same_root = fs::canonicalize(&browser.profile)
             .ok()
             .zip(fs::canonicalize(&self.user_data_dir).ok())
             .is_some_and(|(a, b)| a == b);
@@ -163,8 +163,8 @@ pub fn anticrumb_home() -> PathBuf {
     home.join(".anticrumb")
 }
 
-pub fn default_profile_dir() -> PathBuf {
-    anticrumb_home().join("profile")
+pub fn provider_profile_dir(provider_id: &str) -> PathBuf {
+    anticrumb_home().join("profiles").join(provider_id)
 }
 
 pub fn find_chrome_binary() -> Option<PathBuf> {
@@ -1106,17 +1106,20 @@ fn graceful_shutdown_browser_in(home: &Path, port: u16, pid: u32, profile_dir: O
 
 /// Gracefully shuts down any running Chrome instances launched for managed profiles
 /// under `anticrumb_home()`, leaving externally attached browsers untouched.
-/// Returns the IDs of accounts whose running browser was closed.
-pub fn shutdown_managed_browsers(accounts: &[crate::domain::Account]) -> Vec<String> {
-    shutdown_managed_browsers_in(&anticrumb_home(), accounts)
+/// Returns the provider IDs whose running browser was closed.
+pub fn shutdown_managed_browsers(browsers: &[crate::domain::BrowserProfile]) -> Vec<String> {
+    shutdown_managed_browsers_in(&anticrumb_home(), browsers)
 }
 
-fn shutdown_managed_browsers_in(home: &Path, accounts: &[crate::domain::Account]) -> Vec<String> {
+fn shutdown_managed_browsers_in(
+    home: &Path,
+    browsers: &[crate::domain::BrowserProfile],
+) -> Vec<String> {
     if !home.exists() {
         return Vec::new();
     }
     struct ShutdownTarget {
-        account_id: Option<String>,
+        provider_id: Option<String>,
         port: u16,
         pid: u32,
         profile_dir: PathBuf,
@@ -1125,22 +1128,22 @@ fn shutdown_managed_browsers_in(home: &Path, accounts: &[crate::domain::Account]
     let mut seen_ports = std::collections::HashSet::new();
     let mut targets = Vec::new();
 
-    for account in accounts {
-        if account.port == 0 || validate_profile_under(home, &account.profile).is_err() {
+    for browser in browsers {
+        if browser.port == 0 || validate_profile_under(home, &browser.profile).is_err() {
             continue;
         }
-        let Some(meta) = inspect_running_cdp_in(home, account.port) else {
+        let Some(meta) = inspect_running_cdp_in(home, browser.port) else {
             continue;
         };
-        if !meta.matches_account(account) {
+        if !meta.matches_browser(browser) {
             continue;
         }
-        if seen_ports.insert(account.port) {
+        if seen_ports.insert(browser.port) {
             targets.push(ShutdownTarget {
-                account_id: Some(account.id.clone()),
-                port: account.port,
+                provider_id: Some(browser.provider_id.clone()),
+                port: browser.port,
                 pid: meta.pid,
-                profile_dir: account.profile.clone(),
+                profile_dir: browser.profile.clone(),
             });
         }
     }
@@ -1176,7 +1179,7 @@ fn shutdown_managed_browsers_in(home: &Path, accounts: &[crate::domain::Account]
             }
             if seen_ports.insert(cached.port) {
                 targets.push(ShutdownTarget {
-                    account_id: None,
+                    provider_id: None,
                     port: cached.port,
                     pid: live.pid,
                     profile_dir,
@@ -1199,7 +1202,7 @@ fn shutdown_managed_browsers_in(home: &Path, accounts: &[crate::domain::Account]
                     target.pid,
                     Some(&target.profile_dir),
                 );
-                if let Some(id) = &target.account_id {
+                if let Some(id) = &target.provider_id {
                     if let Ok(mut ids) = closed_ids.lock() {
                         ids.push(id.clone());
                     }
@@ -1224,9 +1227,9 @@ pub fn wait_for_profile_unlock(profile_dir: &Path, timeout: Duration) {
     }
 }
 
-/// Browser lifecycle operations are restricted to managed profiles.
+/// Browser lifecycle operations are restricted to managed profiles under `<ANTICRUMB_HOME>/profiles/<provider_id>`.
 pub fn validate_managed_profile(profile_dir: &Path) -> Result<(), String> {
-    let root = default_profile_dir().parent().unwrap().to_path_buf();
+    let root = anticrumb_home();
     validate_profile_under(&root, profile_dir)
 }
 
@@ -1254,11 +1257,9 @@ fn validate_profile_under(root: &Path, profile_dir: &Path) -> Result<(), String>
         .strip_prefix(&root)
         .map_err(|_| "refusing to manage an external Chrome profile".to_string())?;
     let parts: Vec<_> = relative.components().collect();
-    let managed = relative == Path::new("profile")
-        || (parts.len() == 3
-            && parts[0].as_os_str() == "accounts"
-            && matches!(parts[1], std::path::Component::Normal(_))
-            && parts[2].as_os_str() == "profile");
+    let managed = parts.len() == 2
+        && parts[0].as_os_str() == "profiles"
+        && matches!(parts[1], std::path::Component::Normal(_));
     if !managed {
         return Err("refusing to manage a non-managed profile directory".into());
     }
@@ -1991,15 +1992,15 @@ mod tests {
     fn managed_profile_validation_allows_new_profiles_but_rejects_symlink_escape() {
         let root = tempfile::tempdir().unwrap();
         assert!(
-            validate_profile_under(root.path(), &root.path().join("accounts/new/profile")).is_ok()
+            validate_profile_under(root.path(), &root.path().join("profiles/gemini-web")).is_ok()
         );
         assert!(validate_profile_under(root.path(), &root.path().join("unrelated")).is_err());
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(outside.path(), root.path().join("accounts")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.path().join("profiles")).unwrap();
             assert!(
-                validate_profile_under(root.path(), &root.path().join("accounts/new/profile"))
+                validate_profile_under(root.path(), &root.path().join("profiles/gemini-web"))
                     .is_err()
             );
         }
@@ -2013,7 +2014,7 @@ mod tests {
         };
 
         let home = tempfile::tempdir().unwrap();
-        let managed_profile = home.path().join("accounts/work-claude/profile");
+        let managed_profile = home.path().join("profiles/claude-web");
         fs::create_dir_all(&managed_profile).unwrap();
         let external_dir = tempfile::tempdir().unwrap();
 
@@ -2078,29 +2079,25 @@ mod tests {
         )
         .unwrap();
 
-        let accounts = vec![
-            crate::domain::Account {
-                id: "work-claude".into(),
-                provider: "claude-web".into(),
+        let browsers = vec![
+            crate::domain::BrowserProfile {
+                provider_id: "claude-web".into(),
                 profile: managed_profile,
                 subprofile: None,
                 port: managed_srv.port,
                 headless: true,
-                state: "ready".into(),
             },
-            crate::domain::Account {
-                id: "attached".into(),
-                provider: "gemini-web".into(),
+            crate::domain::BrowserProfile {
+                provider_id: "gemini-web".into(),
                 profile: external_dir.path().to_path_buf(),
                 subprofile: None,
                 port: external_srv.port,
                 headless: false,
-                state: "ready".into(),
             },
         ];
 
-        let closed = shutdown_managed_browsers_in(home.path(), &accounts);
-        assert_eq!(closed, vec!["work-claude".to_string()]);
+        let closed = shutdown_managed_browsers_in(home.path(), &browsers);
+        assert_eq!(closed, vec!["claude-web".to_string()]);
         assert!(managed_closed.load(Ordering::SeqCst));
         assert!(!external_closed.load(Ordering::SeqCst));
         assert!(!cdp_meta_path_in(home.path(), managed_srv.port).exists());

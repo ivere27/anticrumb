@@ -29,6 +29,7 @@
     "image_generation": false,
     "web_usage": false,
     "web_history_cleanup": true,
-    "native_tools": false
+    "native_tools": false,
+    "multi_account": false
   }
 }

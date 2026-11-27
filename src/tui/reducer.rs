@@ -472,7 +472,11 @@ impl State {
         let version = crate::build_info::display_version();
         let commit = crate::build_info::commit_head();
         let version_label = crate::build_info::format_tui_title(&version, commit.as_deref());
-        let account_label = format!("{} · {}", self.provider_name(), self.options.account);
+        let account_label = format!(
+            "{} · {}",
+            self.provider_name(),
+            self.account_display_label()
+        );
         let model_label = format!("{} ({})", self.model_label(), self.thinking_label());
         let workspace_label = Self::format_workspace_home(&self.options.workspace);
 
@@ -923,6 +927,54 @@ impl State {
         provider["capabilities"]["temporary_sessions"].as_bool()
     }
 
+    pub(super) fn provider_multi_account(&self, provider_id: &str) -> bool {
+        self.status["providers"]
+            .as_array()
+            .and_then(|providers| {
+                providers
+                    .iter()
+                    .find(|p| p["id"].as_str() == Some(provider_id))
+            })
+            .and_then(|provider| provider["capabilities"]["multi_account"].as_bool())
+            .unwrap_or(provider_id == crate::provider::DEFAULT_PROVIDER_ID)
+    }
+
+    pub(super) fn format_account_entry(acct: &Value) -> String {
+        let id = acct["id"].as_str().unwrap_or("");
+        let identity = acct["identity"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let label = acct["label"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let slot = acct["slot"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let primary = identity.or(label).unwrap_or(id);
+        match slot {
+            Some(s) => format!("{primary} (u/{s})"),
+            None => primary.to_owned(),
+        }
+    }
+
+    pub(super) fn account_display_label(&self) -> String {
+        if let Some(acct) = self.account() {
+            Self::format_account_entry(acct)
+        } else {
+            self.options.account.clone()
+        }
+    }
+
+    pub(super) fn account_slot(&self) -> Option<&str> {
+        self.account()
+            .and_then(|acct| acct["slot"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     pub(super) fn warn_if_temporary_unsupported(&mut self) {
         if self.options.temporary && self.provider_temporary_support() == Some(false) {
             let name = self.provider_name().to_owned();
@@ -939,6 +991,16 @@ impl State {
         provider_id: &str,
         provider_name: &str,
     ) {
+        self.switch_provider_with_sink(account_id, provider_id, provider_name, None);
+    }
+
+    pub(super) fn switch_provider_with_sink(
+        &mut self,
+        account_id: &str,
+        provider_id: &str,
+        provider_name: &str,
+        sink: Option<&mut dyn EffectSink>,
+    ) {
         if self.busy() {
             self.log("Interrupt the current task before switching provider or account.");
             return;
@@ -952,8 +1014,9 @@ impl State {
         if account_id == self.options.account {
             self.options.provider = Some(provider_id.to_owned());
             self.options.provider_name = Some(provider_name.to_owned());
+            let display = self.account_display_label();
             self.log(&format!(
-                "Already using {provider_name} ({provider_id}) · account {account_id}."
+                "Already using {provider_name} ({provider_id}) · account {display}."
             ));
             return;
         }
@@ -1003,8 +1066,22 @@ impl State {
             .unwrap_or(Value::Null);
         self.load_history();
 
+        if let Some(sink) = sink {
+            self.send(sink, Command::SetActiveAccount(account_id.to_owned()));
+            self.send(
+                sink,
+                Command::WebHistoryStatus(account_id.to_owned(), false),
+            );
+        }
+
+        let display = self.account_display_label();
+        let account_desc = if display == account_id {
+            account_id.to_owned()
+        } else {
+            format!("{display} [{account_id}]")
+        };
         let plain = format!(
-            "Provider: {provider_name} ({provider_id}) · account {account_id} · new conversation"
+            "Provider: {provider_name} ({provider_id}) · account {account_desc} · new conversation"
         );
         self.log_spans(
             &plain,
@@ -1016,7 +1093,7 @@ impl State {
                     Face::ACCENT_BOLD,
                 ),
                 (" · account ".into(), Face::MUTED),
-                (account_id.to_owned(), Face::HIGHLIGHT_BOLD),
+                (account_desc, Face::HIGHLIGHT_BOLD),
                 (" · new conversation".into(), Face::MUTED),
             ],
         );
@@ -1991,7 +2068,36 @@ impl State {
         let previous_connection = self.daemon_summary();
         let prev_pid = self.provider_id().to_owned();
         let prev_temp_support = self.provider_temporary_support();
+        let prev_login_state = self
+            .last_login_status
+            .get("state")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         self.status = status;
+        // If our placeholder account was replaced by a discovered identity-anchored account
+        // on the same provider, silently follow it when idle.
+        if self.active.is_none() && self.account().is_none() {
+            let promoted = self.status["accounts"].as_array().and_then(|accounts| {
+                let active_id = self.status["active_account_id"].as_str();
+                active_id
+                    .and_then(|aid| {
+                        accounts.iter().find(|a| {
+                            a["id"].as_str() == Some(aid)
+                                && a["provider"].as_str() == Some(prev_pid.as_str())
+                        })
+                    })
+                    .or_else(|| {
+                        accounts
+                            .iter()
+                            .find(|a| a["provider"].as_str() == Some(prev_pid.as_str()))
+                    })
+                    .and_then(|a| a["id"].as_str().map(str::to_owned))
+            });
+            if let Some(new_id) = promoted {
+                self.options.account = new_id;
+                self.load_model_preference();
+            }
+        }
         self.notice_chat_cleanup();
         let connection = self.daemon_summary();
         if connection != previous_connection {
@@ -2010,6 +2116,26 @@ impl State {
             .map(|account| account["login"].clone())
             .unwrap_or(Value::Null);
         self.notice_login(login.clone());
+        if login["state"].as_str() == Some("ready")
+            && prev_login_state.as_deref() != Some("ready")
+            && self.provider_multi_account(&next_pid)
+        {
+            let provider_count = self.status["accounts"]
+                .as_array()
+                .map(|accts| {
+                    accts
+                        .iter()
+                        .filter(|a| a["provider"].as_str() == Some(next_pid.as_str()))
+                        .count()
+                })
+                .unwrap_or(0);
+            if provider_count > 1 {
+                self.log(&format!(
+                    "{provider_count} {} accounts available — use /account to switch.",
+                    self.provider_name()
+                ));
+            }
+        }
         if self.human_required() && !was_blocked && !self.login_in_progress() {
             let auth_required = self
                 .account()
@@ -2065,6 +2191,76 @@ impl State {
                 match target {
                     Some(arg) => self.apply_provider_arg(&arg, None),
                     None => self.open_providers(),
+                }
+            }
+            Update::Accounts(status, target) => {
+                if self.active.is_none() {
+                    self.phase = "ready".into();
+                }
+                self.apply_status(status);
+                match target {
+                    Some(arg) => self.apply_account_arg(&arg, None),
+                    None => self.open_accounts(),
+                }
+            }
+            Update::AccountsRefreshed {
+                status,
+                provider_id,
+                count,
+            } => {
+                if self.active.is_none() {
+                    self.phase = "ready".into();
+                }
+                if status.as_object().is_some_and(|m| !m.is_empty()) {
+                    self.apply_status(status);
+                }
+                let provider_name = self.provider_display_name(&provider_id).to_owned();
+                let mut rows = Vec::new();
+                if let Some(accounts) = self.status["accounts"].as_array() {
+                    for acct in accounts
+                        .iter()
+                        .filter(|a| a["provider"].as_str() == Some(provider_id.as_str()))
+                    {
+                        let id = acct["id"].as_str().unwrap_or("");
+                        let marker = if id == self.options.account {
+                            "●"
+                        } else {
+                            "○"
+                        };
+                        let display = Self::format_account_entry(acct);
+                        let state = acct["state"].as_str().unwrap_or("unknown");
+                        rows.push(format!("  {marker} {display} · {state}"));
+                    }
+                }
+                let suffix = if count > 1 {
+                    " Use /account to switch."
+                } else {
+                    ""
+                };
+                self.log(&format!(
+                    "Refreshed {provider_name}: {count} account(s) discovered.{suffix}"
+                ));
+                for row in rows {
+                    self.log(&row);
+                }
+            }
+            Update::ActiveAccountSet { status, account_id } => {
+                if self.active.is_none() && self.phase == "loading" {
+                    self.phase = "ready".into();
+                }
+                self.apply_status(status);
+                if self.options.account != account_id {
+                    let provider_id = self.status["accounts"]
+                        .as_array()
+                        .and_then(|accts| {
+                            accts.iter().find(|a| a["id"].as_str() == Some(&account_id))
+                        })
+                        .and_then(|a| a["provider"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(crate::provider::DEFAULT_PROVIDER_ID)
+                        .to_owned();
+                    let provider_name = self.provider_display_name(&provider_id).to_owned();
+                    self.switch_provider(&account_id, &provider_id, &provider_name);
                 }
             }
             Update::ProviderSetup {
@@ -2172,7 +2368,10 @@ impl State {
                 if self.active.is_none() && self.pending.is_none() && self.phase == "loading" {
                     self.phase = "ready".into();
                 }
-                self.log_markdown(&usage::report(&value));
+                let display_label = (value["account_id"].as_str()
+                    == Some(self.options.account.as_str()))
+                .then(|| self.account_display_label());
+                self.log_markdown(&usage::report_with_label(&value, display_label.as_deref()));
                 self.web_usage = Some(value);
                 self.web_usage_stale = false;
             }
@@ -2291,10 +2490,12 @@ impl State {
     }
 
     fn log_browser_status(&mut self, browser: &Value) {
-        self.log_heading(&format!(
-            "Browser · {}",
-            browser["account_id"].as_str().unwrap_or("")
-        ));
+        let heading_target = browser["provider_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| browser["account_id"].as_str())
+            .unwrap_or("");
+        self.log_heading(&format!("Browser · {heading_target}"));
         let connected = browser["connected"] == true;
         let conn_state = if connected {
             "connected"
@@ -2319,13 +2520,32 @@ impl State {
                 (browser_label.into(), Face::ACCENT),
             ],
         );
-        let acct_state = browser["account_state"].as_str().unwrap_or("unknown");
+        if let Some(total) = browser["account_count"].as_u64() {
+            let ready = browser["ready_accounts"].as_u64().unwrap_or(0);
+            self.log_kv(
+                "· ",
+                Face::ACCENT,
+                "Accounts",
+                &format!("{ready}/{total} ready"),
+                if ready > 0 {
+                    Face::HIGHLIGHT_BOLD
+                } else {
+                    Face::MUTED
+                },
+            );
+        }
+        let acct_state = self
+            .account()
+            .and_then(|a| a["state"].as_str())
+            .or_else(|| browser["account_state"].as_str())
+            .unwrap_or("unknown")
+            .to_owned();
         self.log_kv(
             "· ",
             Face::ACCENT,
             "Account state",
-            acct_state,
-            match acct_state {
+            &acct_state,
+            match acct_state.as_str() {
                 "ready" => Face::HIGHLIGHT_BOLD,
                 "awaiting_human" | "auth_required" => Face::DANGER_BOLD,
                 _ => Face::ACCENT,
@@ -2414,11 +2634,8 @@ impl State {
             Some("waiting" | "refreshing")
         ) {
             self.log("Complete sign-in on the Chrome host. Model choices will load automatically.");
-        } else if matches!(
-            browser["account_state"].as_str(),
-            Some("awaiting_human" | "auth_required")
-        ) {
-            let auth_required = browser["account_state"] == "auth_required";
+        } else if matches!(acct_state.as_str(), "awaiting_human" | "auth_required") {
+            let auth_required = acct_state == "auth_required";
             self.log_human_action_guide(auth_required, browser["headless"].as_bool(), false);
         }
     }
