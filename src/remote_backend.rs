@@ -519,13 +519,15 @@ mod tests {
             std::env::var("ANTICRUMB_LIVE_ACCOUNT").expect("select a live account explicitly");
         let source = Store::open(&crate::cli::root()).unwrap();
         let account: Account = source.get("local", "account", &account_id).unwrap();
+        let browser_profile = source.browser_for_account(&account).unwrap();
         assert!(matches!(
             account.provider.as_str(),
             "claude-web" | "chatgpt-web"
         ));
-        let original = browser::list_targets(account.port).unwrap();
+        let original = browser::list_targets(browser_profile.port).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
+        store.put_browser_profile(&browser_profile).unwrap();
         store
             .put("local", "account", &account.id, &account)
             .unwrap();
@@ -567,7 +569,7 @@ mod tests {
         }
         let _close = CloseTestTabs {
             store: store.clone(),
-            port: account.port,
+            port: browser_profile.port,
             original: original.into_iter().map(|t| t.id).collect(),
             account: account_id.clone(),
         };
@@ -700,11 +702,10 @@ mod tests {
                 &Account {
                     id: "default".into(),
                     provider: crate::domain::default_provider(),
-                    profile: directory.path().into(),
-                    subprofile: None,
-                    port: 1,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();
@@ -996,11 +997,10 @@ mod tests {
                 &Account {
                     id: "default".into(),
                     provider: crate::domain::default_provider(),
-                    profile: dir.path().into(),
-                    subprofile: None,
-                    port: 1,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();
@@ -1172,11 +1172,10 @@ mod tests {
                 &Account {
                     id: "default".into(),
                     provider: crate::domain::default_provider(),
-                    profile: dir.path().into(),
-                    subprofile: None,
-                    port: 1,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();
@@ -1293,11 +1292,10 @@ mod tests {
                 &Account {
                     id: "default".into(),
                     provider: crate::domain::default_provider(),
-                    profile: dir.path().into(),
-                    subprofile: None,
-                    port: 1,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();
@@ -1468,11 +1466,10 @@ mod tests {
                 &Account {
                     id: "default".into(),
                     provider: crate::domain::default_provider(),
-                    profile: dir.path().into(),
-                    subprofile: None,
-                    port: 1,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();
@@ -1574,11 +1571,10 @@ mod tests {
                 &Account {
                     id: "default".into(),
                     provider: crate::domain::default_provider(),
-                    profile: dir.path().into(),
-                    subprofile: None,
-                    port: 1,
-                    headless: true,
                     state: "ready".into(),
+                    identity: None,
+                    label: None,
+                    slot: None,
                 },
             )
             .unwrap();

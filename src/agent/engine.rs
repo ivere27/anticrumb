@@ -3,15 +3,15 @@ use std::time::{Duration, Instant};
 use super::approval::PermissionDecision;
 use super::backend::AgentBackend;
 use super::events::{
-    AgentConfig, AgentEvent, AgentRunResult, AgentStatus, AgentStepRecord, RunControl,
-    ToolCallRequest, ToolOutput,
+    AgentConfig, AgentEvent, AgentRunResult, AgentStatus, AgentStepRecord, OutputStream,
+    RunControl, ToolCallRequest, ToolOutput,
 };
 use super::parser::parse_response;
-use super::prompts::{LoadedPrompts, PromptContext, DEFAULT_SUBAGENT_NOTE};
+use super::prompts::{LoadedPrompts, PromptContext, DEFAULT_AST_NOTE, DEFAULT_SUBAGENT_NOTE};
 use super::tools::{BrowserControlFn, BrowserFetchFn, SpawnAgentFn, ToolContext, ToolRegistry};
 use super::transcript::Transcript;
 
-/// Consecutive replies with an unparsable tool envelope before the run is aborted.
+/// Consecutive replies with an unparsable tool envelope before the feedback adds a stronger hint.
 const MAX_MALFORMED_STREAK: u32 = 3;
 /// Identical consecutive tool-call sets before the model gets an explicit "you are looping" hint.
 const REPEAT_WARN_THRESHOLD: u32 = 3;
@@ -93,6 +93,11 @@ impl<B: AgentBackend> CodingAgent<B> {
         let tools_block = self
             .registry
             .render_compact_tools_block(&prompts.tool_descriptions);
+        let ast_note = if self.registry.contains("code_outline") {
+            DEFAULT_AST_NOTE
+        } else {
+            ""
+        };
         let subagent_note = if self.registry.contains("spawn_agent") {
             DEFAULT_SUBAGENT_NOTE
         } else {
@@ -105,6 +110,7 @@ impl<B: AgentBackend> CodingAgent<B> {
         };
         prompts.render_initial_prompt(&PromptContext {
             workspace_root: &self.config.workspace_root,
+            ast_note,
             shell_note,
             subagent_note,
             max_calls: self.config.max_tool_calls_per_step.max(1),
@@ -128,6 +134,7 @@ impl<B: AgentBackend> CodingAgent<B> {
             files_changed: scope.ctx.changed_files(),
             temp_chat: self.config.temp_chat,
             elapsed_ms: scope.start.elapsed().as_millis(),
+            inspector_pruned: false,
         };
         scope.control.events.emit(AgentEvent::Finished {
             result: result.clone(),
@@ -280,19 +287,33 @@ impl<B: AgentBackend> CodingAgent<B> {
                             message: format!("step {step}: {m}"),
                         });
                     }
-                    if malformed_streak > MAX_MALFORMED_STREAK {
-                        steps.push(record(step, response, vec![], vec![], notes));
-                        return Err(format!(
-                            "model emitted malformed tool calls {malformed_streak} times in a row: {}",
-                            parsed.malformed.join("; ")
-                        ));
-                    }
+                    // Never abort on malformed envelopes: keep feeding the parse error back so the
+                    // model can correct itself. The step budget and cancellation still bound the run.
+                    let hint = if malformed_streak > MAX_MALFORMED_STREAK {
+                        format!(
+                            "\nThis is malformed attempt {malformed_streak} in a row. Escape every newline inside JSON strings as \\n (never emit a raw line break inside a string), escape quotes as \\\", and split large edits into several smaller tool calls."
+                        )
+                    } else {
+                        String::new()
+                    };
                     let fb = format!(
-                        "[TOOL_ERROR]\n{}\nRe-send the call as valid JSON between [TOOL_CALL] and [/TOOL_CALL] markers, enclosing the JSON in a ```json code block:\n[TOOL_CALL]\n```json\n{{\"tool\": \"<name>\", \"args\": {{...}}}}\n```\n[/TOOL_CALL]",
+                        "[TOOL_ERROR]\n{}\nRe-send the call as valid JSON between [TOOL_CALL] and [/TOOL_CALL] markers, enclosing the JSON in a ```json code block:\n[TOOL_CALL]\n```json\n{{\"tool\": \"<name>\", \"args\": {{...}}}}\n```\n[/TOOL_CALL]{hint}",
                         parsed.malformed.join("\n")
                     );
                     transcript.push_user(fb.clone(), false);
                     outgoing.push(fb);
+                    // Deliver user messages typed while the model was failing instead of dropping them.
+                    for msg in control.inbox.drain() {
+                        self.backend.add_artifacts(&msg.artifacts)?;
+                        let msg = msg.message;
+                        ev.emit(AgentEvent::Steered {
+                            message: msg.clone(),
+                        });
+                        notes.push(format!("user message: {msg}"));
+                        let part = format!("[USER_MESSAGE]\n{msg}");
+                        transcript.push_user(part.clone(), false);
+                        outgoing.push(part);
+                    }
                     steps.push(record(step, response, vec![], vec![], notes));
                     continue;
                 }
@@ -341,6 +362,7 @@ impl<B: AgentBackend> CodingAgent<B> {
                     id: approval_id.clone(),
                     step,
                     calls: prompt_calls,
+                    call_indices: plan.prompt_indices.clone(),
                     source: None,
                 });
                 match control.approvals.wait(&approval_id, &control.cancel) {
@@ -389,6 +411,16 @@ impl<B: AgentBackend> CodingAgent<B> {
                     args: call.args.clone(),
                 })
             };
+            let emit_output =
+                |index: usize, call: &ToolCallRequest, stream: OutputStream, text: &str| {
+                    ev.emit(AgentEvent::ToolOutputChunk {
+                        step,
+                        index,
+                        tool: call.tool.clone(),
+                        stream,
+                        text: text.to_owned(),
+                    })
+                };
             let emit_finished = |index: usize, call: &ToolCallRequest, out: &ToolOutput| {
                 ev.emit(AgentEvent::ToolFinished {
                     step,
@@ -401,8 +433,13 @@ impl<B: AgentBackend> CodingAgent<B> {
             };
 
             let observations = if exec_indices.len() == calls.len() {
-                self.registry
-                    .execute_batch(&calls, scope.ctx, &emit_started, &emit_finished)
+                self.registry.execute_batch(
+                    &calls,
+                    scope.ctx,
+                    &emit_started,
+                    &emit_output,
+                    &emit_finished,
+                )
             } else {
                 let exec_calls: Vec<ToolCallRequest> =
                     exec_indices.iter().map(|&i| calls[i].clone()).collect();
@@ -413,6 +450,9 @@ impl<B: AgentBackend> CodingAgent<B> {
                         &exec_calls,
                         scope.ctx,
                         &|local_idx, call| emit_started(exec_indices[local_idx], call),
+                        &|local_idx, call, stream, text| {
+                            emit_output(exec_indices[local_idx], call, stream, text)
+                        },
                         &|local_idx, call, out| emit_finished(exec_indices[local_idx], call, out),
                     )
                 };

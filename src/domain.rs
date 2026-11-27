@@ -328,8 +328,10 @@ impl Message {
     }
 }
 
-fn default_account() -> String {
-    "default".into()
+pub const DEFAULT_ACCOUNT_ID: &str = "gemini";
+
+pub fn default_account() -> String {
+    DEFAULT_ACCOUNT_ID.into()
 }
 fn default_timeout() -> u64 {
     120
@@ -442,7 +444,8 @@ impl PartialEq<&str> for ToolChoice {
 pub struct TurnRequest {
     #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default = "default_account")]
+    /// Empty means "use the host's active account" (resolved at admission).
+    #[serde(default)]
     pub account_id: String,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -483,7 +486,7 @@ impl TurnRequest {
     pub fn text(prompt: impl Into<String>) -> Self {
         Self {
             session_id: None,
-            account_id: default_account(),
+            account_id: String::new(),
             messages: vec![Message::user(prompt)],
             tools: vec![],
             tool_choice: ToolChoice::Unspecified,
@@ -517,15 +520,48 @@ pub fn default_provider() -> String {
     "gemini-web".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Account {
-    pub id: String,
-    pub provider: String,
+/// One managed or attached Chrome profile owned by a provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserProfile {
+    pub provider_id: String,
     pub profile: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subprofile: Option<String>,
     pub port: u16,
     pub headless: bool,
+}
+
+/// One signed-in user account/slot inside a provider's browser profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Account {
+    pub id: String,
+    pub provider: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+}
+
+impl Account {
+    pub fn display_label(&self) -> &str {
+        self.label
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.identity.as_deref().filter(|s| !s.trim().is_empty()))
+            .unwrap_or(&self.id)
+    }
+
+    pub fn short_label(&self) -> &str {
+        let label = self.display_label();
+        label
+            .split('@')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(label)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,7 +764,8 @@ pub struct AgentRequest {
     pub task: String,
     #[serde(default)]
     pub workspace: PathBuf,
-    #[serde(default = "default_account")]
+    /// Empty means "use the host's active account" (resolved at admission).
+    #[serde(default)]
     pub account_id: String,
     #[serde(default)]
     pub model: Option<String>,
@@ -875,7 +912,7 @@ impl ConversationRecord {
             SessionMode::Chat
         };
         let account_id = if latest.request.account_id.is_empty() {
-            "default".into()
+            default_account()
         } else {
             latest.request.account_id.clone()
         };
@@ -1050,8 +1087,7 @@ pub struct ChatCleanupSummary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct BrowserStatusRecord {
-    pub account_id: String,
-    pub account_state: String,
+    pub provider_id: String,
     pub connected: bool,
     pub endpoint: String,
     pub browser: Option<String>,
@@ -1059,6 +1095,8 @@ pub struct BrowserStatusRecord {
     pub profile_matches: Option<bool>,
     pub headless: Option<bool>,
     pub owned_sessions: u64,
+    pub account_count: u32,
+    pub ready_accounts: u32,
     pub last_verified_sign_in: Option<bool>,
     pub checked_at: Option<i64>,
     pub login: Option<LoginStatus>,
@@ -1127,6 +1165,8 @@ pub struct CacheStats {
     pub last_cleanup: i64,
     pub pruned: bool,
     pub busy: bool,
+    pub pruned_events: u64,
+    pub compacted_turns: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -22,6 +22,7 @@ trait FfiServerStream: Sized + Send + 'static {
     fn open(
         self,
         host: Arc<Host>,
+        path: String,
     ) -> impl std::future::Future<
         Output = crate::domain::Result<
             tokio::sync::mpsc::Receiver<crate::domain::Result<Self::Item>>,
@@ -34,8 +35,13 @@ impl FfiServerStream for pb::EventCursor {
     async fn open(
         self,
         host: Arc<Host>,
+        path: String,
     ) -> crate::domain::Result<tokio::sync::mpsc::Receiver<crate::domain::Result<Self::Item>>> {
-        host.watch(self).await
+        if path == "/anticrumb.v1.WorkspaceService/WatchAgentEvents" {
+            host.watch_agent(self).await
+        } else {
+            host.watch(self).await
+        }
     }
 }
 
@@ -44,6 +50,7 @@ impl FfiServerStream for pb::ArtifactRef {
     async fn open(
         self,
         host: Arc<Host>,
+        _path: String,
     ) -> crate::domain::Result<tokio::sync::mpsc::Receiver<crate::domain::Result<Self::Item>>> {
         host.get_artifact_stream(self).await
     }
@@ -90,12 +97,16 @@ impl FfiApi {
     async fn stream<Req: FfiServerStream>(
         &self,
         context: synurang_call::Context,
-        _path: &str,
+        path: &str,
         request: Req,
         responses: synurang_call::Sender<Req::Item>,
     ) -> synurang_call::Result<()> {
         let host = self.host.clone();
-        let mut task = AbortTask(self.runtime.spawn(async move { request.open(host).await }));
+        let path = path.to_owned();
+        let mut task = AbortTask(
+            self.runtime
+                .spawn(async move { request.open(host, path).await }),
+        );
         let mut receiver = tokio::select! {
             error=context.cancelled()=>return Err(error),
             result=&mut task.0=>result.map_err(|e|synurang_call::RpcError::new(13,e.to_string()))?.map_err(codec::module_error)?,

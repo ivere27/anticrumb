@@ -3,7 +3,9 @@ use crate::{
     agent_service::AgentRequest,
     cli::{Client, PromptOptions},
     domain::*,
+    rpc::{client::EventStream, codec, pb},
 };
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::{
@@ -37,6 +39,16 @@ pub(super) enum Update {
     BrowserControl(String),
     LoginOpened(Value),
     Providers(Value, Option<String>),
+    Accounts(Value, Option<String>),
+    AccountsRefreshed {
+        status: Value,
+        provider_id: String,
+        count: usize,
+    },
+    ActiveAccountSet {
+        status: Value,
+        account_id: String,
+    },
     ProviderSetup {
         status: Value,
         account_id: String,
@@ -51,6 +63,11 @@ pub(super) enum Update {
         query: String,
         matches: Vec<super::mentions::MentionMatch>,
         total: usize,
+    },
+    #[cfg_attr(not(feature = "tree-sitter"), allow(dead_code))]
+    HighlightReady {
+        key: super::highlight::HighlightKey,
+        doc: Option<std::sync::Arc<super::highlight::HighlightedDoc>>,
     },
 }
 
@@ -79,12 +96,19 @@ pub(super) enum Command {
     Load(String, PromptOptions),
     Models(String, bool),
     Providers(Option<String>),
+    Accounts(Option<String>),
+    SetActiveAccount(String),
+    RefreshAccounts(String),
     SetupProvider {
         provider_id: String,
         provider_name: String,
     },
     WebUsage(String),
-    Browser(String, String),
+    Browser {
+        provider_id: String,
+        account_id: String,
+        action: String,
+    },
     BrowserControl(crate::rpc::pb::BrowserControlRequest),
     SearchMentions {
         id: u64,
@@ -116,17 +140,12 @@ impl Drop for WorkerQueue {
     }
 }
 
-/// Event polling backs off while a turn is quiet (e.g. waiting on the model)
-/// and snaps back to the fast interval as soon as events flow again.
-const ACTIVE_POLL_MIN: Duration = Duration::from_millis(25);
-const ACTIVE_POLL_MAX: Duration = Duration::from_millis(250);
+/// Exponential reconnect backoff if `WatchAgentEvents` disconnects while a turn is active.
+const STREAM_RECONNECT_MIN: Duration = Duration::from_millis(50);
+const STREAM_RECONNECT_MAX: Duration = Duration::from_secs(2);
 
-fn next_active_poll(current: Duration, saw_events: bool) -> Duration {
-    if saw_events {
-        ACTIVE_POLL_MIN
-    } else {
-        (current * 2).min(ACTIVE_POLL_MAX)
-    }
+fn next_reconnect_delay(current: Duration) -> Duration {
+    (current * 2).min(STREAM_RECONNECT_MAX)
 }
 
 async fn runtime_status(client: &Client) -> Option<Value> {
@@ -154,7 +173,11 @@ fn status_needs_fast_poll(status: &Value) -> bool {
     });
     let cleanup_active = status["chat_cleanup"]["pending"].as_u64().unwrap_or(0) > 0
         || status["chat_cleanup"]["running"].as_u64().unwrap_or(0) > 0;
-    account_waiting || cleanup_active
+    let has_workspace_alerts = status["workspace_alerts"]
+        .as_array()
+        .is_some_and(|alerts| !alerts.is_empty());
+    let has_other_active_agents = status["active_agents"].as_u64().unwrap_or(0) > 0;
+    account_waiting || cleanup_active || has_workspace_alerts || has_other_active_agents
 }
 
 fn status_poll_interval(active: bool, status_fast: bool, history_active: bool) -> Duration {
@@ -165,20 +188,54 @@ fn status_poll_interval(active: bool, status_fast: bool, history_active: bool) -
     }
 }
 
+async fn finish_if_terminal(
+    client: &Client,
+    id: &str,
+    after: &mut i64,
+    tx: &mpsc::Sender<Update>,
+) -> Result<bool> {
+    let agent = client.agent_async(id).await?;
+    if !matches!(agent.state.as_str(), "running" | "queued") {
+        // Drain any remaining events written between stream close and terminal persistence.
+        if let Ok(remaining) = client.events_async(id, *after).await {
+            for event in remaining {
+                *after = event.sequence;
+                if event.kind != "agent_terminal" {
+                    let _ = tx.send(Update::Event(event)).await;
+                }
+            }
+        }
+        let job = Client::agent_value(agent)?;
+        let _ = tx.send(Update::Finished(job)).await;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn open_agent_stream(client: &Client, id: &str, after: i64) -> Result<EventStream> {
+    client
+        .rpc
+        .watch_agent_events(pb::EventCursor {
+            run_id: id.to_owned(),
+            after,
+        })
+        .await
+}
+
 pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc::Sender<Update>) {
     let mut queue = WorkerQueue(rx);
     let mut active = None::<String>;
-    let mut after = 0;
+    let mut after = 0i64;
+    let mut event_stream = None::<EventStream>;
+    let mut reconnect_at = None::<Instant>;
+    let mut reconnect_delay = STREAM_RECONNECT_MIN;
     let mut last_error = String::new();
     let mut history_poll = None::<String>;
     let mut history_error = String::new();
     let mut status_fast = true;
     let mut next_status_at = Instant::now();
-    let mut next_active_at = Instant::now();
-    let mut active_interval = ACTIVE_POLL_MIN;
 
     loop {
-        let active_deadline = active.as_ref().map(|_| next_active_at);
         tokio::select! {
             maybe_cmd = queue.0.recv() => {
                 let Some(command) = maybe_cmd else {
@@ -225,8 +282,17 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             let started = client.start_agent_async(request).await?;
                             active = Some(started.id.clone());
                             after = 0;
-                            active_interval = ACTIVE_POLL_MIN;
-                            next_active_at = Instant::now();
+                            reconnect_delay = STREAM_RECONNECT_MIN;
+                            match open_agent_stream(&client, &started.id, 0).await {
+                                Ok(stream) => {
+                                    event_stream = Some(stream);
+                                    reconnect_at = None;
+                                }
+                                Err(_) => {
+                                    event_stream = None;
+                                    reconnect_at = Some(Instant::now());
+                                }
+                            }
                             let _ = tx.send(Update::Accepted(files.len())).await;
                             let _ = tx
                                 .send(Update::Started {
@@ -275,8 +341,6 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                                     Some(&json!({"approval_id": approval_id, "approved": approved})),
                                 )
                                 .await?;
-                            active_interval = ACTIVE_POLL_MIN;
-                            next_active_at = Instant::now();
                         }
                         Command::BrowserControl(request) => {
                             let response = client.rpc.browser_control(request).await?;
@@ -286,26 +350,33 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                                 ))
                                 .await;
                         }
-                        Command::Browser(account, action) => {
+                        Command::Browser {
+                            provider_id,
+                            account_id,
+                            action,
+                        } => {
                             let value = if action == "show" || action == "hide" {
                                 client
                                     .request_async(
                                         "POST",
-                                        &format!("/api/accounts/{account}/browser-mode"),
+                                        &format!("/api/providers/{provider_id}/browser-mode"),
                                         Some(&json!({"headless": action == "hide"})),
                                     )
                                     .await?
                             } else {
-                                if action == "refresh" || action == "login" {
-                                    let route = if action == "refresh" {
-                                        "resolve"
-                                    } else {
-                                        "login"
-                                    };
+                                if action == "refresh" {
                                     client
                                         .request_async(
                                             "POST",
-                                            &format!("/api/accounts/{account}/{route}"),
+                                            &format!("/api/accounts/{account_id}/resolve"),
+                                            Some(&json!({})),
+                                        )
+                                        .await?;
+                                } else if action == "login" {
+                                    client
+                                        .request_async(
+                                            "POST",
+                                            &format!("/api/providers/{provider_id}/login"),
                                             Some(&json!({})),
                                         )
                                         .await?;
@@ -313,7 +384,7 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                                 client
                                     .request_async(
                                         "GET",
-                                        &format!("/api/accounts/{account}/browser"),
+                                        &format!("/api/providers/{provider_id}/browser"),
                                         None,
                                     )
                                     .await?
@@ -371,35 +442,107 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             let value = client.request_async("GET", "/api/status", None).await?;
                             let _ = tx.send(Update::Providers(value, target)).await;
                         }
+                        Command::Accounts(target) => {
+                            if let Some(target_query) = target {
+                                let active = client
+                                    .request_async(
+                                        "POST",
+                                        "/api/accounts/active",
+                                        Some(&json!({"account_id": target_query})),
+                                    )
+                                    .await?;
+                                let account_id = active["id"]
+                                    .as_str()
+                                    .unwrap_or(&target_query)
+                                    .to_owned();
+                                let status =
+                                    client.request_async("GET", "/api/status", None).await?;
+                                let _ = tx
+                                    .send(Update::ActiveAccountSet { status, account_id })
+                                    .await;
+                            } else {
+                                let value =
+                                    client.request_async("GET", "/api/status", None).await?;
+                                let _ = tx.send(Update::Accounts(value, None)).await;
+                            }
+                        }
+                        Command::SetActiveAccount(account_id) => {
+                            let active = client
+                                .request_async(
+                                    "POST",
+                                    "/api/accounts/active",
+                                    Some(&json!({"account_id": account_id})),
+                                )
+                                .await?;
+                            let resolved_id = active["id"]
+                                .as_str()
+                                .unwrap_or(&account_id)
+                                .to_owned();
+                            let status = client.request_async("GET", "/api/status", None).await?;
+                            let _ = tx
+                                .send(Update::ActiveAccountSet {
+                                    status,
+                                    account_id: resolved_id,
+                                })
+                                .await;
+                        }
+                        Command::RefreshAccounts(provider_id) => {
+                            let client = client.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let update = match client
+                                    .request_async(
+                                        "POST",
+                                        &format!("/api/providers/{provider_id}/refresh-accounts"),
+                                        Some(&json!({})),
+                                    )
+                                    .await
+                                {
+                                    Ok(discovered) => {
+                                        let count =
+                                            discovered.as_array().map(Vec::len).unwrap_or(0);
+                                        let status = client
+                                            .request_async("GET", "/api/status", None)
+                                            .await
+                                            .unwrap_or_else(|_| json!({}));
+                                        Update::AccountsRefreshed {
+                                            status,
+                                            provider_id,
+                                            count,
+                                        }
+                                    }
+                                    Err(error) => Update::Error(error.to_string()),
+                                };
+                                let _ = tx.send(update).await;
+                            });
+                        }
                         Command::SetupProvider {
                             provider_id,
                             provider_name,
                         } => {
-                            let accounts_val =
-                                client.request_async("GET", "/api/accounts", None).await?;
-                            let accounts =
-                                accounts_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
-                            let existing_ids: Vec<&str> =
-                                accounts.iter().filter_map(|a| a["id"].as_str()).collect();
-                            let desired_id =
-                                crate::provider::suggest_account_id(&provider_id, &existing_ids);
                             let created = client
                                 .request_async(
                                     "POST",
-                                    "/api/accounts",
-                                    Some(&json!({
-                                        "id": desired_id,
-                                        "port": 0,
-                                        "provider": provider_id
-                                    })),
+                                    &format!("/api/providers/{provider_id}/ensure-account"),
+                                    Some(&json!({})),
                                 )
                                 .await?;
-                            let account_id =
-                                created["id"].as_str().unwrap_or(&desired_id).to_owned();
+                            let account_id = created["id"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| ServiceError::invalid("created account missing id"))?
+                                .to_owned();
+                            let _ = client
+                                .request_async(
+                                    "POST",
+                                    "/api/accounts/active",
+                                    Some(&json!({"account_id": account_id})),
+                                )
+                                .await;
                             let login_error = client
                                 .request_async(
                                     "POST",
-                                    &format!("/api/accounts/{account_id}/login"),
+                                    &format!("/api/providers/{provider_id}/login"),
                                     Some(&json!({})),
                                 )
                                 .await
@@ -478,10 +621,21 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                             if latest.is_active() {
                                 active = Some(latest.id.clone());
                                 after = 0;
-                                active_interval = ACTIVE_POLL_MIN;
-                                next_active_at = Instant::now();
+                                reconnect_delay = STREAM_RECONNECT_MIN;
+                                match open_agent_stream(&client, &latest.id, 0).await {
+                                    Ok(stream) => {
+                                        event_stream = Some(stream);
+                                        reconnect_at = None;
+                                    }
+                                    Err(_) => {
+                                        event_stream = None;
+                                        reconnect_at = Some(Instant::now());
+                                    }
+                                }
                             } else {
                                 active = None;
+                                event_stream = None;
+                                reconnect_at = None;
                             }
                             let _ = tx.send(Update::Loaded(conv)).await;
                         }
@@ -499,52 +653,158 @@ pub(super) async fn worker(client: Client, rx: mpsc::Receiver<Command>, tx: mpsc
                     }
                 }
             }
+            maybe_item = async {
+                match event_stream.as_mut() {
+                    Some(stream) => stream.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(id) = active.clone() else {
+                    event_stream = None;
+                    reconnect_at = None;
+                    continue;
+                };
+                match maybe_item {
+                    Some(Ok(raw)) => {
+                        reconnect_delay = STREAM_RECONNECT_MIN;
+                        last_error.clear();
+                        match codec::event_from(raw) {
+                            Ok(ev) => {
+                                after = ev.sequence;
+                                if ev.kind == "agent_terminal" {
+                                    event_stream = None;
+                                    match finish_if_terminal(&client, &id, &mut after, &tx).await {
+                                        Ok(true) => {
+                                            active = None;
+                                            reconnect_at = None;
+                                        }
+                                        Ok(false) => {
+                                            reconnect_at = Some(Instant::now() + reconnect_delay);
+                                            reconnect_delay = next_reconnect_delay(reconnect_delay);
+                                        }
+                                        Err(e) => {
+                                            let msg = e.to_string();
+                                            if msg != last_error
+                                                && tx.try_send(Update::Error(msg.clone())).is_ok()
+                                            {
+                                                last_error = msg;
+                                            }
+                                            reconnect_at = Some(Instant::now() + reconnect_delay);
+                                            reconnect_delay = next_reconnect_delay(reconnect_delay);
+                                        }
+                                    }
+                                } else if tx.send(Update::Event(ev)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg != last_error
+                                    && tx.try_send(Update::Error(msg.clone())).is_ok()
+                                {
+                                    last_error = msg;
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        event_stream = None;
+                        match finish_if_terminal(&client, &id, &mut after, &tx).await {
+                            Ok(true) => {
+                                active = None;
+                                reconnect_at = None;
+                                last_error.clear();
+                            }
+                            Ok(false) => {
+                                let msg = e.to_string();
+                                if msg != last_error
+                                    && tx.try_send(Update::Error(msg.clone())).is_ok()
+                                {
+                                    last_error = msg;
+                                }
+                                reconnect_at = Some(Instant::now() + reconnect_delay);
+                                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                            }
+                            Err(err) => {
+                                let msg = err.to_string();
+                                if msg != last_error
+                                    && tx.try_send(Update::Error(msg.clone())).is_ok()
+                                {
+                                    last_error = msg;
+                                }
+                                reconnect_at = Some(Instant::now() + reconnect_delay);
+                                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                            }
+                        }
+                    }
+                    None => {
+                        // Stream ended cleanly; verify whether the turn reached a terminal state.
+                        event_stream = None;
+                        match finish_if_terminal(&client, &id, &mut after, &tx).await {
+                            Ok(true) => {
+                                active = None;
+                                reconnect_at = None;
+                                last_error.clear();
+                            }
+                            Ok(false) => {
+                                reconnect_at = Some(Instant::now() + reconnect_delay);
+                                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg != last_error
+                                    && tx.try_send(Update::Error(msg.clone())).is_ok()
+                                {
+                                    last_error = msg;
+                                }
+                                reconnect_at = Some(Instant::now() + reconnect_delay);
+                                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                            }
+                        }
+                    }
+                }
+            }
             _ = async {
-                match active_deadline {
+                match reconnect_at {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                reconnect_at = None;
                 if let Some(id) = active.clone() {
-                    let mut saw_events = false;
-                    let result = async {
-                        for event in client.events_async(&id, after).await? {
-                            saw_events = true;
-                            after = event.sequence;
-                            if tx.send(Update::Event(event)).await.is_err() {
-                                return Err(ServiceError::invalid("terminal closed"));
-                            }
-                        }
-                        // While events stream the turn is still producing output;
-                        // check terminal state only once the page comes back empty.
-                        if saw_events {
-                            return Ok(());
-                        }
-                        let agent = client.agent_async(&id).await?;
-                        if !matches!(agent.state.as_str(), "running" | "queued") {
-                            // Drain events written between the first read and terminal state persistence.
-                            for event in client.events_async(&id, after).await? {
-                                after = event.sequence;
-                                let _ = tx.send(Update::Event(event)).await;
-                            }
+                    match finish_if_terminal(&client, &id, &mut after, &tx).await {
+                        Ok(true) => {
                             active = None;
-                            let job = Client::agent_value(agent)?;
-                            let _ = tx.send(Update::Finished(job)).await;
+                            event_stream = None;
+                            last_error.clear();
                         }
-                        Ok(())
-                    }
-                    .await;
-                    active_interval = next_active_poll(active_interval, saw_events);
-                    next_active_at = Instant::now() + active_interval;
-                    if let Err(e) = result {
-                        let message = e.to_string();
-                        if message != last_error
-                            && tx.try_send(Update::Error(message.clone())).is_ok()
-                        {
-                            last_error = message;
+                        Ok(false) => match open_agent_stream(&client, &id, after).await {
+                            Ok(stream) => {
+                                event_stream = Some(stream);
+                                reconnect_delay = STREAM_RECONNECT_MIN;
+                                last_error.clear();
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg != last_error
+                                    && tx.try_send(Update::Error(msg.clone())).is_ok()
+                                {
+                                    last_error = msg;
+                                }
+                                reconnect_at = Some(Instant::now() + reconnect_delay);
+                                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                            }
+                        },
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg != last_error
+                                && tx.try_send(Update::Error(msg.clone())).is_ok()
+                            {
+                                last_error = msg;
+                            }
+                            reconnect_at = Some(Instant::now() + reconnect_delay);
+                            reconnect_delay = next_reconnect_delay(reconnect_delay);
                         }
-                    } else {
-                        last_error.clear();
                     }
                 }
             }
@@ -600,15 +860,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_poll_backs_off_when_quiet_and_resets_on_events() {
-        let mut interval = ACTIVE_POLL_MIN;
+    fn stream_reconnect_backs_off_bounded_to_two_seconds() {
+        let mut delay = STREAM_RECONNECT_MIN;
         let mut seen = vec![];
-        for _ in 0..6 {
-            interval = next_active_poll(interval, false);
-            seen.push(interval.as_millis());
+        for _ in 0..7 {
+            delay = next_reconnect_delay(delay);
+            seen.push(delay.as_millis());
         }
-        assert_eq!(seen, [50, 100, 200, 250, 250, 250]);
-        assert_eq!(next_active_poll(interval, true), ACTIVE_POLL_MIN);
+        assert_eq!(seen, [100, 200, 400, 800, 1600, 2000, 2000]);
     }
 
     #[test]

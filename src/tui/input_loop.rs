@@ -2,6 +2,7 @@
 use super::{
     clipboard,
     commands::{complete, Choice, Selection},
+    highlight::HighlightWorker,
     layout::FrameLayout,
     mentions::MentionSearchHandle,
     platform,
@@ -143,16 +144,31 @@ fn is_ignored_input(input: &Input) -> bool {
     )
 }
 
-fn render_stdout(state: &mut State) -> Result<()> {
+const FRAME_BUF_INIT_CAP: usize = 16 * 1024;
+const FRAME_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
+
+fn render_stdout(state: &mut State, buf: &mut Vec<u8>) -> Result<()> {
     let (width, height) = terminal::size().map_err(ServiceError::storage)?;
-    let mut buf = Vec::with_capacity(8192);
-    state.render_frame(&mut buf, width, height)?;
+    buf.clear();
+    state.render_frame(buf, width, height)?;
     if buf.is_empty() {
         return Ok(());
     }
     let mut out = io::stdout().lock();
-    out.write_all(&buf).map_err(ServiceError::storage)?;
-    out.flush().map_err(ServiceError::storage)
+    out.write_all(buf).map_err(ServiceError::storage)?;
+    out.flush().map_err(ServiceError::storage)?;
+    if buf.capacity() > FRAME_BUF_SHRINK_THRESHOLD {
+        buf.clear();
+        buf.shrink_to(FRAME_BUF_INIT_CAP);
+    }
+    Ok(())
+}
+
+fn is_shift_tab(key: &event::KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && (key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)))
 }
 
 pub(super) fn handle_input(
@@ -195,14 +211,19 @@ pub(super) fn handle_input(
                         state.clear_resume_web_history();
                     }
                     KeyCode::Up => state.move_menu(true),
+                    _ if is_shift_tab(&key) => state.move_menu(true),
                     KeyCode::Down | KeyCode::Tab => state.move_menu(false),
                     KeyCode::Char(' ')
                         if key.modifiers.is_empty() && key.kind == event::KeyEventKind::Press =>
                     {
-                        state.toggle_permission_menu_item();
+                        if !state.toggle_permission_menu_item() {
+                            state.shift_inspector_menu_item(true);
+                        }
                     }
                     KeyCode::Left | KeyCode::Right => {
-                        if !state.toggle_permission_menu_item() {
+                        if !state.toggle_permission_menu_item()
+                            && !state.shift_inspector_menu_item(key.code == KeyCode::Right)
+                        {
                             let menu = state.menu.as_mut().unwrap();
                             if let Some(Choice {
                                 value: Selection::Model(model),
@@ -216,6 +237,99 @@ pub(super) fn handle_input(
                     KeyCode::Enter => state.select(sink),
                     _ => {}
                 }
+                return Ok(false);
+            }
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            // Priority 1: Ctrl+O fullscreen Inspector overlay modal routing.
+            if state.inspector_zoom {
+                match key.code {
+                    KeyCode::Esc => {
+                        state.inspector_zoom = false;
+                        state.inspector_zoom_scroll = 0;
+                    }
+                    KeyCode::Char('o' | 'O') if ctrl && !alt => {
+                        state.inspector_zoom = false;
+                        state.inspector_zoom_scroll = 0;
+                    }
+                    KeyCode::Left if !ctrl && !alt => {
+                        state.select_prev_next_tool(false);
+                    }
+                    KeyCode::Right if !ctrl && !alt => {
+                        state.select_prev_next_tool(true);
+                    }
+                    KeyCode::Up => state.scroll_zoom_overlay(true, 1, None),
+                    KeyCode::Down => state.scroll_zoom_overlay(false, 1, None),
+                    KeyCode::PageUp => state.scroll_zoom_overlay(true, 10, None),
+                    KeyCode::PageDown => state.scroll_zoom_overlay(false, 10, None),
+                    KeyCode::Home => state.scroll_zoom_overlay(true, 0, Some(true)),
+                    KeyCode::End => state.scroll_zoom_overlay(false, 0, Some(false)),
+                    KeyCode::Char('f' | 'F' | 'l' | 'L') if !ctrl && !alt => {
+                        state.toggle_inspector_follow();
+                    }
+                    KeyCode::Char('l' | 'L') if alt && !ctrl => {
+                        state.toggle_inspector_follow();
+                    }
+                    KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
+                        if !ctrl
+                            && !alt
+                            && !state.tool_approvals.is_empty()
+                            && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            // Priority 1b: Shortcuts panel overlay modal routing.
+            if state.shortcuts_open {
+                match key.code {
+                    KeyCode::Esc => state.close_shortcuts(),
+                    KeyCode::Char('?' | 'q' | 'Q')
+                        if !ctrl && !alt && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.close_shortcuts();
+                    }
+                    KeyCode::Char('c' | 'C') if ctrl => state.close_shortcuts(),
+                    KeyCode::Char('o' | 'O') if ctrl && !alt => {
+                        state.toggle_inspector_zoom();
+                    }
+                    KeyCode::Up => state.scroll_shortcuts(true, 1, None),
+                    KeyCode::Down => state.scroll_shortcuts(false, 1, None),
+                    KeyCode::Char('k' | 'K') if !ctrl && !alt => {
+                        state.scroll_shortcuts(true, 1, None);
+                    }
+                    KeyCode::Char('j' | 'J') if !ctrl && !alt => {
+                        state.scroll_shortcuts(false, 1, None);
+                    }
+                    KeyCode::PageUp => state.scroll_shortcuts(true, 10, None),
+                    KeyCode::PageDown => state.scroll_shortcuts(false, 10, None),
+                    KeyCode::Home => state.scroll_shortcuts(true, 0, Some(true)),
+                    KeyCode::End => state.scroll_shortcuts(false, 0, Some(false)),
+                    KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
+                        if !ctrl
+                            && !alt
+                            && !state.tool_approvals.is_empty()
+                            && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            // Ctrl+O opens fullscreen Inspector overlay (works even with draft text in composer).
+            if ctrl && !alt && matches!(key.code, KeyCode::Char('o' | 'O')) {
+                state.toggle_inspector_zoom();
+                return Ok(false);
+            }
+            if !ctrl
+                && !alt
+                && key.code == KeyCode::Char('?')
+                && key.kind == event::KeyEventKind::Press
+                && state.can_open_shortcuts()
+            {
+                state.open_shortcuts();
                 return Ok(false);
             }
             if !state.tool_approvals.is_empty()
@@ -233,6 +347,49 @@ pub(super) fn handle_input(
                     }
                     return Ok(false);
                 }
+            }
+            // Priority 2: Tool Inspector Alt+* shortcuts MUST precede catch-all Char/Up/Down/PgUp/PgDn.
+            if alt && !ctrl {
+                match key.code {
+                    KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
+                        if !state.tool_approvals.is_empty()
+                            && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                        return Ok(false);
+                    }
+                    KeyCode::Char('i' | 'I') => {
+                        state.toggle_inspector_mode();
+                        return Ok(false);
+                    }
+                    KeyCode::Char('l' | 'L') => {
+                        state.toggle_inspector_follow();
+                        return Ok(false);
+                    }
+                    KeyCode::Up => {
+                        state.scroll_focused_inspector(true, 3);
+                        return Ok(false);
+                    }
+                    KeyCode::Down => {
+                        state.scroll_focused_inspector(false, 3);
+                        return Ok(false);
+                    }
+                    KeyCode::PageUp => {
+                        state.scroll_focused_inspector(true, 10);
+                        return Ok(false);
+                    }
+                    KeyCode::PageDown => {
+                        state.scroll_focused_inspector(false, 10);
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+            if is_shift_tab(&key) {
+                if key.kind == event::KeyEventKind::Press {
+                    state.toggle_agent_mode();
+                }
+                return Ok(false);
             }
             match key.code {
                 KeyCode::Char('c') if ctrl => {
@@ -336,8 +493,30 @@ pub(super) fn handle_input(
                 {
                     state.editor.word_right();
                 }
-                KeyCode::Left => state.editor.left(),
-                KeyCode::Right => state.editor.right(),
+                KeyCode::Left => {
+                    if key.modifiers.is_empty()
+                        && state.editor.text.is_empty()
+                        && state.mention.is_none()
+                        && state.completion.is_none()
+                        && !state.tool_blocks.is_empty()
+                    {
+                        state.select_prev_next_tool(false);
+                    } else {
+                        state.editor.left();
+                    }
+                }
+                KeyCode::Right => {
+                    if key.modifiers.is_empty()
+                        && state.editor.text.is_empty()
+                        && state.mention.is_none()
+                        && state.completion.is_none()
+                        && !state.tool_blocks.is_empty()
+                    {
+                        state.select_prev_next_tool(true);
+                    } else {
+                        state.editor.right();
+                    }
+                }
                 KeyCode::Home => state.editor.home(),
                 KeyCode::End => state.editor.end(),
                 KeyCode::Backspace
@@ -405,6 +584,9 @@ pub(super) fn handle_input(
                         .take(32_usize.saturating_sub(confirmation.typed.chars().count())),
                 );
             } else {
+                if state.shortcuts_open {
+                    state.close_shortcuts();
+                }
                 state.paste(&text);
             }
         }
@@ -421,7 +603,7 @@ pub(super) fn handle_input(
                     width.into(),
                     height.into(),
                 );
-            } else if !state.completion_mouse(mouse, sink) {
+            } else if !state.completion_mouse(mouse, sink) && !state.approval_mouse(mouse, sink) {
                 if let Some(text) = state.transcript_mouse(mouse) {
                     state.copy_text(&text, true, sink);
                 }
@@ -492,9 +674,11 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     let (commands, rx) = tokio::sync::mpsc::channel(32);
     let (tx, mut updates) = tokio::sync::mpsc::channel(128);
     let mention_search = MentionSearchHandle::spawn(tx.clone());
+    let highlight_worker = HighlightWorker::spawn(tx.clone());
     worker_guard.task = Some(runtime.spawn(worker(client, rx, tx)));
     let mut terminal = Terminal::enter()?;
     let mut state = State::new(options);
+    state.highlights.attach_worker(highlight_worker);
     if let crate::rpc::client::Connection::Grpc {
         endpoint, tls_pin, ..
     } = crate::rpc::workspace_client::selected_connection()
@@ -508,6 +692,10 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         crate::store::Store::open(&crate::cli::root())?.model_catalog(&state.options.account)?;
     state.theme = theme::find(&prefs.theme()).unwrap_or(theme::THEMES[0]);
     state.debug.level = prefs.debug_level();
+    state.layout.inspector = prefs.inspector_config();
+    if state.layout.inspector.mode != super::layout::InspectorMode::Off {
+        state.inspector_last_active_mode = state.layout.inspector.mode;
+    }
     state.preferences = Some(prefs);
     state.load_model_preference();
     state.load_history();
@@ -520,7 +708,6 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         Command::WebHistoryStatus(state.options.account.clone(), false),
     );
     state.log_startup_banner();
-    state.log("Describe a task to begin. Follow-up messages stay in this conversation.\n");
     state.init_debug_session();
     if auto_created {
         state.log(&format!(
@@ -530,7 +717,11 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         ));
         state.send(
             &mut sink,
-            Command::Browser(state.options.account.clone(), "login".into()),
+            Command::Browser {
+                provider_id: state.provider_id().to_owned(),
+                account_id: state.options.account.clone(),
+                action: "login".into(),
+            },
         );
     }
     let mut initial = !state.editor.text.is_empty();
@@ -588,6 +779,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
         let mut dirty = true;
         let mut urgent = true;
         let mut last_render = Instant::now();
+        let mut frame_buf = Vec::with_capacity(FRAME_BUF_INIT_CAP);
         let mut mode_refresh = tokio::time::interval_at(
             tokio::time::Instant::now() + INPUT_MODE_REFRESH,
             INPUT_MODE_REFRESH,
@@ -619,14 +811,14 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
             // Coalesce bursts of background updates (streamed events) into at
             // most one repaint per UPDATE_FRAME; input repaints right away.
             if dirty && (urgent || last_render.elapsed() >= UPDATE_FRAME) {
-                render_stdout(&mut state)?;
+                render_stdout(&mut state, &mut frame_buf)?;
                 dirty = false;
                 urgent = false;
                 last_render = Instant::now();
             }
 
             let dragging = state.selection_drag.is_some();
-            let animating = state.busy() || state.mention_loading();
+            let animating = state.needs_animation() || state.mention_loading();
             let deadline = [
                 dirty.then(|| last_render + UPDATE_FRAME),
                 animating.then(|| last_render + ANIMATION_FRAME),
@@ -707,6 +899,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     // Bounded by INPUT_POLL; must finish before raw mode is disabled.
     let _ = reader.join();
     drop(terminal);
+    state.highlights.detach_worker();
     drop(mention_search);
     drop(commands);
     drop(updates);
@@ -728,14 +921,12 @@ pub(super) fn exit_conversation_message(id: &str, state: &State) -> String {
         } else {
             ""
         };
-        format!(
-            "Session saved{temp_note}. Reconnect with `anticrumb connect`, then use `/resume {id}`."
-        )
+        format!("Session saved{temp_note}. Continue with: anticrumb connect --resume {id}")
     } else if temporary {
         format!(
-            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb resume {id}"
+            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb --resume {id}"
         )
     } else {
-        format!("Session saved. Continue with: anticrumb resume {id}")
+        format!("Session saved. Continue with: anticrumb --resume {id}")
     }
 }

@@ -57,13 +57,13 @@ pub(super) fn footer(value: &Value) -> String {
             let short = match label.as_str() {
                 "Current usage" => "Left".into(),
                 "Weekly limit" => "Wk".into(),
-                _ => super::clip(&label, 8),
+                _ => super::clip(&label, 8).trim_end().to_owned(),
             };
             let balance = remaining_percent(limit)
                 .or_else(|| remaining(limit))
                 .unwrap_or_else(|| "?".into());
             let reset = field(limit, "reset")
-                .map(|reset| format!(" @{}", super::clip(&compact_reset(&reset), 24)))
+                .map(|reset| format!(" @{}", super::clip(&compact_reset(&reset), 24).trim_end()))
                 .unwrap_or_default();
             format!("{short}:{}{reset}", super::clip(&balance, 12))
         })
@@ -71,10 +71,20 @@ pub(super) fn footer(value: &Value) -> String {
         .join(" ")
 }
 
+#[allow(dead_code)]
 pub(super) fn report(value: &Value) -> String {
+    report_with_label(value, None)
+}
+
+pub(super) fn report_with_label(value: &Value, account_label: Option<&str>) -> String {
+    let acct = account_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| field(value, "account_id"))
+        .unwrap_or_default();
     let mut lines = vec![format!(
-        "**Web account usage** · {}{}",
-        field(value, "account_id").unwrap_or_default(),
+        "**Web account usage** · {acct}{}",
         field(value, "plan")
             .map(|plan| format!(" · **{plan}**"))
             .unwrap_or_default()
@@ -197,5 +207,20 @@ mod tests {
         assert_eq!(footer(&counted), "Images:≈75% @2026-11-20");
         assert!(super::report(&counted)
             .contains("9 images remaining** · 25% used (3 images) · **2026-11-20**"));
+
+        // Normalized English labels from data-testid paired with raw localized reset strings.
+        let korean_resets = json!({"limits":[
+            {"label":"Current usage","used":"0% 사용됨","used_percent":0.0,"reset":"오후 1:39에 초기화"},
+            {"label":"Weekly limit","used":"35% 사용됨","used_percent":35.0,"reset":"11월 28일 오후 10:39에 초기화"}
+        ]});
+        assert_eq!(
+            footer(&korean_resets),
+            "Left:≈100% @오후 1:39에 초기화 Wk:≈65% @11월 28일 오후 10:39에"
+        );
+        let korean_report = super::report(&korean_resets);
+        assert!(korean_report.contains("**Current usage**: **≈100% remaining**"));
+        assert!(korean_report.contains("**오후 1:39에 초기화**"));
+        assert!(korean_report.contains("**Weekly limit**: **≈65% remaining**"));
+        assert!(korean_report.contains("**11월 28일 오후 10:39에 초기화**"));
     }
 }

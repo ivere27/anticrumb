@@ -99,7 +99,33 @@ fn utc_datetime_parts(epoch_secs: u64) -> DateTimeParts {
     }
 }
 
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn utc_ymd(epoch_secs: u64) -> Option<(i32, u32, u32)> {
+    let parts = utc_datetime_parts(epoch_secs);
+    let year = i32::try_from(parts.year).ok()?;
+    Some((year, parts.month, parts.day))
+}
+
+pub(crate) fn is_valid_civil_date(year: i32, month: u32, day: u32) -> bool {
+    if !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let y = i64::from(year);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    day <= max_day
+}
+
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
@@ -500,8 +526,16 @@ mod tests {
                 second,
             };
             assert_eq!(utc_datetime_parts(epoch), expected);
+            assert_eq!(utc_ymd(epoch), Some((year as i32, month, day)));
             assert_eq!(civil_to_epoch_secs(expected), Some(epoch as i64));
         }
+        assert_eq!(utc_ymd(u64::MAX), None);
+        assert!(is_valid_civil_date(2000, 2, 29));
+        assert!(is_valid_civil_date(2028, 2, 29));
+        assert!(!is_valid_civil_date(1900, 2, 29));
+        assert!(!is_valid_civil_date(2026, 2, 29));
+        assert!(!is_valid_civil_date(2026, 4, 31));
+        assert!(!is_valid_civil_date(2026, 13, 1));
     }
 
     #[test]

@@ -647,6 +647,7 @@ fn read_only_calls_run_in_parallel_and_keep_order() {
         &calls,
         &ctx,
         &|i, _| started.lock().unwrap().push(i),
+        &|_, _, _, _| {},
         &|_, _, _| {},
     );
     assert!(
@@ -663,7 +664,7 @@ fn read_only_calls_run_in_parallel_and_keep_order() {
     // mutating calls stay sequential
     let calls: Vec<_> = ["w1", "w2"].iter().map(|n| call(n, json!({}))).collect();
     let t = Instant::now();
-    reg.execute_batch(&calls, &ctx, &|_, _| {}, &|_, _, _| {});
+    reg.execute_batch(&calls, &ctx, &|_, _| {}, &|_, _, _, _| {}, &|_, _, _| {});
     assert!(t.elapsed() >= Duration::from_millis(600));
     let _ = fs::remove_dir_all(&ws);
 }
@@ -818,13 +819,16 @@ fn malformed_tool_block_is_fed_back_instead_of_ending_the_run() {
     assert!(prompts.lock().unwrap()[1].starts_with("[TOOL_ERROR]"));
     assert_eq!(fs::read_to_string(ws.join("ok.txt")).unwrap(), "fine");
 
-    // endless garbage aborts
-    let (mock, _) = MockBackend::scripted(Box::new(|_, _| {
+    // endless garbage never aborts the run: errors keep being fed back (with a stronger hint
+    // after repeated failures) until the step budget ends it.
+    let (mock, prompts) = MockBackend::scripted(Box::new(|_, _| {
         Ok("[TOOL_CALL]\nnot json\n[/TOOL_CALL]".to_string())
     }));
     let mut agent = CodingAgent::new(mock, cfg(&ws));
-    let err = agent.run("x", &RunControl::default()).unwrap_err();
-    assert!(err.contains("malformed"), "{err}");
+    let res = agent.run("x", &RunControl::default()).unwrap();
+    assert_eq!(res.status, AgentStatus::MaxSteps);
+    let p = prompts.lock().unwrap();
+    assert!(p.last().unwrap().contains("malformed attempt"));
     let _ = fs::remove_dir_all(&ws);
 }
 
@@ -1961,4 +1965,194 @@ fn permission_matchers_block_path_traversal_prefix_boundary_and_shell_chaining()
         !gate.resolve("ap-drop", true),
         "dropped ApprovalGuard must clean up unresolved approval_id"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_tool_streams_output_chunks_with_coalescing_and_64kib_cap() {
+    let ws = temp_ws("shell_stream");
+    let (mock, _) = MockBackend::replies(vec![
+        // Command 1: staggered stdout & stderr over ~240ms to verify live chunk streaming.
+        tool_block(
+            "run_shell",
+            json!({
+                "command": "printf 'line-1\\n'; printf 'err-1\\n' >&2; sleep 0.14; printf 'line-2\\n'"
+            }),
+        ),
+        // Command 2: > 80 KiB output to verify 64 KiB streaming cap.
+        tool_block(
+            "run_shell",
+            json!({
+                "command": "head -c 90000 /dev/zero | tr '\\0' 'A'"
+            }),
+        ),
+        "streamed ok".into(),
+    ]);
+    let mut agent = CodingAgent::new(mock, cfg(&ws));
+    let chunks = Arc::new(Mutex::new(
+        Vec::<(usize, usize, OutputStream, String)>::new(),
+    ));
+    let chunks_ref = Arc::clone(&chunks);
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: ToolApprovalGate::default(),
+        events: EventSink::new(move |ev| {
+            if let AgentEvent::ToolOutputChunk {
+                step,
+                index,
+                stream,
+                text,
+                ..
+            } = ev
+            {
+                chunks_ref.lock().unwrap().push((step, index, stream, text));
+            }
+        }),
+    };
+    let res = agent.run("Stream shell output", &control).unwrap();
+    assert_eq!(res.status, AgentStatus::Completed);
+
+    let captured = chunks.lock().unwrap();
+    let step1_stdout: String = captured
+        .iter()
+        .filter(|(s, i, st, _)| *s == 1 && *i == 0 && *st == OutputStream::Stdout)
+        .map(|(_, _, _, t)| t.as_str())
+        .collect();
+    let step1_stderr: String = captured
+        .iter()
+        .filter(|(s, i, st, _)| *s == 1 && *i == 0 && *st == OutputStream::Stderr)
+        .map(|(_, _, _, t)| t.as_str())
+        .collect();
+    assert!(step1_stdout.contains("line-1") && step1_stdout.contains("line-2"));
+    assert!(step1_stderr.contains("err-1"));
+
+    let step2_bytes: usize = captured
+        .iter()
+        .filter(|(s, i, _, _)| *s == 2 && *i == 0)
+        .map(|(_, _, _, t)| t.len())
+        .sum();
+    assert!(step2_bytes > 0, "expected streamed chunks for step 2");
+    assert!(
+        step2_bytes <= 64 * 1024,
+        "streamed shell output exceeded 64 KiB cap: {step2_bytes}"
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn tool_context_with_output_callback_shares_files_changed_and_read_cache_in_parallel() {
+    let ws = temp_ws("ctx_shared_arc");
+    fs::write(ws.join("base.txt"), "hello world\n").unwrap();
+    let reg = ToolRegistry::with_builtin_coding_tools();
+    let mut ctx = ToolContext::new(ws.clone());
+    ctx.dedup_reads = true;
+
+    // Parallel read_file calls populate shared read_cache via cloned contexts.
+    let read_calls = vec![
+        ToolCallRequest {
+            tool: "read_file".into(),
+            args: json!({"path": "base.txt"}),
+        },
+        ToolCallRequest {
+            tool: "read_file".into(),
+            args: json!({"path": "base.txt"}),
+        },
+    ];
+    let outputs = reg.execute_batch(
+        &read_calls,
+        &ctx,
+        &|_, _| {},
+        &|_, _, _, _| {},
+        &|_, _, _| {},
+    );
+    assert!(outputs.iter().all(|o| o.ok));
+    // Subsequent read on original ctx must observe the shared read_cache entry!
+    let cached = reg.execute_call(&read_calls[0], &ctx);
+    assert!(cached.ok);
+    assert!(
+        cached.output.contains("[unchanged since earlier read"),
+        "read_cache must be shared across with_output_callback clones: {}",
+        cached.output
+    );
+
+    // Mutating tools executed via execute_batch (using with_output_callback) must record
+    // changed_files into the parent ToolContext AND invalidate read_cache.
+    let edit_calls = vec![
+        ToolCallRequest {
+            tool: "write_file".into(),
+            args: json!({"path": "created.txt", "content": "fresh"}),
+        },
+        ToolCallRequest {
+            tool: "edit_file".into(),
+            args: json!({"path": "base.txt", "old_text": "hello", "new_text": "updated"}),
+        },
+    ];
+    let edit_out = reg.execute_batch(
+        &edit_calls,
+        &ctx,
+        &|_, _| {},
+        &|_, _, _, _| {},
+        &|_, _, _| {},
+    );
+    assert!(edit_out.iter().all(|o| o.ok));
+    assert_eq!(ctx.changed_files(), vec!["base.txt", "created.txt"]);
+
+    // After edit_file invalidated shared read_cache, reading base.txt returns fresh content.
+    let fresh = reg.execute_call(&read_calls[0], &ctx);
+    assert!(fresh.ok);
+    assert!(fresh.output.contains("updated world"));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn partial_approval_batch_emits_exact_original_call_indices() {
+    let ws = temp_ws("approval_call_indices");
+    fs::write(ws.join("info.txt"), "ok").unwrap();
+    let (mock, _) = MockBackend::replies(vec![
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {"tool": "read_file", "args": {"path": "info.txt"}},
+                    {"tool": "write_file", "args": {"path": "one.txt", "content": "1"}},
+                    {"tool": "read_file", "args": {"path": "info.txt"}},
+                    {"tool": "write_file", "args": {"path": "two.txt", "content": "2"}}
+                ]
+            })
+        ),
+        "finished".into(),
+    ]);
+    let mut c = cfg(&ws);
+    c.approval_policy = ToolApprovalPolicy {
+        default_decision: PermissionDecision::Ask,
+        rules: vec![ToolPermissionRule {
+            tool: "read_file".into(),
+            matcher: ToolArgMatcher::Any,
+            decision: PermissionDecision::Allow,
+        }],
+    };
+    let mut agent = CodingAgent::new(mock, c);
+    let gate = ToolApprovalGate::default();
+    let gate_ref = gate.clone();
+    let recorded_indices = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let indices_ref = Arc::clone(&recorded_indices);
+    let control = RunControl {
+        cancel: CancelToken::new(),
+        inbox: SteerInbox::default(),
+        approvals: gate,
+        events: EventSink::new(move |ev| {
+            if let AgentEvent::ToolApprovalRequested {
+                id, call_indices, ..
+            } = ev
+            {
+                *indices_ref.lock().unwrap() = call_indices;
+                assert!(gate_ref.resolve(&id, true));
+            }
+        }),
+    };
+    let res = agent.run("Check call_indices mapping", &control).unwrap();
+    assert_eq!(res.status, AgentStatus::Completed);
+    assert_eq!(*recorded_indices.lock().unwrap(), vec![1, 3]);
+    let _ = fs::remove_dir_all(&ws);
 }

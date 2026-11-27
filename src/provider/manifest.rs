@@ -1,6 +1,7 @@
 use super::{
-    gemini::{model_discovery_error, unique_model_aliases},
-    validate_provider_id, Provider, ProviderCapabilities, ProviderContext, ProviderInfo,
+    gemini::{model_discovery_error, unique_model_aliases, verify_probe_identity},
+    validate_provider_id, AccountRoute, DiscoveredAccount, Provider, ProviderCapabilities,
+    ProviderContext, ProviderInfo,
 };
 #[path = "history.rs"]
 mod history;
@@ -53,6 +54,8 @@ pub struct ProviderManifest {
     pub chat_url_prefixes: Vec<String>,
     pub reusable_path_prefixes: Vec<String>,
     pub usage_url: Option<String>,
+    pub entry_url_template: Option<String>,
+    pub usage_url_template: Option<String>,
     pub observer_binding: Option<String>,
     pub requires_models_control: bool,
     pub default_model: Option<String>,
@@ -131,6 +134,12 @@ impl ProviderManifest {
         }
         if let Some(url) = &self.usage_url {
             validate_http_url(url, "usage_url")?;
+        }
+        if let Some(tpl) = &self.entry_url_template {
+            validate_http_url(&tpl.replace("{slot}", "0"), "entry_url_template")?;
+        }
+        if let Some(tpl) = &self.usage_url_template {
+            validate_http_url(&tpl.replace("{slot}", "0"), "usage_url_template")?;
         }
         for prefix in &self.chat_url_prefixes {
             validate_http_url(prefix, "chat_url_prefix")?;
@@ -223,16 +232,32 @@ impl ManifestWebProvider {
     }
 
     fn web_chat_config(&self) -> Result<Arc<WebChatConfig>> {
-        let entry_url = self.manifest.entry_url.clone().ok_or_else(|| {
-            ServiceError::new(
-                ErrorCode::UnsupportedCapability,
-                "provider",
-                format!(
-                    "provider '{}' has no entry_url configured",
-                    self.manifest.id
-                ),
-            )
-        })?;
+        self.web_chat_config_for(None)
+    }
+
+    pub(super) fn web_chat_config_for(
+        &self,
+        account: Option<&Account>,
+    ) -> Result<Arc<WebChatConfig>> {
+        let route = account.map(|a| self.account_route(a));
+        let entry_url = route
+            .as_ref()
+            .map(|r| r.entry_url.clone())
+            .or_else(|| self.manifest.entry_url.clone())
+            .filter(|u| !u.is_empty() && u != "about:blank")
+            .ok_or_else(|| {
+                ServiceError::new(
+                    ErrorCode::UnsupportedCapability,
+                    "provider",
+                    format!(
+                        "provider '{}' has no entry_url configured",
+                        self.manifest.id
+                    ),
+                )
+            })?;
+        let usage_url = route
+            .and_then(|r| r.usage_url)
+            .or_else(|| self.manifest.usage_url.clone());
         let manifest = self.manifest.clone();
         Ok(Arc::new(WebChatConfig {
             provider_id: self.manifest.id.clone(),
@@ -248,7 +273,7 @@ impl ManifestWebProvider {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_OBSERVER_BINDING.into()),
             requires_models_control: self.manifest.requires_models_control,
-            usage_url: self.manifest.usage_url.clone(),
+            usage_url,
             resolve_script: Arc::new(move |name| Self::resolve_script(&manifest, name)),
         }))
     }
@@ -293,14 +318,16 @@ impl ManifestWebProvider {
         &self,
         store: &Store,
         config: &Arc<WebChatConfig>,
+        browser_profile: &BrowserProfile,
         account: &Account,
+        input_lock: Option<Arc<std::sync::Mutex<()>>>,
         session: &mut Session,
         request: &TurnRequest,
         cancel: &CancelToken,
         deadline: Instant,
         emit: Emit<'_>,
     ) -> Result<(WebChatTab, bool, bool)> {
-        let opts = browser::LaunchOptions::headless_account(account, &config.entry_url);
+        let opts = browser::LaunchOptions::headless_browser(browser_profile, &config.entry_url);
         let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
         let other_owned: HashSet<String> = store
             .list::<Session>("local", "session")
@@ -444,6 +471,7 @@ impl ManifestWebProvider {
         }
         .map_err(|e| ServiceError::backend(e, false))?;
         tab.set_control(cancel.clone(), deadline);
+        tab.set_input_lock(input_lock);
         let is_continue = mode == ChatSessionMode::Continue;
         Ok((tab, is_continue, is_continue && same_warm_tab))
     }
@@ -546,7 +574,7 @@ impl ManifestWebProvider {
         &self,
         tab: &mut WebChatTab,
         config: &WebChatConfig,
-        account: &Account,
+        browser_port: u16,
         session: &mut Session,
         prompt: &str,
         emit: Emit<'_>,
@@ -609,7 +637,7 @@ impl ManifestWebProvider {
                         | ErrorCode::SubmissionOutcomeUnknown
                 ) {
                     if let Some(target) = &session.target_id {
-                        let _ = WebChatTab::stop_owned(account.port, target, config);
+                        let _ = WebChatTab::stop_owned(browser_port, target, config);
                     }
                 }
                 return Err(err);
@@ -670,17 +698,46 @@ impl Provider for ManifestWebProvider {
         self.manifest.entry_url.as_deref()
     }
 
-    fn is_login_ready(&self, account: &Account, cancel: CancelToken) -> Result<bool> {
+    fn account_route(&self, account: &Account) -> AccountRoute {
+        let slot = account
+            .slot
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let entry_url = match (&self.manifest.entry_url_template, slot) {
+            (Some(tpl), Some(s)) => tpl.replace("{slot}", s),
+            _ => self
+                .manifest
+                .entry_url
+                .clone()
+                .unwrap_or_else(|| "about:blank".into()),
+        };
+        let usage_url = match (&self.manifest.usage_url_template, slot) {
+            (Some(tpl), Some(s)) => Some(tpl.replace("{slot}", s)),
+            _ => self.manifest.usage_url.clone(),
+        };
+        AccountRoute {
+            entry_url,
+            usage_url,
+            scope: slot.map(str::to_owned),
+        }
+    }
+
+    fn is_login_ready(
+        &self,
+        browser_profile: &BrowserProfile,
+        cancel: CancelToken,
+    ) -> Result<bool> {
         if !self.manifest.capabilities.browser_auth {
             return Ok(true);
         }
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let Some(meta) = browser::inspect_running_cdp(account.port) else {
+        let Some(meta) = browser::inspect_running_cdp(browser_profile.port) else {
             return Ok(false);
         };
-        if !meta.matches_account(account) {
+        if !meta.matches_browser(browser_profile) {
             return Ok(false);
         }
         let Ok(config) = self.web_chat_config() else {
@@ -689,8 +746,8 @@ impl Provider for ManifestWebProvider {
         let Ok(driver) = self.script("driver.js") else {
             return Ok(false);
         };
-        let targets =
-            browser::list_targets(account.port).map_err(|e| ServiceError::backend(e, false))?;
+        let targets = browser::list_targets(browser_profile.port)
+            .map_err(|e| ServiceError::backend(e, false))?;
         for target in targets
             .into_iter()
             .filter(|t| {
@@ -704,7 +761,7 @@ impl Provider for ManifestWebProvider {
                 .check()
                 .map_err(|e| ServiceError::backend(e, false))?;
             let path = browser::ws_path_from_url(&target.ws_url).map_err(ServiceError::invalid)?;
-            let mut cdp = CdpClient::connect(account.port, &path)
+            let mut cdp = CdpClient::connect(browser_profile.port, &path)
                 .map_err(|e| ServiceError::backend(e, false))?;
             cdp.set_control(cancel.clone(), Instant::now() + Duration::from_secs(2));
             let result = cdp
@@ -730,9 +787,176 @@ impl Provider for ManifestWebProvider {
         Ok(false)
     }
 
+    fn discover_accounts(
+        &self,
+        _ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
+        cancel: CancelToken,
+    ) -> Result<Vec<DiscoveredAccount>> {
+        if !self.manifest.capabilities.browser_auth
+            || self.manifest.entry_url.is_none()
+            || self.script("driver.js").is_err()
+        {
+            return Ok(vec![DiscoveredAccount {
+                identity: None,
+                label: Some(self.manifest.name.clone()),
+                slot: None,
+            }]);
+        }
+        cancel
+            .check()
+            .map_err(|e| ServiceError::backend(e, false))?;
+        let config = self.web_chat_config()?;
+        let driver = self.script("driver.js")?;
+        let opts = browser::LaunchOptions::headless_browser(browser_profile, &config.entry_url);
+        let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
+        let existing = browser::list_targets(host.port).ok().and_then(|targets| {
+            targets.into_iter().find(|t| {
+                t.target_type == "page"
+                    && config.url_matches_origin(&t.url)
+                    && !config.is_auth_url(&t.url)
+            })
+        });
+        let (target, created) = if let Some(t) = existing {
+            (t, false)
+        } else {
+            (
+                browser::create_tab(host.port, &config.entry_url)
+                    .map_err(|e| ServiceError::backend(e, false))?,
+                true,
+            )
+        };
+        let _close = browser::CloseTabGuard {
+            port: host.port,
+            target_id: created.then(|| target.id.clone()),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let path = browser::ws_path_from_url(&target.ws_url).map_err(ServiceError::invalid)?;
+        let mut cdp =
+            CdpClient::connect(host.port, &path).map_err(|e| ServiceError::backend(e, false))?;
+        cdp.set_control(cancel.clone(), deadline);
+        let _ = cdp.call("Runtime.enable", json!({}));
+
+        if self.manifest.capabilities.multi_account {
+            if let Ok(eval) = cdp.call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": format!("({})({})", driver, json!({"op": "accounts"})),
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                    "timeout": 4000
+                }),
+            ) {
+                if eval.get("exceptionDetails").is_none() {
+                    if let Some(arr) = eval["result"]["value"].as_array() {
+                        let parsed: Vec<DiscoveredAccount> =
+                            arr.iter()
+                                .filter_map(|item| {
+                                    let identity = item["identity"]
+                                        .as_str()
+                                        .map(|s| s.trim().to_ascii_lowercase())
+                                        .filter(|s| !s.is_empty());
+                                    let label = item["label"]
+                                        .as_str()
+                                        .map(|s| s.trim().to_owned())
+                                        .filter(|s| !s.is_empty())
+                                        .or_else(|| identity.clone());
+                                    let slot = item["slot"]
+                                        .as_str()
+                                        .map(|s| s.trim().to_owned())
+                                        .filter(|s| !s.is_empty());
+                                    (identity.is_some() || label.is_some() || slot.is_some())
+                                        .then_some(DiscoveredAccount {
+                                            identity,
+                                            label,
+                                            slot,
+                                        })
+                                })
+                                .collect();
+                        if !parsed.is_empty() {
+                            return Ok(parsed);
+                        }
+                    }
+                }
+            }
+        }
+
+        let probe_expr = format!("({})({})", driver, json!({"op": "probe"}));
+        while Instant::now() < deadline {
+            cancel
+                .check()
+                .map_err(|e| ServiceError::backend(e, false))?;
+            if let Ok(eval) = cdp.call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": &probe_expr,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                    "timeout": 2000
+                }),
+            ) {
+                if eval.get("exceptionDetails").is_none() {
+                    let value = &eval["result"]["value"];
+                    if value["verification"] == true {
+                        return Err(ServiceError::new(
+                            ErrorCode::VerificationRequired,
+                            "account_discovery",
+                            format!(
+                                "complete human verification for '{}' in Chrome",
+                                self.manifest.name
+                            ),
+                        ));
+                    }
+                    if value["url"].as_str().is_some_and(|u| config.is_auth_url(u)) {
+                        return Err(ServiceError::new(
+                            ErrorCode::AuthRequired,
+                            "account_discovery",
+                            format!(
+                                "Sign in to '{}' with /browser login or `anticrumb login --provider {}`.",
+                                self.manifest.name, self.manifest.id
+                            ),
+                        ));
+                    }
+                    if value["signed_in"] == true && value["editor"] == true {
+                        let identity = value["identity"]
+                            .as_str()
+                            .map(|s| s.trim().to_ascii_lowercase())
+                            .filter(|s| !s.is_empty());
+                        let label = value["label"]
+                            .as_str()
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| identity.clone());
+                        let slot = value["slot"]
+                            .as_str()
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty());
+                        return Ok(vec![DiscoveredAccount {
+                            identity,
+                            label,
+                            slot,
+                        }]);
+                    }
+                }
+            }
+            if cancel.sleep_or_cancelled(Duration::from_millis(150)) {
+                return Err(ServiceError::backend("cancelled".into(), false));
+            }
+        }
+        Err(ServiceError::new(
+            ErrorCode::AuthRequired,
+            "account_discovery",
+            format!(
+                "Sign in to '{}' with /browser login or `anticrumb login --provider {}`.",
+                self.manifest.name, self.manifest.id
+            ),
+        ))
+    }
+
     fn discover_models(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
     ) -> Result<ModelCatalogRecord> {
@@ -745,8 +969,8 @@ impl Provider for ManifestWebProvider {
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let config = self.web_chat_config()?;
-        let opts = browser::LaunchOptions::headless_account(account, &config.entry_url);
+        let config = self.web_chat_config_for(Some(account))?;
+        let opts = browser::LaunchOptions::headless_browser(browser_profile, &config.entry_url);
         let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
         let reused_target = ctx.store.and_then(|s| {
             web_chat::with_tab_pool_matcher(&config, |matcher| {
@@ -765,7 +989,7 @@ impl Provider for ManifestWebProvider {
         };
         let keep_in_pool = ctx
             .store
-            .is_some_and(|s| tab_pool::record_system_tab_id(s, &account.id, &target.id));
+            .is_some_and(|s| tab_pool::record_system_tab_id(s, &account.id, host.port, &target.id));
         let id = target.id.clone();
         let deadline = Instant::now() + MODEL_DISCOVERY_TIMEOUT;
         if !created_new && !config.is_reusable_url(&target.url) {
@@ -789,6 +1013,8 @@ impl Provider for ManifestWebProvider {
                 false,
             )
             .map_err(|e| model_discovery_error(e, "prepare", deadline))?;
+            tab.set_input_lock(ctx.input_lock.cloned());
+            verify_probe_identity(account, tab.initial_probe())?;
             let auth = tab
                 .check_auth_status()
                 .map_err(|e| ServiceError::backend(e, false))?;
@@ -797,8 +1023,8 @@ impl Provider for ManifestWebProvider {
                     ErrorCode::AuthRequired,
                     "probe",
                     format!(
-                        "Sign in with /browser login or `anticrumb accounts login {}`. Model choices load automatically after sign-in.",
-                        account.id
+                        "Sign in with /browser login or `anticrumb login --provider {}`. Model choices load automatically after sign-in.",
+                        self.manifest.id
                     ),
                 ));
             }
@@ -866,6 +1092,7 @@ impl Provider for ManifestWebProvider {
     fn generate(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &mut Session,
         request: &TurnRequest,
@@ -879,7 +1106,7 @@ impl Provider for ManifestWebProvider {
                 "provider operation requires persistent store context",
             )
         })?;
-        let config = self.web_chat_config()?;
+        let config = self.web_chat_config_for(Some(account))?;
         self.require_web_turn_scripts()?;
         if request.mode == SessionMode::Temporary && !self.manifest.capabilities.temporary_sessions
         {
@@ -898,9 +1125,19 @@ impl Provider for ManifestWebProvider {
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
         let (mut tab, is_continue, same_warm_tab) = self.acquire_tab(
-            store, &config, account, session, request, &cancel, deadline, emit,
+            store,
+            &config,
+            browser_profile,
+            account,
+            ctx.input_lock.cloned(),
+            session,
+            request,
+            &cancel,
+            deadline,
+            emit,
         )?;
         tab.set_pace(load_human_pace(Some(store)));
+        verify_probe_identity(account, tab.initial_probe())?;
         if tab.initial_probe()["signed_in"] != true
             && !tab
                 .check_auth_status()
@@ -910,7 +1147,7 @@ impl Provider for ManifestWebProvider {
             return Err(ServiceError::new(
                 ErrorCode::AuthRequired,
                 "prepare",
-                "account is signed out; use accounts login and accounts resolve",
+                "account is signed out; use /browser login or `anticrumb login`",
             ));
         }
         if is_continue {
@@ -920,7 +1157,7 @@ impl Provider for ManifestWebProvider {
                 probe_count,
                 session,
                 |expected| tab.verify_owned_turns(expected),
-                |s| self.close_session(ctx, account, s),
+                |s| self.close_session(ctx, browser_profile, account, s),
             )?;
         }
         self.prepare_tab(
@@ -944,7 +1181,14 @@ impl Provider for ManifestWebProvider {
             "submitted",
             json!({"session_id": session.id, "chars": prompt.chars().count()}),
         )?;
-        let result = self.stream_turn(&mut tab, &config, account, session, &prompt, emit)?;
+        let result = self.stream_turn(
+            &mut tab,
+            &config,
+            browser_profile.port,
+            session,
+            &prompt,
+            emit,
+        )?;
         session.remote_url = Some(result.chat_url.clone());
         session.remote_turns += 1;
         let (text, tool_calls) = crate::protocol::decode(&result.response, request)?;
@@ -983,6 +1227,7 @@ impl Provider for ManifestWebProvider {
     fn recover_media(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &Session,
     ) -> Result<Vec<String>> {
@@ -1003,11 +1248,11 @@ impl Provider for ManifestWebProvider {
                 "provider operation requires persistent store context",
             )
         })?;
-        let config = self.web_chat_config()?;
+        let config = self.web_chat_config_for(Some(account))?;
         let owned = crate::tab_pool::owned_media_target(
             store,
             session,
-            browser::list_targets(account.port).unwrap_or_default(),
+            browser::list_targets(browser_profile.port).unwrap_or_default(),
         )?;
         let (target, created) = if let Some(target) = owned {
             (target, false)
@@ -1022,17 +1267,17 @@ impl Provider for ManifestWebProvider {
                 ));
             }
             (
-                browser::create_tab(account.port, url)
+                browser::create_tab(browser_profile.port, url)
                     .map_err(|e| ServiceError::backend(e, false))?,
                 true,
             )
         };
         let _close = browser::CloseTabGuard {
-            port: account.port,
+            port: browser_profile.port,
             target_id: created.then(|| target.id.clone()),
         };
         let mut tab = WebChatTab::attach(
-            account.port,
+            browser_profile.port,
             target,
             ChatSessionMode::Continue,
             config,
@@ -1041,6 +1286,7 @@ impl Provider for ManifestWebProvider {
             true,
         )
         .map_err(|e| ServiceError::backend(e, false))?;
+        verify_probe_identity(account, tab.initial_probe())?;
         tab.wait_owned_response(session.remote_turns)
             .map_err(|e| ServiceError::backend(e, false))?;
         Self::capture_media(store, &mut tab, &account.id)
@@ -1049,31 +1295,35 @@ impl Provider for ManifestWebProvider {
     fn delete_conversation(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &Session,
         cancel: CancelToken,
     ) -> Result<()> {
-        history::delete(self, ctx, account, session, cancel)
+        history::delete(self, ctx, browser_profile, account, session, cancel)
     }
 
     fn clear_web_history(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
         progress: &mut dyn FnMut(&str, u32) -> Result<()>,
     ) -> Result<u32> {
-        history::clear(self, ctx, account, cancel, progress)
+        history::clear(self, ctx, browser_profile, account, cancel, progress)
     }
 
     fn read_usage(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         cancel: CancelToken,
     ) -> Result<WebUsageReport> {
+        let route = self.account_route(account);
         let (Some(usage_url), true) = (
-            self.manifest.usage_url.as_deref(),
+            route.usage_url.as_deref(),
             self.manifest.capabilities.web_usage && self.script("usage.js").is_ok(),
         ) else {
             return Err(ServiceError::new(
@@ -1088,8 +1338,8 @@ impl Provider for ManifestWebProvider {
         cancel
             .check()
             .map_err(|e| ServiceError::backend(e, false))?;
-        let config = self.web_chat_config()?;
-        let opts = browser::LaunchOptions::headless_account(account, &config.entry_url);
+        let config = self.web_chat_config_for(Some(account))?;
+        let opts = browser::LaunchOptions::headless_browser(browser_profile, &config.entry_url);
         let host = browser::ensure_browser(&opts).map_err(|e| ServiceError::backend(e, false))?;
         let reserved = ctx.store.and_then(|s| {
             web_chat::with_tab_pool_matcher(&config, |matcher| {
@@ -1106,7 +1356,7 @@ impl Provider for ManifestWebProvider {
         };
         let keep_persistent = ctx
             .store
-            .is_some_and(|s| tab_pool::record_system_tab_id(s, &account.id, &target.id));
+            .is_some_and(|s| tab_pool::record_system_tab_id(s, &account.id, host.port, &target.id));
         let deadline = Instant::now() + WEB_USAGE_TIMEOUT;
         if !created_new {
             crate::gemini::navigate_tab_commit(host.port, &target, usage_url, &cancel, deadline)
@@ -1143,14 +1393,21 @@ impl Provider for ManifestWebProvider {
     fn close_session(
         &self,
         ctx: &ProviderContext<'_>,
+        browser_profile: &BrowserProfile,
         account: &Account,
         session: &Session,
     ) -> Result<()> {
-        let (Some(store), Ok(config)) = (ctx.store, self.web_chat_config()) else {
+        let (Some(store), Ok(config)) = (ctx.store, self.web_chat_config_for(Some(account))) else {
             return Ok(());
         };
         web_chat::with_tab_pool_matcher(&config, |matcher| {
-            tab_pool::release_session_tab_for(store, account, session, matcher)
+            tab_pool::release_session_tab_for(
+                store,
+                &account.id,
+                browser_profile.port,
+                session,
+                matcher,
+            )
         })
     }
 }

@@ -331,9 +331,17 @@ pub trait AccountServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<AccountList>>;
 
 
-    fn create_account(&self, context: Context,
+    fn ensure_provider_account(&self, context: Context,
 
-        request: CreateAccountRequest,
+        request: ProviderRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Account>>;
+
+
+    fn set_active_account(&self, context: Context,
+
+        request: AccountRef,
 
 
     ) -> impl synurang_call::ServiceFuture<Result<Account>>;
@@ -345,38 +353,6 @@ pub trait AccountServiceService: synurang_call::Service + 'static {
 
 
     ) -> impl synurang_call::ServiceFuture<Result<Account>>;
-
-
-    fn get_browser_status(&self, context: Context,
-
-        request: AccountRef,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
-
-
-    fn attach_browser(&self, context: Context,
-
-        request: AttachBrowserRequest,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
-
-
-    fn set_browser_mode(&self, context: Context,
-
-        request: SetBrowserModeRequest,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
-
-
-    fn open_login(&self, context: Context,
-
-        request: AccountRef,
-
-
-    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
 
 
     fn get_web_usage(&self, context: Context,
@@ -401,6 +377,54 @@ pub trait AccountServiceService: synurang_call::Service + 'static {
 
 
     ) -> impl synurang_call::ServiceFuture<Result<WebHistoryCleanupStatus>>;
+
+
+    fn list_browsers(&self, context: Context,
+
+        request: Empty,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<BrowserProfileList>>;
+
+
+    fn refresh_accounts(&self, context: Context,
+
+        request: ProviderRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<AccountList>>;
+
+
+    fn get_browser_status(&self, context: Context,
+
+        request: ProviderRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
+
+
+    fn attach_browser(&self, context: Context,
+
+        request: AttachBrowserRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
+
+
+    fn set_browser_mode(&self, context: Context,
+
+        request: SetBrowserModeRequest,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<BrowserStatus>>;
+
+
+    fn open_login(&self, context: Context,
+
+        request: ProviderRef,
+
+
+    ) -> impl synurang_call::ServiceFuture<Result<Empty>>;
 
 
     fn browser_fetch(&self, context: Context,
@@ -446,19 +470,41 @@ pub fn register_account_service<S: AccountServiceService>(instance: &mut Instanc
 
     {
         let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/CreateAccount",
+        instance.register("/anticrumb.v1.AccountService/EnsureProviderAccount",
             false,
             false,
             move |context, requests, responses| {
                 let service = service.clone();
                 Box::pin(async move {
-                    let mut requests = requests.typed::<CreateAccountRequest>();
+                    let mut requests = requests.typed::<ProviderRef>();
                     let responses = responses.typed::<Account>();
 
                     let request = requests.one().await?;
 
 
-                    let response = service.create_account(context,
+                    let response = service.ensure_provider_account(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/SetActiveAccount",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<AccountRef>();
+                    let responses = responses.typed::<Account>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.set_active_account(context,
                         request).await?;
                     responses.send(response).await
 
@@ -481,94 +527,6 @@ pub fn register_account_service<S: AccountServiceService>(instance: &mut Instanc
 
 
                     let response = service.pause_account(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/GetBrowserStatus",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<AccountRef>();
-                    let responses = responses.typed::<BrowserStatus>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.get_browser_status(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/AttachBrowser",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<AttachBrowserRequest>();
-                    let responses = responses.typed::<BrowserStatus>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.attach_browser(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/SetBrowserMode",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<SetBrowserModeRequest>();
-                    let responses = responses.typed::<BrowserStatus>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.set_browser_mode(context,
-                        request).await?;
-                    responses.send(response).await
-
-                })
-            })?;
-    }
-
-    {
-        let service = service.clone();
-        instance.register("/anticrumb.v1.AccountService/OpenLogin",
-            false,
-            false,
-            move |context, requests, responses| {
-                let service = service.clone();
-                Box::pin(async move {
-                    let mut requests = requests.typed::<AccountRef>();
-                    let responses = responses.typed::<Empty>();
-
-                    let request = requests.one().await?;
-
-
-                    let response = service.open_login(context,
                         request).await?;
                     responses.send(response).await
 
@@ -635,6 +593,138 @@ pub fn register_account_service<S: AccountServiceService>(instance: &mut Instanc
 
 
                     let response = service.get_web_history_cleanup(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/ListBrowsers",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<Empty>();
+                    let responses = responses.typed::<BrowserProfileList>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.list_browsers(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/RefreshAccounts",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ProviderRef>();
+                    let responses = responses.typed::<AccountList>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.refresh_accounts(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/GetBrowserStatus",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ProviderRef>();
+                    let responses = responses.typed::<BrowserStatus>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.get_browser_status(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/AttachBrowser",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<AttachBrowserRequest>();
+                    let responses = responses.typed::<BrowserStatus>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.attach_browser(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/SetBrowserMode",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<SetBrowserModeRequest>();
+                    let responses = responses.typed::<BrowserStatus>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.set_browser_mode(context,
+                        request).await?;
+                    responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.AccountService/OpenLogin",
+            false,
+            false,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<ProviderRef>();
+                    let responses = responses.typed::<Empty>();
+
+                    let request = requests.one().await?;
+
+
+                    let response = service.open_login(context,
                         request).await?;
                     responses.send(response).await
 
@@ -1266,6 +1356,15 @@ pub trait WorkspaceServiceService: synurang_call::Service + 'static {
     ) -> impl synurang_call::ServiceFuture<Result<EventPage>>;
 
 
+    fn watch_agent_events(&self, context: Context,
+
+        request: EventCursor,
+
+
+        responses: Sender<Event>,
+    ) -> impl synurang_call::ServiceFuture<Result<()>>;
+
+
     fn get_conversation(&self, context: Context,
 
         request: ConversationRef,
@@ -1480,6 +1579,27 @@ pub fn register_workspace_service<S: WorkspaceServiceService>(instance: &mut Ins
                     let response = service.read_agent_events(context,
                         request).await?;
                     responses.send(response).await
+
+                })
+            })?;
+    }
+
+    {
+        let service = service.clone();
+        instance.register("/anticrumb.v1.WorkspaceService/WatchAgentEvents",
+            false,
+            true,
+            move |context, requests, responses| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let mut requests = requests.typed::<EventCursor>();
+                    let responses = responses.typed::<Event>();
+
+                    let request = requests.one().await?;
+
+
+                    service.watch_agent_events(context,
+                        request, responses).await
 
                 })
             })?;

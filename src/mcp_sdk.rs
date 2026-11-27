@@ -25,12 +25,14 @@ impl Server {
     ) -> Result<Value> {
         match name {
             "gemini_models" => {
-                let catalog = self
-                    .rpc
-                    .get_catalog(pb::AccountRef {
-                        account_id: "default".into(),
-                    })
-                    .await?;
+                let account_id = match args["account_id"].as_str() {
+                    Some(id) => {
+                        validate_id(id)?;
+                        id.to_owned()
+                    }
+                    None => String::new(),
+                };
+                let catalog = self.rpc.get_catalog(pb::AccountRef { account_id }).await?;
                 let provider = if catalog.provider.is_empty() {
                     crate::domain::default_provider()
                 } else {
@@ -85,7 +87,7 @@ impl Server {
                 .ok_or_else(|| ServiceError::invalid("missing prompt"))?,
         );
         request.session_id = args["session_id"].as_str().map(str::to_owned);
-        request.account_id = args["account_id"].as_str().unwrap_or("default").into();
+        request.account_id = args["account_id"].as_str().unwrap_or("").into();
         request.retention = match args["session_retention"].as_str() {
             None | Some("ephemeral") => SessionRetention::Ephemeral,
             Some("retain") => SessionRetention::Retain,
@@ -215,7 +217,7 @@ fn definitions() -> Vec<Tool> {
     vec![
         Tool::new("gemini_ask","Ask Gemini Web; optional explicitly owned conversation. Does not execute coding tools.",query.as_object().unwrap().clone()),
         Tool::new("gemini_image_generate","Generate/edit images; attach input image artifact IDs; returns artifact IDs.",query.as_object().unwrap().clone()),
-        Tool::new("gemini_models","Read locally cached model capabilities without opening a browser.",json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone()),
+        Tool::new("gemini_models","Read locally cached model capabilities without opening a browser.",json!({"type":"object","properties":{"account_id":{"type":"string"}},"additionalProperties":false}).as_object().unwrap().clone()),
         Tool::new("gemini_session_get","Inspect the typed mode, state, and continuability of an owned browser session.",json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}).as_object().unwrap().clone()),
         Tool::new("gemini_session_close","Close an owned browser conversation tab.",json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}).as_object().unwrap().clone()),
         Tool::new("gemini_media_download","Download images already generated in an owned session; never resubmits a prompt.",json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}).as_object().unwrap().clone()),

@@ -2,6 +2,10 @@
 use super::{
     debug_log::DebugLogger,
     editor::Editor,
+    layout::{
+        AfterTurnPolicy, InspectorConfig, InspectorMode, INSPECTOR_MAX_WIDTH_PCT,
+        INSPECTOR_MIN_WIDTH_PCT,
+    },
     markdown::Face,
     model_picker::{self, ModelChoice},
     reducer::{EffectSink, State},
@@ -31,6 +35,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
         "/provider",
         "Choose the provider / account for the next turn",
     ),
+    (
+        "/account",
+        "Choose, switch, or refresh signed-in accounts (/account [target|refresh])",
+    ),
     ("/model", "Choose the model for the next turn"),
     ("/usage", "Check web account usage limits and reset times"),
     (
@@ -42,6 +50,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
         "Runtime health, clients, jobs, browser connection, model and workspace",
     ),
     ("/theme", "Choose a terminal color palette"),
+    (
+        "/inspector",
+        "Configure Tool Inspector layout (inline|side|off, width, after-turn, follow)",
+    ),
     (
         "/browse",
         "Control web pages: open, snapshot, click, fill, press, tabs, close; /browse help",
@@ -75,6 +87,80 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Exit and stop this application's running work"),
 ];
 
+pub(super) struct ShortcutSection {
+    pub title: &'static str,
+    pub subtitle: Option<&'static str>,
+    pub highlight_key: bool,
+    pub items: &'static [(&'static str, &'static str)],
+}
+
+pub(super) const SHORTCUT_SECTIONS: &[ShortcutSection] = &[
+    ShortcutSection {
+        title: "Composer & Editing",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Enter", "Send message or steer active turn"),
+            ("Alt/Shift+Enter", "Insert newline (Ctrl+J also works)"),
+            ("↑ / ↓", "Move line, or recall prompt history"),
+            ("Ctrl+A / E", "Line start / end (Home / End)"),
+            ("Ctrl/Alt+←/→", "Word/path move (Alt+B / Alt+F)"),
+            ("Ctrl+U / K", "Delete to line start / end"),
+            ("Ctrl+W", "Delete word (Ctrl/Alt+Bksp block)"),
+            ("Ctrl+V", "Paste clipboard (folds >1,000c)"),
+            ("Alt+E", "Expand folded paste block at cursor"),
+        ],
+    },
+    ShortcutSection {
+        title: "Mentions & Completion",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Tab", "Complete /command or @path mention"),
+            ("@path", "Attach file (@\"path with spaces\")"),
+            ("@git:diff[+]", "Unstaged git diff (+ AST context)"),
+            ("@git:staged[+]", "Staged git diff (+ AST context)"),
+            ("@git:<ref>[+]", "Commit patch (+ AST context)"),
+        ],
+    },
+    ShortcutSection {
+        title: "Modes & Session",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Shift+Tab", "Toggle Chat / Agent (or --yolo)"),
+            ("Y / N", "Approve / reject tool (empty input)"),
+            ("Esc", "Close popup/sel or interrupt turn"),
+            ("Ctrl+C", "Interrupt, clear draft, or 2× exit"),
+            ("Ctrl+D", "Exit when empty / delete forward"),
+            ("?", "Toggle shortcuts panel (empty input)"),
+        ],
+    },
+    ShortcutSection {
+        title: "Scroll & Tool Inspector",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Wheel / PgUp·Dn", "Scroll pane; drag to select & copy"),
+            ("← / → (empty)", "Prev / next tool (→ resumes Follow)"),
+            ("Ctrl+O", "Fullscreen Inspector (←/→ ↑↓ f Esc)"),
+            ("Alt+I / Alt+L", "Toggle Inspector / live Follow feed"),
+            ("Alt+↑ / ↓", "Scroll Inspector (Alt+PgUp / PgDn)"),
+        ],
+    },
+];
+
+pub(super) const SHORTCUT_QUICK_COMMANDS: ShortcutSection = ShortcutSection {
+    title: "Quick Commands",
+    subtitle: Some("/help for full list"),
+    highlight_key: false,
+    items: &[
+        ("/mode /model", "Switch mode, model, /temp, /permissions"),
+        ("/resume /new", "Reopen, /clear, or /copy last reply"),
+        ("/inspector", "Layout, /status, /usage, /theme"),
+    ],
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PermissionKind {
     Read,
@@ -85,18 +171,36 @@ pub(super) enum PermissionKind {
     Ast,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InspectorField {
+    Mode,
+    Width,
+    AfterTurn,
+    Follow,
+}
+
 pub(super) enum Selection {
     Provider {
         account_id: String,
         provider_id: String,
         provider_name: String,
     },
+    Account {
+        account_id: String,
+        provider_id: String,
+        provider_name: String,
+    },
+    RefreshAccounts(String),
     SetupProvider {
         provider_id: String,
         provider_name: String,
     },
     Model(ModelChoice),
     Theme(theme::Theme),
+    Inspector {
+        field: InspectorField,
+        config: InspectorConfig,
+    },
     Resume(String),
     DeleteConversation(String),
     CancelDelete,
@@ -362,36 +466,44 @@ impl State {
     pub(super) fn open_models(&mut self) {
         let mut choices = Vec::new();
         let mut selected = 0;
+        let mut matched_current = false;
         if let Some(models) = self.catalog["models"].as_array() {
             for model in models.iter().filter(|m| m["locked"] != true) {
                 let Some(id) = model["mode_id"].as_str() else {
                     continue;
                 };
-                if self.options.model.as_deref() == Some(id)
-                    || (self.options.model.is_none() && model["selected"] == true)
-                {
+                let is_current = self.options.model.as_deref() == Some(id)
+                    || (self.options.model.is_none() && model["selected"] == true);
+                if is_current {
                     selected = choices.len();
+                    matched_current = true;
                 }
                 let levels = self.catalog["model_thinking"]
                     .get(id)
                     .unwrap_or(&Value::Null);
                 choices.push(Choice {
                     label: model_picker::title(model),
-                    value: Selection::Model(ModelChoice::new(
-                        Some(id.into()),
-                        levels,
-                        self.options.thinking.as_deref(),
-                    )),
+                    value: Selection::Model(
+                        ModelChoice::new(Some(id.into()), levels, self.options.thinking.as_deref())
+                            .with_current(is_current),
+                    ),
                 });
             }
         }
+        let default_is_current = !matched_current && self.options.model.is_none();
+        if default_is_current {
+            selected = choices.len();
+        }
         choices.push(Choice {
             label: "Web default".into(),
-            value: Selection::Model(ModelChoice::new(
-                None,
-                &self.catalog["thinking"],
-                self.options.thinking.as_deref(),
-            )),
+            value: Selection::Model(
+                ModelChoice::new(
+                    None,
+                    &self.catalog["thinking"],
+                    self.options.thinking.as_deref(),
+                )
+                .with_current(default_is_current),
+            ),
         });
         self.menu = Some(Menu {
             title: "Model · ↑↓ model · ←→ thinking · Enter apply · Esc cancel".into(),
@@ -423,9 +535,10 @@ impl State {
                 if account_id == self.options.account {
                     selected = choices.len();
                 }
+                let display = Self::format_account_entry(acct);
                 choices.push(Choice {
                     label: format!(
-                        "{provider_name} ({provider_id}) · account {account_id} · {state_str}"
+                        "{provider_name} ({provider_id}) · account {display} · {state_str}"
                     ),
                     value: Selection::Provider {
                         account_id: account_id.to_owned(),
@@ -497,7 +610,7 @@ impl State {
         }) {
             let (account_id, provider_id) = account_id;
             let provider_name = self.provider_display_name(&provider_id).to_owned();
-            self.switch_provider(&account_id, &provider_id, &provider_name);
+            self.switch_provider_with_sink(&account_id, &provider_id, &provider_name, sink);
             return;
         }
         if let Some((provider_id, provider_name)) =
@@ -538,6 +651,124 @@ impl State {
         } else {
             self.log(&format!(
                 "Unknown provider or account '{arg}'. Run /provider to choose or set up a provider."
+            ));
+        }
+    }
+
+    pub(super) fn open_accounts(&mut self) {
+        let provider_id = self.provider_id().to_owned();
+        let provider_name = self.provider_name().to_owned();
+        if !self.provider_multi_account(&provider_id) {
+            let current = self.account_display_label();
+            self.log(&format!(
+                "{provider_name} ({provider_id}) supports a single account per Chrome profile (current: {current}). Use /provider to switch providers or /browser login to sign in."
+            ));
+            return;
+        }
+        let mut choices = Vec::new();
+        let mut selected = 0;
+        if let Some(accounts) = self.status["accounts"].as_array() {
+            for acct in accounts
+                .iter()
+                .filter(|a| a["provider"].as_str() == Some(provider_id.as_str()))
+            {
+                let Some(account_id) = acct["id"].as_str() else {
+                    continue;
+                };
+                let current = account_id == self.options.account;
+                if current {
+                    selected = choices.len();
+                }
+                let marker = if current { "●" } else { "○" };
+                let display = Self::format_account_entry(acct);
+                let state = acct["state"].as_str().unwrap_or("unknown");
+                choices.push(Choice {
+                    label: format!("{marker} {display} · {state}"),
+                    value: Selection::Account {
+                        account_id: account_id.to_owned(),
+                        provider_id: provider_id.clone(),
+                        provider_name: provider_name.clone(),
+                    },
+                });
+            }
+        }
+        choices.push(Choice {
+            label: "↻ Refresh accounts from Chrome".into(),
+            value: Selection::RefreshAccounts(provider_id),
+        });
+        self.menu = Some(Menu {
+            title: format!("Accounts · {provider_name} · Enter switch · Esc cancel"),
+            choices,
+            selected,
+        });
+    }
+
+    pub(super) fn apply_account_arg(&mut self, arg: &str, sink: Option<&mut dyn EffectSink>) {
+        let provider_id = self.provider_id().to_owned();
+        let provider_name = self.provider_name().to_owned();
+        if !self.provider_multi_account(&provider_id) {
+            let current = self.account_display_label();
+            self.log(&format!(
+                "{provider_name} ({provider_id}) supports a single account per Chrome profile (current: {current}). Use /provider to switch providers or /browser login to sign in."
+            ));
+            return;
+        }
+        let accounts = self.status["accounts"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let q = arg.trim();
+        let q_lower = q.to_ascii_lowercase();
+        let slot_query = q_lower
+            .strip_prefix("/u/")
+            .or_else(|| q_lower.strip_prefix("u/"))
+            .unwrap_or(&q_lower);
+        let provider_accts: Vec<&Value> = accounts
+            .iter()
+            .filter(|a| a["provider"].as_str() == Some(provider_id.as_str()))
+            .collect();
+        let matched = provider_accts
+            .iter()
+            .copied()
+            .find(|a| a["id"].as_str() == Some(q))
+            .or_else(|| {
+                provider_accts.iter().copied().find(|a| {
+                    a["identity"]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(q))
+                })
+            })
+            .or_else(|| {
+                provider_accts.iter().copied().find(|a| {
+                    a["label"]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(q))
+                })
+            })
+            .or_else(|| {
+                provider_accts
+                    .iter()
+                    .copied()
+                    .find(|a| a["slot"].as_str() == Some(slot_query))
+            })
+            .or_else(|| {
+                let prefix_matches: Vec<&Value> = provider_accts
+                    .iter()
+                    .copied()
+                    .filter(|a| {
+                        a["identity"]
+                            .as_str()
+                            .and_then(|e| e.split('@').next())
+                            .is_some_and(|local| local.eq_ignore_ascii_case(q))
+                    })
+                    .collect();
+                (prefix_matches.len() == 1).then(|| prefix_matches[0])
+            });
+        if let Some(account_id) = matched.and_then(|a| a["id"].as_str()).map(str::to_owned) {
+            self.switch_provider_with_sink(&account_id, &provider_id, &provider_name, sink);
+        } else {
+            self.log(&format!(
+                "No account matching '{arg}' for {provider_name}. Run /account to choose or /account refresh to scan Chrome."
             ));
         }
     }
@@ -648,61 +879,10 @@ impl State {
             self.log_command(&format!("{command:<14}"), description);
         }
         self.log_heading("Input & Shortcuts");
-        for (key, description) in [
-            (
-                "@path",
-                "Attach file through Gemini's picker (@\"path with spaces\")",
-            ),
-            ("@git:diff", "Attach unstaged git diff as a patch file"),
-            (
-                "@git:diff+",
-                "Attach unstaged git diff with tree-sitter AST context",
-            ),
-            ("@git:staged", "Attach staged git diff as a patch file"),
-            (
-                "@git:staged+",
-                "Attach staged git diff with tree-sitter AST context",
-            ),
-            (
-                "@git:<commit>",
-                "Attach a specific git commit as a patch file",
-            ),
-            (
-                "@git:<commit>+",
-                "Attach a specific git commit with tree-sitter AST context",
-            ),
-            ("Tab", "Complete slash commands or @path"),
-            (
-                "Up / Down",
-                "Move within input, or recall history at top/bottom row",
-            ),
-            (
-                "Wheel / PgUp",
-                "Scroll transcript; drag transcript to select & copy",
-            ),
-            ("/copy", "Copy last assistant response with Markdown"),
-            (
-                "Ctrl+A/E/U/K/W",
-                "Editing shortcuts · Left/Right/Home/End move cursor",
-            ),
-            (
-                "Ctrl/Alt+←/→",
-                "Move by word/path component · Alt+B/F also works · paste is one block",
-            ),
-            (
-                "Alt/Shift+Enter",
-                "Insert newline · Enter sends or steers active turn",
-            ),
-            (
-                "Paste (>1,000c)",
-                "Folds long paste into a block · Alt+E expands · Ctrl+V pastes",
-            ),
-            (
-                "Esc / Ctrl+C",
-                "Interrupt · Ctrl+D / /exit leaves and stops active jobs",
-            ),
-        ] {
-            self.log_shortcut(&format!("{key:<15}"), description);
+        for section in SHORTCUT_SECTIONS {
+            for (key, description) in section.items {
+                self.log_shortcut(&format!("{key:<15}"), description);
+            }
         }
         self.log("Character counts are measured; exact Gemini token usage is unavailable.");
     }
@@ -713,7 +893,12 @@ impl State {
         let thinking = self.thinking_label().to_owned();
         let theme_name = self.theme.name.to_owned();
         let workspace = self.options.workspace.display().to_string();
-        let account = self.options.account.clone();
+        let account_display = self.account_display_label();
+        let account = if account_display == self.options.account {
+            self.options.account.clone()
+        } else {
+            format!("{account_display} ({})", self.options.account)
+        };
         let conversation = self.conversation_id.as_deref().unwrap_or("new").to_owned();
         let active_turn = self.active.clone();
         let perms = self.options.effective_permissions();
@@ -766,6 +951,14 @@ impl State {
             Face::HIGHLIGHT,
         );
         self.log_kv("· ", Face::ACCENT, "Theme", &theme_name, Face::ACCENT);
+        let inspector_summary = self.layout.inspector.summary();
+        self.log_kv(
+            "· ",
+            Face::ACCENT,
+            "Inspector",
+            &inspector_summary,
+            Face::ACCENT,
+        );
         self.log_kv(
             "· ",
             Face::ACCENT,
@@ -859,6 +1052,122 @@ impl State {
         );
     }
 
+    pub(super) fn open_inspector_menu(&mut self, config: InspectorConfig, selected: usize) {
+        if self.inspector_preview_origin.is_none() {
+            self.inspector_preview_origin = Some(self.layout.inspector);
+        }
+        let cfg = config.normalized();
+        let choices = vec![
+            Choice {
+                label: format!("Mode         ‹ {} ›", cfg.mode.label()),
+                value: Selection::Inspector {
+                    field: InspectorField::Mode,
+                    config: cfg,
+                },
+            },
+            Choice {
+                label: format!("Width        ‹ {}% ›", cfg.width_pct),
+                value: Selection::Inspector {
+                    field: InspectorField::Width,
+                    config: cfg,
+                },
+            },
+            Choice {
+                label: format!("After-turn   ‹ {} ›", cfg.after_turn.label()),
+                value: Selection::Inspector {
+                    field: InspectorField::AfterTurn,
+                    config: cfg,
+                },
+            },
+            Choice {
+                label: format!(
+                    "Auto-follow  ‹ {} ›",
+                    if cfg.follow { "Follow" } else { "Manual" }
+                ),
+                value: Selection::Inspector {
+                    field: InspectorField::Follow,
+                    config: cfg,
+                },
+            },
+        ];
+        self.menu = Some(Menu {
+            title: "Inspector · ↑↓ move · ←→/Space change · Enter save · Esc cancel".into(),
+            choices,
+            selected: selected.min(3),
+        });
+    }
+
+    pub(super) fn shift_inspector_menu_item(&mut self, forward: bool) -> bool {
+        let Some(menu) = self.menu.as_ref() else {
+            return false;
+        };
+        let selected = menu.selected;
+        let Some(Choice {
+            value: Selection::Inspector { field, mut config },
+            ..
+        }) = menu.choices.get(selected)
+        else {
+            return false;
+        };
+        match field {
+            InspectorField::Mode => config.mode = config.mode.cycle(forward),
+            InspectorField::Width => {
+                config.width_pct = if forward {
+                    config
+                        .width_pct
+                        .saturating_add(5)
+                        .min(INSPECTOR_MAX_WIDTH_PCT)
+                } else {
+                    config
+                        .width_pct
+                        .saturating_sub(5)
+                        .max(INSPECTOR_MIN_WIDTH_PCT)
+                };
+            }
+            InspectorField::AfterTurn => config.after_turn = config.after_turn.cycle(forward),
+            InspectorField::Follow => config.follow = !config.follow,
+        }
+        let cfg = config.normalized();
+        self.layout.inspector = cfg;
+        self.tool_blocks.apply_after_turn_policy(cfg.after_turn);
+        self.tool_blocks.bump_layout_rev();
+        self.open_inspector_menu(cfg, selected);
+        true
+    }
+
+    pub(super) fn apply_inspector_config(&mut self, config: InspectorConfig, announce: bool) {
+        let prev = self.layout.inspector;
+        let cfg = config.normalized();
+        self.layout.inspector = cfg;
+        if cfg.mode != InspectorMode::Off {
+            self.inspector_last_active_mode = cfg.mode;
+        }
+        if cfg.after_turn != prev.after_turn {
+            self.tool_blocks.apply_after_turn_policy(cfg.after_turn);
+        }
+        if cfg.follow != prev.follow {
+            self.tool_blocks.apply_follow_default(cfg.follow);
+        }
+        self.tool_blocks.bump_layout_rev();
+        if let Some(data) = &self.preferences {
+            if let Err(e) = data.set_inspector_config(&cfg) {
+                self.log_error(&format!("Inspector setting could not be saved: {e}"));
+            }
+        }
+        if announce {
+            let summary = cfg.summary();
+            let plain = format!("Inspector: {summary}");
+            self.log_spans(
+                &plain,
+                vec![
+                    ("· ".into(), Face::ACCENT),
+                    ("Inspector: ".into(), Face::MUTED),
+                    (summary, Face::HIGHLIGHT_BOLD),
+                ],
+            );
+        }
+    }
+
     pub(super) fn open_permissions(
         &mut self,
         perms: crate::domain::ToolPermissions,
@@ -942,6 +1251,7 @@ impl State {
         self.options.no_shell = !perms.shell;
         if perms != crate::domain::ToolPermissions::all() {
             self.options.yolo = false;
+            self.yolo_toggle_armed = false;
         }
         if let Some(data) = &self.preferences {
             if let Err(e) = data.set_permissions(perms) {
@@ -951,32 +1261,71 @@ impl State {
         self.log(&format!("Tool permissions saved: {}.", perms.summary()));
     }
 
+    fn restore_standard_agent_permissions(&mut self, reset_if_unsaved: bool) {
+        if let Some(data) = &self.preferences {
+            if let Some(saved_perms) = data.permissions() {
+                self.options.permissions = saved_perms;
+                self.options.no_shell = !saved_perms.shell;
+                return;
+            }
+            if let Some(saved_no_shell) = data.no_shell() {
+                self.options.no_shell = saved_no_shell;
+                self.options.permissions.shell = !saved_no_shell;
+                return;
+            }
+        }
+        if reset_if_unsaved {
+            self.options.permissions = crate::domain::ToolPermissions::read_only();
+            self.options.no_shell = true;
+        }
+    }
+
     pub(super) fn set_agent_mode(&mut self, agent: bool, yolo: bool) {
+        let was_yolo = self.options.yolo;
+        let was_yolo_state = was_yolo || self.yolo_toggle_armed;
         self.options.overrides.insert("agent".into());
         self.options.agent = agent;
         self.options.yolo = agent && yolo;
         if !agent {
+            if was_yolo && !self.yolo_toggle_armed {
+                self.restore_standard_agent_permissions(true);
+            }
             self.log("Mode set to Chat: direct conversation without tools for the next turn.");
         } else if yolo {
+            self.yolo_toggle_armed = true;
             self.options.overrides.insert("no_shell".into());
             self.options.no_shell = false;
             self.log(
                 "Mode set to Agent (--yolo): all file, shell, browser, and sub-agent tools allowed for the next turn.",
             );
         } else {
-            if let Some(data) = &self.preferences {
-                if let Some(saved_perms) = data.permissions() {
-                    self.options.permissions = saved_perms;
-                    self.options.no_shell = !saved_perms.shell;
-                } else if let Some(saved_no_shell) = data.no_shell() {
-                    self.options.no_shell = saved_no_shell;
-                    self.options.permissions.shell = !saved_no_shell;
-                }
+            self.yolo_toggle_armed = false;
+            if was_yolo_state {
+                self.restore_standard_agent_permissions(true);
             }
             self.log(&format!(
                 "Mode set to Agent (Y/N tool approval · permissions: {}).",
                 self.options.effective_permissions().summary()
             ));
+        }
+    }
+
+    pub(super) fn toggle_agent_mode(&mut self) {
+        self.options.overrides.insert("agent".into());
+        if self.options.agent {
+            let was_unarmed_yolo = self.options.yolo && !self.yolo_toggle_armed;
+            self.options.agent = false;
+            self.options.yolo = false;
+            if was_unarmed_yolo {
+                self.restore_standard_agent_permissions(true);
+            }
+        } else {
+            self.options.agent = true;
+            self.options.yolo = self.yolo_toggle_armed;
+            if self.options.yolo {
+                self.options.overrides.insert("no_shell".into());
+                self.options.no_shell = false;
+            }
         }
     }
 
@@ -1209,6 +1558,29 @@ impl State {
                         self.apply_provider_arg(arg, Some(sink));
                     }
                 }
+                "/account" => {
+                    if self.busy() {
+                        self.log(
+                            "Interrupt the current task before switching or refreshing accounts.",
+                        );
+                    } else if arg.eq_ignore_ascii_case("refresh") {
+                        let provider_id = self.provider_id().to_owned();
+                        let provider_name = self.provider_name().to_owned();
+                        self.phase = "loading".into();
+                        self.log(&format!(
+                            "Scanning Chrome for signed-in {provider_name} accounts…"
+                        ));
+                        self.send(sink, Command::RefreshAccounts(provider_id));
+                    } else if self.status["accounts"].as_array().is_none_or(Vec::is_empty) {
+                        self.phase = "loading".into();
+                        let target = (!arg.is_empty()).then(|| arg.to_owned());
+                        self.send(sink, Command::Accounts(target));
+                    } else if arg.is_empty() {
+                        self.open_accounts();
+                    } else {
+                        self.apply_account_arg(arg, Some(sink));
+                    }
+                }
                 "/model" => {
                     if arg.is_empty() || arg == "refresh" {
                         let refresh = arg == "refresh";
@@ -1266,6 +1638,58 @@ impl State {
                         self.log("Unknown theme. Use /theme to select a palette.");
                     }
                 }
+                "/inspector" => {
+                    if arg.is_empty() {
+                        let cfg = self.layout.inspector;
+                        self.open_inspector_menu(cfg, 0);
+                    } else {
+                        let mut cfg = self.layout.inspector;
+                        let mut valid = true;
+                        let mut explicit_follow = false;
+                        for token in arg.split_whitespace() {
+                            match token.to_ascii_lowercase().as_str() {
+                                "inline" => cfg.mode = InspectorMode::Inline,
+                                "side" => cfg.mode = InspectorMode::Side,
+                                "off" => cfg.mode = InspectorMode::Off,
+                                "fit" => cfg.after_turn = AfterTurnPolicy::Fit,
+                                "collapse" => cfg.after_turn = AfterTurnPolicy::Collapse,
+                                "keep" => cfg.after_turn = AfterTurnPolicy::Keep,
+                                "follow" | "auto" => {
+                                    cfg.follow = true;
+                                    explicit_follow = true;
+                                }
+                                "manual" => {
+                                    cfg.follow = false;
+                                    explicit_follow = true;
+                                }
+                                other => {
+                                    if let Ok(pct) = other.trim_end_matches('%').parse::<u8>() {
+                                        if (INSPECTOR_MIN_WIDTH_PCT..=INSPECTOR_MAX_WIDTH_PCT)
+                                            .contains(&pct)
+                                        {
+                                            cfg.width_pct = pct;
+                                        } else {
+                                            valid = false;
+                                            break;
+                                        }
+                                    } else {
+                                        valid = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if valid {
+                            self.inspector_preview_origin = None;
+                            self.apply_inspector_config(cfg, true);
+                            if explicit_follow {
+                                self.tool_blocks.apply_follow_default(cfg.follow);
+                            }
+                        } else {
+                            self.log("Usage: /inspector [inline|side|off | 35..=70 | fit|collapse|keep | follow|manual]");
+                        }
+                    }
+                }
                 "/browse" => {
                     let parsed = crate::browser_control::terminal::parse(arg);
                     match parsed {
@@ -1300,7 +1724,11 @@ impl State {
                     } else {
                         self.send(
                             sink,
-                            Command::Browser(self.options.account.clone(), arg.into()),
+                            Command::Browser {
+                                provider_id: self.provider_id().to_owned(),
+                                account_id: self.options.account.clone(),
+                                action: arg.into(),
+                            },
                         );
                     }
                 }
@@ -1331,11 +1759,16 @@ impl State {
                     self.subagents.clear();
                     self.tool_approvals.clear();
                     self.answered_approvals.clear();
+                    self.inspector_zoom = false;
+                    self.inspector_zoom_scroll = 0;
                     self.reset_scroll();
                     self.clear_selection();
                     self.clear_painted_regions();
                     if command == "/clear" {
                         self.transcript.clear();
+                        self.tool_blocks.clear();
+                    } else {
+                        self.seal_active_tool_block(true);
                     }
                     self.log("New conversation. Saved conversations are available in /resume.");
                 }
@@ -1737,11 +2170,18 @@ impl State {
         if let Some(original) = self.theme_preview_origin.take() {
             self.theme = original;
         }
+        if let Some(original) = self.inspector_preview_origin.take() {
+            self.layout.inspector = original;
+            self.tool_blocks
+                .apply_after_turn_policy(original.after_turn);
+            self.tool_blocks.bump_layout_rev();
+        }
         self.menu = self.resume_menu.take();
     }
 
     pub(super) fn select(&mut self, sink: &mut dyn EffectSink) {
         self.theme_preview_origin = None;
+        self.inspector_preview_origin = None;
         let Some(mut menu) = self.menu.take() else {
             return;
         };
@@ -1753,8 +2193,26 @@ impl State {
                 account_id,
                 provider_id,
                 provider_name,
+            }
+            | Selection::Account {
+                account_id,
+                provider_id,
+                provider_name,
             } => {
-                self.switch_provider(&account_id, &provider_id, &provider_name);
+                self.switch_provider_with_sink(
+                    &account_id,
+                    &provider_id,
+                    &provider_name,
+                    Some(sink),
+                );
+            }
+            Selection::RefreshAccounts(provider_id) => {
+                let provider_name = self.provider_display_name(&provider_id).to_owned();
+                self.phase = "loading".into();
+                self.log(&format!(
+                    "Scanning Chrome for signed-in {provider_name} accounts…"
+                ));
+                self.send(sink, Command::RefreshAccounts(provider_id));
             }
             Selection::SetupProvider {
                 provider_id,
@@ -1786,6 +2244,7 @@ impl State {
                 );
             }
             Selection::Theme(theme) => self.choose_theme(theme),
+            Selection::Inspector { config, .. } => self.apply_inspector_config(config, true),
             Selection::Mode { agent, yolo } => self.set_agent_mode(agent, yolo),
             Selection::Temporary(temporary) => self.set_temporary(temporary),
             Selection::Permission { perms, .. } => self.apply_permissions(perms),

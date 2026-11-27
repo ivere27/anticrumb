@@ -51,29 +51,80 @@ pub(super) async fn dispatch_remote(
             }
             Some(value.encode_to_vec())
         }
-        "/anticrumb.v1.AccountService/CreateAccount" => {
+        "/anticrumb.v1.AccountService/ListBrowsers" => {
+            let value = remote
+                .list_browsers(decode_proto::<pb::Empty>(bytes)?)
+                .await?;
+            for b in &value.browsers {
+                host.service
+                    .store
+                    .put_browser_profile(&codec::browser_profile_from(b.clone())?)?;
+            }
+            Some(value.encode_to_vec())
+        }
+        "/anticrumb.v1.AccountService/EnsureProviderAccount" => {
             let a = remote
-                .create_account(decode_proto::<pb::CreateAccountRequest>(bytes)?)
+                .ensure_provider_account(decode_proto::<pb::ProviderRef>(bytes)?)
                 .await?;
             host.service
                 .store
                 .put("local", "account", &a.id, &codec::account_from(a.clone())?)?;
+            if let Ok(browsers) = remote.list_browsers(pb::Empty {}).await {
+                for b in browsers.browsers {
+                    if let Ok(profile) = codec::browser_profile_from(b) {
+                        let _ = host.service.store.put_browser_profile(&profile);
+                    }
+                }
+            }
             Some(a.encode_to_vec())
+        }
+        "/anticrumb.v1.AccountService/SetActiveAccount" => {
+            let a = remote
+                .set_active_account(decode_proto::<pb::AccountRef>(bytes)?)
+                .await?;
+            host.service
+                .store
+                .put("local", "account", &a.id, &codec::account_from(a.clone())?)?;
+            host.service.store.set_active_account_id(&a.id)?;
+            Some(a.encode_to_vec())
+        }
+        "/anticrumb.v1.AccountService/RefreshAccounts" => {
+            let value = remote
+                .refresh_accounts(decode_proto::<pb::ProviderRef>(bytes)?)
+                .await?;
+            for a in &value.accounts {
+                host.service.store.put(
+                    "local",
+                    "account",
+                    &a.id,
+                    &codec::account_from(a.clone())?,
+                )?;
+            }
+            Some(value.encode_to_vec())
         }
         "/anticrumb.v1.AccountService/AttachBrowser" => {
             let r = decode_proto::<pb::AttachBrowserRequest>(bytes)?;
             let value = remote.attach_browser(r.clone()).await?;
-            host.service.store.put(
-                &r.account_id,
-                "catalog",
-                "models",
-                &ModelCatalogRecord::default(),
-            )?;
+            for account in host.service.store.accounts_for_provider(&r.provider_id)? {
+                host.service.store.put(
+                    &account.id,
+                    "catalog",
+                    "models",
+                    &ModelCatalogRecord::default(),
+                )?;
+            }
+            if let Ok(browsers) = remote.list_browsers(pb::Empty {}).await {
+                for b in browsers.browsers {
+                    if let Ok(profile) = codec::browser_profile_from(b) {
+                        let _ = host.service.store.put_browser_profile(&profile);
+                    }
+                }
+            }
             Some(value.encode_to_vec())
         }
         "/anticrumb.v1.AccountService/OpenLogin" => Some(
             remote
-                .open_login(decode_proto::<pb::AccountRef>(bytes)?)
+                .open_login(decode_proto::<pb::ProviderRef>(bytes)?)
                 .await?
                 .encode_to_vec(),
         ),
@@ -94,7 +145,7 @@ pub(super) async fn dispatch_remote(
         }
         "/anticrumb.v1.AccountService/GetBrowserStatus" => Some(
             remote
-                .get_browser_status(decode_proto::<pb::AccountRef>(bytes)?)
+                .get_browser_status(decode_proto::<pb::ProviderRef>(bytes)?)
                 .await?
                 .encode_to_vec(),
         ),
@@ -113,7 +164,10 @@ pub(super) async fn dispatch_remote(
         "/anticrumb.v1.AccountService/BrowserControl" => {
             let request = decode_proto::<pb::BrowserControlRequest>(bytes)?;
             let account = if request.account_id.is_empty() {
-                "default".to_owned()
+                host.service
+                    .store
+                    .resolve_active_account_id()
+                    .unwrap_or_else(|_| default_account())
             } else {
                 request.account_id.clone()
             };
@@ -295,17 +349,33 @@ async fn dispatch_clear_web_history(
 }
 
 pub(super) fn sync_browser_cache(store: &Store, status: &pb::HostStatus) -> Result<()> {
+    for browser in &status.browsers {
+        let record = codec::browser_profile_from(browser.clone())?;
+        if store.browser_profile(&record.provider_id).ok().as_ref() != Some(&record) {
+            store.put_browser_profile(&record)?;
+        }
+    }
+    let mut synced_provider_logins = std::collections::HashSet::new();
     for account in &status.accounts {
-        if let Ok(mut saved) = store.get::<Account>("local", "account", &account.id) {
-            let provider_changed =
-                !account.provider.is_empty() && saved.provider != account.provider;
-            if saved.state != account.state || provider_changed {
-                saved.state.clone_from(&account.state);
-                if provider_changed {
-                    saved.provider.clone_from(&account.provider);
-                }
-                store.put("local", "account", &account.id, &saved)?;
-            }
+        let incoming = Account {
+            id: account.id.clone(),
+            provider: if account.provider.is_empty() {
+                default_provider()
+            } else {
+                account.provider.clone()
+            },
+            state: account.state.clone(),
+            identity: account.identity.clone().filter(|s| !s.trim().is_empty()),
+            label: account.label.clone().filter(|s| !s.trim().is_empty()),
+            slot: account.slot.clone().filter(|s| !s.trim().is_empty()),
+        };
+        if store
+            .get::<Account>("local", "account", &account.id)
+            .ok()
+            .as_ref()
+            != Some(&incoming)
+        {
+            store.put("local", "account", &account.id, &incoming)?;
         }
         if let Some(catalog) = &account.catalog {
             let record = codec::catalog_from(catalog.clone());
@@ -313,10 +383,23 @@ pub(super) fn sync_browser_cache(store: &Store, status: &pb::HostStatus) -> Resu
                 store.put(&account.id, "catalog", "models", &record)?;
             }
         }
-        let login = account.login.clone().map(codec::login_status_from);
-        let saved = crate::account::login_status(store, &account.id);
-        if saved != login {
-            store.put(&account.id, "login", "current", &login)?;
+        if synced_provider_logins.insert(incoming.provider.clone()) {
+            let login = account.login.clone().map(codec::login_status_from);
+            let saved = crate::account::provider_login_status(store, &incoming.provider);
+            if saved != login {
+                store.put("local", "provider_login", &incoming.provider, &login)?;
+            }
+        }
+    }
+    if let Some(active) = status
+        .active_account_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if store.active_account_id()?.as_deref() != Some(active)
+            && store.get::<Account>("local", "account", active).is_ok()
+        {
+            store.set_active_account_id(active)?;
         }
     }
     Ok(())
@@ -330,14 +413,21 @@ mod login_cache_tests {
     fn remote_login_catalog_is_cached_without_rewriting_unchanged_values() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        let account = Account {
-            id: "fixture".into(),
-            provider: default_provider(),
-            profile: directory.path().join("profile"),
+        let browser = BrowserProfile {
+            provider_id: default_provider(),
+            profile: directory.path().join("profiles/gemini-web"),
             subprofile: None,
             port: 9222,
             headless: false,
+        };
+        store.put_browser_profile(&browser).unwrap();
+        let account = Account {
+            id: "fixture".into(),
+            provider: default_provider(),
             state: "awaiting_human".into(),
+            identity: Some("alice@gmail.com".into()),
+            label: Some("alice@gmail.com".into()),
+            slot: Some("0".into()),
         };
         store
             .put("local", "account", &account.id, &account)
@@ -353,10 +443,16 @@ mod login_cache_tests {
         };
         let status = pb::HostStatus {
             server_id: "browser-fixture".into(),
+            browsers: vec![codec::browser_profile_to(browser)],
+            active_account_id: Some(account.id.clone()),
             accounts: vec![pb::AccountStatus {
                 id: account.id.clone(),
                 provider: account.provider.clone(),
                 state: "ready".into(),
+                identity: account.identity.clone(),
+                label: account.label.clone(),
+                slot: account.slot.clone(),
+                active: true,
                 selected_model: None,
                 catalog: Some(codec::catalog_to(&account.id, "browser-fixture", catalog)),
                 login: Some(pb::LoginStatus {
@@ -379,10 +475,14 @@ mod login_cache_tests {
             "fixture model"
         );
         assert_eq!(
-            crate::account::login_status(&store, &account.id)
+            crate::account::provider_login_status(&store, &account.provider)
                 .unwrap()
                 .state,
             "ready"
+        );
+        assert_eq!(
+            store.active_account_id().unwrap().as_deref(),
+            Some(account.id.as_str())
         );
         let before = store.total_changes();
         sync_browser_cache(&store, &status).unwrap();
@@ -390,6 +490,6 @@ mod login_cache_tests {
         let mut cleared = status;
         cleared.accounts[0].login = None;
         sync_browser_cache(&store, &cleared).unwrap();
-        assert!(crate::account::login_status(&store, &account.id).is_none());
+        assert!(crate::account::provider_login_status(&store, &account.provider).is_none());
     }
 }

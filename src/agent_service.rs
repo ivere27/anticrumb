@@ -3,13 +3,217 @@ use crate::{agent::*, cli::Client, domain::*, remote_backend::RemoteBackend, sto
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 pub use crate::domain::AgentRequest;
+
+const LIVE_EVENT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const LIVE_EVENT_TTL: Duration = Duration::from_secs(30);
+const DURABLE_TOOL_EVENT_OUTPUT_MAX: usize = 2048;
+const COMPLETED_ALERT_TTL: Duration = Duration::from_secs(15);
+const FAILED_ALERT_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceAlertKind {
+    Approval,
+    Attention,
+    Failed,
+    Completed,
+}
+
+impl WorkspaceAlertKind {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Approval => 0,
+            Self::Attention => 1,
+            Self::Failed => 2,
+            Self::Completed => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceAlertRecord {
+    pub workspace: String,
+    pub agent_id: String,
+    pub kind: WorkspaceAlertKind,
+    pub count: u32,
+    pub updated_at: i64,
+}
+
+#[derive(Clone)]
+struct TerminalAlertEntry {
+    record: WorkspaceAlertRecord,
+    recorded_at: Instant,
+    ttl: Duration,
+}
+
+#[derive(Default)]
+struct WorkspaceAlertTracker {
+    active_workspaces: HashMap<String, String>,
+    terminal: HashMap<String, TerminalAlertEntry>,
+}
+
+impl WorkspaceAlertTracker {
+    fn on_start(&mut self, job_id: &str, workspace: &Path) {
+        let ws = workspace.to_string_lossy().into_owned();
+        self.terminal.remove(&ws);
+        self.active_workspaces.insert(job_id.to_owned(), ws);
+    }
+
+    fn on_finish(
+        &mut self,
+        job_id: &str,
+        workspace: &Path,
+        state: &str,
+        error: Option<&ServiceError>,
+    ) {
+        let ws = self
+            .active_workspaces
+            .remove(job_id)
+            .unwrap_or_else(|| workspace.to_string_lossy().into_owned());
+        self.prune_expired();
+        let (kind, ttl) = match state {
+            "completed" => (WorkspaceAlertKind::Completed, COMPLETED_ALERT_TTL),
+            "failed" => {
+                let is_attention = error.is_some_and(|e| {
+                    matches!(
+                        e.code,
+                        ErrorCode::AuthRequired | ErrorCode::VerificationRequired
+                    )
+                });
+                (
+                    if is_attention {
+                        WorkspaceAlertKind::Attention
+                    } else {
+                        WorkspaceAlertKind::Failed
+                    },
+                    FAILED_ALERT_TTL,
+                )
+            }
+            _ => {
+                self.terminal.remove(&ws);
+                return;
+            }
+        };
+        self.terminal.insert(
+            ws.clone(),
+            TerminalAlertEntry {
+                record: WorkspaceAlertRecord {
+                    workspace: ws,
+                    agent_id: job_id.to_owned(),
+                    kind,
+                    count: 1,
+                    updated_at: now_ms(),
+                },
+                recorded_at: Instant::now(),
+                ttl,
+            },
+        );
+    }
+
+    fn prune_expired(&mut self) {
+        self.terminal
+            .retain(|_, entry| entry.recorded_at.elapsed() < entry.ttl);
+    }
+}
+
+struct LiveEventEntry {
+    event: Event,
+    bytes: usize,
+    ephemeral: bool,
+}
+
+struct LiveEventLog {
+    next_seq: i64,
+    evicted_through_seq: i64,
+    evicted_durable: bool,
+    entries: VecDeque<LiveEventEntry>,
+    bytes: usize,
+    notify: Arc<tokio::sync::Notify>,
+    finished_at: Option<Instant>,
+}
+
+impl LiveEventLog {
+    fn new() -> Self {
+        Self {
+            next_seq: 0,
+            evicted_through_seq: 0,
+            evicted_durable: false,
+            entries: VecDeque::new(),
+            bytes: 0,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            finished_at: None,
+        }
+    }
+
+    fn push(&mut self, run_id: &str, kind: String, data: Value, ephemeral: bool) {
+        self.next_seq += 1;
+        let bytes = kind.len() + data.to_string().len() + 64;
+        self.entries.push_back(LiveEventEntry {
+            event: Event {
+                sequence: self.next_seq,
+                run_id: run_id.to_owned(),
+                kind,
+                data,
+                at: now_ms(),
+            },
+            bytes,
+            ephemeral,
+        });
+        self.bytes = self.bytes.saturating_add(bytes);
+        while self.bytes > LIVE_EVENT_MAX_BYTES && self.entries.len() > 1 {
+            // Prefer evicting high-frequency ephemeral chunks first; only evict oldest
+            // durable entry as a last resort to enforce the strict 2 MiB RAM ceiling.
+            let idx = self
+                .entries
+                .iter()
+                .position(|e| matches!(e.event.kind.as_str(), "tool_output_chunk" | "model_chunk"))
+                .or_else(|| self.entries.iter().position(|e| e.ephemeral))
+                .or(Some(0));
+            let Some(i) = idx else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(i) {
+                self.bytes = self.bytes.saturating_sub(removed.bytes);
+                self.evicted_through_seq = self.evicted_through_seq.max(removed.event.sequence);
+                if !removed.ephemeral {
+                    self.evicted_durable = true;
+                }
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn finish(&mut self, run_id: &str, state: &str, error: Option<&ServiceError>) {
+        self.push(
+            run_id,
+            "agent_terminal".into(),
+            json!({"state": state, "error": error}),
+            false,
+        );
+        self.finished_at = Some(Instant::now());
+        self.notify.notify_waiters();
+    }
+
+    fn is_expired(&self) -> bool {
+        self.finished_at
+            .is_some_and(|at| at.elapsed() >= LIVE_EVENT_TTL)
+    }
+
+    fn is_reapable(&self) -> bool {
+        self.is_expired() && Arc::strong_count(&self.notify) == 1
+    }
+}
+
+fn reap_live_events(logs: &mut HashMap<String, LiveEventLog>) {
+    logs.retain(|_, log| !log.is_reapable());
+}
 
 #[derive(Clone)]
 struct AgentRuntimeSpec {
@@ -298,6 +502,7 @@ fn subagent_event_sink(
             id: approval_id,
             step,
             calls,
+            call_indices,
             source,
         } => {
             parent_events.emit(AgentEvent::SubagentProgress {
@@ -310,6 +515,7 @@ fn subagent_event_sink(
                 id: approval_id,
                 step,
                 calls,
+                call_indices,
                 source: source.or_else(|| Some(format!("worker: {label}"))),
             });
         }
@@ -466,6 +672,8 @@ pub struct AgentManager {
     controls: Mutex<HashMap<String, RunControl>>,
     failures: Mutex<HashMap<String, AgentRecord>>,
     worker_gates: Mutex<HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>>,
+    live_events: Arc<Mutex<HashMap<String, LiveEventLog>>>,
+    alerts: Mutex<WorkspaceAlertTracker>,
     stopping: std::sync::atomic::AtomicBool,
 }
 impl AgentManager {
@@ -486,6 +694,8 @@ impl AgentManager {
             controls: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             worker_gates: Mutex::new(HashMap::new()),
+            live_events: Arc::new(Mutex::new(HashMap::new())),
+            alerts: Mutex::new(WorkspaceAlertTracker::default()),
             stopping: false.into(),
         }))
     }
@@ -578,17 +788,46 @@ impl AgentManager {
     }
 
     fn new_run_control(&self, job_id: &str) -> RunControl {
+        {
+            let mut logs = self.live_events.lock().unwrap_or_else(|e| e.into_inner());
+            reap_live_events(&mut logs);
+            logs.insert(job_id.to_owned(), LiveEventLog::new());
+        }
         let journal = self.store.clone();
+        let live_events = Arc::clone(&self.live_events);
         let event_id = job_id.to_owned();
         let cancel = CancelToken::new();
         let journal_cancel = cancel.clone();
         let events = EventSink::new(move |event| {
+            let ephemeral = event.is_ephemeral();
             let value =
                 serde_json::to_value(&event).unwrap_or(json!({"event":"serialization_error"}));
             let kind = value["event"].as_str().unwrap_or("unknown").to_owned();
-            if let Err(error) = journal.event(&event_id, &kind, value) {
-                eprintln!("agent journal: {error}");
-                journal_cancel.cancel();
+            {
+                let mut logs = live_events.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(log) = logs.get_mut(&event_id) {
+                    log.push(&event_id, kind.clone(), value.clone(), ephemeral);
+                }
+            }
+            if !ephemeral {
+                let durable_value = if kind == "tool_finished" {
+                    let mut v = value;
+                    if let Some(out) = v.get("output").and_then(Value::as_str) {
+                        if out.chars().count() > DURABLE_TOOL_EVENT_OUTPUT_MAX {
+                            v["output"] = Value::String(crate::agent::tools::truncate_tool_output(
+                                out,
+                                DURABLE_TOOL_EVENT_OUTPUT_MAX,
+                            ));
+                        }
+                    }
+                    v
+                } else {
+                    value
+                };
+                if let Err(error) = journal.event(&event_id, &kind, durable_value) {
+                    eprintln!("agent journal: {error}");
+                    journal_cancel.cancel();
+                }
             }
         });
         RunControl {
@@ -713,9 +952,55 @@ impl AgentManager {
             .unwrap_or(u32::MAX))
     }
 
+    pub(crate) fn workspace_alerts(&self) -> Result<Vec<WorkspaceAlertRecord>> {
+        let active_pending: Vec<(String, u32)> = {
+            let controls = self.controls.lock().map_err(ServiceError::storage)?;
+            controls
+                .iter()
+                .filter_map(|(job_id, ctrl)| {
+                    let count = ctrl.approvals.pending_count();
+                    (count > 0).then(|| (job_id.clone(), count.try_into().unwrap_or(u32::MAX)))
+                })
+                .collect()
+        };
+        let mut tracker = self.alerts.lock().map_err(ServiceError::storage)?;
+        tracker.prune_expired();
+        let mut by_workspace: HashMap<String, WorkspaceAlertRecord> = tracker
+            .terminal
+            .iter()
+            .map(|(ws, entry)| (ws.clone(), entry.record.clone()))
+            .collect();
+        let now = now_ms();
+        for (job_id, count) in active_pending {
+            let Some(ws) = tracker.active_workspaces.get(&job_id).cloned() else {
+                continue;
+            };
+            by_workspace.insert(
+                ws.clone(),
+                WorkspaceAlertRecord {
+                    workspace: ws,
+                    agent_id: job_id,
+                    kind: WorkspaceAlertKind::Approval,
+                    count,
+                    updated_at: now,
+                },
+            );
+        }
+        let mut list: Vec<WorkspaceAlertRecord> = by_workspace.into_values().collect();
+        list.sort_by(|a, b| {
+            a.kind
+                .priority()
+                .cmp(&b.kind.priority())
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        });
+        Ok(list)
+    }
+
     fn finish_agent_job(&self, job_id: &str, mut terminal: AgentRecord, lease: Option<fs::File>) {
         let state = terminal.state.clone();
         let error = terminal.error.clone();
+        let workspace = terminal.request.workspace.clone();
         // Hold `controls` across lease release, terminal event/state persistence,
         // and control removal so a caller polling `GetAgent` cannot observe the
         // terminal state and race ahead into `start()`/`delete()` while this
@@ -735,6 +1020,17 @@ impl AgentManager {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(job_id.to_owned(), terminal);
         }
+        {
+            let mut logs = self.live_events.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(log) = logs.get_mut(job_id) {
+                log.finish(job_id, &state, error.as_ref());
+            }
+            reap_live_events(&mut logs);
+        }
+        {
+            let mut tracker = self.alerts.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.on_finish(job_id, &workspace, &state, error.as_ref());
+        }
         controls.remove(job_id);
     }
 
@@ -748,7 +1044,10 @@ impl AgentManager {
             return Err(ServiceError::invalid("workspace must be a directory"));
         }
         if request.account_id.trim().is_empty() {
-            request.account_id = "default".into();
+            request.account_id = self
+                .store
+                .resolve_active_account_id()
+                .unwrap_or_else(|_| default_account());
         }
         let mut controls = self.controls.lock().map_err(ServiceError::storage)?;
         // cancel_all sets stopping before taking this lock, so a job cannot
@@ -795,6 +1094,10 @@ impl AgentManager {
             },
         )?;
         controls.insert(id.clone(), control.clone());
+        {
+            let mut tracker = self.alerts.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.on_start(&id, &request.workspace);
+        }
         drop(artifact_lease);
         drop(controls);
         let stale_workspace_sessions = if has_workspace_lease {
@@ -902,6 +1205,220 @@ impl AgentManager {
             return Ok(job);
         }
         self.store.get("local", "agent", id)
+    }
+    pub fn read_events(&self, id: &str, after: i64) -> Result<Vec<Event>> {
+        self.snapshot(id)?;
+        {
+            let mut logs = self.live_events.lock().unwrap_or_else(|e| e.into_inner());
+            reap_live_events(&mut logs);
+            if let Some(log) = logs.get(id) {
+                if !log.is_expired() {
+                    return Ok(log
+                        .entries
+                        .iter()
+                        .filter(|e| e.event.sequence > after)
+                        .take(256)
+                        .map(|e| e.event.clone())
+                        .collect());
+                }
+            }
+        }
+        self.store.events(id, after)
+    }
+    pub fn watch_events(
+        self: &Arc<Self>,
+        id: &str,
+        after: i64,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<Event>>> {
+        self.snapshot(id)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let live_notify = {
+            let mut logs = self.live_events.lock().unwrap_or_else(|e| e.into_inner());
+            reap_live_events(&mut logs);
+            logs.get(id)
+                .filter(|log| !log.is_expired())
+                .map(|log| Arc::clone(&log.notify))
+        };
+        let manager = Arc::clone(self);
+        let run_id = id.to_owned();
+        tokio::spawn(async move {
+            let mut cursor = after;
+            if let Some(notify) = live_notify {
+                // Detect late subscriber / reconnect after ring-buffer eviction:
+                // backfill any evicted durable SQLite events and notify the client of the gap.
+                let gap_info = {
+                    let logs = manager
+                        .live_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    logs.get(&run_id).and_then(|log| {
+                        (cursor < log.evicted_through_seq).then(|| {
+                            let earliest_durable_at = log
+                                .entries
+                                .iter()
+                                .find(|e| !e.ephemeral)
+                                .map(|e| e.event.at)
+                                .unwrap_or(i64::MAX);
+                            (
+                                log.evicted_through_seq,
+                                log.evicted_durable,
+                                earliest_durable_at,
+                            )
+                        })
+                    })
+                };
+                if let Some((evicted_through, evicted_durable, earliest_durable_at)) = gap_info {
+                    if evicted_durable {
+                        let rid = run_id.clone();
+                        let mut db_cursor = 0i64;
+                        loop {
+                            let rid_page = rid.clone();
+                            let Ok(page) = manager
+                                .store
+                                .blocking(move |s| s.events(&rid_page, db_cursor))
+                                .await
+                            else {
+                                break;
+                            };
+                            if page.is_empty() {
+                                break;
+                            }
+                            let count = page.len();
+                            for mut ev in page {
+                                db_cursor = ev.sequence;
+                                if ev.at < earliest_durable_at {
+                                    // Keep cursor <= evicted_through so subsequent live entries stream in order.
+                                    ev.sequence = cursor;
+                                    if tx.send(Ok(ev)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            if count < 256 {
+                                break;
+                            }
+                        }
+                    }
+                    let warn_ev = Event {
+                        sequence: cursor,
+                        run_id: run_id.clone(),
+                        kind: "warning".into(),
+                        data: json!({
+                            "event": "warning",
+                            "message": format!(
+                                "Earlier live output chunks (through seq {evicted_through}) were trimmed to stay within the 2 MiB live buffer."
+                            ),
+                            "evicted_through_seq": evicted_through,
+                        }),
+                        at: now_ms(),
+                    };
+                    if tx.send(Ok(warn_ev)).await.is_err() {
+                        return;
+                    }
+                }
+                loop {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let notified = Arc::clone(&notify).notified_owned();
+                    let (batch, has_more, finished) = {
+                        let logs = manager
+                            .live_events
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        match logs.get(&run_id) {
+                            Some(log) => {
+                                let mut out = Vec::new();
+                                let mut more = false;
+                                for entry in &log.entries {
+                                    if entry.event.sequence > cursor {
+                                        if out.len() < 256 {
+                                            out.push(entry.event.clone());
+                                        } else {
+                                            more = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                (out, more, log.finished_at.is_some())
+                            }
+                            None => (Vec::new(), false, true),
+                        }
+                    };
+                    for ev in batch {
+                        cursor = ev.sequence;
+                        if tx.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if has_more {
+                        continue;
+                    }
+                    if finished {
+                        // Drain any last events that may have raced with finished_at.
+                        let tail = {
+                            let logs = manager
+                                .live_events
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            logs.get(&run_id)
+                                .map(|log| {
+                                    log.entries
+                                        .iter()
+                                        .filter(|e| e.event.sequence > cursor)
+                                        .map(|e| e.event.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        };
+                        for ev in tail {
+                            if tx.send(Ok(ev)).await.is_err() {
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tx.closed() => break,
+                        _ = notified => {}
+                    }
+                }
+            } else {
+                // Historical turn: stream durable events from SQLite and close cleanly.
+                loop {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let rid = run_id.clone();
+                    let page = manager
+                        .store
+                        .blocking(move |s| s.events(&rid, cursor))
+                        .await;
+                    match page {
+                        Ok(events) => {
+                            if events.is_empty() {
+                                break;
+                            }
+                            let count = events.len();
+                            for ev in events {
+                                cursor = ev.sequence;
+                                if tx.send(Ok(ev)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if count < 256 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
     fn resolve_conversation(
         &self,
@@ -1098,11 +1615,15 @@ impl AgentManager {
             }
         }
         self.validate_artifacts(&job.request.account_id, &job.request.artifacts)?;
-        self.store.event(
-            id,
-            "steer_received",
-            json!({"message":message,"artifacts":artifacts}),
-        )?;
+        let steer_payload = json!({"message":message,"artifacts":artifacts});
+        self.store
+            .event(id, "steer_received", steer_payload.clone())?;
+        {
+            let mut logs = self.live_events.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(log) = logs.get_mut(id) {
+                log.push(id, "steer_received".into(), steer_payload, false);
+            }
+        }
         c.inbox.push_with_artifacts(message.into(), artifacts);
         Ok(())
     }
@@ -1139,33 +1660,26 @@ impl AgentManager {
         id: &str,
         artifacts: &mut Vec<String>,
     ) -> Result<Vec<Value>> {
-        let mut after = 0;
         let mut observations = std::collections::VecDeque::new();
-        loop {
-            let events = self.store.events(id, after)?;
-            if events.is_empty() {
-                break;
-            }
-            for event in events {
-                after = event.sequence;
-                if event.kind == "steer_received" {
-                    if let Some(ids) = event.data["artifacts"].as_array() {
-                        for id in ids.iter().filter_map(Value::as_str) {
-                            if !artifacts.iter().any(|a| a == id) {
-                                artifacts.push(id.into());
-                            }
+        let events = self
+            .store
+            .events_by_kinds(id, &["tool_started", "tool_finished", "steer_received"])?;
+        for event in events {
+            if event.kind == "steer_received" {
+                if let Some(ids) = event.data["artifacts"].as_array() {
+                    for id in ids.iter().filter_map(Value::as_str) {
+                        if !artifacts.iter().any(|a| a == id) {
+                            artifacts.push(id.into());
                         }
                     }
                 }
-                if ["tool_started", "tool_finished", "steer_received"]
-                    .contains(&event.kind.as_str())
-                {
-                    let raw = event.data.to_string();
-                    observations.push_back(json!({"event":event.kind,"data":raw.chars().take(1500).collect::<String>()}));
-                    while observations.len() > 8 {
-                        observations.pop_front();
-                    }
-                }
+            }
+            let raw = event.data.to_string();
+            observations.push_back(
+                json!({"event":event.kind,"data":raw.chars().take(1500).collect::<String>()}),
+            );
+            while observations.len() > 8 {
+                observations.pop_front();
             }
         }
         Ok(observations.into_iter().collect())
@@ -1176,22 +1690,16 @@ impl AgentManager {
     }
 
     fn job_session_ids(&self, agent_id: &str, include_subagents: bool) -> Result<Vec<String>> {
-        let mut after = 0;
+        let kinds: &[&str] = if include_subagents {
+            &[EVENT_BROWSER_SESSION, EVENT_SUBAGENT_BROWSER_SESSION]
+        } else {
+            &[EVENT_BROWSER_SESSION]
+        };
+        let events = self.store.events_by_kinds(agent_id, kinds)?;
         let mut sessions = Vec::new();
-        loop {
-            let events = self.store.events(agent_id, after)?;
-            if events.is_empty() {
-                break;
-            }
-            for event in events {
-                after = event.sequence;
-                let matches_kind = event.kind == EVENT_BROWSER_SESSION
-                    || (include_subagents && event.kind == EVENT_SUBAGENT_BROWSER_SESSION);
-                if matches_kind {
-                    if let Some(id) = event.data["session_id"].as_str() {
-                        sessions.push(id.to_owned());
-                    }
-                }
+        for event in events {
+            if let Some(id) = event.data["session_id"].as_str() {
+                sessions.push(id.to_owned());
             }
         }
         Ok(sessions)
@@ -2295,5 +2803,379 @@ mod tests {
         let waiter2 = std::thread::spawn(move || gate2.wait("approval-2", &cancel2));
         manager.cancel("job-1").unwrap();
         assert_eq!(waiter2.join().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_events_stay_in_ram_zero_sqlite_inserts_and_watch_stream_delivers_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store.clone()).unwrap();
+        let job_id = "agent-stream-0-insert";
+        let request = AgentRequest {
+            environment: None,
+            task: "stream test".into(),
+            workspace: dir.path().to_path_buf(),
+            account_id: "default".into(),
+            model: None,
+            thinking: None,
+            session_mode: SessionMode::Temporary,
+            no_shell: false,
+            max_steps: 4,
+            knowledge: None,
+            mcp_config: None,
+            artifacts: vec![],
+            conversation_id: Some("conv-stream".into()),
+            chat_only: false,
+            permissions: None,
+            session_retention: SessionRetention::Retain,
+            tool_approval: ToolApprovalMode::Auto,
+        };
+        let running = AgentRecord {
+            id: job_id.into(),
+            conversation_id: "conv-stream".into(),
+            state: "running".into(),
+            request: request.clone(),
+            result: None,
+            error: None,
+            created_at: 1,
+            updated_at: 0,
+        };
+        store.put("local", "agent", job_id, &running).unwrap();
+        let control = manager.new_run_control(job_id);
+        manager
+            .controls
+            .lock()
+            .unwrap()
+            .insert(job_id.into(), control.clone());
+
+        let mut rx = manager.watch_events(job_id, 0).unwrap();
+
+        // Emit ALL 6 ephemeral kinds + durable events.
+        control.events.emit(AgentEvent::RequestPayload {
+            request: json!({"prompt": "secret"}),
+            prompt: "secret".into(),
+        });
+        control.events.emit(AgentEvent::ModelInput { chars: 5 });
+        control.events.emit(AgentEvent::BrowserStage {
+            stage: "navigating".into(),
+            detail: "open".into(),
+        });
+        control.events.emit(AgentEvent::ModelChunk {
+            step: 1,
+            text: "thinking...".into(),
+        });
+        control.events.emit(AgentEvent::ToolStarted {
+            step: 1,
+            index: 0,
+            tool: "run_shell".into(),
+            args: json!({"command": "cargo test"}),
+        });
+        control.events.emit(AgentEvent::ToolOutputChunk {
+            step: 1,
+            index: 0,
+            tool: "run_shell".into(),
+            stream: OutputStream::Stdout,
+            text: "chunk-1\n".into(),
+        });
+        control.events.emit(AgentEvent::SubagentProgress {
+            id: "sub_1".into(),
+            label: "audit".into(),
+            phase: "step 1".into(),
+            detail: "running".into(),
+        });
+        control.events.emit(AgentEvent::ToolFinished {
+            step: 1,
+            index: 0,
+            tool: "run_shell".into(),
+            ok: true,
+            output: "z".repeat(4000),
+            elapsed_ms: 42,
+        });
+        control.events.emit(AgentEvent::BrowserSession {
+            session_id: "sess-1".into(),
+        });
+
+        let terminal = AgentRecord {
+            id: job_id.into(),
+            conversation_id: "conv-stream".into(),
+            state: "completed".into(),
+            request,
+            result: Some(AgentRunResult {
+                status: AgentStatus::Completed,
+                final_response: "done".into(),
+                ..Default::default()
+            }),
+            error: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        manager.finish_agent_job(job_id, terminal, None);
+
+        // 1. WatchAgentEvents stream receives EVERY ephemeral + durable event in sequence order.
+        let mut streamed = Vec::new();
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("watch_events did not terminate")
+        {
+            streamed.push(item.unwrap());
+        }
+        let streamed_kinds: Vec<&str> = streamed.iter().map(|e| e.kind.as_str()).collect();
+        for expected in [
+            "request_payload",
+            "model_input",
+            "browser_stage",
+            "model_chunk",
+            "tool_started",
+            "tool_output_chunk",
+            "subagent_progress",
+            "tool_finished",
+            "browser_session",
+            "agent_terminal",
+        ] {
+            assert!(
+                streamed_kinds.contains(&expected),
+                "watch_events missing {expected}: {streamed_kinds:?}"
+            );
+        }
+        assert!(streamed.windows(2).all(|w| w[0].sequence < w[1].sequence));
+
+        // 2. SQLite `events` table has ZERO rows for any ephemeral kind!
+        let db_events = store.events(job_id, 0).unwrap();
+        let db_kinds: Vec<&str> = db_events.iter().map(|e| e.kind.as_str()).collect();
+        for ephemeral in [
+            "tool_output_chunk",
+            "model_chunk",
+            "browser_stage",
+            "subagent_progress",
+            "request_payload",
+            "model_input",
+        ] {
+            assert!(
+                !db_kinds.contains(&ephemeral),
+                "ephemeral event {ephemeral} leaked into SQLite: {db_kinds:?}"
+            );
+        }
+        assert_eq!(
+            db_kinds,
+            vec![
+                "tool_started",
+                "tool_finished",
+                "browser_session",
+                "agent_terminal"
+            ]
+        );
+        // Durable tool_finished output in SQLite is bounded by DURABLE_TOOL_EVENT_OUTPUT_MAX.
+        let finished_ev = db_events
+            .iter()
+            .find(|e| e.kind == "tool_finished")
+            .unwrap();
+        assert!(
+            finished_ev.data["output"].as_str().unwrap().chars().count()
+                < DURABLE_TOOL_EVENT_OUTPUT_MAX + 128
+        );
+
+        // 3. After RAM LiveEventLog eviction (simulating 30s TTL), watch_events & read_events
+        // fall back cleanly to durable SQLite events.
+        manager.live_events.lock().unwrap().remove(job_id);
+        let fallback_read = manager.read_events(job_id, 0).unwrap();
+        assert_eq!(fallback_read.len(), 4);
+        let mut fallback_rx = manager.watch_events(job_id, 0).unwrap();
+        let mut fallback_streamed = Vec::new();
+        while let Some(item) = fallback_rx.recv().await {
+            fallback_streamed.push(item.unwrap());
+        }
+        assert_eq!(fallback_streamed.len(), 4);
+    }
+
+    #[test]
+    fn live_event_log_evicts_ephemeral_chunks_before_lifecycle_events_under_cap() {
+        let mut log = LiveEventLog::new();
+        log.push(
+            "run-cap",
+            "tool_approval_requested".into(),
+            json!({"id": "apr-keep", "calls": []}),
+            false,
+        );
+        log.push(
+            "run-cap",
+            "tool_started".into(),
+            json!({"tool": "run_shell"}),
+            false,
+        );
+        // Push > 2 MiB of ephemeral chunks.
+        let big = "x".repeat(64 * 1024);
+        for i in 0..45 {
+            log.push(
+                "run-cap",
+                "tool_output_chunk".into(),
+                json!({"i": i, "text": big}),
+                true,
+            );
+        }
+        assert!(log.bytes <= LIVE_EVENT_MAX_BYTES);
+        assert!(log.evicted_through_seq > 0);
+        assert!(!log.evicted_durable);
+        let kinds: Vec<&str> = log.entries.iter().map(|e| e.event.kind.as_str()).collect();
+        assert!(kinds.contains(&"tool_approval_requested"));
+        assert!(kinds.contains(&"tool_started"));
+        assert!(
+            log.entries.len() < 47,
+            "oldest ephemeral chunks must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_event_log_overflow_notifies_late_watcher_and_backfills_evicted_durable_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store.clone()).unwrap();
+        let job_id = "agent-overflow-gap";
+        let request = AgentRequest {
+            environment: None,
+            task: "overflow test".into(),
+            workspace: dir.path().to_path_buf(),
+            account_id: "default".into(),
+            model: None,
+            thinking: None,
+            session_mode: SessionMode::Temporary,
+            no_shell: false,
+            max_steps: 4,
+            knowledge: None,
+            mcp_config: None,
+            artifacts: vec![],
+            conversation_id: Some("conv-overflow".into()),
+            chat_only: false,
+            permissions: None,
+            session_retention: SessionRetention::Retain,
+            tool_approval: ToolApprovalMode::Auto,
+        };
+        store
+            .put(
+                "local",
+                "agent",
+                job_id,
+                &AgentRecord {
+                    id: job_id.into(),
+                    conversation_id: "conv-overflow".into(),
+                    state: "running".into(),
+                    request: request.clone(),
+                    result: None,
+                    error: None,
+                    created_at: 1,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+        let control = manager.new_run_control(job_id);
+        // Emit durable event + >2 MiB ephemeral chunks BEFORE watcher connects (late subscriber).
+        control.events.emit(AgentEvent::ToolStarted {
+            step: 1,
+            index: 0,
+            tool: "run_shell".into(),
+            args: json!({"command": "yes"}),
+        });
+        let big = "x".repeat(64 * 1024);
+        for _ in 0..45 {
+            control.events.emit(AgentEvent::ToolOutputChunk {
+                step: 1,
+                index: 0,
+                tool: "run_shell".into(),
+                stream: OutputStream::Stdout,
+                text: big.clone(),
+            });
+        }
+
+        // Late subscriber connects at after=0 AFTER overflow evicted early chunks.
+        let mut rx = manager.watch_events(job_id, 0).unwrap();
+        manager.finish_agent_job(
+            job_id,
+            AgentRecord {
+                id: job_id.into(),
+                conversation_id: "conv-overflow".into(),
+                state: "completed".into(),
+                request,
+                result: Some(AgentRunResult {
+                    status: AgentStatus::Completed,
+                    final_response: "done".into(),
+                    ..Default::default()
+                }),
+                error: None,
+                created_at: 1,
+                updated_at: 2,
+            },
+            None,
+        );
+
+        let mut received = Vec::new();
+        while let Some(ev) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("late watch_events did not finish")
+        {
+            received.push(ev.unwrap());
+        }
+        assert!(
+            received
+                .iter()
+                .any(|e| e.kind == "warning" && e.data["evicted_through_seq"].as_i64().is_some()),
+            "late subscriber must receive gap warning after ring-buffer eviction"
+        );
+        assert!(received.iter().any(|e| e.kind == "tool_started"));
+        assert!(received.iter().any(|e| e.kind == "agent_terminal"));
+    }
+
+    #[test]
+    fn workspace_alerts_track_live_approvals_and_terminal_outcomes_with_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store).unwrap();
+        let ws_a = dir.path().join("a");
+        let ws_b = dir.path().join("b");
+        let ws_c = dir.path().join("c");
+        fs::create_dir_all(&ws_a).unwrap();
+        fs::create_dir_all(&ws_b).unwrap();
+        fs::create_dir_all(&ws_c).unwrap();
+
+        // Register active job in ws_b with a pending approval.
+        let ctrl_b = manager.new_run_control("job-b");
+        ctrl_b.approvals.register("apr-1");
+        manager
+            .controls
+            .lock()
+            .unwrap()
+            .insert("job-b".into(), ctrl_b.clone());
+        manager.alerts.lock().unwrap().on_start("job-b", &ws_b);
+
+        // Finish jobs in ws_a (completed) and ws_c (failed).
+        manager.alerts.lock().unwrap().on_start("job-a", &ws_a);
+        manager
+            .alerts
+            .lock()
+            .unwrap()
+            .on_finish("job-a", &ws_a, "completed", None);
+        manager.alerts.lock().unwrap().on_start("job-c", &ws_c);
+        manager.alerts.lock().unwrap().on_finish(
+            "job-c",
+            &ws_c,
+            "failed",
+            Some(&ServiceError::new(ErrorCode::Internal, "agent", "boom")),
+        );
+
+        let alerts = manager.workspace_alerts().unwrap();
+        assert_eq!(alerts.len(), 3);
+        assert_eq!(alerts[0].kind, WorkspaceAlertKind::Approval);
+        assert_eq!(alerts[0].workspace, ws_b.to_string_lossy());
+        assert_eq!(alerts[0].count, 1);
+        assert_eq!(alerts[1].kind, WorkspaceAlertKind::Failed);
+        assert_eq!(alerts[1].workspace, ws_c.to_string_lossy());
+        assert_eq!(alerts[2].kind, WorkspaceAlertKind::Completed);
+        assert_eq!(alerts[2].workspace, ws_a.to_string_lossy());
+
+        // Resolving approval removes ws_b's approval alert immediately; restarting ws_a clears its completed alert.
+        assert!(manager.approve_tool("job-b", "apr-1", true).is_ok());
+        manager.alerts.lock().unwrap().on_start("job-a-2", &ws_a);
+        let after = manager.workspace_alerts().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].kind, WorkspaceAlertKind::Failed);
+        assert_eq!(after[0].workspace, ws_c.to_string_lossy());
     }
 }

@@ -4,16 +4,24 @@ use super::{
     commands::{Choice, Completion, HistoryClearConfirmation, Menu, Selection},
     debug_log::DebugLogger,
     editor::{Draft, Editor},
-    layout::{FrameLayout, LayoutConfig},
+    highlight::HighlightCache,
+    inspector::{
+        self, BlockId, BlockRowKind, InspectorBadgeAction, PaintedInspectorPane, PaintedToolBlock,
+        ToolBlockStore,
+    },
+    layout::{
+        FrameLayout, HorizontalSplit, InspectorConfig, InspectorMode, LayoutConfig,
+        INSPECTOR_MAX_WIDTH_PCT, INSPECTOR_MIN_WIDTH_PCT,
+    },
     markdown::{self, Face},
     mentions::{self, MentionKind, MentionMatch, MentionPopup},
     preferences::{self, Preferences},
     selection, theme,
-    transcript::{clip, inline_notice_parts, Entry, Transcript, TranscriptLines},
+    transcript::{clip, inline_notice_parts, Entry, SplitCacheKey, Transcript, TranscriptLines},
     usage,
     worker::{Command, Update},
 };
-use crate::cli::PromptOptions;
+use crate::{agent::OutputStream, cli::PromptOptions};
 use crossterm::event::{self, MouseButton, MouseEventKind};
 use serde_json::{json, Value};
 use std::{
@@ -62,6 +70,7 @@ pub(super) struct LastClick {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SelectionTarget {
     Transcript,
+    Inspector,
     Hint,
     Composer,
     Subagents,
@@ -120,8 +129,23 @@ impl ScrollBottomBadge {
     }
 }
 
+pub type ApprovalButtonsHitbox = (u16, Option<(u16, u16)>, Option<(u16, u16)>);
+
+struct InspectorSelectionTarget {
+    rect: super::layout::Rect,
+    header_rows: u16,
+    body_rows: usize,
+    body_start: usize,
+    lines: Vec<markdown::Line>,
+    inline_target: Option<BlockId>,
+}
+
 pub(super) struct State {
     pub options: PromptOptions,
+    /// Whether `Shift+Tab` toggles `CHAT <-> YOLO` instead of `CHAT <-> AGENT`.
+    /// Armed only by explicit CLI `--yolo` or `/mode yolo` (and disarmed by
+    /// `/mode agent` or narrowing `/permissions`). Never armed implicitly by `/resume`.
+    pub yolo_toggle_armed: bool,
     pub preferences: Option<Preferences>,
     pub theme: theme::Theme,
     pub theme_preview_origin: Option<theme::Theme>,
@@ -177,15 +201,29 @@ pub(super) struct State {
     pub scroll_anchor_deficit: Option<usize>,
     pub scroll_anchor_stream_len: usize,
     pub scroll_anchor_revision: u64,
+    pub scroll_anchor_tool_rev: u64,
     pub has_unread_below: bool,
     pub painted_hint: Vec<markdown::Line>,
     pub painted_composer: Vec<markdown::Line>,
     pub painted_subagents: Vec<markdown::Line>,
     pub painted_footer: Vec<markdown::Line>,
+    pub painted_blocks: Vec<PaintedToolBlock>,
+    pub painted_inspector: Option<PaintedInspectorPane>,
+    pub painted_inline_inspector_target: Option<BlockId>,
     pub painted_size: (u16, u16),
     pub painted_layout: Option<FrameLayout>,
     pub scroll_bottom_button: Option<(u16, u16, u16)>,
+    pub approval_buttons: Option<ApprovalButtonsHitbox>,
     pub layout: LayoutConfig,
+    pub tool_blocks: ToolBlockStore,
+    pub highlights: HighlightCache,
+    pub inspector_zoom: bool,
+    pub inspector_zoom_scroll: usize,
+    pub shortcuts_open: bool,
+    pub shortcuts_scroll: usize,
+    pub inspector_preview_origin: Option<InspectorConfig>,
+    pub inspector_last_active_mode: InspectorMode,
+    pub divider_drag: bool,
     pub selection: Option<selection::Selection>,
     pub selection_target: SelectionTarget,
     pub selection_drag: Option<SelectionDrag>,
@@ -212,11 +250,13 @@ fn status_visible_changed(prev: &Value, next: &Value) -> bool {
 impl State {
     pub(super) fn new(mut options: PromptOptions) -> Self {
         options.no_shell = !options.effective_permissions().shell;
+        let yolo_toggle_armed = options.yolo;
         let files = std::mem::take(&mut options.files);
         let mut editor = Editor::default();
         editor.set(options.words.join(" "));
         Self {
             options,
+            yolo_toggle_armed,
             preferences: None,
             theme: theme::THEMES[0],
             theme_preview_origin: None,
@@ -272,15 +312,29 @@ impl State {
             scroll_anchor_deficit: None,
             scroll_anchor_stream_len: 0,
             scroll_anchor_revision: 0,
+            scroll_anchor_tool_rev: 0,
             has_unread_below: false,
             painted_hint: Vec::new(),
             painted_composer: Vec::new(),
             painted_subagents: Vec::new(),
             painted_footer: Vec::new(),
+            painted_blocks: Vec::new(),
+            painted_inspector: None,
+            painted_inline_inspector_target: None,
             painted_size: (0, 0),
             painted_layout: None,
             scroll_bottom_button: None,
+            approval_buttons: None,
             layout: LayoutConfig::default(),
+            tool_blocks: ToolBlockStore::default(),
+            highlights: HighlightCache::default(),
+            inspector_zoom: false,
+            inspector_zoom_scroll: 0,
+            shortcuts_open: false,
+            shortcuts_scroll: 0,
+            inspector_preview_origin: None,
+            inspector_last_active_mode: InspectorMode::Inline,
+            divider_drag: false,
             selection: None,
             selection_target: SelectionTarget::Transcript,
             selection_drag: None,
@@ -305,18 +359,59 @@ impl State {
             || self.phase == "loading"
     }
 
+    /// True only when visual animation (spinner frames) is actively needed.
+    /// Static `Y/N` approval waiting pauses spinner wakeups for near-zero idle CPU.
+    pub(super) fn needs_animation(&self) -> bool {
+        let active_animating = self.active.is_some()
+            && (self.tool_approvals.is_empty()
+                || self.tool_blocks.has_running_tools()
+                || !self.stream.is_empty()
+                || !self.thinking_preview.is_empty()
+                || !self.subagents.is_empty());
+        active_animating
+            || self.pending.is_some()
+            || self.deleting_conversation.is_some()
+            || self.clearing_web_history
+            || self.phase == "loading"
+    }
+
     #[cfg(test)]
     pub(super) fn logs(&self) -> String {
         self.transcript.plain_text()
     }
 
-    pub(super) fn push_entry(&mut self, plain: &str, entry: Entry) {
-        let max_bytes = if self.debug.level >= 2 {
+    fn max_transcript_bytes(&self) -> usize {
+        if self.debug.level >= 2 {
             1024 * 1024
         } else {
             128 * 1024
-        };
-        self.transcript.push(plain, entry, max_bytes);
+        }
+    }
+
+    pub(super) fn seal_active_tool_block(&mut self, cancel_incomplete: bool) {
+        if let Some((block_id, plain)) = self
+            .tool_blocks
+            .seal_active_block(self.layout.inspector.after_turn, cancel_incomplete)
+        {
+            self.push_entry_raw(&plain, Entry::ToolBlock(block_id));
+        }
+    }
+
+    pub(super) fn push_entry_raw(&mut self, plain: &str, entry: Entry) {
+        let max_bytes = self.max_transcript_bytes();
+        let evicted = self.transcript.push(plain, entry, max_bytes);
+        if !evicted.is_empty() {
+            self.tool_blocks.remove_blocks(&evicted);
+        }
+    }
+
+    pub(super) fn push_entry(&mut self, plain: &str, entry: Entry) {
+        // Ordering invariant: seal any active tool block immediately before pushing
+        // any non-tool entry so prose, prompts, and summaries stay in chronological order.
+        if !matches!(entry, Entry::ToolBlock(_)) {
+            self.seal_active_tool_block(false);
+        }
+        self.push_entry_raw(plain, entry);
     }
 
     pub(super) fn log(&mut self, text: &str) {
@@ -379,16 +474,45 @@ impl State {
     }
 
     pub(super) fn log_startup_banner(&mut self) {
+        let notice = super::notices::pick_startup_notice();
+        self.log_startup_banner_with_notice(notice.as_ref());
+    }
+
+    pub(super) fn log_startup_banner_with_notice(
+        &mut self,
+        notice: Option<&super::notices::NoticeEntry>,
+    ) {
         let version = crate::build_info::display_version();
         let commit = crate::build_info::commit_head();
         let version_label = crate::build_info::format_tui_title(&version, commit.as_deref());
-        let account_label = format!("{} · {}", self.provider_name(), self.options.account);
+        let account_label = format!(
+            "{} · {}",
+            self.provider_name(),
+            self.account_display_label()
+        );
         let model_label = format!("{} ({})", self.model_label(), self.thinking_label());
         let workspace_label = Self::format_workspace_home(&self.options.workspace);
 
+        // Theme-independent baked cookie + falling crumbs palette,
+        // tuned for contrast on both dark and light terminal themes.
+        const CRUST_TOP: Face = Face::rgb_bold(0xD9, 0x88, 0x38);
+        const CRUST_LEFT: Face = Face::rgb(0xC4, 0x71, 0x2B);
+        const CRUST_RIGHT: Face = Face::rgb(0xA8, 0x58, 0x20);
+        const CRUST_BOTTOM: Face = Face::rgb(0x9E, 0x51, 0x1E);
+        const DOUGH: Face = Face::rgb(0xEA, 0xB6, 0x5B);
+        const DOUGH_SHADE: Face = Face::rgb(0xDC, 0xA0, 0x45);
+        const CHIP: Face = Face::rgb(0x6B, 0x3A, 0x1E);
+        const CHUNK_GOLD: Face = Face::rgb_bold(0xF2, 0xBC, 0x57);
+        const CHUNK_CRUST: Face = Face::rgb_bold(0xD6, 0x7B, 0x29);
+        const CRUMB_HONEY: Face = Face::rgb_bold(0xED, 0x9F, 0x38);
+        const CRUMB_OAT: Face = Face::rgb(0xD9, 0xA7, 0x60);
+        const CRUMB_CINNAMON: Face = Face::rgb(0xB8, 0x6B, 0x35);
+        const CRUMB_AMBER: Face = Face::rgb_bold(0xDF, 0x86, 0x2F);
+        const CRUMB_COCOA: Face = Face::rgb_bold(0x8F, 0x4B, 0x24);
+
         let mut row0 = vec![
             ("    ".into(), Face::TEXT),
-            ("▄██████▄".into(), Face::HEADING),
+            ("▄██████▄".into(), CRUST_TOP),
             ("      ".into(), Face::TEXT),
             (format!("anticrumb {version}"), Face::BOLD),
         ];
@@ -398,67 +522,46 @@ impl State {
 
         let row1 = vec![
             ("   ".into(), Face::TEXT),
-            ("██".into(), Face::HEADING),
-            ("▀████▀".into(), Face::CODE),
-            ("█▌".into(), Face::HEADING),
+            ("██".into(), CRUST_LEFT),
+            ("▀█".into(), DOUGH),
+            ("█".into(), CHIP),
+            ("██▀".into(), DOUGH),
+            ("█▌".into(), CRUST_RIGHT),
             ("     ".into(), Face::TEXT),
             (account_label.clone(), Face::MUTED),
         ];
 
         let row2 = vec![
             ("   ".into(), Face::TEXT),
-            ("██".into(), Face::HEADING),
-            ("▄████".into(), Face::CODE),
+            ("██".into(), CRUST_LEFT),
+            ("▄██".into(), DOUGH_SHADE),
+            ("█".into(), CHIP),
+            ("█".into(), DOUGH_SHADE),
             ("  ".into(), Face::TEXT),
-            ("▀▄".into(), Face::ACCENT_BOLD),
+            ("▀".into(), CHUNK_GOLD),
+            ("▄".into(), CHUNK_CRUST),
             ("    ".into(), Face::TEXT),
             (model_label.clone(), Face::TEXT),
         ];
 
         let row3 = vec![
             ("    ".into(), Face::TEXT),
-            ("▀████▀".into(), Face::HEADING),
+            ("▀████▀".into(), CRUST_BOTTOM),
             ("  ".into(), Face::TEXT),
-            ("▪".into(), Face::CODE),
+            ("▪".into(), CRUMB_HONEY),
             (" ".into(), Face::TEXT),
-            ("·".into(), Face::HIGHLIGHT_BOLD),
+            ("·".into(), CRUMB_OAT),
             ("   ".into(), Face::TEXT),
             (workspace_label.clone(), Face::MUTED),
         ];
 
-        let temp_suffix = if self.options.temporary {
-            " · Temp (anonymous, no server history)"
-        } else {
-            ""
-        };
-        let mode_summary = if !self.options.agent {
-            if self.options.temporary {
-                format!("Mode: Chat{temp_suffix} (use /temp off for normal or /mode for Agent)")
-            } else {
-                "Mode: Chat (use /mode or --agent / --yolo for Agent mode)".to_owned()
-            }
-        } else if self.options.yolo {
-            format!("Mode: Agent (--yolo · all tools & sub-agents allowed){temp_suffix}")
-        } else {
-            format!(
-                "Mode: Agent (permissions: {}){temp_suffix}",
-                self.options.effective_permissions().summary()
-            )
-        };
-        let mode_face = if self.options.agent {
-            Face::HIGHLIGHT_BOLD
-        } else {
-            Face::ACCENT
-        };
         let row4 = vec![
             ("      ".into(), Face::TEXT),
-            ("·".into(), Face::MUTED),
+            ("·".into(), CRUMB_CINNAMON),
             ("  ".into(), Face::TEXT),
-            ("▪".into(), Face::ACCENT_BOLD),
+            ("▪".into(), CRUMB_AMBER),
             ("   ".into(), Face::TEXT),
-            ("▪".into(), Face::CODE),
-            ("    ".into(), Face::TEXT),
-            (mode_summary.clone(), mode_face),
+            ("▪".into(), CRUMB_COCOA),
         ];
 
         self.log_spans("", Vec::new());
@@ -466,7 +569,16 @@ impl State {
         self.log_spans(&account_label, row1);
         self.log_spans(&model_label, row2);
         self.log_spans(&workspace_label, row3);
-        self.log_spans(&mode_summary, row4);
+        self.log_spans("", row4);
+        if let Some(entry) = notice {
+            let lines = super::notices::format_notice_lines(entry);
+            if !lines.is_empty() {
+                self.log_spans("", Vec::new());
+                for line in lines {
+                    self.log_spans(&line.plain, line.spans);
+                }
+            }
+        }
         self.log_spans("", Vec::new());
     }
 
@@ -516,125 +628,6 @@ impl State {
         );
     }
 
-    pub(super) fn log_tool(&mut self, tool: &str, detail: &str) {
-        let plain = format!("  • {tool} {detail}");
-        self.push_entry(
-            &plain,
-            Entry::Tool {
-                tool: tool.into(),
-                detail: detail.into(),
-            },
-        );
-    }
-
-    fn log_preview_lines(&mut self, prefix: &str, text: &str, face: Face, max_lines: usize) {
-        let all_lines: Vec<&str> = text.lines().collect();
-        if all_lines.is_empty() {
-            let plain = format!("{prefix}(empty)");
-            self.log_spans(
-                &plain,
-                vec![(prefix.to_owned(), face), ("(empty)".into(), Face::MUTED)],
-            );
-            return;
-        }
-        for line in all_lines.iter().take(max_lines) {
-            let body = clip(line, 110);
-            let plain = format!("{prefix}{body}");
-            self.log_spans(&plain, vec![(prefix.to_owned(), face), (body, face)]);
-        }
-        if all_lines.len() > max_lines {
-            let rem = format!("… ({} more line(s))", all_lines.len() - max_lines);
-            let plain = format!("{prefix}{rem}");
-            self.log_spans(&plain, vec![(prefix.to_owned(), face), (rem, Face::MUTED)]);
-        }
-    }
-
-    pub(super) fn log_tool_approval_request(
-        &mut self,
-        step: usize,
-        calls: &[Value],
-        source: Option<&str>,
-    ) {
-        let total = calls.len();
-        let origin = source
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| format!(" · {s}"))
-            .unwrap_or_default();
-        let header = format!("\n  ? Review {total} tool(s){origin} · step {step}");
-        self.log_spans(
-            &header,
-            vec![
-                ("\n  ? ".into(), Face::HEADING),
-                (format!("Review {total} tool(s)"), Face::BOLD),
-                (format!("{origin} · step {step}"), Face::MUTED),
-            ],
-        );
-        for (idx, call) in calls.iter().enumerate() {
-            let n = idx + 1;
-            let preview = crate::cli::describe_tool_approval_call(call);
-            let prefix = format!("    [{n}/{total}] ");
-            let detail = if matches!(preview.tool.as_str(), "web_fetch" | "browser_fetch") {
-                clip(&preview.detail, 102)
-            } else {
-                preview.detail
-            };
-            let detail_face = if preview.detail_muted {
-                Face::MUTED
-            } else {
-                Face::TEXT
-            };
-            if detail.is_empty() {
-                self.log_spans(
-                    &format!("{prefix}{}", preview.tool),
-                    vec![(prefix, Face::MUTED), (preview.tool, Face::CODE_BOLD)],
-                );
-            } else {
-                let plain = format!("{prefix}{}{detail}", preview.tool);
-                self.log_spans(
-                    &plain,
-                    vec![
-                        (prefix, Face::MUTED),
-                        (preview.tool, Face::CODE_BOLD),
-                        (detail, detail_face),
-                    ],
-                );
-            }
-            for block in preview.blocks {
-                let face = match block.kind {
-                    crate::cli::ToolPreviewKind::Removed => Face::DANGER,
-                    crate::cli::ToolPreviewKind::Added => Face::HIGHLIGHT,
-                    crate::cli::ToolPreviewKind::Code | crate::cli::ToolPreviewKind::Command => {
-                        Face::CODE
-                    }
-                    crate::cli::ToolPreviewKind::Muted => Face::MUTED,
-                };
-                self.log_preview_lines(block.prefix, &block.text, face, block.max_lines);
-            }
-        }
-        let action_hint = if total <= 1 {
-            "  Press Y to approve tool, N to reject (Esc interrupts).".to_owned()
-        } else {
-            format!("  Press Y to approve all {total} tools, N to reject (Esc interrupts).")
-        };
-        self.log_spans(
-            &action_hint,
-            vec![
-                ("  Press ".into(), Face::MUTED),
-                ("Y".into(), Face::HIGHLIGHT_BOLD),
-                (
-                    if total <= 1 {
-                        " to approve tool, ".into()
-                    } else {
-                        format!(" to approve all {total} tools, ")
-                    },
-                    Face::MUTED,
-                ),
-                ("N".into(), Face::DANGER_BOLD),
-                (" to reject (Esc interrupts).".into(), Face::MUTED),
-            ],
-        );
-    }
-
     pub(super) fn respond_tool_approval(
         &mut self,
         approved: bool,
@@ -648,24 +641,8 @@ impl State {
             return false;
         };
         self.answered_approvals.insert(approval.id.clone());
-        let label = format!("{} tool(s)", approval.call_count.max(1));
-        if approved {
-            self.log_spans(
-                &format!("  ✓ Approved {label}"),
-                vec![
-                    ("  ✓ Approved ".into(), Face::HIGHLIGHT_BOLD),
-                    (label, Face::MUTED),
-                ],
-            );
-        } else {
-            self.log_spans(
-                &format!("  ✗ Rejected {label}"),
-                vec![
-                    ("  ✗ Rejected ".into(), Face::DANGER_BOLD),
-                    (label, Face::MUTED),
-                ],
-            );
-        }
+        self.tool_blocks
+            .on_approval_resolved(&approval.id, approved);
         self.phase = if !self.tool_approvals.is_empty() {
             "approval (Y/N)".into()
         } else if approved {
@@ -692,20 +669,20 @@ impl State {
             tag,
             body,
         ) {
-            self.push_entry(&err, Entry::Error(err.clone()));
+            self.push_entry_raw(&err, Entry::Error(err.clone()));
         }
     }
 
     pub(super) fn log_debug(&mut self, tag: &str, detail: &str) {
         self.write_debug_log(tag, detail);
         let plain = format!("  ⚙ [{tag}] {detail}");
-        self.log_spans(
+        self.push_entry_raw(
             &plain,
-            vec![
+            Entry::Spans(vec![
                 ("  ⚙ ".into(), Face::ACCENT),
                 (format!("[{tag}] "), Face::ACCENT),
                 (detail.to_owned(), Face::MUTED),
-            ],
+            ]),
         );
     }
 
@@ -733,7 +710,7 @@ impl State {
         } else {
             format!("  ⚙ [{tag}] {header}\n{body}")
         };
-        self.log_spans(&plain, parts);
+        self.push_entry_raw(&plain, Entry::Spans(parts));
     }
 
     pub(super) fn set_debug_level(&mut self, level: u8) {
@@ -963,6 +940,54 @@ impl State {
         provider["capabilities"]["temporary_sessions"].as_bool()
     }
 
+    pub(super) fn provider_multi_account(&self, provider_id: &str) -> bool {
+        self.status["providers"]
+            .as_array()
+            .and_then(|providers| {
+                providers
+                    .iter()
+                    .find(|p| p["id"].as_str() == Some(provider_id))
+            })
+            .and_then(|provider| provider["capabilities"]["multi_account"].as_bool())
+            .unwrap_or(provider_id == crate::provider::DEFAULT_PROVIDER_ID)
+    }
+
+    pub(super) fn format_account_entry(acct: &Value) -> String {
+        let id = acct["id"].as_str().unwrap_or("");
+        let identity = acct["identity"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let label = acct["label"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let slot = acct["slot"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let primary = identity.or(label).unwrap_or(id);
+        match slot {
+            Some(s) => format!("{primary} (u/{s})"),
+            None => primary.to_owned(),
+        }
+    }
+
+    pub(super) fn account_display_label(&self) -> String {
+        if let Some(acct) = self.account() {
+            Self::format_account_entry(acct)
+        } else {
+            self.options.account.clone()
+        }
+    }
+
+    pub(super) fn account_slot(&self) -> Option<&str> {
+        self.account()
+            .and_then(|acct| acct["slot"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     pub(super) fn warn_if_temporary_unsupported(&mut self) {
         if self.options.temporary && self.provider_temporary_support() == Some(false) {
             let name = self.provider_name().to_owned();
@@ -979,6 +1004,16 @@ impl State {
         provider_id: &str,
         provider_name: &str,
     ) {
+        self.switch_provider_with_sink(account_id, provider_id, provider_name, None);
+    }
+
+    pub(super) fn switch_provider_with_sink(
+        &mut self,
+        account_id: &str,
+        provider_id: &str,
+        provider_name: &str,
+        sink: Option<&mut dyn EffectSink>,
+    ) {
         if self.busy() {
             self.log("Interrupt the current task before switching provider or account.");
             return;
@@ -992,8 +1027,9 @@ impl State {
         if account_id == self.options.account {
             self.options.provider = Some(provider_id.to_owned());
             self.options.provider_name = Some(provider_name.to_owned());
+            let display = self.account_display_label();
             self.log(&format!(
-                "Already using {provider_name} ({provider_id}) · account {account_id}."
+                "Already using {provider_name} ({provider_id}) · account {display}."
             ));
             return;
         }
@@ -1023,6 +1059,11 @@ impl State {
         self.subagents.clear();
         self.tool_approvals.clear();
         self.answered_approvals.clear();
+        self.inspector_zoom = false;
+        self.inspector_zoom_scroll = 0;
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
+        self.seal_active_tool_block(true);
         self.reset_scroll();
         self.clear_selection();
         self.clear_painted_regions();
@@ -1038,8 +1079,22 @@ impl State {
             .unwrap_or(Value::Null);
         self.load_history();
 
+        if let Some(sink) = sink {
+            self.send(sink, Command::SetActiveAccount(account_id.to_owned()));
+            self.send(
+                sink,
+                Command::WebHistoryStatus(account_id.to_owned(), false),
+            );
+        }
+
+        let display = self.account_display_label();
+        let account_desc = if display == account_id {
+            account_id.to_owned()
+        } else {
+            format!("{display} [{account_id}]")
+        };
         let plain = format!(
-            "Provider: {provider_name} ({provider_id}) · account {account_id} · new conversation"
+            "Provider: {provider_name} ({provider_id}) · account {account_desc} · new conversation"
         );
         self.log_spans(
             &plain,
@@ -1051,7 +1106,7 @@ impl State {
                     Face::ACCENT_BOLD,
                 ),
                 (" · account ".into(), Face::MUTED),
-                (account_id.to_owned(), Face::HIGHLIGHT_BOLD),
+                (account_desc, Face::HIGHLIGHT_BOLD),
                 (" · new conversation".into(), Face::MUTED),
             ],
         );
@@ -1898,10 +1953,16 @@ impl State {
         self.subagents.clear();
         self.tool_approvals.clear();
         self.answered_approvals.clear();
+        self.inspector_zoom = false;
+        self.inspector_zoom_scroll = 0;
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
         self.reset_scroll();
         self.clear_selection();
         self.clear_painted_regions();
         self.transcript.clear();
+        self.tool_blocks.clear();
+        self.highlights.clear();
         let state_str = conversation.summary.state.as_str();
         let state_face = match state_str {
             "completed" | "ready" => Face::HIGHLIGHT_BOLD,
@@ -1935,6 +1996,16 @@ impl State {
             let task = turn.request.task.as_str();
             self.push_entry(&format!("› {task}"), Entry::Prompt(task.into()));
             if let Some(result) = &turn.result {
+                if !result.steps.is_empty() {
+                    if let Some((block_id, plain)) = self.tool_blocks.build_from_turn_steps(
+                        &result.steps,
+                        result.inspector_pruned,
+                        self.layout.inspector.after_turn,
+                        self.layout.inspector.follow,
+                    ) {
+                        self.push_entry_raw(&plain, Entry::ToolBlock(block_id));
+                    }
+                }
                 if !result.final_response.is_empty() {
                     self.log_markdown(&result.final_response);
                     self.copy_response = result.final_response.clone();
@@ -2010,7 +2081,36 @@ impl State {
         let previous_connection = self.daemon_summary();
         let prev_pid = self.provider_id().to_owned();
         let prev_temp_support = self.provider_temporary_support();
+        let prev_login_state = self
+            .last_login_status
+            .get("state")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         self.status = status;
+        // If our placeholder account was replaced by a discovered identity-anchored account
+        // on the same provider, silently follow it when idle.
+        if self.active.is_none() && self.account().is_none() {
+            let promoted = self.status["accounts"].as_array().and_then(|accounts| {
+                let active_id = self.status["active_account_id"].as_str();
+                active_id
+                    .and_then(|aid| {
+                        accounts.iter().find(|a| {
+                            a["id"].as_str() == Some(aid)
+                                && a["provider"].as_str() == Some(prev_pid.as_str())
+                        })
+                    })
+                    .or_else(|| {
+                        accounts
+                            .iter()
+                            .find(|a| a["provider"].as_str() == Some(prev_pid.as_str()))
+                    })
+                    .and_then(|a| a["id"].as_str().map(str::to_owned))
+            });
+            if let Some(new_id) = promoted {
+                self.options.account = new_id;
+                self.load_model_preference();
+            }
+        }
         self.notice_chat_cleanup();
         let connection = self.daemon_summary();
         if connection != previous_connection {
@@ -2029,6 +2129,26 @@ impl State {
             .map(|account| account["login"].clone())
             .unwrap_or(Value::Null);
         self.notice_login(login.clone());
+        if login["state"].as_str() == Some("ready")
+            && prev_login_state.as_deref() != Some("ready")
+            && self.provider_multi_account(&next_pid)
+        {
+            let provider_count = self.status["accounts"]
+                .as_array()
+                .map(|accts| {
+                    accts
+                        .iter()
+                        .filter(|a| a["provider"].as_str() == Some(next_pid.as_str()))
+                        .count()
+                })
+                .unwrap_or(0);
+            if provider_count > 1 {
+                self.log(&format!(
+                    "{provider_count} {} accounts available — use /account to switch.",
+                    self.provider_name()
+                ));
+            }
+        }
         if self.human_required() && !was_blocked && !self.login_in_progress() {
             let auth_required = self
                 .account()
@@ -2084,6 +2204,76 @@ impl State {
                 match target {
                     Some(arg) => self.apply_provider_arg(&arg, None),
                     None => self.open_providers(),
+                }
+            }
+            Update::Accounts(status, target) => {
+                if self.active.is_none() {
+                    self.phase = "ready".into();
+                }
+                self.apply_status(status);
+                match target {
+                    Some(arg) => self.apply_account_arg(&arg, None),
+                    None => self.open_accounts(),
+                }
+            }
+            Update::AccountsRefreshed {
+                status,
+                provider_id,
+                count,
+            } => {
+                if self.active.is_none() {
+                    self.phase = "ready".into();
+                }
+                if status.as_object().is_some_and(|m| !m.is_empty()) {
+                    self.apply_status(status);
+                }
+                let provider_name = self.provider_display_name(&provider_id).to_owned();
+                let mut rows = Vec::new();
+                if let Some(accounts) = self.status["accounts"].as_array() {
+                    for acct in accounts
+                        .iter()
+                        .filter(|a| a["provider"].as_str() == Some(provider_id.as_str()))
+                    {
+                        let id = acct["id"].as_str().unwrap_or("");
+                        let marker = if id == self.options.account {
+                            "●"
+                        } else {
+                            "○"
+                        };
+                        let display = Self::format_account_entry(acct);
+                        let state = acct["state"].as_str().unwrap_or("unknown");
+                        rows.push(format!("  {marker} {display} · {state}"));
+                    }
+                }
+                let suffix = if count > 1 {
+                    " Use /account to switch."
+                } else {
+                    ""
+                };
+                self.log(&format!(
+                    "Refreshed {provider_name}: {count} account(s) discovered.{suffix}"
+                ));
+                for row in rows {
+                    self.log(&row);
+                }
+            }
+            Update::ActiveAccountSet { status, account_id } => {
+                if self.active.is_none() && self.phase == "loading" {
+                    self.phase = "ready".into();
+                }
+                self.apply_status(status);
+                if self.options.account != account_id {
+                    let provider_id = self.status["accounts"]
+                        .as_array()
+                        .and_then(|accts| {
+                            accts.iter().find(|a| a["id"].as_str() == Some(&account_id))
+                        })
+                        .and_then(|a| a["provider"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(crate::provider::DEFAULT_PROVIDER_ID)
+                        .to_owned();
+                    let provider_name = self.provider_display_name(&provider_id).to_owned();
+                    self.switch_provider(&account_id, &provider_id, &provider_name);
                 }
             }
             Update::ProviderSetup {
@@ -2191,7 +2381,10 @@ impl State {
                 if self.active.is_none() && self.pending.is_none() && self.phase == "loading" {
                     self.phase = "ready".into();
                 }
-                self.log_markdown(&usage::report(&value));
+                let display_label = (value["account_id"].as_str()
+                    == Some(self.options.account.as_str()))
+                .then(|| self.account_display_label());
+                self.log_markdown(&usage::report_with_label(&value, display_label.as_deref()));
                 self.web_usage = Some(value);
                 self.web_usage_stale = false;
             }
@@ -2302,15 +2495,20 @@ impl State {
                     .as_mut()
                     .is_some_and(|mention| mention.apply_results(id, &query, matches, total));
             }
+            Update::HighlightReady { key, doc } => {
+                return self.highlights.apply_result(key, doc);
+            }
         }
         true
     }
 
     fn log_browser_status(&mut self, browser: &Value) {
-        self.log_heading(&format!(
-            "Browser · {}",
-            browser["account_id"].as_str().unwrap_or("")
-        ));
+        let heading_target = browser["provider_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| browser["account_id"].as_str())
+            .unwrap_or("");
+        self.log_heading(&format!("Browser · {heading_target}"));
         let connected = browser["connected"] == true;
         let conn_state = if connected {
             "connected"
@@ -2335,13 +2533,32 @@ impl State {
                 (browser_label.into(), Face::ACCENT),
             ],
         );
-        let acct_state = browser["account_state"].as_str().unwrap_or("unknown");
+        if let Some(total) = browser["account_count"].as_u64() {
+            let ready = browser["ready_accounts"].as_u64().unwrap_or(0);
+            self.log_kv(
+                "· ",
+                Face::ACCENT,
+                "Accounts",
+                &format!("{ready}/{total} ready"),
+                if ready > 0 {
+                    Face::HIGHLIGHT_BOLD
+                } else {
+                    Face::MUTED
+                },
+            );
+        }
+        let acct_state = self
+            .account()
+            .and_then(|a| a["state"].as_str())
+            .or_else(|| browser["account_state"].as_str())
+            .unwrap_or("unknown")
+            .to_owned();
         self.log_kv(
             "· ",
             Face::ACCENT,
             "Account state",
-            acct_state,
-            match acct_state {
+            &acct_state,
+            match acct_state.as_str() {
                 "ready" => Face::HIGHLIGHT_BOLD,
                 "awaiting_human" | "auth_required" => Face::DANGER_BOLD,
                 _ => Face::ACCENT,
@@ -2430,11 +2647,8 @@ impl State {
             Some("waiting" | "refreshing")
         ) {
             self.log("Complete sign-in on the Chrome host. Model choices will load automatically.");
-        } else if matches!(
-            browser["account_state"].as_str(),
-            Some("awaiting_human" | "auth_required")
-        ) {
-            let auth_required = browser["account_state"] == "auth_required";
+        } else if matches!(acct_state.as_str(), "awaiting_human" | "auth_required") {
+            let auth_required = acct_state == "auth_required";
             self.log_human_action_guide(auth_required, browser["headless"].as_bool(), false);
         }
     }
@@ -2454,6 +2668,7 @@ impl State {
         self.subagents.clear();
         self.tool_approvals.clear();
         self.answered_approvals.clear();
+        self.seal_active_tool_block(true);
         self.phase = job["state"].as_str().unwrap_or("finished").into();
         if let Some(text) = job["result"]["final_response"].as_str() {
             if text != self.last_response {
@@ -2678,6 +2893,14 @@ impl State {
                     .as_array()
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
+                let call_indices: Vec<usize> = event.data["call_indices"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if !approval_id.is_empty()
                     && !self.answered_approvals.contains(&approval_id)
                     && !self
@@ -2686,12 +2909,19 @@ impl State {
                         .any(|item| item.id == approval_id)
                 {
                     self.tool_approvals.push_back(PendingToolApproval {
-                        id: approval_id,
+                        id: approval_id.clone(),
                         step,
                         source: source.clone(),
                         call_count: calls.len(),
                     });
-                    self.log_tool_approval_request(step, calls, source.as_deref());
+                    self.tool_blocks.on_approval_requested(
+                        approval_id,
+                        step,
+                        calls,
+                        &call_indices,
+                        source,
+                        self.layout.inspector.follow,
+                    );
                     self.phase = "approval (Y/N)".into();
                     if self.debug.level >= 1 {
                         self.log_debug(
@@ -2704,41 +2934,24 @@ impl State {
             "tool_approval_resolved" => {
                 let approval_id = event.data["id"].as_str().unwrap_or("");
                 let approved = event.data["approved"] == true;
-                let removed = self
+                if let Some(idx) = self
                     .tool_approvals
                     .iter()
                     .position(|item| item.id == approval_id)
-                    .and_then(|idx| self.tool_approvals.remove(idx));
-                if !self.answered_approvals.remove(approval_id) {
-                    let count_label = removed
-                        .as_ref()
-                        .map(|item| format!("{} tool(s)", item.call_count.max(1)))
-                        .unwrap_or_else(|| "tool batch".into());
-                    if approved {
-                        let plain = format!("  ✓ Approved {count_label}");
-                        self.log_spans(
-                            &plain,
-                            vec![
-                                ("  ✓ Approved ".into(), Face::HIGHLIGHT_BOLD),
-                                (count_label, Face::MUTED),
-                            ],
-                        );
-                    } else {
-                        let plain = format!("  ✗ Rejected {count_label}");
-                        self.log_spans(
-                            &plain,
-                            vec![
-                                ("  ✗ Rejected ".into(), Face::DANGER_BOLD),
-                                (count_label, Face::MUTED),
-                            ],
-                        );
-                    }
-                    if self.active.is_some() && self.tool_approvals.is_empty() {
-                        self.phase = if approved { "working" } else { "thinking" }.into();
-                    }
+                {
+                    self.tool_approvals.remove(idx);
+                }
+                self.tool_blocks.on_approval_resolved(approval_id, approved);
+                if !self.answered_approvals.remove(approval_id)
+                    && self.active.is_some()
+                    && self.tool_approvals.is_empty()
+                {
+                    self.phase = if approved { "working" } else { "thinking" }.into();
                 }
             }
             "tool_started" => {
+                let step = event.data["step"].as_u64().unwrap_or(0) as usize;
+                let index = event.data["index"].as_u64().unwrap_or(0) as usize;
                 let tool = event.data["tool"].as_str().unwrap_or("tool");
                 self.phase = if self.debug.level >= 1 {
                     format!("tool:{tool}")
@@ -2746,32 +2959,39 @@ impl State {
                     "working".into()
                 };
                 let args = &event.data["args"];
-                let detail = args["path"]
-                    .as_str()
-                    .or(args["command"].as_str())
-                    .or(args["url"].as_str())
-                    .or(args["query"].as_str())
-                    .or(args["label"].as_str())
-                    .or(args["task"].as_str())
-                    .unwrap_or("");
-                self.log_tool(tool, &clip(detail, 100));
+                self.tool_blocks.on_tool_started(
+                    step,
+                    index,
+                    tool.to_owned(),
+                    args.clone(),
+                    self.layout.inspector.follow,
+                );
                 if self.debug.level >= 2 {
                     let pretty_args =
                         serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
                     self.log_debug_block("tool_args", tool, &pretty_args);
                 }
             }
+            "tool_output_chunk" => {
+                let step = event.data["step"].as_u64().unwrap_or(0) as usize;
+                let index = event.data["index"].as_u64().unwrap_or(0) as usize;
+                let stream = match event.data["stream"].as_str() {
+                    Some("stderr") => OutputStream::Stderr,
+                    _ => OutputStream::Stdout,
+                };
+                let text = event.data["text"].as_str().unwrap_or("");
+                self.tool_blocks
+                    .on_tool_output_chunk(step, index, stream, text);
+            }
             "tool_finished" => {
+                let step = event.data["step"].as_u64().unwrap_or(0) as usize;
+                let index = event.data["index"].as_u64().unwrap_or(0) as usize;
                 let ok = event.data["ok"] != false;
                 let elapsed = event.data["elapsed_ms"].as_u64().unwrap_or(0);
                 let tool = event.data["tool"].as_str().unwrap_or("tool");
                 let out = event.data["output"].as_str().unwrap_or("");
-                if !ok {
-                    self.log_error(&format!(
-                        "    ! {}",
-                        clip(if out.is_empty() { "tool failed" } else { out }, 240)
-                    ));
-                }
+                self.tool_blocks
+                    .on_tool_finished(step, index, tool, ok, out.to_owned(), elapsed);
                 if self.debug.level >= 2 {
                     let header =
                         format!("{tool} · {} · {elapsed}ms", if ok { "ok" } else { "err" });
@@ -2818,6 +3038,7 @@ impl State {
                     self.log_debug("subagent", &format!("started [{label}] ({id})"));
                 }
                 if !id.is_empty() {
+                    self.tool_blocks.on_subagent_started(&id, &label);
                     if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == id) {
                         existing.label = label;
                         existing.phase = "starting".into();
@@ -2844,6 +3065,9 @@ impl State {
                         &format!("[{label}] {phase} · {}", clip(&detail, 120)),
                     );
                 }
+                if !id.is_empty() {
+                    self.tool_blocks.on_subagent_progress(id, &phase, &detail);
+                }
                 if let Some(sub) = self.subagents.iter_mut().find(|s| s.id == id) {
                     sub.phase = phase;
                     sub.detail = detail;
@@ -2860,10 +3084,13 @@ impl State {
             }
             "subagent_finished" => {
                 let id = event.data["id"].as_str().unwrap_or("");
+                let ok = event.data["ok"] != false;
+                let elapsed = event.data["elapsed_ms"].as_u64().unwrap_or(0);
+                if !id.is_empty() {
+                    self.tool_blocks.on_subagent_finished(id, ok, elapsed);
+                }
                 if self.debug.level >= 1 && !id.is_empty() {
                     let label = event.data["label"].as_str().unwrap_or("worker");
-                    let ok = event.data["ok"] != false;
-                    let elapsed = event.data["elapsed_ms"].as_u64().unwrap_or(0);
                     self.log_debug(
                         "subagent",
                         &format!(
@@ -2896,9 +3123,248 @@ impl State {
         }
     }
 
+    pub(super) fn toggle_inspector_mode(&mut self) {
+        let mut cfg = self.layout.inspector;
+        if cfg.mode == InspectorMode::Off {
+            cfg.mode = if self.inspector_last_active_mode == InspectorMode::Off {
+                InspectorMode::Inline
+            } else {
+                self.inspector_last_active_mode
+            };
+        } else {
+            self.inspector_last_active_mode = cfg.mode;
+            cfg.mode = InspectorMode::Off;
+        }
+        self.apply_inspector_config(cfg, false);
+    }
+
+    pub(super) fn toggle_inspector_zoom(&mut self) {
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
+        if self.inspector_zoom {
+            self.inspector_zoom = false;
+            self.inspector_zoom_scroll = 0;
+        } else if self.tool_blocks.focused_block().is_some() {
+            self.inspector_zoom = true;
+            self.inspector_zoom_scroll = 0;
+            self.clear_selection();
+        }
+    }
+
+    pub(super) fn can_open_shortcuts(&self) -> bool {
+        self.editor.text.is_empty()
+            && self.history_clear_confirmation.is_none()
+            && self.menu.is_none()
+            && !self.inspector_zoom
+            && self.tool_approvals.is_empty()
+            && self.completion.is_none()
+            && self.mention.is_none()
+    }
+
+    pub(super) fn show_footer_shortcut_hint(&self) -> bool {
+        !self.busy() && !self.shortcuts_open && self.can_open_shortcuts()
+    }
+
+    pub(super) fn open_shortcuts(&mut self) {
+        self.shortcuts_open = true;
+        self.shortcuts_scroll = 0;
+        self.clear_selection();
+    }
+
+    pub(super) fn close_shortcuts(&mut self) {
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
+    }
+
+    pub(super) fn scroll_shortcuts(&mut self, up: bool, lines: usize, to_edge: Option<bool>) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let width = self
+            .painted_layout
+            .map(|l| usize::from(l.width))
+            .unwrap_or_else(|| usize::from(self.painted_size.0.max(80)));
+        let avail_rows = self
+            .painted_layout
+            .map(|l| usize::from(l.transcript.len))
+            .unwrap_or(16);
+        let (total_rows, visible_rows) = super::render::shortcuts_panel_metrics(width, avail_rows);
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+        self.shortcuts_scroll = match to_edge {
+            Some(true) => 0,
+            Some(false) => max_scroll,
+            None => {
+                let current = self.shortcuts_scroll.min(max_scroll);
+                if up {
+                    current.saturating_sub(lines)
+                } else {
+                    current.saturating_add(lines).min(max_scroll)
+                }
+            }
+        };
+    }
+
+    pub(super) fn select_prev_next_tool(&mut self, next: bool) -> bool {
+        let changed = self.tool_blocks.select_prev_next(next);
+        if changed {
+            self.inspector_zoom_scroll = 0;
+        }
+        changed
+    }
+
+    pub(super) fn toggle_inspector_follow(&mut self) -> bool {
+        let changed = self.tool_blocks.toggle_follow();
+        if changed {
+            self.inspector_zoom_scroll = 0;
+        }
+        changed
+    }
+
+    pub(super) fn scroll_focused_inspector(&mut self, up: bool, lines: usize) {
+        let Some(block_id) = self.tool_blocks.focused_id() else {
+            return;
+        };
+        let (total, body_rows) = if let Some(pane) = self
+            .painted_inspector
+            .as_ref()
+            .filter(|p| p.block_id == block_id)
+        {
+            (pane.detail_lines.len(), pane.body_rows)
+        } else if let Some(pb) = self
+            .painted_blocks
+            .iter()
+            .find(|p| p.block_id == block_id && p.inspector_detail_lines.is_some())
+        {
+            (
+                pb.inspector_detail_lines.as_ref().map_or(0, |d| d.len()),
+                pb.inspector_body_rows,
+            )
+        } else {
+            let width = self.painted_size.0.max(80);
+            let split = HorizontalSplit::compute(width, &self.layout.inspector);
+            let right_w = split.map_or(usize::from(width), |s| usize::from(s.right.len));
+            let detail = self.tool_blocks.detail_lines(
+                block_id,
+                right_w.saturating_sub(1).max(1),
+                &self.highlights,
+            );
+            let rows = self.painted_layout.map_or(10, |l| {
+                usize::from(l.transcript.len).saturating_sub(2).max(1)
+            });
+            (detail.len(), rows)
+        };
+        let max_scroll = total.saturating_sub(body_rows.max(1));
+        self.tool_blocks
+            .scroll_block(block_id, up, lines, max_scroll);
+    }
+
+    pub(super) fn scroll_zoom_overlay(&mut self, up: bool, lines: usize, to_edge: Option<bool>) {
+        let Some(block_id) = self.tool_blocks.focused_id() else {
+            return;
+        };
+        let (total, body_rows) = if let Some(pane) = self.painted_inspector.as_ref() {
+            (pane.detail_lines.len(), pane.body_rows)
+        } else {
+            let width = self.painted_size.0.max(80);
+            let detail = self.tool_blocks.detail_lines(
+                block_id,
+                usize::from(width).saturating_sub(2).max(1),
+                &self.highlights,
+            );
+            let rows = self.painted_layout.map_or(16, |l| {
+                usize::from(l.transcript.len).saturating_sub(2).max(1)
+            });
+            (detail.len(), rows)
+        };
+        let max_scroll = total.saturating_sub(body_rows.max(1));
+        self.inspector_zoom_scroll = match to_edge {
+            Some(true) => max_scroll,
+            Some(false) => 0,
+            None => {
+                let current = self.inspector_zoom_scroll.min(max_scroll);
+                if up {
+                    current.saturating_add(lines).min(max_scroll)
+                } else {
+                    current.saturating_sub(lines)
+                }
+            }
+        };
+    }
+
+    pub(super) fn transcript_lines_for(
+        &self,
+        layout: FrameLayout,
+        spinner: &str,
+    ) -> (TranscriptLines, Option<HorizontalSplit>, SplitCacheKey) {
+        let viewport = usize::from(layout.transcript.len);
+        let side_split = layout.inspector_rect.is_some();
+        let inline_split = if self.layout.inspector.mode == InspectorMode::Inline {
+            HorizontalSplit::compute(layout.width, &self.layout.inspector)
+        } else {
+            None
+        };
+        let split_active = side_split || inline_split.is_some();
+        let wrap_width = if side_split {
+            usize::from(layout.transcript_left.len)
+        } else {
+            usize::from(layout.width)
+        };
+        let block_left_width = if let Some(split) = inline_split {
+            usize::from(split.left.len)
+        } else if side_split {
+            usize::from(layout.transcript_left.len)
+        } else {
+            usize::from(layout.width).saturating_sub(1)
+        };
+        let split_key = if self.tool_blocks.is_empty() {
+            SplitCacheKey::default()
+        } else {
+            SplitCacheKey {
+                block_left_width,
+                split_active,
+                inline_split_left: inline_split.map_or(0, |s| s.left.len),
+                inline_split_right: inline_split.map_or(0, |s| s.right.len),
+                after_turn: self.layout.inspector.after_turn,
+                min_block_rows: if inline_split.is_some() {
+                    inspector::sealed_expanded_block_rows(viewport)
+                } else {
+                    0
+                },
+            }
+        };
+        let lines = self.transcript.lines_with_blocks(
+            &self.stream,
+            wrap_width,
+            &self.tool_blocks,
+            &self.tool_approvals,
+            split_key,
+            inline_split,
+            viewport,
+            spinner,
+            &self.highlights,
+        );
+        (lines, inline_split, split_key)
+    }
+
     #[cfg(test)]
     pub(super) fn transcript_lines(&self, width: usize) -> Vec<markdown::Line> {
-        self.transcript.render_lines(&self.stream, width)
+        let layout = self
+            .compute_layout(width as u16, 24)
+            .map(|(l, _)| l)
+            .unwrap_or_else(|| {
+                FrameLayout::compute_with_inspector(
+                    &self.layout,
+                    (width as u16).max(12),
+                    24,
+                    1,
+                    (0, 0),
+                    0,
+                    0,
+                    !self.tool_blocks.is_empty(),
+                )
+                .unwrap()
+            });
+        self.transcript_lines_for(layout, "⠋").0.to_vec()
     }
 
     pub(super) fn reset_scroll(&mut self) {
@@ -2910,6 +3376,7 @@ impl State {
         self.scroll_anchor_deficit = None;
         self.scroll_anchor_stream_len = 0;
         self.scroll_anchor_revision = 0;
+        self.scroll_anchor_tool_rev = 0;
         self.has_unread_below = false;
     }
 
@@ -2925,7 +3392,7 @@ impl State {
     pub(super) fn scroll_bottom_badge(&self) -> ScrollBottomBadge {
         if !self.has_unread_below {
             ScrollBottomBadge::Idle
-        } else if self.active.is_some() {
+        } else if self.needs_animation() {
             ScrollBottomBadge::Streaming
         } else {
             ScrollBottomBadge::NewOutput
@@ -2940,6 +3407,9 @@ impl State {
         visible_stream_len: usize,
     ) {
         let current_revision = self.transcript.revision();
+        let current_tool_rev = self.tool_blocks.content_rev();
+        let content_changed = current_revision != self.scroll_anchor_revision
+            || current_tool_rev != self.scroll_anchor_tool_rev;
         let anchored = self.scroll > 0 || self.scroll_anchor_deficit.is_some();
         let has_valid_anchor = anchored
             && self.scroll_anchor_width > 0
@@ -2963,7 +3433,7 @@ impl State {
                     } else {
                         self.scroll = self.scroll.saturating_add(delta);
                     }
-                    if visible_stream_len > 0 || current_revision != self.scroll_anchor_revision {
+                    if visible_stream_len > 0 || content_changed {
                         self.has_unread_below = true;
                     }
                 } else if adjusted_lines < anchor_lines {
@@ -2977,21 +3447,15 @@ impl State {
                     } else {
                         self.scroll -= delta;
                     }
-                    if current_revision != self.scroll_anchor_revision
-                        || visible_stream_len > self.scroll_anchor_stream_len
-                    {
+                    if content_changed || visible_stream_len > self.scroll_anchor_stream_len {
                         self.has_unread_below = true;
                     }
-                } else if visible_stream_len > self.scroll_anchor_stream_len
-                    || current_revision != self.scroll_anchor_revision
-                {
+                } else if visible_stream_len > self.scroll_anchor_stream_len || content_changed {
                     self.has_unread_below = true;
                 }
             } else {
                 self.scroll_anchor_deficit = None;
-                if current_revision != self.scroll_anchor_revision
-                    || visible_stream_len > self.scroll_anchor_stream_len
-                {
+                if content_changed || visible_stream_len > self.scroll_anchor_stream_len {
                     self.has_unread_below = true;
                 }
             }
@@ -3009,6 +3473,7 @@ impl State {
         self.scroll_anchor_width = wrap_width;
         self.scroll_anchor_stream_len = visible_stream_len;
         self.scroll_anchor_revision = current_revision;
+        self.scroll_anchor_tool_rev = current_tool_rev;
     }
 
     pub(super) fn scroll_transcript(
@@ -3018,8 +3483,9 @@ impl State {
         width: usize,
         height: usize,
     ) {
-        let viewport = self
-            .compute_layout(width as u16, height as u16)
+        let computed = self.compute_layout(width as u16, height as u16);
+        let viewport = computed
+            .as_ref()
             .map_or(1, |(layout, _)| usize::from(layout.transcript.len).max(1));
         if self.selection.is_some() && self.selection_target == SelectionTarget::Transcript {
             self.scroll_selection(up, lines, viewport);
@@ -3028,12 +3494,40 @@ impl State {
         // Release the previous frame's Rc snapshot so the cache can append new
         // items in-place (Rc refcount → 1) instead of deep-copying everything.
         self.painted_all_transcript.clear();
-        let all = self.transcript.lines(&self.stream, width);
-        let total_lines = all.len();
-        let evicted_lines = all.evicted_lines();
-        let visible_stream_len = all.visible_stream_len();
-        drop(all);
-        self.sync_scroll_anchor(total_lines, evicted_lines, width, visible_stream_len);
+        let (total_lines, evicted_lines, visible_stream_len, anchor_w) =
+            if let Some((layout, _)) = computed {
+                let (all, _, _) = self.transcript_lines_for(layout, "⠋");
+                let w = if layout.inspector_rect.is_some() {
+                    usize::from(layout.transcript_left.len)
+                } else {
+                    usize::from(layout.width)
+                };
+                (all.len(), all.evicted_lines(), all.visible_stream_len(), w)
+            } else {
+                let empty_approvals = VecDeque::new();
+                let split_key = SplitCacheKey {
+                    block_left_width: width.saturating_sub(1),
+                    ..SplitCacheKey::default()
+                };
+                let all = self.transcript.lines_with_blocks(
+                    &self.stream,
+                    width,
+                    &self.tool_blocks,
+                    &empty_approvals,
+                    split_key,
+                    None,
+                    viewport,
+                    "⠋",
+                    &self.highlights,
+                );
+                (
+                    all.len(),
+                    all.evicted_lines(),
+                    all.visible_stream_len(),
+                    width,
+                )
+            };
+        self.sync_scroll_anchor(total_lines, evicted_lines, anchor_w, visible_stream_len);
         let maximum = total_lines.saturating_sub(viewport);
         let current = self.scroll.min(maximum);
         let next = if up {
@@ -3048,6 +3542,7 @@ impl State {
     pub(super) fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_drag = None;
+        self.painted_inline_inspector_target = None;
     }
 
     pub(super) fn clear_painted_regions(&mut self) {
@@ -3064,8 +3559,51 @@ impl State {
         self.painted_composer.clear();
         self.painted_subagents.clear();
         self.painted_footer.clear();
+        self.painted_blocks.clear();
+        self.painted_inspector = None;
+        self.painted_inline_inspector_target = None;
+        self.divider_drag = false;
         self.painted_layout = None;
         self.scroll_bottom_button = None;
+        self.approval_buttons = None;
+    }
+
+    pub(super) fn approval_mouse(
+        &mut self,
+        mouse: event::MouseEvent,
+        sink: &mut dyn EffectSink,
+    ) -> bool {
+        if self.tool_approvals.is_empty()
+            || self.menu.is_some()
+            || self.history_clear_confirmation.is_some()
+            || self.shortcuts_open
+        {
+            return false;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return false;
+        }
+        let Some((row, approve, reject)) = self.approval_buttons else {
+            return false;
+        };
+        if mouse.row != row {
+            return false;
+        }
+        let decision = if approve.is_some_and(|(s, e)| mouse.column >= s && mouse.column < e) {
+            Some(true)
+        } else if reject.is_some_and(|(s, e)| mouse.column >= s && mouse.column < e) {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(approved) = decision else {
+            return false;
+        };
+        self.clear_selection();
+        self.last_click = None;
+        self.clipboard_notice = None;
+        self.respond_tool_approval(approved, sink);
+        true
     }
 
     pub(super) fn scroll_wheel(&mut self, up: bool, width: usize, height: usize) {
@@ -3077,6 +3615,10 @@ impl State {
         }
         if self.menu.is_some() {
             self.move_menu(up);
+        } else if self.inspector_zoom {
+            self.scroll_zoom_overlay(up, 3, None);
+        } else if self.shortcuts_open {
+            self.scroll_shortcuts(up, 3, None);
         } else {
             self.scroll_transcript(up, 3, width, height);
         }
@@ -3090,12 +3632,31 @@ impl State {
         width: usize,
         height: usize,
     ) {
-        if self.selection.is_some()
-            && self.selection_target == SelectionTarget::Transcript
-            && self.menu.is_none()
-            && self.deleting_conversation.is_none()
-            && self.history_clear_confirmation.is_none()
-        {
+        if self.deleting_conversation.is_some() || self.history_clear_confirmation.is_some() {
+            return;
+        }
+        if self.menu.is_some() {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            self.move_menu(up);
+            return;
+        }
+        if self.inspector_zoom {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            self.scroll_zoom_overlay(up, 3, None);
+            return;
+        }
+        if self.shortcuts_open {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            self.scroll_shortcuts(up, 3, None);
+            return;
+        }
+        if self.selection.is_some() && self.selection_target == SelectionTarget::Transcript {
             let (_, _, viewport) = self.transcript_bounds();
             self.scroll_selection(up, 3, viewport);
             self.extend_transcript_selection(column, row);
@@ -3106,10 +3667,7 @@ impl State {
             }
             return;
         }
-        if self.menu.is_none()
-            && self.deleting_conversation.is_none()
-            && self.history_clear_confirmation.is_none()
-            && self.mention.is_some()
+        if self.mention.is_some()
             && self
                 .painted_layout
                 .is_some_and(|layout| layout.completion.contains(row))
@@ -3118,6 +3676,39 @@ impl State {
             self.last_click = None;
             self.clipboard_notice = None;
             self.move_mention(up);
+            return;
+        }
+        // Right Inspector wheel (Side mode pane)
+        if let Some(pane) = self
+            .painted_inspector
+            .as_ref()
+            .filter(|pane| pane.rect.contains(column, row))
+            .map(|pane| (pane.block_id, pane.detail_lines.len(), pane.body_rows))
+        {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            let max_scroll = pane.1.saturating_sub(pane.2.max(1));
+            self.tool_blocks.scroll_block(pane.0, up, 3, max_scroll);
+            return;
+        }
+        // Right Inspector wheel (Inline sticky block pane)
+        if let Some((block_id, total, body_rows)) = self.painted_blocks.iter().find_map(|pb| {
+            pb.inspector_rect
+                .filter(|rect| rect.contains(column, row))
+                .map(|_| {
+                    (
+                        pb.block_id,
+                        pb.inspector_detail_lines.as_ref().map_or(0, |d| d.len()),
+                        pb.inspector_body_rows,
+                    )
+                })
+        }) {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            let max_scroll = total.saturating_sub(body_rows.max(1));
+            self.tool_blocks.scroll_block(block_id, up, 3, max_scroll);
             return;
         }
         self.scroll_wheel(up, width, height);
@@ -3172,6 +3763,10 @@ impl State {
 
     fn extend_transcript_selection(&mut self, column: u16, row: u16) {
         let (transcript_start, transcript_end, viewport) = self.transcript_bounds();
+        let max_col = self
+            .painted_layout
+            .map_or(self.painted_size.0, |l| l.transcript_left.end())
+            .max(1);
         let Some(selection_len) = self.selection.as_ref().map(|s| s.lines.len()) else {
             return;
         };
@@ -3179,19 +3774,13 @@ impl State {
         let (sel_col, sel_row) = if row < transcript_start {
             (0, view_start)
         } else if row >= transcript_end {
-            (usize::from(self.painted_size.0), view_end.saturating_sub(1))
+            (usize::from(max_col), view_end.saturating_sub(1))
         } else {
             let abs_row = view_start + usize::from(row - transcript_start);
             if abs_row >= selection_len {
-                (
-                    usize::from(self.painted_size.0),
-                    selection_len.saturating_sub(1),
-                )
+                (usize::from(max_col), selection_len.saturating_sub(1))
             } else {
-                (
-                    usize::from(column.min(self.painted_size.0.saturating_sub(1))),
-                    abs_row,
-                )
+                (usize::from(column.min(max_col.saturating_sub(1))), abs_row)
             }
         };
         if let Some(selection) = self.selection.as_mut() {
@@ -3199,10 +3788,61 @@ impl State {
         }
     }
 
+    fn active_inspector_selection_metrics(
+        &self,
+    ) -> Option<(super::layout::Rect, u16, usize, usize)> {
+        if let Some(target_id) = self.painted_inline_inspector_target {
+            if let Some(pb) = self.painted_blocks.iter().find(|p| p.block_id == target_id) {
+                if let Some(rect) = pb.inspector_rect {
+                    return Some((
+                        rect,
+                        pb.inspector_header_rows,
+                        pb.inspector_body_rows,
+                        pb.inspector_body_start,
+                    ));
+                }
+            }
+        }
+        self.painted_inspector
+            .as_ref()
+            .map(|pane| (pane.rect, pane.header_rows, pane.body_rows, pane.body_start))
+    }
+
+    fn extend_inspector_selection(&mut self, column: u16, row: u16) {
+        let Some((rect, header_rows, body_rows, body_start)) =
+            self.active_inspector_selection_metrics()
+        else {
+            return;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        if selection.lines.is_empty() || body_rows == 0 {
+            return;
+        }
+        let body_top = rect.row.start.saturating_add(header_rows);
+        let body_bottom = body_top.saturating_add(body_rows as u16);
+        let text_col_start = rect.col.start.saturating_add(1);
+        let max_rel_col = usize::from(rect.col.len.saturating_sub(2));
+        let (sel_col, sel_row) = if row < body_top {
+            (0, body_start.min(selection.lines.len() - 1))
+        } else if row >= body_bottom {
+            let last_vis = (body_start + body_rows.saturating_sub(1))
+                .min(selection.lines.len().saturating_sub(1));
+            (max_rel_col, last_vis)
+        } else {
+            let rel_row = usize::from(row - body_top);
+            let abs_row = (body_start + rel_row).min(selection.lines.len().saturating_sub(1));
+            let rel_col = usize::from(column.saturating_sub(text_col_start)).min(max_rel_col);
+            (rel_col, abs_row)
+        };
+        selection.extend(sel_col, sel_row);
+    }
+
     fn target_band(&self, target: SelectionTarget) -> Option<(u16, u16, usize)> {
         let layout = self.painted_layout?;
         let (span, col_offset) = match target {
-            SelectionTarget::Transcript => return None,
+            SelectionTarget::Transcript | SelectionTarget::Inspector => return None,
             SelectionTarget::Hint => (layout.hint, 0),
             SelectionTarget::Composer => (layout.composer, 2),
             SelectionTarget::Subagents => (layout.subagents, 0),
@@ -3306,9 +3946,61 @@ impl State {
         true
     }
 
-    pub(super) fn transcript_mouse(&mut self, mouse: event::MouseEvent) -> Option<String> {
-        if self.menu.is_some() || self.history_clear_confirmation.is_some() {
+    fn start_inspector_selection(
+        &mut self,
+        mouse: event::MouseEvent,
+        target: InspectorSelectionTarget,
+    ) {
+        let InspectorSelectionTarget {
+            rect,
+            header_rows,
+            body_rows,
+            body_start,
+            lines,
+            inline_target,
+        } = target;
+        let body_top = rect.row.start.saturating_add(header_rows);
+        let body_bottom = body_top.saturating_add(body_rows as u16);
+        if body_rows == 0 || mouse.row < body_top || mouse.row >= body_bottom {
             self.clear_selection();
+            self.last_click = None;
+            return;
+        }
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(600);
+        let is_double = self.last_click.is_some_and(|prev| {
+            prev.at.elapsed() <= DOUBLE_CLICK_WINDOW
+                && prev.row == mouse.row
+                && prev.column.abs_diff(mouse.column) <= 2
+        });
+        let rel_row = usize::from(mouse.row - body_top);
+        let abs_row = body_start + rel_row;
+        let text_col_start = rect.col.start.saturating_add(1);
+        let rel_col = usize::from(mouse.column.saturating_sub(text_col_start));
+        if is_double {
+            self.last_click = None;
+            self.selection = selection::Selection::new_block(lines, rel_col, abs_row);
+        } else {
+            self.last_click = Some(LastClick {
+                at: Instant::now(),
+                column: mouse.column,
+                row: mouse.row,
+            });
+            self.selection = selection::Selection::new(lines, rel_col, abs_row);
+        }
+        if self.selection.is_some() {
+            self.selection_target = SelectionTarget::Inspector;
+            self.selection_drag = None;
+            self.painted_inline_inspector_target = inline_target;
+        } else {
+            self.last_click = None;
+            self.painted_inline_inspector_target = None;
+        }
+    }
+
+    pub(super) fn transcript_mouse(&mut self, mouse: event::MouseEvent) -> Option<String> {
+        if self.menu.is_some() || self.history_clear_confirmation.is_some() || self.shortcuts_open {
+            self.clear_selection();
+            self.divider_drag = false;
             self.last_click = None;
             return None;
         }
@@ -3324,6 +4016,172 @@ impl State {
                     return None;
                 }
                 self.clipboard_notice = None;
+
+                // 1. Divider drag hit (±1 col), disabled during Alt+Z zoom overlay.
+                if !self.inspector_zoom {
+                    let hit_side_divider = self.painted_layout.is_some_and(|layout| {
+                        layout.transcript.contains(mouse.row)
+                            && layout
+                                .divider_x
+                                .is_some_and(|dx| mouse.column.abs_diff(dx) <= 1)
+                    });
+                    let hit_inline_divider = self.painted_blocks.iter().any(|pb| {
+                        mouse.row >= pb.vis_row_start
+                            && mouse.row < pb.vis_row_end
+                            && pb
+                                .divider_x
+                                .is_some_and(|dx| mouse.column.abs_diff(dx) <= 1)
+                    });
+                    if hit_side_divider || hit_inline_divider {
+                        self.divider_drag = true;
+                        self.clear_selection();
+                        self.last_click = None;
+                        return None;
+                    }
+                }
+
+                // 2. Inspector footer badge click (`[● Follow]` / `[▶ Follow]` / `[↓ Live]`).
+                if let Some((block_id, action)) = self.painted_inspector.as_ref().and_then(|pane| {
+                    pane.live_badge.and_then(|(r, s, e, act)| {
+                        (mouse.row == r && mouse.column >= s && mouse.column < e)
+                            .then_some((pane.block_id, act))
+                    })
+                }) {
+                    match action {
+                        InspectorBadgeAction::ToggleFollow => {
+                            self.toggle_inspector_follow();
+                        }
+                        InspectorBadgeAction::JumpToBottom => {
+                            if self.inspector_zoom {
+                                self.inspector_zoom_scroll = 0;
+                            } else {
+                                self.tool_blocks.jump_to_live(block_id);
+                            }
+                        }
+                    }
+                    self.clear_selection();
+                    self.last_click = None;
+                    return None;
+                }
+                if let Some((block_id, action)) = self.painted_blocks.iter().find_map(|pb| {
+                    pb.live_badge.and_then(|(r, s, e, act)| {
+                        (mouse.row == r && mouse.column >= s && mouse.column < e)
+                            .then_some((pb.block_id, act))
+                    })
+                }) {
+                    match action {
+                        InspectorBadgeAction::ToggleFollow => {
+                            self.toggle_inspector_follow();
+                        }
+                        InspectorBadgeAction::JumpToBottom => {
+                            self.tool_blocks.jump_to_live(block_id);
+                        }
+                    }
+                    self.clear_selection();
+                    self.last_click = None;
+                    return None;
+                }
+
+                // 3. Alt+Z fullscreen zoom overlay body selection.
+                if self.inspector_zoom {
+                    if let Some(target) = self.painted_inspector.as_ref().and_then(|pane| {
+                        pane.rect.contains(mouse.column, mouse.row).then(|| {
+                            InspectorSelectionTarget {
+                                rect: pane.rect,
+                                header_rows: pane.header_rows,
+                                body_rows: pane.body_rows,
+                                body_start: pane.body_start,
+                                lines: (*pane.detail_lines).clone(),
+                                inline_target: None,
+                            }
+                        })
+                    }) {
+                        self.start_inspector_selection(mouse, target);
+                    } else {
+                        self.clear_selection();
+                        self.last_click = None;
+                    }
+                    return None;
+                }
+
+                // 4. Side mode right Inspector selection.
+                if let Some((block_id, target)) = self.painted_inspector.as_ref().and_then(|pane| {
+                    pane.rect.contains(mouse.column, mouse.row).then(|| {
+                        (
+                            pane.block_id,
+                            InspectorSelectionTarget {
+                                rect: pane.rect,
+                                header_rows: pane.header_rows,
+                                body_rows: pane.body_rows,
+                                body_start: pane.body_start,
+                                lines: (*pane.detail_lines).clone(),
+                                inline_target: None,
+                            },
+                        )
+                    })
+                }) {
+                    self.tool_blocks.set_focused(block_id);
+                    self.start_inspector_selection(mouse, target);
+                    return None;
+                }
+
+                // 5. Inline ToolBlock right Inspector selection or left list item / collapse click.
+                if let Some((block_id, target)) = self.painted_blocks.iter().find_map(|pb| {
+                    let rect = pb.inspector_rect?;
+                    rect.contains(mouse.column, mouse.row).then(|| {
+                        (
+                            pb.block_id,
+                            InspectorSelectionTarget {
+                                rect,
+                                header_rows: pb.inspector_header_rows,
+                                body_rows: pb.inspector_body_rows,
+                                body_start: pb.inspector_body_start,
+                                lines: pb
+                                    .inspector_detail_lines
+                                    .as_ref()
+                                    .map(|d| (**d).clone())
+                                    .unwrap_or_default(),
+                                inline_target: Some(pb.block_id),
+                            },
+                        )
+                    })
+                }) {
+                    self.tool_blocks.set_focused(block_id);
+                    self.start_inspector_selection(mouse, target);
+                    return None;
+                }
+
+                if let Some((block_id, kind)) = self.painted_blocks.iter().find_map(|pb| {
+                    (mouse.row >= pb.vis_row_start
+                        && mouse.row < pb.vis_row_end
+                        && mouse.column >= pb.left_col_start
+                        && mouse.column < pb.left_col_end)
+                        .then(|| {
+                            pb.row_map
+                                .iter()
+                                .find(|(r, _)| *r == mouse.row)
+                                .map(|(_, k)| (pb.block_id, *k))
+                        })
+                        .flatten()
+                }) {
+                    match kind {
+                        BlockRowKind::CollapsedHeader | BlockRowKind::Header => {
+                            self.tool_blocks.toggle_collapse(block_id);
+                            self.clear_selection();
+                            self.last_click = None;
+                            return None;
+                        }
+                        BlockRowKind::ToolItem(idx) => {
+                            self.tool_blocks.select_item(block_id, idx);
+                            self.clear_selection();
+                            self.last_click = None;
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 6. Standard Transcript / band selection.
                 let hit = self
                     .hit_test_selection_target(mouse.row)
                     .filter(|(target, _, _)| {
@@ -3363,6 +4221,7 @@ impl State {
                                 (self.painted_transcript.clone(), viewport_row)
                             }
                         }
+                        SelectionTarget::Inspector => return None,
                         SelectionTarget::Hint => (self.painted_hint.clone(), viewport_row),
                         SelectionTarget::Composer => (self.painted_composer.clone(), viewport_row),
                         SelectionTarget::Subagents => {
@@ -3402,6 +4261,21 @@ impl State {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self.divider_drag {
+                    let total = self.painted_size.0.max(1);
+                    let right_cols = total.saturating_sub(mouse.column.saturating_add(1));
+                    let pct = ((u32::from(right_cols) * 100 + u32::from(total) / 2)
+                        / u32::from(total))
+                    .clamp(
+                        u32::from(INSPECTOR_MIN_WIDTH_PCT),
+                        u32::from(INSPECTOR_MAX_WIDTH_PCT),
+                    ) as u8;
+                    if self.layout.inspector.width_pct != pct {
+                        self.layout.inspector.width_pct = pct;
+                        self.tool_blocks.bump_layout_rev();
+                    }
+                    return None;
+                }
                 if self.last_click.is_some_and(|prev| {
                     prev.row != mouse.row || prev.column.abs_diff(mouse.column) > 1
                 }) {
@@ -3445,20 +4319,34 @@ impl State {
                         }
                     }
                     self.extend_transcript_selection(mouse.column, mouse.row);
+                } else if self.selection_target == SelectionTarget::Inspector {
+                    self.extend_inspector_selection(mouse.column, mouse.row);
                 } else {
                     self.extend_band_selection(mouse.column, mouse.row);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.divider_drag {
+                    self.divider_drag = false;
+                    let cfg = self.layout.inspector.normalized();
+                    self.layout.inspector = cfg;
+                    if let Some(prefs) = &self.preferences {
+                        let _ = prefs.set_inspector_config(&cfg);
+                    }
+                    return None;
+                }
                 if self.selection.is_some() {
                     if self.selection_target == SelectionTarget::Transcript {
                         self.extend_transcript_selection(mouse.column, mouse.row);
+                    } else if self.selection_target == SelectionTarget::Inspector {
+                        self.extend_inspector_selection(mouse.column, mouse.row);
                     } else {
                         self.extend_band_selection(mouse.column, mouse.row);
                     }
                 }
                 let copied = self.selection.take().and_then(|selection| selection.text());
                 self.selection_drag = None;
+                self.painted_inline_inspector_target = None;
                 let keep_arm_on_tap_jitter = self.last_click.is_some_and(|prev| {
                     prev.at.elapsed() <= Duration::from_millis(250)
                         && prev.row == mouse.row

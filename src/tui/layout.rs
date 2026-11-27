@@ -22,6 +22,108 @@ pub(super) const DOCK_ORDER: [Band; 7] = [
     Band::Footer,
 ];
 
+pub(super) const INSPECTOR_MIN_WIDTH_PCT: u8 = 35;
+pub(super) const INSPECTOR_MAX_WIDTH_PCT: u8 = 70;
+pub(super) const INSPECTOR_MIN_LEFT_COLS: u16 = 28;
+pub(super) const INSPECTOR_MIN_RIGHT_COLS: u16 = 44;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectorMode {
+    #[default]
+    Inline,
+    Side,
+    Off,
+}
+
+impl InspectorMode {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Inline => "Inline",
+            Self::Side => "Side",
+            Self::Off => "Off",
+        }
+    }
+
+    pub(super) fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Inline, true) | (Self::Off, false) => Self::Side,
+            (Self::Side, true) | (Self::Inline, false) => Self::Off,
+            (Self::Off, true) | (Self::Side, false) => Self::Inline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterTurnPolicy {
+    #[default]
+    Fit,
+    Collapse,
+    Keep,
+}
+
+impl AfterTurnPolicy {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Fit => "Fit",
+            Self::Collapse => "Collapse",
+            Self::Keep => "Keep",
+        }
+    }
+
+    pub(super) fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Fit, true) | (Self::Keep, false) => Self::Collapse,
+            (Self::Collapse, true) | (Self::Fit, false) => Self::Keep,
+            (Self::Keep, true) | (Self::Collapse, false) => Self::Fit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct InspectorConfig {
+    pub mode: InspectorMode,
+    pub width_pct: u8,
+    pub after_turn: AfterTurnPolicy,
+    pub follow: bool,
+    pub min_split_width: u16,
+}
+
+impl Default for InspectorConfig {
+    fn default() -> Self {
+        Self {
+            mode: InspectorMode::Inline,
+            width_pct: 55,
+            after_turn: AfterTurnPolicy::Fit,
+            follow: true,
+            min_split_width: 100,
+        }
+    }
+}
+
+impl InspectorConfig {
+    pub fn normalized(mut self) -> Self {
+        self.width_pct = self
+            .width_pct
+            .clamp(INSPECTOR_MIN_WIDTH_PCT, INSPECTOR_MAX_WIDTH_PCT);
+        let floor = INSPECTOR_MIN_LEFT_COLS + 1 + INSPECTOR_MIN_RIGHT_COLS;
+        self.min_split_width = self.min_split_width.clamp(floor, 400);
+        self
+    }
+
+    pub(super) fn summary(&self) -> String {
+        format!(
+            "{} · {}% · after-turn {} · {}",
+            self.mode.label().to_ascii_lowercase(),
+            self.width_pct,
+            self.after_turn.label().to_ascii_lowercase(),
+            if self.follow { "follow" } else { "manual" }
+        )
+    }
+}
+
 /// Runtime-mutable layout specification driving `FrameLayout::compute`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LayoutConfig {
@@ -33,6 +135,7 @@ pub(super) struct LayoutConfig {
     pub max_composer_rows: usize,
     pub max_completion_rows: usize,
     pub max_subagent_rows: usize,
+    pub inspector: InspectorConfig,
 }
 
 impl Default for LayoutConfig {
@@ -46,6 +149,7 @@ impl Default for LayoutConfig {
             max_composer_rows: 5,
             max_completion_rows: 8,
             max_subagent_rows: 8,
+            inspector: InspectorConfig::default(),
         }
     }
 }
@@ -83,12 +187,85 @@ impl RowSpan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ColSpan {
+    pub start: u16,
+    pub len: u16,
+}
+
+impl ColSpan {
+    pub(super) fn end(self) -> u16 {
+        self.start.saturating_add(self.len)
+    }
+
+    pub(super) fn contains(self, col: u16) -> bool {
+        col >= self.start && col < self.end()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Rect {
+    pub col: ColSpan,
+    pub row: RowSpan,
+}
+
+impl Rect {
+    pub(super) fn contains(self, col: u16, row: u16) -> bool {
+        self.col.contains(col) && self.row.contains(row)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HorizontalSplit {
+    pub left: ColSpan,
+    pub divider_x: u16,
+    pub right: ColSpan,
+}
+
+impl HorizontalSplit {
+    pub(super) fn compute(total_width: u16, config: &InspectorConfig) -> Option<Self> {
+        if config.mode == InspectorMode::Off {
+            return None;
+        }
+        let min_total = config
+            .min_split_width
+            .max(INSPECTOR_MIN_LEFT_COLS + 1 + INSPECTOR_MIN_RIGHT_COLS);
+        if total_width < min_total {
+            return None;
+        }
+        let usable = total_width.saturating_sub(1);
+        let pct = u32::from(
+            config
+                .width_pct
+                .clamp(INSPECTOR_MIN_WIDTH_PCT, INSPECTOR_MAX_WIDTH_PCT),
+        );
+        let desired_right = ((u32::from(total_width) * pct + 50) / 100) as u16;
+        let max_right = usable.saturating_sub(INSPECTOR_MIN_LEFT_COLS);
+        let right_len = desired_right.clamp(INSPECTOR_MIN_RIGHT_COLS, max_right);
+        let left_len = usable.saturating_sub(right_len);
+        Some(Self {
+            left: ColSpan {
+                start: 0,
+                len: left_len,
+            },
+            divider_x: left_len,
+            right: ColSpan {
+                start: left_len.saturating_add(1),
+                len: right_len,
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FrameLayout {
     pub width: u16,
     pub height: u16,
     pub header: RowSpan,
     pub transcript: RowSpan,
+    pub transcript_left: ColSpan,
+    pub inspector_rect: Option<Rect>,
+    pub divider_x: Option<u16>,
     pub hint: RowSpan,
     pub composer: RowSpan,
     pub completion: RowSpan,
@@ -103,6 +280,7 @@ impl FrameLayout {
         terminal_width.saturating_sub(4)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn compute(
         config: &LayoutConfig,
         width: u16,
@@ -111,6 +289,29 @@ impl FrameLayout {
         editor_cursor: (usize, usize),
         completion_rows: usize,
         subagent_count: usize,
+    ) -> Option<Self> {
+        Self::compute_with_inspector(
+            config,
+            width,
+            height,
+            editor_rows,
+            editor_cursor,
+            completion_rows,
+            subagent_count,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compute_with_inspector(
+        config: &LayoutConfig,
+        width: u16,
+        height: u16,
+        editor_rows: usize,
+        editor_cursor: (usize, usize),
+        completion_rows: usize,
+        subagent_count: usize,
+        has_tool_blocks: bool,
     ) -> Option<Self> {
         if width < 12 || height < 6 {
             return None;
@@ -193,11 +394,39 @@ impl FrameLayout {
             composer.start + cursor_row.saturating_sub(editor_from) as u16,
         );
 
+        let side_split = if config.inspector.mode == InspectorMode::Side && has_tool_blocks {
+            HorizontalSplit::compute(width, &config.inspector)
+        } else {
+            None
+        };
+        let (transcript_left, divider_x, inspector_rect) = if let Some(split) = side_split {
+            (
+                split.left,
+                Some(split.divider_x),
+                Some(Rect {
+                    col: split.right,
+                    row: transcript,
+                }),
+            )
+        } else {
+            (
+                ColSpan {
+                    start: 0,
+                    len: width,
+                },
+                None,
+                None,
+            )
+        };
+
         Some(Self {
             width,
             height,
             header,
             transcript,
+            transcript_left,
+            inspector_rect,
+            divider_x,
             hint,
             composer,
             completion,
@@ -334,5 +563,81 @@ mod tests {
         let hidden = FrameLayout::compute(&config, 100, 26, 1, (0, 0), 0, 2).unwrap();
         assert_eq!(hidden.header, RowSpan { start: 0, len: 0 });
         assert_eq!(hidden.transcript, RowSpan { start: 0, len: 22 });
+    }
+
+    #[test]
+    fn horizontal_split_and_inspector_layout_invariants() {
+        let mut cfg = InspectorConfig::default();
+        assert_eq!(cfg.mode, InspectorMode::Inline);
+        assert_eq!(cfg.width_pct, 55);
+        assert_eq!(cfg.min_split_width, 100);
+
+        // Below min_split_width -> None.
+        assert!(HorizontalSplit::compute(80, &cfg).is_none());
+        assert!(HorizontalSplit::compute(99, &cfg).is_none());
+
+        // Off mode -> always None regardless of width.
+        cfg.mode = InspectorMode::Off;
+        assert!(HorizontalSplit::compute(200, &cfg).is_none());
+
+        // Across widths 100..=240 and width_pct 0..=100, strict invariants hold.
+        for mode in [InspectorMode::Inline, InspectorMode::Side] {
+            for pct in [0u8, 30, 35, 50, 55, 70, 95] {
+                let c = InspectorConfig {
+                    mode,
+                    width_pct: pct,
+                    ..InspectorConfig::default()
+                };
+                for width in [100u16, 101, 120, 160, 240] {
+                    let split = HorizontalSplit::compute(width, &c).expect("split active");
+                    assert_eq!(split.left.start, 0);
+                    assert_eq!(split.divider_x, split.left.end());
+                    assert_eq!(split.right.start, split.divider_x + 1);
+                    assert_eq!(split.right.end(), width);
+                    assert!(split.left.len >= INSPECTOR_MIN_LEFT_COLS);
+                    assert!(split.right.len >= INSPECTOR_MIN_RIGHT_COLS);
+                    assert_eq!(split.left.len + 1 + split.right.len, width);
+                }
+            }
+        }
+
+        // FrameLayout::compute_with_inspector:
+        // 1. Inline mode never allocates top-level inspector_rect (splits per block).
+        let inline_cfg = LayoutConfig::default();
+        let inline =
+            FrameLayout::compute_with_inspector(&inline_cfg, 120, 26, 1, (0, 0), 0, 0, true)
+                .unwrap();
+        assert!(inline.inspector_rect.is_none());
+        assert!(inline.divider_x.is_none());
+        assert_eq!(inline.transcript_left, ColSpan { start: 0, len: 120 });
+
+        // 2. Side mode with 0 tool blocks keeps 100% full width (no wasted 55% blank pane).
+        let mut side_cfg = LayoutConfig::default();
+        side_cfg.inspector.mode = InspectorMode::Side;
+        let side_empty =
+            FrameLayout::compute_with_inspector(&side_cfg, 120, 26, 1, (0, 0), 0, 0, false)
+                .unwrap();
+        assert!(side_empty.inspector_rect.is_none());
+        assert!(side_empty.divider_x.is_none());
+        assert_eq!(side_empty.transcript_left, ColSpan { start: 0, len: 120 });
+
+        // 3. Side mode with tool blocks splits Band::Transcript cleanly.
+        let side_active =
+            FrameLayout::compute_with_inspector(&side_cfg, 120, 26, 1, (0, 0), 0, 0, true).unwrap();
+        let insp = side_active.inspector_rect.expect("side inspector rect");
+        let div = side_active.divider_x.expect("side divider");
+        assert_eq!(side_active.transcript_left.start, 0);
+        assert_eq!(side_active.transcript_left.end(), div);
+        assert_eq!(insp.col.start, div + 1);
+        assert_eq!(insp.col.end(), 120);
+        assert_eq!(insp.row.start, side_active.transcript.start);
+        assert_eq!(insp.row.len, side_active.transcript.len);
+        assert_eq!(side_active.transcript_left.len + 1 + insp.col.len, 120);
+
+        // 4. Side mode below min_split_width falls back to single column.
+        let side_narrow =
+            FrameLayout::compute_with_inspector(&side_cfg, 80, 26, 1, (0, 0), 0, 0, true).unwrap();
+        assert!(side_narrow.inspector_rect.is_none());
+        assert_eq!(side_narrow.transcript_left, ColSpan { start: 0, len: 80 });
     }
 }

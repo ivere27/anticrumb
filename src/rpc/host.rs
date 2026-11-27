@@ -40,22 +40,7 @@ impl Host {
             providers.load_providers_dir(dir)?;
         }
         providers.load_persisted_manifests(&store)?;
-        if store.get::<Account>("local", "account", "default").is_err() {
-            store.put(
-                "local",
-                "account",
-                "default",
-                &Account {
-                    id: "default".into(),
-                    provider: default_provider(),
-                    profile: crate::browser_host::default_profile_dir(),
-                    subprofile: None,
-                    port: 9222,
-                    headless: true,
-                    state: "auth_required".into(),
-                },
-            )?;
-        }
+        crate::account::ensure_provider_account(&store, &providers, &default_provider())?;
         let backend = Arc::new(crate::service::WebBackend::with_providers(
             store.clone(),
             providers.clone(),
@@ -184,14 +169,14 @@ impl Host {
         if self.role != "browser" {
             return;
         }
-        let accounts = self
+        let browsers = self
             .service
             .store
-            .list::<Account>("local", "account")
+            .list_browser_profiles()
             .unwrap_or_default();
-        let closed_ids = crate::browser_host::shutdown_managed_browsers(&accounts);
-        for id in closed_ids {
-            let _ = crate::account::invalidate_account_sessions(&self.service.store, &id);
+        let closed_providers = crate::browser_host::shutdown_managed_browsers(&browsers);
+        for provider_id in closed_providers {
+            let _ = crate::account::invalidate_provider_sessions(&self.service.store, &provider_id);
         }
     }
     pub fn info(&self) -> pb::HostInfo {
@@ -253,7 +238,9 @@ impl Host {
                     .await
                 {
                     Ok(()) => {
+                        host_status.browsers = cached.browsers;
                         host_status.accounts = cached.accounts;
+                        host_status.active_account_id = cached.active_account_id;
                         host_status.providers = cached.providers;
                         status.connected = true;
                         status.error.clear();
@@ -281,6 +268,61 @@ impl Host {
             }
         }
         Some(status)
+    }
+    fn resolve_account_id(&self, raw: &str) -> Result<String> {
+        if raw.trim().is_empty() {
+            self.service.store.resolve_active_account_id()
+        } else {
+            Ok(raw.trim().to_owned())
+        }
+    }
+    fn resolve_provider_id(&self, raw: &str) -> String {
+        if raw.trim().is_empty() {
+            self.service
+                .store
+                .resolve_active_account_id()
+                .ok()
+                .and_then(|aid| {
+                    self.service
+                        .store
+                        .get::<Account>("local", "account", &aid)
+                        .ok()
+                })
+                .map(|a| a.provider)
+                .unwrap_or_else(default_provider)
+        } else {
+            raw.trim().to_owned()
+        }
+    }
+    async fn rescan_provider_accounts(&self, provider_id: &str) -> Result<()> {
+        let browser_gate = self.service.browser_gate(provider_id);
+        let browser_permit = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            browser_gate.write_owned(),
+        )
+        .await
+        .map_err(|_| {
+            ServiceError::new(
+                ErrorCode::QueueFull,
+                "account",
+                "provider browser is busy; cannot rescan accounts",
+            )
+        })?;
+        let store = self.service.store.clone();
+        let provider = self.providers.resolve(provider_id)?;
+        let provider_id = provider_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _browser_permit = browser_permit;
+            crate::account::refresh_accounts(
+                &store,
+                &provider_id,
+                provider.as_ref(),
+                crate::agent::CancelToken::new(),
+            )
+        })
+        .await
+        .map_err(ServiceError::storage)??;
+        Ok(())
     }
     pub async fn dispatch(self: &Arc<Self>, path: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
         if bytes.len() > MAX_MESSAGE {
@@ -312,15 +354,13 @@ impl Host {
                 .await?
                 .encode_to_vec()),
             "/anticrumb.v1.AccountService/ClearWebHistory" => {
-                let status = self
-                    .service
-                    .clear_web_history(&decode!(pb::AccountRef).account_id)?;
+                let account_id = self.resolve_account_id(&decode!(pb::AccountRef).account_id)?;
+                let status = self.service.clear_web_history(&account_id)?;
                 Ok(codec::web_history_to(status).encode_to_vec())
             }
             "/anticrumb.v1.AccountService/GetWebHistoryCleanup" => {
-                let status = self
-                    .service
-                    .web_history_cleanup(&decode!(pb::AccountRef).account_id)?;
+                let account_id = self.resolve_account_id(&decode!(pb::AccountRef).account_id)?;
+                let status = self.service.web_history_cleanup(&account_id)?;
                 Ok(codec::web_history_to(status).encode_to_vec())
             }
             "/anticrumb.v1.TurnService/CreateTurn" => {
@@ -371,99 +411,212 @@ impl Host {
                 Ok(pb::ArtifactList { artifacts }.encode_to_vec())
             }
             "/anticrumb.v1.AccountService/GetWebUsage" => {
-                let account = decode!(pb::AccountRef).account_id;
-                // Usage reads on an idle Worker (or temporary overflow) tab so active chat turns
-                // do not block `/usage`. Only block during sign-in, history cleanup, or lifecycle ops.
-                let login_active = crate::account::login_status(&self.service.store, &account)
+                let account_id = self.resolve_account_id(&decode!(pb::AccountRef).account_id)?;
+                for attempt in 0..2 {
+                    let account: Account =
+                        self.service.store.get("local", "account", &account_id)?;
+                    // Usage reads on an idle Worker (or temporary overflow) tab so active chat turns
+                    // do not block `/usage`. Only block during sign-in, history cleanup, or lifecycle ops.
+                    let login_active = crate::account::provider_login_status(
+                        &self.service.store,
+                        &account.provider,
+                    )
                     .is_some_and(|v| matches!(v.state.as_str(), "waiting" | "refreshing"));
-                let history_active = self.service.web_history_active(&account)?;
-                if login_active || history_active {
-                    return Err(ServiceError::new(
-                        ErrorCode::QueueFull,
-                        "usage",
-                        "account is signing in or cleaning history; wait for it to finish, then try /usage again",
-                    ));
+                    let history_active = self.service.web_history_active(&account_id)?;
+                    if login_active || history_active {
+                        return Err(ServiceError::new(
+                            ErrorCode::QueueFull,
+                            "usage",
+                            "account is signing in or cleaning history; wait for it to finish, then try /usage again",
+                        ));
+                    }
+                    let browser_permit = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        self.service.browser_gate(&account.provider).read_owned(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        ServiceError::new(
+                            ErrorCode::QueueFull,
+                            "usage",
+                            "provider browser is busy; wait for the current browser operation to finish, then try /usage again",
+                        )
+                    })?;
+                    let usage_gate = self.usage_gate(&account_id);
+                    let usage_permit = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        usage_gate.acquire_owned(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .ok_or_else(|| {
+                        ServiceError::new(
+                            ErrorCode::QueueFull,
+                            "usage",
+                            "account is busy; wait for the current browser operation to finish, then try /usage again",
+                        )
+                    })?;
+                    let host = self.clone();
+                    let path_owned = path.to_owned();
+                    let account_for_task = account_id.clone();
+                    let bytes_clone = bytes.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        let _browser_permit = browser_permit;
+                        let _usage_permit = usage_permit;
+                        host.account_action(&path_owned, &account_for_task, &bytes_clone)
+                    })
+                    .await
+                    .map_err(ServiceError::storage)?;
+                    match res {
+                        Err(ref err) if err.stage == "identity_mismatch" && attempt == 0 => {
+                            if self
+                                .rescan_provider_accounts(&account.provider)
+                                .await
+                                .is_ok()
+                            {
+                                continue;
+                            }
+                            return res;
+                        }
+                        other => return other,
+                    }
                 }
-                let usage_gate = self.usage_gate(&account);
-                let permit = tokio::time::timeout(
+                unreachable!()
+            }
+            "/anticrumb.v1.AccountService/BrowserFetch" => {
+                let req = decode!(pb::BrowserFetchRequest);
+                let account_id = self.resolve_account_id(&req.account_id)?;
+                let account: Account = self.service.store.get("local", "account", &account_id)?;
+                let browser_permit = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
-                    usage_gate.acquire_owned(),
+                    self.service.browser_gate(&account.provider).read_owned(),
                 )
                 .await
-                .ok()
-                .and_then(std::result::Result::ok)
-                .ok_or_else(|| {
+                .map_err(|_| {
                     ServiceError::new(
                         ErrorCode::QueueFull,
-                        "usage",
-                        "account is busy; wait for the current browser operation to finish, then try /usage again",
+                        "browser_fetch",
+                        "provider browser is busy",
                     )
                 })?;
+                // Browser fetch uses an isolated ephemeral tab for external pages/search
+                // and is decoupled from the chat tab pool and account gate.
                 let host = self.clone();
                 let path = path.to_owned();
                 tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    host.account_action(&path, &account, &bytes)
+                    let _browser_permit = browser_permit;
+                    host.account_action(&path, &account_id, &bytes)
                 })
                 .await
                 .map_err(ServiceError::storage)?
             }
-            "/anticrumb.v1.AccountService/BrowserFetch" => {
-                let req = decode!(pb::BrowserFetchRequest);
-                let account = if req.account_id.is_empty() {
-                    "default".to_owned()
-                } else {
-                    req.account_id
-                };
-                // Browser fetch uses an isolated ephemeral tab for external pages/search
-                // and is decoupled from the Gemini chat tab pool and account gate.
-                let host = self.clone();
-                let path = path.to_owned();
-                tokio::task::spawn_blocking(move || host.account_action(&path, &account, &bytes))
-                    .await
-                    .map_err(ServiceError::storage)?
-            }
             "/anticrumb.v1.AccountService/BrowserControl" => {
                 let req = decode!(pb::BrowserControlRequest);
-                let account = if req.account_id.is_empty() {
-                    "default".to_owned()
-                } else {
-                    req.account_id
-                };
+                let account_id = self.resolve_account_id(&req.account_id)?;
+                let account: Account = self.service.store.get("local", "account", &account_id)?;
+                let browser_permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    self.service.browser_gate(&account.provider).read_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    ServiceError::new(
+                        ErrorCode::QueueFull,
+                        "browser_control",
+                        "provider browser is busy",
+                    )
+                })?;
                 // Stateful browser control runs on dedicated controlled tabs, decoupled from
-                // Gemini's account_gate and chat tab pool.
+                // the account_gate and chat tab pool.
                 let host = self.clone();
                 let path = path.to_owned();
-                tokio::task::spawn_blocking(move || host.account_action(&path, &account, &bytes))
-                    .await
-                    .map_err(ServiceError::storage)?
+                tokio::task::spawn_blocking(move || {
+                    let _browser_permit = browser_permit;
+                    host.account_action(&path, &account_id, &bytes)
+                })
+                .await
+                .map_err(ServiceError::storage)?
             }
-            "/anticrumb.v1.ModelService/RefreshCatalog"
-            | "/anticrumb.v1.AccountService/OpenLogin"
-            | "/anticrumb.v1.AccountService/SetBrowserMode"
-            | "/anticrumb.v1.AccountService/AttachBrowser"
-            | "/anticrumb.v1.AccountService/PauseAccount" => {
-                let account = if path.ends_with("/AttachBrowser") {
-                    decode!(pb::AttachBrowserRequest).account_id
-                } else if path.ends_with("/SetBrowserMode") {
-                    decode!(pb::SetBrowserModeRequest).account_id
-                } else {
-                    decode!(pb::AccountRef).account_id
-                };
-                let cancelled = self.logins.cancel(&self.service.store, &account)?;
-                let gate = self.service.account_gate(&account);
-                let permit = if cancelled || path.ends_with("/RefreshCatalog") {
-                    tokio::time::timeout(std::time::Duration::from_secs(15), gate.acquire_owned())
-                        .await
-                        .ok()
-                        .and_then(std::result::Result::ok)
-                } else {
-                    gate.try_acquire_owned().ok()
+            "/anticrumb.v1.ModelService/RefreshCatalog" => {
+                let account_id = self.resolve_account_id(&decode!(pb::AccountRef).account_id)?;
+                for attempt in 0..2 {
+                    let account: Account =
+                        self.service.store.get("local", "account", &account_id)?;
+                    let _ = self.logins.cancel(&self.service.store, &account.provider)?;
+                    let browser_permit = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        self.service.browser_gate(&account.provider).read_owned(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        ServiceError::new(
+                            ErrorCode::QueueFull,
+                            "account",
+                            "provider browser is busy",
+                        )
+                    })?;
+                    let gate = self.service.account_gate(&account_id);
+                    let permit = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        gate.acquire_owned(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .ok_or_else(|| {
+                        ServiceError::new(ErrorCode::QueueFull, "account", "account is busy")
+                    })?;
+                    let usage_gate = self.usage_gate(&account_id);
+                    let usage_permit = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        usage_gate.acquire_owned(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .ok_or_else(|| {
+                        ServiceError::new(
+                            ErrorCode::QueueFull,
+                            "account",
+                            "account is busy checking usage",
+                        )
+                    })?;
+                    let host = self.clone();
+                    let path_owned = path.to_owned();
+                    let account_for_task = account_id.clone();
+                    let bytes_clone = bytes.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        let _browser_permit = browser_permit;
+                        let _permit = permit;
+                        let _usage_permit = usage_permit;
+                        host.account_action(&path_owned, &account_for_task, &bytes_clone)
+                    })
+                    .await
+                    .map_err(ServiceError::storage)?;
+                    match res {
+                        Err(ref err) if err.stage == "identity_mismatch" && attempt == 0 => {
+                            if self
+                                .rescan_provider_accounts(&account.provider)
+                                .await
+                                .is_ok()
+                            {
+                                continue;
+                            }
+                            return res;
+                        }
+                        other => return other,
+                    }
                 }
-                .ok_or_else(|| {
+                unreachable!()
+            }
+            "/anticrumb.v1.AccountService/PauseAccount" => {
+                let account_id = self.resolve_account_id(&decode!(pb::AccountRef).account_id)?;
+                let gate = self.service.account_gate(&account_id);
+                let permit = gate.try_acquire_owned().map_err(|_| {
                     ServiceError::new(ErrorCode::QueueFull, "account", "account is busy")
                 })?;
-                let usage_gate = self.usage_gate(&account);
+                let usage_gate = self.usage_gate(&account_id);
                 let usage_permit = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     usage_gate.acquire_owned(),
@@ -483,7 +636,47 @@ impl Host {
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let _usage_permit = usage_permit;
-                    host.account_action(&path, &account, &bytes)
+                    host.account_action(&path, &account_id, &bytes)
+                })
+                .await
+                .map_err(ServiceError::storage)?
+            }
+            "/anticrumb.v1.AccountService/OpenLogin"
+            | "/anticrumb.v1.AccountService/SetBrowserMode"
+            | "/anticrumb.v1.AccountService/AttachBrowser"
+            | "/anticrumb.v1.AccountService/RefreshAccounts" => {
+                let provider_id = if path.ends_with("/AttachBrowser") {
+                    self.resolve_provider_id(&decode!(pb::AttachBrowserRequest).provider_id)
+                } else if path.ends_with("/SetBrowserMode") {
+                    self.resolve_provider_id(&decode!(pb::SetBrowserModeRequest).provider_id)
+                } else {
+                    self.resolve_provider_id(&decode!(pb::ProviderRef).id)
+                };
+                crate::account::ensure_provider_account(
+                    &self.service.store,
+                    &self.providers,
+                    &provider_id,
+                )?;
+                let cancelled = self.logins.cancel(&self.service.store, &provider_id)?;
+                let browser_gate = self.service.browser_gate(&provider_id);
+                let browser_permit = if cancelled || path.ends_with("/RefreshAccounts") {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        browser_gate.write_owned(),
+                    )
+                    .await
+                    .ok()
+                } else {
+                    browser_gate.try_write_owned().ok()
+                }
+                .ok_or_else(|| {
+                    ServiceError::new(ErrorCode::QueueFull, "browser", "provider browser is busy")
+                })?;
+                let host = self.clone();
+                let path = path.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let _browser_permit = browser_permit;
+                    host.provider_action(&path, &provider_id, &bytes)
                 })
                 .await
                 .map_err(ServiceError::storage)?
@@ -515,9 +708,11 @@ impl Host {
         match path {
             "/anticrumb.v1.AccountService/GetWebUsage" => {
                 let account: Account = store.get("local", "account", id)?;
+                let browser = store.browser_for_account(&account)?;
                 let provider = self.providers.resolve(&account.provider)?;
                 let mut usage = crate::account::web_usage_with_store(
                     Some(store),
+                    &browser,
                     &account,
                     provider.as_ref(),
                     crate::agent::CancelToken::new(),
@@ -529,8 +724,9 @@ impl Host {
                 let req = pb::BrowserFetchRequest::decode(bytes)
                     .map_err(|e| ServiceError::invalid(format!("invalid protobuf: {e}")))?;
                 let account: Account = store.get("local", "account", id)?;
+                let browser = store.browser_for_account(&account)?;
                 let out = crate::account::browser_fetch(
-                    &account,
+                    &browser,
                     &req.url,
                     req.wait_ms,
                     req.max_chars as usize,
@@ -547,7 +743,9 @@ impl Host {
                 let req = pb::BrowserControlRequest::decode(bytes)
                     .map_err(|e| ServiceError::invalid(format!("invalid protobuf: {e}")))?;
                 let account: Account = store.get("local", "account", id)?;
+                let browser = store.browser_for_account(&account)?;
                 let mut out = self.browser_control.execute(
+                    &browser,
                     &account,
                     &req,
                     crate::agent::CancelToken::new(),
@@ -563,42 +761,11 @@ impl Host {
             }
             "/anticrumb.v1.ModelService/RefreshCatalog" => {
                 let mut account: Account = store.get("local", "account", id)?;
+                let browser = store.browser_for_account(&account)?;
                 let provider = self.providers.resolve(&account.provider)?;
-                let catalog = crate::account::probe(store, &mut account, provider.as_ref())?;
+                let catalog =
+                    crate::account::probe(store, &browser, &mut account, provider.as_ref())?;
                 Ok(codec::catalog_to(id, &self.server_id, catalog).encode_to_vec())
-            }
-            "/anticrumb.v1.AccountService/OpenLogin" => {
-                let account: Account = store.get("local", "account", id)?;
-                let provider = self.providers.resolve(&account.provider)?;
-                crate::account::login(store, id, provider.as_ref())?;
-                self.logins.start(
-                    store.clone(),
-                    store.get("local", "account", id)?,
-                    provider,
-                    self.service.account_gate(id),
-                )?;
-                Ok(pb::Empty {}.encode_to_vec())
-            }
-            "/anticrumb.v1.AccountService/SetBrowserMode" => {
-                let r = pb::SetBrowserModeRequest::decode(bytes)
-                    .map_err(|e| ServiceError::invalid(format!("invalid protobuf: {e}")))?;
-                let account: Account = store.get("local", "account", id)?;
-                let provider = self.providers.resolve(&account.provider)?;
-                let mut status =
-                    crate::account::set_browser_mode(store, id, r.headless, provider.as_ref())?;
-                if !r.headless {
-                    let account: Account = store.get("local", "account", id)?;
-                    if !matches!(account.state.as_str(), "ready" | "disabled") {
-                        self.logins.start(
-                            store.clone(),
-                            account,
-                            provider,
-                            self.service.account_gate(id),
-                        )?;
-                        status = crate::account::browser_status(store, id)?;
-                    }
-                }
-                Ok(codec::browser_status_to(status).encode_to_vec())
             }
             "/anticrumb.v1.AccountService/PauseAccount" => {
                 let mut account: Account = store.get("local", "account", id)?;
@@ -606,15 +773,81 @@ impl Host {
                 store.put("local", "account", id, &account)?;
                 Ok(codec::account_to(account).encode_to_vec())
             }
-            _ => {
+            _ => Err(ServiceError::new(
+                ErrorCode::UnsupportedCapability,
+                "rpc",
+                format!("unknown account action: {path}"),
+            )),
+        }
+    }
+    fn provider_action(&self, path: &str, provider_id: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        let store = &self.service.store;
+        match path {
+            "/anticrumb.v1.AccountService/OpenLogin" => {
+                let provider = self.providers.resolve(provider_id)?;
+                crate::account::login(store, provider_id, provider.as_ref())?;
+                let browser = store.browser_profile(provider_id)?;
+                self.logins.start(
+                    store.clone(),
+                    browser,
+                    provider,
+                    self.service.browser_gate(provider_id),
+                )?;
+                Ok(pb::Empty {}.encode_to_vec())
+            }
+            "/anticrumb.v1.AccountService/SetBrowserMode" => {
+                let r = pb::SetBrowserModeRequest::decode(bytes)
+                    .map_err(|e| ServiceError::invalid(format!("invalid protobuf: {e}")))?;
+                let provider = self.providers.resolve(provider_id)?;
+                let mut status = crate::account::set_browser_mode(
+                    store,
+                    provider_id,
+                    r.headless,
+                    provider.as_ref(),
+                )?;
+                if !r.headless {
+                    let accounts = store.accounts_for_provider(provider_id)?;
+                    let needs_login = accounts.is_empty()
+                        || accounts
+                            .iter()
+                            .any(|a| !matches!(a.state.as_str(), "ready" | "disabled"));
+                    if needs_login {
+                        let browser = store.browser_profile(provider_id)?;
+                        self.logins.start(
+                            store.clone(),
+                            browser,
+                            provider,
+                            self.service.browser_gate(provider_id),
+                        )?;
+                        status = crate::account::browser_status(store, provider_id)?;
+                    }
+                }
+                Ok(codec::browser_status_to(status).encode_to_vec())
+            }
+            "/anticrumb.v1.AccountService/RefreshAccounts" => {
+                let provider = self.providers.resolve(provider_id)?;
+                let accounts = crate::account::refresh_accounts(
+                    store,
+                    provider_id,
+                    provider.as_ref(),
+                    crate::agent::CancelToken::new(),
+                )?;
+                Ok(pb::AccountList {
+                    accounts: accounts.into_iter().map(codec::account_to).collect(),
+                }
+                .encode_to_vec())
+            }
+            "/anticrumb.v1.AccountService/AttachBrowser" => {
                 let r = pb::AttachBrowserRequest::decode(bytes).map_err(ServiceError::storage)?;
                 let port = u16::try_from(r.port).map_err(ServiceError::storage)?;
-                crate::account::attach(store, id, port)?;
-                Ok(
-                    codec::browser_status_to(crate::account::browser_status(store, id)?)
-                        .encode_to_vec(),
-                )
+                let status = crate::account::attach(store, provider_id, port)?;
+                Ok(codec::browser_status_to(status).encode_to_vec())
             }
+            _ => Err(ServiceError::new(
+                ErrorCode::UnsupportedCapability,
+                "rpc",
+                format!("unknown provider action: {path}"),
+            )),
         }
     }
     fn dispatch_sync(&self, path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -636,6 +869,12 @@ impl Host {
                 reply!(codec::usage_to(store.usage_record()?))
             }
             "/anticrumb.v1.PlatformService/GetStatus" => {
+                let active_account_id = store.resolve_active_account_id().ok();
+                let browsers = store
+                    .list_browser_profiles()?
+                    .into_iter()
+                    .map(codec::browser_profile_to)
+                    .collect();
                 let accounts = store
                     .list::<Account>("local", "account")?
                     .into_iter()
@@ -650,14 +889,20 @@ impl Host {
                                 .find(|m| m.selected)
                                 .map(|m| m.display_name().to_owned())
                         });
+                        let active = active_account_id.as_deref() == Some(a.id.as_str());
+                        let login = crate::account::provider_login_status(store, &a.provider)
+                            .map(codec::login_status_to);
                         Ok(pb::AccountStatus {
                             id: a.id.clone(),
                             provider: a.provider,
                             state: a.state,
+                            identity: a.identity,
+                            label: a.label,
+                            slot: a.slot,
+                            active,
                             selected_model,
+                            login,
                             catalog: Some(codec::catalog_to(&a.id, &self.server_id, catalog)),
-                            login: crate::account::login_status(store, &a.id)
-                                .map(codec::login_status_to),
                         })
                     })
                     .collect::<Result<_>>()?;
@@ -670,8 +915,10 @@ impl Host {
                         .transpose()?
                         .unwrap_or(0),
                     server_id: self.server_id.clone(),
-                    accounts,
                     usage: Some(codec::usage_to(store.usage_record()?)),
+                    browsers,
+                    accounts,
+                    active_account_id,
                     providers: self
                         .providers
                         .list()
@@ -682,6 +929,15 @@ impl Host {
                     chat_cleanup: Some(codec::chat_cleanup_to(crate::service::cleanup::status(
                         store
                     )?)),
+                    workspace_alerts: self
+                        .agents
+                        .as_ref()
+                        .map(|agents| agents.workspace_alerts())
+                        .transpose()?
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(codec::workspace_alert_to)
+                        .collect(),
                 })
             }
             "/anticrumb.v1.PlatformService/PruneCache" => {
@@ -733,44 +989,53 @@ impl Host {
                     .map(codec::account_to)
                     .collect()
             }),
-            "/anticrumb.v1.AccountService/CreateAccount" => {
-                let r = decode!(pb::CreateAccountRequest);
-                validate_id(&r.id)?;
-                let provider = if r.provider.is_empty() {
-                    default_provider()
-                } else {
-                    r.provider
-                };
-                self.providers.resolve(&provider)?;
-                let requested_port = u16::try_from(r.port).map_err(ServiceError::storage)?;
-                let existing = store.list::<Account>("local", "account")?;
-                if existing.iter().any(|a| a.id == r.id) {
-                    return Err(ServiceError::invalid("account ID already exists"));
-                }
-                let port = allocate_cdp_port(&existing, requested_port)?;
-                let a = Account {
-                    id: r.id.clone(),
-                    provider,
-                    profile: crate::cli::app_dir()
-                        .join("accounts")
-                        .join(&r.id)
-                        .join("profile"),
-                    subprofile: None,
-                    port,
-                    headless: true,
-                    state: "auth_required".into(),
-                };
-                store.put("local", "account", &a.id, &a)?;
-                reply!(codec::account_to(a))
+            "/anticrumb.v1.AccountService/ListBrowsers" => reply!(pb::BrowserProfileList {
+                browsers: store
+                    .list_browser_profiles()?
+                    .into_iter()
+                    .map(codec::browser_profile_to)
+                    .collect()
+            }),
+            "/anticrumb.v1.AccountService/EnsureProviderAccount" => {
+                let r = decode!(pb::ProviderRef);
+                let (_, account) =
+                    crate::account::ensure_provider_account(store, &self.providers, &r.id)?;
+                reply!(codec::account_to(account))
+            }
+            "/anticrumb.v1.AccountService/SetActiveAccount" => {
+                let r = decode!(pb::AccountRef);
+                let account = store.resolve_account_query(&r.account_id, None)?;
+                store.set_active_account_id(&account.id)?;
+                reply!(codec::account_to(account))
             }
             "/anticrumb.v1.AccountService/GetBrowserStatus" => {
-                reply!(codec::browser_status_to(crate::account::browser_status(
-                    store,
-                    &decode!(pb::AccountRef).account_id
-                )?))
+                let provider_id = self.resolve_provider_id(&decode!(pb::ProviderRef).id);
+                let status = match store.browser_profile(&provider_id) {
+                    Ok(_) => crate::account::browser_status(store, &provider_id)?,
+                    Err(err) if err.code == ErrorCode::NotFound => {
+                        self.providers.resolve(&provider_id)?;
+                        BrowserStatusRecord {
+                            provider_id: provider_id.clone(),
+                            connected: false,
+                            endpoint: String::new(),
+                            browser: None,
+                            profile: crate::browser_host::provider_profile_dir(&provider_id),
+                            profile_matches: None,
+                            headless: None,
+                            owned_sessions: 0,
+                            account_count: 0,
+                            ready_accounts: 0,
+                            last_verified_sign_in: None,
+                            checked_at: None,
+                            login: crate::account::provider_login_status(store, &provider_id),
+                        }
+                    }
+                    Err(err) => return Err(err),
+                };
+                reply!(codec::browser_status_to(status))
             }
             "/anticrumb.v1.ModelService/GetCatalog" => {
-                let id = decode!(pb::AccountRef).account_id;
+                let id = self.resolve_account_id(&decode!(pb::AccountRef).account_id)?;
                 reply!(codec::catalog_to(
                     &id,
                     &self.server_id,
@@ -798,20 +1063,22 @@ impl Host {
                 self.service.cancel(&decode!(pb::TurnRef).id)?;
                 reply!(pb::Empty {})
             }
-            "/anticrumb.v1.TurnService/ReadEvents"
-            | "/anticrumb.v1.WorkspaceService/ReadAgentEvents" => {
+            "/anticrumb.v1.TurnService/ReadEvents" => {
                 let r = decode!(pb::EventCursor);
-                if path.contains("TurnService") {
-                    self.service.snapshot(&r.run_id)?;
-                } else {
-                    self.agents()?.snapshot(&r.run_id)?;
-                }
+                self.service.snapshot(&r.run_id)?;
                 reply!(pb::EventPage {
                     events: store
                         .events(&r.run_id, r.after)?
                         .into_iter()
                         .map(codec::event_to)
                         .collect()
+                })
+            }
+            "/anticrumb.v1.WorkspaceService/ReadAgentEvents" => {
+                let r = decode!(pb::EventCursor);
+                let events = self.agents()?.read_events(&r.run_id, r.after)?;
+                reply!(pb::EventPage {
+                    events: events.into_iter().map(codec::event_to).collect()
                 })
             }
             "/anticrumb.v1.SessionService/GetSession" => {
@@ -972,9 +1239,14 @@ impl Host {
         let expected_size = meta.size;
         let writer = store
             .blocking(move |s| {
-                let _: Account = s.get("local", "account", &meta_account)?;
+                let resolved_account = if meta_account.trim().is_empty() {
+                    s.resolve_active_account_id()?
+                } else {
+                    meta_account
+                };
+                let _: Account = s.get("local", "account", &resolved_account)?;
                 s.artifact_writer(
-                    &meta_account,
+                    &resolved_account,
                     &meta_name,
                     &meta_mime,
                     Some(expected_size),
@@ -1014,7 +1286,14 @@ impl Host {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<pb::GetArtifactChunk>>> {
         let store = self.service.store.clone();
         let (art, mut file) = store
-            .blocking(move |s| s.open_artifact(&req.account_id, &req.id))
+            .blocking(move |s| {
+                let account_id = if req.account_id.trim().is_empty() {
+                    s.resolve_active_account_id()?
+                } else {
+                    req.account_id
+                };
+                s.open_artifact(&account_id, &req.id)
+            })
             .await?;
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.try_send(Ok(pb::GetArtifactChunk {
@@ -1176,6 +1455,28 @@ impl Host {
         });
         Ok(rx)
     }
+    pub async fn watch_agent(
+        self: &Arc<Self>,
+        cursor: pb::EventCursor,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<pb::Event>>> {
+        if self.role != "workspace" {
+            return Err(ServiceError::new(
+                ErrorCode::UnsupportedCapability,
+                "rpc",
+                "workspace tools are not available on a browser host",
+            ));
+        }
+        let mut inner = self.agents()?.watch_events(&cursor.run_id, cursor.after)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(item) = inner.recv().await {
+                if tx.send(item.map(codec::event_to)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
     async fn read_run(&self, id: &str) -> Result<Run> {
         self.service.snapshot_async(id).await
     }
@@ -1209,38 +1510,5 @@ async fn forward_remaining_events(
 impl Drop for Host {
     fn drop(&mut self) {
         self.logins.cancel_all(&self.service.store);
-    }
-}
-
-fn allocate_cdp_port(existing: &[Account], requested: u16) -> Result<u16> {
-    if requested > 0 {
-        if existing.iter().any(|a| a.port == requested) {
-            return Err(ServiceError::invalid("account port already exists"));
-        }
-        return Ok(requested);
-    }
-    let used: std::collections::HashSet<u16> = existing.iter().map(|a| a.port).collect();
-    for port in crate::browser_host::DEFAULT_CDP_PORT..=u16::MAX {
-        if used.contains(&port) || crate::browser_host::is_port_alive(port) {
-            continue;
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    Err(ServiceError::invalid("no free CDP port available"))
-}
-
-fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 128
-        || matches!(id, "local" | "ui")
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
-    {
-        Err(ServiceError::invalid("invalid account identifier"))
-    } else {
-        Ok(())
     }
 }

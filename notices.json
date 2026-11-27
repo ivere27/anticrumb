@@ -1,0 +1,75 @@
+{
+  "_comment": "Bundled startup tips and author project notices shown occasionally in the interactive TUI. Static file only — no network requests or telemetry. Set ANTICRUMB_NO_NOTICE=1 to disable.",
+  "entries": [
+    {
+      "id": "tip-git-diff-plus",
+      "kind": "tip",
+      "text": "Use @git:diff+ or @git:HEAD~1+ for AST-aware cross-file diffs.",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-queue-steering",
+      "kind": "tip",
+      "text": "Press Enter mid-turn to queue a steering message (supports @file).",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-provider-switch",
+      "kind": "tip",
+      "text": "Use /provider to switch between Gemini, Claude, and ChatGPT accounts.",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-temp-chat",
+      "kind": "tip",
+      "text": "Run /temp on for anonymous chats (no server history; persisted).",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-inspector-keys",
+      "kind": "tip",
+      "text": "Press Ctrl+O for fullscreen Tool Inspector, or Alt+I to toggle panel.",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-model-thinking",
+      "kind": "tip",
+      "text": "In /model, use Up/Down for models and Left/Right for thinking effort.",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-copy-markdown",
+      "kind": "tip",
+      "text": "Run /copy to copy the last response with original Markdown intact.",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-new-resume",
+      "kind": "tip",
+      "text": "Use /new for each task to keep context sharp; revisit via /resume.",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-permissions",
+      "kind": "tip",
+      "text": "Fine-tune Agent access with /permissions (read, edit, shell, browser).",
+      "probability": 0.05
+    },
+    {
+      "id": "tip-prompts-agents-md",
+      "kind": "tip",
+      "text": "Customize agent prompts with /prompts init or project AGENTS.md files.",
+      "probability": 0.05
+    },
+    {
+      "id": "author-synurang",
+      "kind": "author",
+      "title": "Synurang",
+      "text": "In-process gRPC/FFI bridge powering anticrumb",
+      "url": "https://github.com/ivere27/synurang",
+      "probability": 0.05,
+      "starts_at": "2026-11-26",
+      "expires_at": "2027-06-30"
+    }
+  ]
+}

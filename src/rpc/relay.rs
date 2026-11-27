@@ -352,9 +352,18 @@ pub(crate) async fn workspace_with_browser(
         }
         store.put("local", "host", "browser_peer", &info.server_id)?;
     }
+    for browser in client.list_browsers(pb::Empty {}).await?.browsers {
+        let value = codec::browser_profile_from(browser)?;
+        store.put_browser_profile(&value)?;
+    }
     for account in client.list_accounts(pb::Empty {}).await?.accounts {
         let value = codec::account_from(account)?;
         store.put("local", "account", &value.id, &value)?;
+    }
+    if let Ok(status) = client.get_status(pb::Empty {}).await {
+        if let Some(active) = status.active_account_id {
+            let _ = store.set_active_account_id(&active);
+        }
     }
     let backend = Arc::new(Relay {
         client: client.clone(),

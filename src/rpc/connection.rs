@@ -289,7 +289,9 @@ fn verify(runtime: &tokio::runtime::Runtime, connection: &Connection) -> Result<
 pub fn handles(args: &[String]) -> bool {
     args.is_empty()
         || args.first().is_some_and(|value| {
-            matches!(value.as_str(), "status" | "local") || value.contains("://")
+            matches!(value.as_str(), "status" | "local")
+                || value.starts_with('-')
+                || value.contains("://")
         })
 }
 
@@ -306,9 +308,10 @@ fn status(root: &Path) -> Result<serde_json::Value> {
     Ok(json!({"default":"local", "saved_remote":saved}))
 }
 
-/// Return an explicitly selected remote connection; informational commands do not
+/// Return an explicitly selected remote connection and any trailing CLI/TUI arguments
+/// to forward (such as `--resume ID`). Informational commands do not
 /// start a runtime or contact either a local host or the saved remote endpoint.
-pub fn command(args: &[String]) -> Result<Option<Connection>> {
+pub fn command(args: &[String]) -> Result<Option<(Connection, Vec<String>)>> {
     match args.first().map(String::as_str) {
         Some("status") if args.len() == 1 => {
             println!("{}", status(&cli::config_root())?);
@@ -325,8 +328,10 @@ pub fn command(args: &[String]) -> Result<Option<Connection>> {
             println!("Saved remote profile removed. Run anticrumb to use the local daemon.");
             Ok(None)
         }
-        Some(address) => configure(Setup::parse(address, &args[1..])?).map(Some),
-        None => {
+        Some(address) if address.contains("://") => {
+            configure(Setup::parse(address, &args[1..])?).map(|conn| Some((conn, Vec::new())))
+        }
+        _ => {
             let Some(connection) = load(&cli::config_root())? else {
                 return Err(ServiceError::invalid(
                     "no saved remote profile; run anticrumb connect https://HOST:PORT --token STRING",
@@ -334,7 +339,7 @@ pub fn command(args: &[String]) -> Result<Option<Connection>> {
             };
             let runtime = tokio::runtime::Runtime::new().map_err(ServiceError::storage)?;
             verify(&runtime, &connection)?;
-            Ok(Some(connection))
+            Ok(Some((connection, args.to_vec())))
         }
     }
 }
@@ -487,5 +492,20 @@ mod tests {
         )
         .unwrap();
         assert!(load(root.path()).is_err());
+    }
+
+    #[test]
+    fn connect_handles_tui_flags_without_shadowing_provider_integrations() {
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+        assert!(handles(&[]));
+        assert!(handles(&s(&["--resume", "conv_123"])));
+        assert!(handles(&s(&["--yolo"])));
+        assert!(handles(&s(&["status"])));
+        assert!(handles(&s(&["local"])));
+        assert!(handles(&s(&["https://127.0.0.1:50051", "--token", "t"])));
+        assert!(!handles(&s(&["resume", "conv_123"])));
+        for integration in ["opencode", "codex", "claude", "antigravity", "mcp"] {
+            assert!(!handles(&s(&[integration])), "{integration}");
+        }
     }
 }

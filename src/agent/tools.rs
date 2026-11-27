@@ -12,11 +12,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::cancel::CancelToken;
-use super::events::{ToolCallRequest, ToolOutput, DEFAULT_SHELL_TIMEOUT_SECS};
+use super::events::{OutputStream, ToolCallRequest, ToolOutput, DEFAULT_SHELL_TIMEOUT_SECS};
 use super::process::{format_report, BackgroundProcesses, CapturedProcess};
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 12_000;
 const MAX_WEB_TOOL_OUTPUT_CHARS: usize = 16_000;
+const SHELL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const SHELL_STREAM_COALESCE_BYTES: usize = 4 * 1024;
+const SHELL_STREAM_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 500;
 const MAX_GREP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_GREP_FILES: usize = 2000;
@@ -140,6 +143,11 @@ pub struct SpawnAgentOutcome {
 pub type SpawnAgentFn =
     Arc<dyn Fn(&str, &str, bool, &CancelToken) -> Result<SpawnAgentOutcome, String> + Send + Sync>;
 
+/// Incremental live-output callback for streaming tools (e.g., `run_shell`).
+pub type ToolOutputFn = Arc<dyn Fn(OutputStream, &str) + Send + Sync>;
+
+type ReadCache = Arc<Mutex<BTreeMap<(PathBuf, usize, usize), String>>>;
+
 pub struct ToolContext {
     pub environment: Option<std::collections::BTreeMap<String, String>>,
     pub workspace_root: PathBuf,
@@ -153,13 +161,15 @@ pub struct ToolContext {
     pub browser_fetch: Option<BrowserFetchFn>,
     /// Optional runtime bridge for `browser_control` (stateful Chrome CDP actions).
     pub browser_control: Option<BrowserControlFn>,
-    browser_control_help_ready: AtomicBool,
+    browser_control_help_ready: Arc<AtomicBool>,
     /// Optional runtime bridge for `spawn_agent` (delegating tasks to the `Worker` `TempChat` tab pool).
     pub spawn_agent: Option<SpawnAgentFn>,
+    /// Optional live stdout/stderr streaming callback for long-running tools.
+    pub on_output: Option<ToolOutputFn>,
     /// Whether `read_file` should elide repeated reads of unchanged file ranges in persistent sessions.
     pub dedup_reads: bool,
-    read_cache: Mutex<BTreeMap<(PathBuf, usize, usize), String>>,
-    changed_files: Mutex<BTreeSet<String>>,
+    read_cache: ReadCache,
+    changed_files: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl ToolContext {
@@ -173,11 +183,33 @@ impl ToolContext {
             background: Arc::default(),
             browser_fetch: None,
             browser_control: None,
-            browser_control_help_ready: AtomicBool::new(false),
+            browser_control_help_ready: Arc::new(AtomicBool::new(false)),
             spawn_agent: None,
+            on_output: None,
             dedup_reads: false,
-            read_cache: Mutex::new(BTreeMap::new()),
-            changed_files: Mutex::new(BTreeSet::new()),
+            read_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            changed_files: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    /// O(1) shallow clone sharing mutable state (`browser_control_help_ready`, `read_cache`,
+    /// `changed_files`, `background`, `cancel`) with an attached live-output callback.
+    pub fn with_output_callback(&self, cb: ToolOutputFn) -> Self {
+        Self {
+            environment: self.environment.clone(),
+            workspace_root: self.workspace_root.clone(),
+            shell_timeout: self.shell_timeout,
+            allow_shell: self.allow_shell,
+            cancel: self.cancel.clone(),
+            background: Arc::clone(&self.background),
+            browser_fetch: self.browser_fetch.clone(),
+            browser_control: self.browser_control.clone(),
+            browser_control_help_ready: Arc::clone(&self.browser_control_help_ready),
+            spawn_agent: self.spawn_agent.clone(),
+            on_output: Some(cb),
+            dedup_reads: self.dedup_reads,
+            read_cache: Arc::clone(&self.read_cache),
+            changed_files: Arc::clone(&self.changed_files),
         }
     }
 
@@ -482,14 +514,21 @@ impl ToolRegistry {
 
     /// Execute all calls of one model reply. Consecutive read-only calls run concurrently,
     /// everything else runs sequentially in the order the model wrote it. Results keep call order.
-    /// `on_start` / `on_done` fire from the executing thread as each call begins / completes.
+    /// `on_start` / `on_output` / `on_done` fire in strict causal order per call.
     pub fn execute_batch(
         &self,
         calls: &[ToolCallRequest],
         ctx: &ToolContext,
         on_start: &(dyn Fn(usize, &ToolCallRequest) + Sync),
+        on_output: &(dyn Fn(usize, &ToolCallRequest, OutputStream, &str) + Sync),
         on_done: &(dyn Fn(usize, &ToolCallRequest, &ToolOutput) + Sync),
     ) -> Vec<ToolOutput> {
+        enum BatchMsg {
+            Start(usize),
+            Output(usize, OutputStream, String),
+            Done(usize, ToolOutput),
+        }
+
         let mut results: Vec<Option<ToolOutput>> = vec![None; calls.len()];
         let mut idx = 0;
         while idx < calls.len() {
@@ -499,47 +538,55 @@ impl ToolRegistry {
                     end += 1;
                 }
             }
-            if end - idx == 1 {
-                on_start(idx, &calls[idx]);
-                let out = self.execute_call(&calls[idx], ctx);
-                on_done(idx, &calls[idx], &out);
-                results[idx] = Some(out);
-            } else {
-                let outs: Vec<(usize, ToolOutput)> = std::thread::scope(|s| {
-                    let handles: Vec<_> = (idx..end)
-                        .map(|i| {
-                            let call = &calls[i];
-                            s.spawn(move || {
-                                on_start(i, call);
-                                let out = self.execute_call(call, ctx);
-                                on_done(i, call, &out);
-                                (i, out)
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .enumerate()
-                        .map(|(off, h)| {
-                            h.join().unwrap_or_else(|_| {
-                                (
-                                    idx + off,
-                                    ToolOutput {
-                                        tool: calls[idx + off].tool.clone(),
-                                        ok: false,
-                                        output: "error: tool worker thread panicked".into(),
-                                        artifacts: Vec::new(),
-                                        elapsed_ms: 0,
-                                    },
-                                )
-                            })
-                        })
-                        .collect()
-                });
-                for (i, out) in outs {
-                    results[i] = Some(out);
+            let (tx, rx) = std::sync::mpsc::channel::<BatchMsg>();
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(end - idx);
+                for (i, call) in calls.iter().enumerate().take(end).skip(idx) {
+                    let worker_tx = tx.clone();
+                    let existing_cb = ctx.on_output.clone();
+                    let out_tx = worker_tx.clone();
+                    let call_ctx = ctx.with_output_callback(Arc::new(move |stream, text| {
+                        if let Some(prev) = &existing_cb {
+                            prev(stream, text);
+                        }
+                        let _ = out_tx.send(BatchMsg::Output(i, stream, text.to_owned()));
+                    }));
+                    handles.push((
+                        i,
+                        s.spawn(move || {
+                            let _ = worker_tx.send(BatchMsg::Start(i));
+                            let out = self.execute_call(call, &call_ctx);
+                            let _ = worker_tx.send(BatchMsg::Done(i, out));
+                        }),
+                    ));
                 }
-            }
+                drop(tx);
+                for msg in rx {
+                    match msg {
+                        BatchMsg::Start(i) => on_start(i, &calls[i]),
+                        BatchMsg::Output(i, stream, text) => {
+                            on_output(i, &calls[i], stream, &text);
+                        }
+                        BatchMsg::Done(i, out) => {
+                            on_done(i, &calls[i], &out);
+                            results[i] = Some(out);
+                        }
+                    }
+                }
+                for (i, handle) in handles {
+                    if handle.join().is_err() && results[i].is_none() {
+                        let out = ToolOutput {
+                            tool: calls[i].tool.clone(),
+                            ok: false,
+                            output: "error: tool worker thread panicked".into(),
+                            artifacts: Vec::new(),
+                            elapsed_ms: 0,
+                        };
+                        on_done(i, &calls[i], &out);
+                        results[i] = Some(out);
+                    }
+                }
+            });
             idx = end;
         }
         results.into_iter().flatten().collect()
@@ -839,7 +886,7 @@ enum GrepMode {
 
 /// ripgrep `--smart-case`: case-sensitive only when the pattern contains an uppercase
 /// literal. Escapes (`\S`, `\W`) and Unicode class names (`\p{Lu}`, `\pL`) are ignored.
-fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
+pub(crate) fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
     if fixed {
         return pattern.chars().any(char::is_uppercase);
     }
@@ -862,6 +909,30 @@ fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
         }
     }
     false
+}
+
+/// Compiles a ripgrep-compatible regex with smart-case and literal fallback on invalid regex
+/// (matching `GrepSearchTool::execute` semantics for Inspector search-match highlighting).
+pub(crate) fn compile_grep_regex(pattern: &str, fixed: bool) -> Option<regex::Regex> {
+    if pattern.is_empty() {
+        return None;
+    }
+    let case_sensitive = pattern_has_uppercase(pattern, fixed);
+    let build = |src: &str| {
+        regex::RegexBuilder::new(src)
+            .case_insensitive(!case_sensitive)
+            .multi_line(true)
+            .crlf(true)
+            .size_limit(2 << 20)
+            .build()
+    };
+    if fixed {
+        build(&regex::escape(pattern)).ok()
+    } else {
+        build(pattern)
+            .ok()
+            .or_else(|| build(&regex::escape(pattern)).ok())
+    }
 }
 
 fn clip_grep_line(line: &str) -> String {
@@ -1820,6 +1891,39 @@ fn non_empty_command(args: &Value) -> Result<&str, String> {
     Ok(c)
 }
 
+fn slice_utf8_max_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn emit_stream_buf(
+    cb: &ToolOutputFn,
+    stream: OutputStream,
+    buf: &mut String,
+    emitted_bytes: &mut usize,
+) {
+    if buf.is_empty() {
+        return;
+    }
+    let remaining = SHELL_STREAM_MAX_BYTES.saturating_sub(*emitted_bytes);
+    if remaining == 0 {
+        buf.clear();
+        return;
+    }
+    let chunk = slice_utf8_max_bytes(buf, remaining);
+    if !chunk.is_empty() {
+        cb(stream, chunk);
+        *emitted_bytes += chunk.len();
+    }
+    buf.clear();
+}
+
 /// Tool: `run_shell` (blocking with timeout, cancellable, kills the whole process tree)
 pub struct ShellTool;
 
@@ -1857,10 +1961,67 @@ impl AgentTool for ShellTool {
         let mut proc =
             CapturedProcess::spawn_with_env(command_str, &cwd, ctx.environment.as_ref())?;
         let deadline = Instant::now() + timeout;
+        let mut stdout_off = 0usize;
+        let mut stderr_off = 0usize;
+        let mut pending_out = String::new();
+        let mut pending_err = String::new();
+        let mut emitted_bytes = 0usize;
+        let mut last_flush = Instant::now();
+
+        let mut drain_stream = |proc: &CapturedProcess, force_flush: bool| {
+            let Some(cb) = &ctx.on_output else {
+                return;
+            };
+            if emitted_bytes >= SHELL_STREAM_MAX_BYTES {
+                pending_out.clear();
+                pending_err.clear();
+                return;
+            }
+            loop {
+                let (out_chunk, err_chunk) = proc.take_output_since(
+                    &mut stdout_off,
+                    &mut stderr_off,
+                    SHELL_STREAM_COALESCE_BYTES,
+                    force_flush,
+                );
+                let got_any = !out_chunk.is_empty() || !err_chunk.is_empty();
+                if !out_chunk.is_empty() {
+                    pending_out.push_str(&out_chunk);
+                }
+                if !err_chunk.is_empty() {
+                    pending_err.push_str(&err_chunk);
+                }
+                let pending_len = pending_out.len() + pending_err.len();
+                let should_flush = force_flush
+                    || pending_len >= SHELL_STREAM_COALESCE_BYTES
+                    || (pending_len > 0 && last_flush.elapsed() >= SHELL_STREAM_FLUSH_INTERVAL);
+                if should_flush && pending_len > 0 {
+                    emit_stream_buf(
+                        cb,
+                        OutputStream::Stdout,
+                        &mut pending_out,
+                        &mut emitted_bytes,
+                    );
+                    emit_stream_buf(
+                        cb,
+                        OutputStream::Stderr,
+                        &mut pending_err,
+                        &mut emitted_bytes,
+                    );
+                    last_flush = Instant::now();
+                }
+                if !force_flush || !got_any || emitted_bytes >= SHELL_STREAM_MAX_BYTES {
+                    break;
+                }
+            }
+        };
+
         loop {
+            drain_stream(&proc, false);
             if let Some(code) = proc.poll_exit() {
                 if proc.readers_finished() {
                     proc.join_readers();
+                    drain_stream(&proc, true);
                     let (o, e) = proc.output_since(0, 0);
                     return Ok(format_report(Some(code), &o, &e));
                 }
@@ -1874,6 +2035,8 @@ impl AgentTool for ShellTool {
             };
             if let Some(reason) = stop {
                 proc.kill();
+                proc.join_readers();
+                drain_stream(&proc, true);
                 let (o, e) = proc.output_since(0, 0);
                 return Err(format!(
                     "{reason}: {command_str}\n{}",

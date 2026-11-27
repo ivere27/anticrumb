@@ -60,6 +60,8 @@ fn previous_response_replays_in_a_new_session_and_respects_account_scope() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let mut first = TurnRequest::text("first");
+    // Persisted runs always carry the account resolved at admission.
+    first.account_id = DEFAULT_ACCOUNT_ID.into();
     first.messages.insert(
         0,
         Message {

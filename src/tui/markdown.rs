@@ -2,10 +2,39 @@
 //! Styling is generated locally; terminal control sequences in content are discarded.
 mod table;
 
-use super::theme::Theme;
+use super::{
+    highlight::{self, HighlightCache, HighlightLang, Lookup},
+    theme::Theme,
+};
 use crossterm::{queue, style};
+use std::borrow::Cow;
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
+
+#[cfg_attr(not(feature = "tree-sitter"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SyntaxRole {
+    #[default]
+    None,
+    Plain,
+    Keyword,
+    String,
+    Comment,
+    Type,
+    Function,
+    Constant,
+    Operator,
+    Property,
+    Macro,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum DiffBg {
+    #[default]
+    None,
+    Added,
+    Removed,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Face {
@@ -19,6 +48,11 @@ pub(super) struct Face {
     pub accent: bool,
     pub highlight: bool,
     pub danger: bool,
+    pub search_match: bool,
+    pub syntax: SyntaxRole,
+    pub diff_bg: DiffBg,
+    /// Optional theme-independent foreground RGB override (e.g. fixed-palette artwork).
+    pub fg: Option<(u8, u8, u8)>,
 }
 
 impl Face {
@@ -33,7 +67,40 @@ impl Face {
         accent: false,
         highlight: false,
         danger: false,
+        search_match: false,
+        syntax: SyntaxRole::None,
+        diff_bg: DiffBg::None,
+        fg: None,
     };
+    pub const SEARCH_MATCH: Self = Self {
+        bold: true,
+        search_match: true,
+        ..Self::TEXT
+    };
+    pub const fn syntax(role: SyntaxRole) -> Self {
+        Self {
+            italic: matches!(role, SyntaxRole::Comment),
+            syntax: role,
+            ..Self::TEXT
+        }
+    }
+    pub const fn with_diff_bg(mut self, diff_bg: DiffBg) -> Self {
+        self.diff_bg = diff_bg;
+        self
+    }
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            fg: Some((r, g, b)),
+            ..Self::TEXT
+        }
+    }
+    pub const fn rgb_bold(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            bold: true,
+            fg: Some((r, g, b)),
+            ..Self::TEXT
+        }
+    }
     pub const BOLD: Self = Self {
         bold: true,
         ..Self::TEXT
@@ -110,6 +177,16 @@ fn push(spans: &mut Line, text: &str, face: Face) {
     }
 }
 
+fn push_char(spans: &mut Line, ch: char, face: Face) {
+    if let Some(last) = spans.last_mut().filter(|span| span.face == face) {
+        last.text.push(ch);
+    } else {
+        let mut text = String::with_capacity(ch.len_utf8());
+        text.push(ch);
+        spans.push(Span { text, face });
+    }
+}
+
 pub(super) fn strip_controls<'a>(
     text: &'a str,
     allow_newlines_and_tabs: bool,
@@ -119,7 +196,23 @@ pub(super) fn strip_controls<'a>(
     })
 }
 
-fn clean(text: &str) -> String {
+/// Zero-allocation fast path for `clean` when `text` contains no ANSI escapes,
+/// ASCII controls (other than `\n`/`\t`), DEL (`0x7f`), or UTF-8 C1 controls (`0xC2 0x80..0x9F`).
+pub(super) fn clean_cow(text: &str) -> Cow<'_, str> {
+    if text
+        .bytes()
+        .all(|b| b != 0x7f && b != 0xc2 && (b >= 0x20 || b == b'\n' || b == b'\t'))
+    {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(clean_alloc(text))
+}
+
+pub(super) fn clean(text: &str) -> String {
+    clean_cow(text).into_owned()
+}
+
+fn clean_alloc(text: &str) -> String {
     let mut chars = text.chars().peekable();
     let mut output = String::with_capacity(text.len());
     while let Some(ch) = chars.next() {
@@ -196,7 +289,7 @@ fn inline(text: &str, face: Face, depth: usize, budget: &mut usize, spans: &mut 
                 .next()
                 .filter(char::is_ascii_punctuation)
             {
-                push(spans, &next.to_string(), face);
+                push_char(spans, next, face);
                 at += 1 + next.len_utf8();
                 continue;
             }
@@ -243,7 +336,7 @@ fn inline(text: &str, face: Face, depth: usize, budget: &mut usize, spans: &mut 
             push(spans, &text[at..at + count], face);
             at += count;
         } else {
-            push(spans, &ch.to_string(), face);
+            push_char(spans, ch, face);
             at += ch.len_utf8();
         }
     }
@@ -268,7 +361,7 @@ fn wrap(spans: Line, width: usize, lines: &mut Vec<Line>) {
                     lines.push(std::mem::take(&mut line));
                     used = 0;
                 }
-                push(&mut line, &ch.to_string(), span.face);
+                push_char(&mut line, ch, span.face);
                 used += cells;
             }
         }
@@ -277,42 +370,37 @@ fn wrap(spans: Line, width: usize, lines: &mut Vec<Line>) {
 }
 
 pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
-    let text = clean(text);
+    lines_with_highlights(text, width, None, false).0
+}
+
+pub(super) fn lines_with_highlights(
+    text: &str,
+    width: usize,
+    highlights: Option<&HighlightCache>,
+    allow_unclosed_fences: bool,
+) -> (Vec<Line>, bool) {
+    let text = clean_cow(text);
     let mut result = Vec::new();
-    let mut fence = None::<(char, usize)>;
+    let mut had_pending = false;
     let source: Vec<_> = text.split('\n').collect();
     let mut index = 0;
     while index < source.len() {
         let line = source[index];
-        if fence.is_none() {
-            if let Some((consumed, rendered)) = table::render(&source[index..], width) {
-                result.extend(rendered);
-                index += consumed;
-                continue;
-            }
+        if let Some((consumed, rendered)) = table::render(&source[index..], width) {
+            result.extend(rendered);
+            index += consumed;
+            continue;
         }
         index += 1;
         let trimmed = line.trim_start_matches(' ');
         let leading = line.len() - trimmed.len();
         let mark = trimmed.chars().next().unwrap_or(' ');
         let count = trimmed.chars().take_while(|ch| *ch == mark).count();
-        let mut spans = Vec::new();
-        let mut budget = 64;
-        if let Some((opened, length)) = fence {
-            if leading <= 3
-                && mark == opened
-                && count >= length
-                && trimmed[count..].trim().is_empty()
-            {
-                fence = None;
-                continue;
-            }
-            push(&mut spans, line, Face::CODE);
-        } else if leading <= 3 && matches!(mark, '`' | '~') && count >= 3 {
-            fence = Some((mark, count));
+        if leading <= 3 && matches!(mark, '`' | '~') && count >= 3 {
             let language = trimmed[count..].trim();
+            let mut hdr_spans = Vec::new();
             push(
-                &mut spans,
+                &mut hdr_spans,
                 if language.is_empty() {
                     "code"
                 } else {
@@ -320,7 +408,102 @@ pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
                 },
                 Face::MUTED,
             );
-        } else if leading <= 3 && mark == '#' && count <= 6 && trimmed[count..].starts_with(' ') {
+            wrap(hdr_spans, width, &mut result);
+
+            let body_start = index;
+            let mut closed = false;
+            while index < source.len() {
+                let candidate = source[index];
+                let cand_trimmed = candidate.trim_start_matches(' ');
+                let cand_leading = candidate.len() - cand_trimmed.len();
+                let cand_mark = cand_trimmed.chars().next().unwrap_or(' ');
+                let cand_count = cand_trimmed
+                    .chars()
+                    .take_while(|ch| *ch == cand_mark)
+                    .count();
+                if cand_leading <= 3
+                    && cand_mark == mark
+                    && cand_count >= count
+                    && cand_trimmed[cand_count..].trim().is_empty()
+                {
+                    closed = true;
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            let body_end = if closed { index - 1 } else { index };
+            let body_lines = &source[body_start..body_end];
+            if body_lines.is_empty() {
+                continue;
+            }
+
+            let hl_lang = highlights.and_then(|_| highlight::lang_from_fence_tag(language));
+            match (hl_lang, highlights) {
+                (Some(HighlightLang::UnifiedDiff), Some(cache)) => {
+                    let joined = body_lines.join("\n");
+                    let doc = if closed || allow_unclosed_fences {
+                        match cache.lookup_or_schedule(HighlightLang::UnifiedDiff, &joined) {
+                            Lookup::Ready(doc) => Some(doc),
+                            Lookup::Pending => {
+                                had_pending = true;
+                                None
+                            }
+                            Lookup::Unsupported => None,
+                        }
+                    } else {
+                        None
+                    };
+                    highlight::push_unified_diff(&mut result, &joined, doc.as_deref(), width);
+                }
+                (Some(HighlightLang::Code(ts_lang)), Some(cache))
+                    if closed || allow_unclosed_fences =>
+                {
+                    let joined = body_lines.join("\n");
+                    match cache.lookup_or_schedule(HighlightLang::Code(ts_lang), &joined) {
+                        Lookup::Ready(doc) => {
+                            let token_lines = doc.code_lines().unwrap_or(&[]);
+                            for (i, body_line) in body_lines.iter().enumerate() {
+                                let tokens = token_lines.get(i).map_or(&[][..], Vec::as_slice);
+                                let parts = highlight::line_spans(body_line, tokens, DiffBg::None);
+                                let mut line_spans = Vec::new();
+                                for (seg, face) in parts {
+                                    push(&mut line_spans, seg, face);
+                                }
+                                wrap(line_spans, width, &mut result);
+                            }
+                        }
+                        Lookup::Pending => {
+                            had_pending = true;
+                            for body_line in body_lines {
+                                let mut spans = Vec::new();
+                                push(&mut spans, body_line, Face::CODE);
+                                wrap(spans, width, &mut result);
+                            }
+                        }
+                        Lookup::Unsupported => {
+                            for body_line in body_lines {
+                                let mut spans = Vec::new();
+                                push(&mut spans, body_line, Face::CODE);
+                                wrap(spans, width, &mut result);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    for body_line in body_lines {
+                        let mut spans = Vec::new();
+                        push(&mut spans, body_line, Face::CODE);
+                        wrap(spans, width, &mut result);
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut spans = Vec::new();
+        let mut budget = 64;
+        if leading <= 3 && mark == '#' && count <= 6 && trimmed[count..].starts_with(' ') {
             inline(
                 trimmed[count..].trim_start(),
                 Face::HEADING,
@@ -333,11 +516,11 @@ pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
         }
         wrap(spans, width, &mut result);
     }
-    result
+    (result, had_pending)
 }
 
 pub(super) fn literal(text: &str, face: Face, width: usize) -> Vec<Line> {
-    let text = clean(text);
+    let text = clean_cow(text);
     let mut result = Vec::new();
     for line in text.split('\n') {
         let mut spans = Vec::new();
@@ -354,16 +537,17 @@ pub(super) fn prefixed(
     body_face: Face,
     width: usize,
 ) -> Vec<Line> {
-    let prefix = clean(prefix);
-    let body = clean(body);
+    let prefix = clean_cow(prefix);
+    let body = clean_cow(body);
     let mut result = Vec::new();
+    let mut indent: Option<String> = None;
     for (index, line) in body.split('\n').enumerate() {
         let mut spans = Vec::new();
         if index == 0 {
             push(&mut spans, &prefix, prefix_face);
         } else {
-            let indent = " ".repeat(prefix.chars().count());
-            push(&mut spans, &indent, prefix_face);
+            let spaces = indent.get_or_insert_with(|| " ".repeat(prefix.chars().count()));
+            push(&mut spans, spaces, prefix_face);
         }
         push(&mut spans, line, body_face);
         wrap(spans, width, &mut result);
@@ -371,10 +555,28 @@ pub(super) fn prefixed(
     result
 }
 
+pub(super) fn prefixed_spans(
+    prefix: &str,
+    prefix_face: Face,
+    body_spans: &[(&str, Face)],
+    width: usize,
+) -> Vec<Line> {
+    let prefix = clean_cow(prefix);
+    let mut line = Vec::new();
+    push(&mut line, &prefix, prefix_face);
+    for (text, face) in body_spans {
+        let cleaned = clean_cow(text);
+        push(&mut line, &cleaned, *face);
+    }
+    let mut result = Vec::new();
+    wrap(line, width, &mut result);
+    result
+}
+
 pub(super) fn spans(parts: &[(&str, Face)], width: usize) -> Vec<Line> {
     let mut line = Vec::new();
     for (text, face) in parts {
-        let cleaned = clean(text);
+        let cleaned = clean_cow(text);
         push(&mut line, &cleaned, *face);
     }
     let mut result = Vec::new();
@@ -398,9 +600,40 @@ fn is_dark_color(color: style::Color) -> bool {
     }
 }
 
+fn syntax_color(role: SyntaxRole, theme: Theme) -> style::Color {
+    match role {
+        SyntaxRole::None | SyntaxRole::Plain => theme.text,
+        SyntaxRole::Keyword => theme.syntax.keyword,
+        SyntaxRole::String => theme.syntax.string,
+        SyntaxRole::Comment => theme.syntax.comment,
+        SyntaxRole::Type => theme.syntax.ty,
+        SyntaxRole::Function => theme.syntax.function,
+        SyntaxRole::Constant => theme.syntax.constant,
+        SyntaxRole::Operator => theme.syntax.operator,
+        SyntaxRole::Property => theme.syntax.property,
+        SyntaxRole::Macro => theme.syntax.macro_call,
+    }
+}
+
+fn diff_bg_color(diff_bg: DiffBg, theme: Theme) -> style::Color {
+    match diff_bg {
+        DiffBg::Added => theme.syntax.diff_added_bg,
+        DiffBg::Removed => theme.syntax.diff_removed_bg,
+        DiffBg::None => theme.background,
+    }
+}
+
 fn span_colors(face: Face, theme: Theme, selected: bool) -> (style::Color, style::Color) {
+    let custom_fg = face.fg.map(|(r, g, b)| style::Color::Rgb { r, g, b });
     if !selected {
-        let fg = if face.danger {
+        if face.search_match {
+            return (theme.syntax.match_fg, theme.syntax.match_bg);
+        }
+        let fg = if let Some(rgb) = custom_fg {
+            rgb
+        } else if face.syntax != SyntaxRole::None {
+            syntax_color(face.syntax, theme)
+        } else if face.danger {
             theme.danger
         } else if face.highlight {
             theme.highlight
@@ -417,9 +650,20 @@ fn span_colors(face: Face, theme: Theme, selected: bool) -> (style::Color, style
         } else {
             theme.text
         };
-        return (fg, theme.background);
+        return (fg, diff_bg_color(face.diff_bg, theme));
     }
-    let semantic = if face.danger {
+    let semantic = if let Some(rgb) = custom_fg {
+        Some(rgb)
+    } else if face.search_match {
+        Some(theme.syntax.match_bg)
+    } else if face.syntax != SyntaxRole::None {
+        match face.syntax {
+            SyntaxRole::None | SyntaxRole::Plain | SyntaxRole::Comment | SyntaxRole::Operator => {
+                None
+            }
+            role => Some(syntax_color(role, theme)),
+        }
+    } else if face.danger {
         Some(theme.danger)
     } else if face.highlight {
         Some(theme.highlight)
@@ -480,6 +724,153 @@ fn write_styled_line(
         style::SetBackgroundColor(theme.background),
         style::SetForegroundColor(theme.text)
     )
+}
+
+pub(super) fn write_spaces(out: &mut impl Write, mut count: usize) -> io::Result<()> {
+    const SPACES: &str = "                                                                ";
+    while count > 0 {
+        let chunk = count.min(SPACES.len());
+        out.write_all(&SPACES.as_bytes()[..chunk])?;
+        count -= chunk;
+    }
+    Ok(())
+}
+
+fn write_face_style(
+    out: &mut impl Write,
+    face: Face,
+    theme: Theme,
+    selected: bool,
+) -> io::Result<()> {
+    let (fg, bg) = span_colors(face, theme, selected);
+    queue!(
+        out,
+        style::SetAttribute(style::Attribute::Reset),
+        style::SetBackgroundColor(bg),
+        style::SetForegroundColor(fg)
+    )?;
+    if face.bold {
+        queue!(out, style::SetAttribute(style::Attribute::Bold))?;
+    }
+    if face.italic {
+        queue!(out, style::SetAttribute(style::Attribute::Italic))?;
+    }
+    if face.strike {
+        queue!(out, style::SetAttribute(style::Attribute::CrossedOut))?;
+    }
+    Ok(())
+}
+
+/// Stream a styled line clipped to `max_width` display columns directly to `out`
+/// with zero intermediate `Vec`/`String` allocations, optionally preceded by a single
+/// indent space and right-padded with spaces up to `pad_to.min(max_width)`.
+/// Returns the number of display columns written (excluding right padding).
+pub(super) fn write_clipped_padded_line(
+    out: &mut impl Write,
+    line: &[Span],
+    leading_space: bool,
+    max_width: usize,
+    pad_to: usize,
+    theme: Theme,
+) -> io::Result<usize> {
+    let mut used = 0usize;
+    let mut last_face: Option<Face> = None;
+    if leading_space && max_width > 0 {
+        write_face_style(out, Face::TEXT, theme, false)?;
+        out.write_all(b" ")?;
+        used = 1;
+        last_face = Some(Face::TEXT);
+    }
+    'spans: for span in line {
+        if used >= max_width {
+            break;
+        }
+        let cleaned = clean_cow(&span.text);
+        // Fast path: find the longest prefix with no newline/tab/control chars that fits `max_width`.
+        let mut fast_end = 0usize;
+        let mut fast_w = 0usize;
+        let mut needs_slow = false;
+        for (byte_idx, ch) in cleaned.char_indices() {
+            if matches!(ch, '\n' | '\r' | '\t') || ch.is_control() {
+                needs_slow = true;
+                break;
+            }
+            let cw = ch.width().unwrap_or(0);
+            if used + fast_w + cw > max_width {
+                break;
+            }
+            fast_w += cw;
+            fast_end = byte_idx + ch.len_utf8();
+        }
+        if !needs_slow {
+            if fast_end > 0 {
+                if last_face != Some(span.face) {
+                    write_face_style(out, span.face, theme, false)?;
+                    last_face = Some(span.face);
+                }
+                out.write_all(&cleaned.as_bytes()[..fast_end])?;
+                used += fast_w;
+            }
+            if fast_end < cleaned.len() {
+                break 'spans;
+            }
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for ch in cleaned.chars() {
+            let ch = if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            };
+            if ch.is_control() {
+                continue;
+            }
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > max_width {
+                break 'spans;
+            }
+            if last_face != Some(span.face) {
+                write_face_style(out, span.face, theme, false)?;
+                last_face = Some(span.face);
+            }
+            out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+            used += cw;
+        }
+    }
+    let fill = pad_to.min(max_width).saturating_sub(used);
+    let trailing_diff_bg = line
+        .last()
+        .map(|s| s.face.diff_bg)
+        .filter(|bg| *bg != DiffBg::None);
+    if fill > 0 {
+        if let Some(diff_bg) = trailing_diff_bg {
+            queue!(
+                out,
+                style::SetAttribute(style::Attribute::Reset),
+                style::SetBackgroundColor(diff_bg_color(diff_bg, theme)),
+                style::SetForegroundColor(theme.text)
+            )?;
+            write_spaces(out, fill)?;
+            queue!(
+                out,
+                style::SetAttribute(style::Attribute::Reset),
+                style::SetBackgroundColor(theme.background),
+                style::SetForegroundColor(theme.text)
+            )?;
+            return Ok(used);
+        }
+    }
+    queue!(
+        out,
+        style::SetAttribute(style::Attribute::Reset),
+        style::SetBackgroundColor(theme.background),
+        style::SetForegroundColor(theme.text)
+    )?;
+    if fill > 0 {
+        write_spaces(out, fill)?;
+    }
+    Ok(used)
 }
 
 pub(super) fn write_line(out: &mut impl Write, line: &Line, theme: Theme) -> io::Result<()> {
@@ -745,5 +1136,45 @@ mod tests {
         assert!(result[1][0].face.bold);
         assert!(result[2].is_empty());
         assert!(result[3][0].face.accent);
+    }
+
+    #[test]
+    fn syntax_and_diff_bg_faces_adapt_dynamically_across_dark_and_light_themes() {
+        let monokai = super::super::theme::find("monokai").unwrap();
+        let latte = super::super::theme::find("catppuccin-latte").unwrap();
+        let line = vec![
+            Span {
+                text: "+ ".into(),
+                face: Face::HIGHLIGHT_BOLD.with_diff_bg(DiffBg::Added),
+            },
+            Span {
+                text: "fn".into(),
+                face: Face::syntax(SyntaxRole::Keyword).with_diff_bg(DiffBg::Added),
+            },
+        ];
+
+        let mut mono_out = Vec::new();
+        write_clipped_padded_line(&mut mono_out, &line, false, 12, 12, monokai).unwrap();
+        let mono_str = String::from_utf8(mono_out).unwrap();
+        assert!(mono_str.contains(&format!(
+            "{}",
+            style::SetBackgroundColor(monokai.syntax.diff_added_bg)
+        )));
+        assert!(mono_str.contains(&format!(
+            "{}",
+            style::SetForegroundColor(monokai.syntax.keyword)
+        )));
+
+        let mut latte_out = Vec::new();
+        write_clipped_padded_line(&mut latte_out, &line, false, 12, 12, latte).unwrap();
+        let latte_str = String::from_utf8(latte_out).unwrap();
+        assert!(latte_str.contains(&format!(
+            "{}",
+            style::SetBackgroundColor(latte.syntax.diff_added_bg)
+        )));
+        assert!(latte_str.contains(&format!(
+            "{}",
+            style::SetForegroundColor(latte.syntax.keyword)
+        )));
     }
 }

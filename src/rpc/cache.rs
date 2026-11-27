@@ -101,5 +101,7 @@ fn stats_to(stats: CacheStats) -> pb::CacheStats {
         last_cleanup: stats.last_cleanup,
         pruned: stats.pruned,
         busy: stats.busy,
+        pruned_events: stats.pruned_events,
+        compacted_turns: stats.compacted_turns,
     }
 }

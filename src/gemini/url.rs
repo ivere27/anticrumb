@@ -122,6 +122,102 @@ pub(crate) fn rpc_account_scope(url: &Url) -> Option<String> {
     )
 }
 
+pub(crate) fn normalized_slot(slot: Option<&str>) -> &str {
+    slot.map(str::trim)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("0")
+}
+
+pub(crate) fn gemini_app_url(slot: Option<&str>) -> String {
+    format!("https://gemini.google.com/u/{}/app", normalized_slot(slot))
+}
+
+pub(crate) fn gemini_usage_url(slot: Option<&str>) -> String {
+    let idx = normalized_slot(slot);
+    if idx == "0" {
+        "https://gemini.google.com/u/0/usage".into()
+    } else {
+        format!("https://gemini.google.com/u/{idx}/usage")
+    }
+}
+
+pub(crate) fn is_reusable_gemini_url_for(raw: &str, scope: Option<&str>) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    if !is_reusable_gemini_url(raw) {
+        return false;
+    }
+    let expected = normalized_slot(scope);
+    let actual = account_scope(&url);
+    match actual.as_deref() {
+        Some(actual_scope) => actual_scope == expected,
+        None => {
+            // Root `/` without `/app` maps to default account "0".
+            let segments: Vec<_> = url.path_segments().into_iter().flatten().collect();
+            segments.is_empty() && expected == "0"
+        }
+    }
+}
+
+pub(crate) fn is_gemini_usage_url_for(raw: &str, scope: Option<&str>) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    if !is_gemini_origin(&url) {
+        return false;
+    }
+    let expected = normalized_slot(scope);
+    let segments: Vec<_> = url.path_segments().into_iter().flatten().collect();
+    let path_scope = match segments.as_slice() {
+        ["usage"] => None,
+        ["u", account, "usage"]
+            if !account.is_empty() && account.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Some(*account)
+        }
+        _ => return false,
+    };
+    let query_scope = url
+        .query_pairs()
+        .find(|(key, _)| key == "authuser")
+        .map(|(_, value)| value.into_owned());
+    if let (Some(path), Some(query)) = (path_scope, query_scope.as_deref()) {
+        if path != query {
+            return false;
+        }
+    }
+    let actual = query_scope
+        .or_else(|| path_scope.map(str::to_owned))
+        .unwrap_or_else(|| "0".into());
+    actual == expected
+}
+
+pub(crate) fn rebase_gemini_chat_url(
+    raw: &str,
+    slot: Option<&str>,
+) -> std::result::Result<String, &'static str> {
+    let parsed = parse_gemini_chat_url(raw)?;
+    let segments: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
+    let chat_id = match segments.as_slice() {
+        ["app", id] | ["u", _, "app", id] => *id,
+        _ => return Err("invalid gemini chat URL"),
+    };
+    let idx = normalized_slot(slot);
+    Ok(format!("https://gemini.google.com/u/{idx}/app/{chat_id}"))
+}
+
+pub(crate) fn gemini_url_scope(raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    if !is_gemini_origin(&url) {
+        return None;
+    }
+    if let Some(scope) = account_scope(&url) {
+        return Some(scope);
+    }
+    rpc_account_scope(&url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +243,65 @@ mod tests {
         assert!(!url_has_chat_id("https://gemini.google.com/u/0/app"));
         assert!(url_has_chat_id("https://gemini.google.com/app/abc123"));
         assert!(url_has_chat_id("https://gemini.google.com/u/0/app/abc123"));
+    }
+
+    #[test]
+    fn scoped_gemini_urls_isolate_accounts_and_rebase_chat_ids() {
+        assert!(is_reusable_gemini_url_for(
+            "https://gemini.google.com/app",
+            Some("0")
+        ));
+        assert!(is_reusable_gemini_url_for(
+            "https://gemini.google.com/u/0/app/chat_1",
+            Some("0")
+        ));
+        assert!(!is_reusable_gemini_url_for(
+            "https://gemini.google.com/u/1/app",
+            Some("0")
+        ));
+        assert!(is_reusable_gemini_url_for(
+            "https://gemini.google.com/u/1/app/chat_2",
+            Some("1")
+        ));
+        assert!(!is_reusable_gemini_url_for(
+            "https://gemini.google.com/app/chat_1",
+            Some("1")
+        ));
+
+        assert!(is_gemini_usage_url_for(
+            "https://gemini.google.com/usage",
+            Some("0")
+        ));
+        assert!(is_gemini_usage_url_for(
+            "https://gemini.google.com/u/0/usage",
+            Some("0")
+        ));
+        assert!(is_gemini_usage_url_for(
+            "https://gemini.google.com/u/1/usage",
+            Some("1")
+        ));
+        assert!(is_gemini_usage_url_for(
+            "https://gemini.google.com/usage?authuser=1",
+            Some("1")
+        ));
+        assert!(!is_gemini_usage_url_for(
+            "https://gemini.google.com/usage",
+            Some("1")
+        ));
+        assert!(!is_gemini_usage_url_for(
+            "https://gemini.google.com/u/1/usage",
+            Some("0")
+        ));
+
+        assert_eq!(
+            rebase_gemini_chat_url("https://gemini.google.com/app/chat_abc", Some("1")).unwrap(),
+            "https://gemini.google.com/u/1/app/chat_abc"
+        );
+        assert_eq!(
+            rebase_gemini_chat_url("https://gemini.google.com/u/0/app/chat_abc", Some("2"))
+                .unwrap(),
+            "https://gemini.google.com/u/2/app/chat_abc"
+        );
+        assert!(rebase_gemini_chat_url("https://gemini.google.com/app", Some("1")).is_err());
     }
 }

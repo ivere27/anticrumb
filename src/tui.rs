@@ -4,11 +4,14 @@ mod clipboard;
 mod commands;
 mod debug_log;
 mod editor;
+mod highlight;
 mod input_loop;
+mod inspector;
 mod layout;
 mod markdown;
 mod mentions;
 mod model_picker;
+mod notices;
 mod platform;
 pub(crate) mod preferences;
 mod reducer;
@@ -622,7 +625,7 @@ mod tests {
             .logs()
             .contains("Daemon: remote https://browser.example:50051 · connected"));
         let remote_footer = state.status_text(100);
-        assert!(remote_footer.ends_with("D:remote(browser.example:50051)"));
+        assert!(remote_footer.ends_with("remote(browser.example:50051)"));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(remote_footer.as_str()),
             100
@@ -645,7 +648,7 @@ mod tests {
         state.editor.set("unfinished work".into());
         state.update(Update::StatusDisconnected);
         let offline_footer = state.status_text(100);
-        assert!(offline_footer.ends_with("D:remote/offline(browser.example:50051)"));
+        assert!(offline_footer.ends_with("remote/offline(browser.example:50051)"));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(offline_footer.as_str()),
             100
@@ -689,7 +692,7 @@ mod tests {
             }
         })));
         let connected = state.status_text(110);
-        assert!(connected.ends_with("  D:remote(192.168.1.10:50051)"));
+        assert!(connected.ends_with("  remote(192.168.1.10:50051)"));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(connected.as_str()),
             110
@@ -709,7 +712,7 @@ mod tests {
             }
         })));
         let remote_down = state.status_text(110);
-        assert!(remote_down.ends_with("  D:remote/offline(192.168.1.10:50051)"));
+        assert!(remote_down.ends_with("  remote/offline(192.168.1.10:50051)"));
         assert_eq!(
             state.status_spans(110).last().unwrap().1,
             markdown::Face::DANGER_BOLD
@@ -728,7 +731,7 @@ mod tests {
             footer_ansi.contains(&danger_fg),
             "disconnected daemon badge must use theme danger color"
         );
-        assert!(footer_ansi.contains("D:remote/offline(192.168.1.10:50051)"));
+        assert!(footer_ansi.contains("remote/offline(192.168.1.10:50051)"));
 
         // IPv6 endpoint and local disconnect also align right and use danger color.
         state.update(Update::Status(json!({
@@ -738,7 +741,7 @@ mod tests {
                 "connected": true
             }
         })));
-        assert!(state.status_text(110).ends_with("  D:remote([::1]:50051)"));
+        assert!(state.status_text(110).ends_with("  remote([::1]:50051)"));
 
         state.update(Update::Status(json!({
             "browser_connection": {
@@ -747,13 +750,13 @@ mod tests {
                 "connected": true
             }
         })));
-        assert!(state.status_text(110).ends_with("  D:local"));
+        assert!(state.status_text(110).ends_with("  local"));
         assert_eq!(
             state.status_spans(110).last().unwrap().1,
             markdown::Face::MUTED
         );
         state.update(Update::StatusDisconnected);
-        assert!(state.status_text(110).ends_with("  D:local/offline"));
+        assert!(state.status_text(110).ends_with("  local/offline"));
         assert_eq!(
             state.status_spans(110).last().unwrap().1,
             markdown::Face::DANGER_BOLD
@@ -772,7 +775,7 @@ mod tests {
             .starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm"));
         // When right-aligned daemon badge is omitted on narrow terminals, remaining space renders left items.
         let narrow_52 = state.status_text(52);
-        assert!(narrow_52.starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm · M:"));
+        assert!(narrow_52.starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm · "));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(narrow_52.as_str()),
             52
@@ -797,7 +800,7 @@ mod tests {
             .logs()
             .contains("Daemon: remote https://100.121.6.125:50051/ (🦍🐆🦇🐪) · connected"));
         let footer = state.status_text(110);
-        assert!(footer.ends_with("  D:remote(100.121.6.125:50051)"));
+        assert!(footer.ends_with("  remote(100.121.6.125:50051)"));
         assert!(!footer.contains("🦍"));
 
         state.update(Update::StatusDisconnected);
@@ -1177,15 +1180,15 @@ mod tests {
         };
         let mut state = State::new(options);
         state.options.model = Some("chosen".into());
-        assert!(state.status_text(100).contains("M:chosen"));
+        assert!(state.status_text(100).contains("chosen"));
         state.active_model = Some("actual".into());
         state.in_chars = 123;
         state.out_chars = 45;
         let footer = state.status_text(100);
-        assert!(footer.contains("M:actual"));
-        assert!(footer.contains("W:work"));
+        assert!(footer.contains("actual"));
+        assert!(footer.contains("work"));
         assert!(footer.contains("U:123/45c T:?"));
-        assert!(!footer.contains("M:chosen"));
+        assert!(!footer.contains("chosen"));
     }
 
     #[test]
@@ -1930,6 +1933,33 @@ mod tests {
         assert!(rendered.contains(&format!("({commit})")));
         assert!(rendered.contains("Gemini Web · default"));
         assert!(rendered.contains("/tmp/fixture-proj"));
+
+        // Logo uses theme-independent RGB colors regardless of the active theme.
+        let crust_top_ansi = format!(
+            "{}",
+            crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb {
+                r: 0xD9,
+                g: 0x88,
+                b: 0x38,
+            })
+        );
+        let crumb_honey_ansi = format!(
+            "{}",
+            crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb {
+                r: 0xED,
+                g: 0x9F,
+                b: 0x38,
+            })
+        );
+        assert!(rendered.contains(&crust_top_ansi));
+        assert!(rendered.contains(&crumb_honey_ansi));
+
+        state.theme = super::theme::find("catppuccin-latte").unwrap();
+        let mut latte_frame = Vec::new();
+        state.render_frame(&mut latte_frame, 100, 24).unwrap();
+        let latte_rendered = String::from_utf8(latte_frame).unwrap();
+        assert!(latte_rendered.contains(&crust_top_ansi));
+        assert!(latte_rendered.contains(&crumb_honey_ansi));
     }
 
     #[test]
@@ -1971,13 +2001,23 @@ mod tests {
         menu.selected = 1;
         state.select(&mut tx);
 
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::SetActiveAccount(id) if id == "claude"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::WebHistoryStatus(id, false) if id == "claude"
+        ));
+
         assert_eq!(state.options.account, "claude");
         assert_eq!(state.options.provider.as_deref(), Some("claude-web"));
         assert_eq!(state.provider_name(), "Claude Web");
         assert!(state.conversation_id.is_none());
         assert!(state.active_model.is_none());
         assert_eq!(state.catalog["models"][0]["mode_id"], "Sonnet 5.5");
-        assert!(state.status_text(120).contains("claude-web/claude:ready"));
+        assert!(state.status_text(120).contains("claude-web:ready"));
+        assert!(!state.status_text(120).contains("claude-web/claude:ready"));
 
         // Direct `/provider chatgpt-web` on an unconfigured provider triggers automatic account + login setup.
         state.editor.set("/provider chatgpt-web".into());
@@ -2019,6 +2059,67 @@ mod tests {
         assert!(!state.submit(&mut tx));
         assert_eq!(state.options.account, "default");
         assert!(state.logs().contains("Interrupt the current task"));
+    }
+
+    #[test]
+    fn status_bar_omits_email_and_shows_slot_or_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            account: "gemini-alice".into(),
+            ..Default::default()
+        });
+        state.update(Update::Status(json!({
+            "providers": [
+                {"id": "gemini-web", "name": "Gemini Web"},
+                {"id": "claude-web", "name": "Claude Web"}
+            ],
+            "accounts": [
+                {
+                    "id": "gemini-alice",
+                    "provider": "gemini-web",
+                    "state": "ready",
+                    "identity": "alice@gmail.com",
+                    "label": "alice@gmail.com",
+                    "slot": "0"
+                },
+                {
+                    "id": "gemini-plain",
+                    "provider": "gemini-web",
+                    "state": "ready",
+                    "identity": "bob@gmail.com"
+                },
+                {
+                    "id": "claude",
+                    "provider": "claude-web",
+                    "state": "ready",
+                    "identity": "carol@example.com"
+                }
+            ]
+        })));
+        let with_slot = state.status_text(120);
+        assert!(with_slot.contains(" · gemini-web/u/0:ready"), "{with_slot}");
+        assert!(!with_slot.contains("alice@gmail.com"), "{with_slot}");
+
+        state.options.account = "gemini-plain".into();
+        let without_slot = state.status_text(120);
+        assert!(
+            without_slot.contains(" · gemini-web:ready"),
+            "{without_slot}"
+        );
+        assert!(!without_slot.contains("bob@gmail.com"), "{without_slot}");
+
+        state.options.account = "claude".into();
+        state.options.provider = Some("claude-web".into());
+        let other_provider = state.status_text(120);
+        assert!(
+            other_provider.contains(" · claude-web:ready"),
+            "{other_provider}"
+        );
+        assert!(
+            !other_provider.contains("carol@example.com"),
+            "{other_provider}"
+        );
     }
 
     #[test]
@@ -2845,7 +2946,7 @@ mod tests {
         assert!(!state.options.agent);
         assert!(!state.options.yolo);
         state.log_startup_banner();
-        assert!(state.logs().contains("Mode: Chat"));
+        assert!(!state.logs().contains("Mode: Chat"));
         assert!(state.status_text(120).contains(" · CHAT · "));
 
         // 1. Default permissions are read-only (`read` only). Open `/permissions`, toggle `edit` ON, and save.
@@ -3286,7 +3387,7 @@ mod tests {
         assert!(!relaunched.options.overrides.contains("temporary"));
         assert!(relaunched.status_text(120).contains(" · CHAT · TEMP · "));
         relaunched.log_startup_banner();
-        assert!(relaunched
+        assert!(!relaunched
             .logs()
             .contains("Temp (anonymous, no server history)"));
 
@@ -3414,7 +3515,7 @@ mod tests {
         let msg = super::input_loop::exit_conversation_message("job-normal", &state);
         assert_eq!(
             msg,
-            "Session saved. Continue with: anticrumb resume job-normal"
+            "Session saved. Continue with: anticrumb --resume job-normal"
         );
 
         // 2. Run `/new` then send a temporary turn, toggle `/temp off` right before exit ->
@@ -3440,7 +3541,7 @@ mod tests {
         let msg_active_temp = super::input_loop::exit_conversation_message("job-temp", &state);
         assert_eq!(
             msg_active_temp,
-            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb resume job-temp"
+            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb --resume job-temp"
         );
 
         // 3. gRPC remote session with temporary mode includes the temporary note too.
@@ -3450,7 +3551,7 @@ mod tests {
         let msg_grpc_temp = super::input_loop::exit_conversation_message("job-temp", &state);
         assert_eq!(
             msg_grpc_temp,
-            "Session saved (temporary mode: not stored on provider server). Reconnect with `anticrumb connect`, then use `/resume job-temp`."
+            "Session saved (temporary mode: not stored on provider server). Continue with: anticrumb connect --resume job-temp"
         );
     }
 
@@ -4765,7 +4866,7 @@ mod tests {
             data: json!({"step": 1, "text": "committed"}),
             at: 0,
         }));
-        let lines_after = state.transcript.lines(&state.stream, 80).len();
+        let lines_after = state.transcript_lines(80).len();
         assert_eq!(lines_after, lines_before);
         state
             .render_frame(&mut out, 80, 16)
@@ -5153,7 +5254,7 @@ mod tests {
             conversation_id: "conv-ap".into(),
         });
 
-        // 1. Batch tool_approval_requested displays every tool + diff/command preview in transcript.
+        // 1. Batch tool_approval_requested populates ToolBlock without duplicate transcript dump.
         state.update(Update::Event(crate::domain::Event {
             sequence: 1,
             run_id: "agent-ap".into(),
@@ -5177,14 +5278,33 @@ mod tests {
         }));
         assert_eq!(state.tool_approvals.len(), 1);
         assert_eq!(state.phase, "approval (Y/N)");
-        let logs = state.logs();
-        assert!(logs.contains("Review 2 tool(s)"));
-        assert!(logs.contains("[1/2] edit_file: src/main.rs"));
-        assert!(logs.contains("- old_line()"));
-        assert!(logs.contains("+ new_line()"));
-        assert!(logs.contains("[2/2] run_shell"));
-        assert!(logs.contains("$ cargo check"));
-        assert!(logs.contains("Press Y to approve all 2 tools, N to reject"));
+        assert!(!state.needs_animation());
+        assert!(
+            !state.logs().contains("Review 2 tool(s)"),
+            "legacy duplicate approval dump must not appear in transcript logs"
+        );
+        let active_block = state.tool_blocks.active_block().expect("active tool block");
+        assert_eq!(active_block.items.len(), 2);
+        assert_eq!(active_block.items[0].tool, "edit_file");
+        assert_eq!(active_block.items[1].tool, "run_shell");
+
+        // Wide split (100 cols) renders tool list + continuous right Inspector Live Feed with BOTH pending tools!
+        let mut wide_ap = Vec::new();
+        state.render_frame(&mut wide_ap, 100, 24).unwrap();
+        let wide_str = String::from_utf8(wide_ap).unwrap();
+        assert!(wide_str.contains("edit_file"));
+        assert!(wide_str.contains("run_shell"));
+        assert!(wide_str.contains("approve 2 tools"));
+        assert!(wide_str.contains("old_line()") && wide_str.contains("cargo check"));
+
+        // Narrow single-column (< min_split_width) renders safe inline approval preview + Ctrl+O hint.
+        let mut narrow_ap = Vec::new();
+        state.render_frame(&mut narrow_ap, 80, 24).unwrap();
+        let narrow_ap_str = String::from_utf8(narrow_ap).unwrap();
+        assert!(narrow_ap_str.contains("- old_line()"));
+        assert!(narrow_ap_str.contains("+ new_line()"));
+        assert!(narrow_ap_str.contains("$ cargo check"));
+        assert!(narrow_ap_str.contains("Ctrl+O: full view"));
 
         // 2. Queued subagent approval shows queued count in hint bar; rendered frame displays [Y]/[N].
         state.update(Update::Event(crate::domain::Event {
@@ -5272,6 +5392,10 @@ mod tests {
         }
         assert!(state.tool_approvals.is_empty());
         assert_eq!(state.phase, "thinking");
+        assert_eq!(
+            state.tool_blocks.active_block().unwrap().items[2].status,
+            super::inspector::ToolStatus::Rejected
+        );
 
         // 5. While pending, scrolling up keeps BOTH [Y]/[N] and clickable scroll-bottom button, and Esc cancels.
         for i in 1..=30 {
@@ -5345,10 +5469,15 @@ mod tests {
         };
         state.update(Update::Event(req_event.clone()));
         let logs_once = state.logs();
-        // Duplicate approval_id must not re-log or enqueue again.
+        let item_count_once = state.tool_blocks.active_block().unwrap().items.len();
+        // Duplicate approval_id must not re-log, enqueue, or duplicate ToolBlock items.
         state.update(Update::Event(req_event));
         assert_eq!(state.tool_approvals.len(), 1);
         assert_eq!(state.logs(), logs_once);
+        assert_eq!(
+            state.tool_blocks.active_block().unwrap().items.len(),
+            item_count_once
+        );
 
         // Typing 'y' while composer already has draft text must not approve the tool batch.
         state.editor.set("please check ".into());
@@ -5368,5 +5497,2025 @@ mod tests {
         let narrow_str = String::from_utf8(narrow_frame).unwrap();
         assert!(narrow_str.contains("[Y] Approve"));
         assert!(narrow_str.contains("[N] Reject"));
+    }
+
+    #[test]
+    fn inspector_block_sealing_preserves_multistep_prose_and_merges_consecutive_tools() {
+        let mut state = State::new(PromptOptions::default());
+        state.update(Update::Started {
+            id: "run-order".into(),
+            conversation_id: "conv-order".into(),
+        });
+        state.push_entry("› Inspect files", Entry::Prompt("Inspect files".into()));
+
+        // Consecutive tool steps without prose stay merged into ONE ToolBlock.
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-order".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "args": {"path": "a.rs"}}),
+            at: 1,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 2,
+            run_id: "run-order".into(),
+            kind: "tool_finished".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "ok": true, "output": "fn a() {}", "elapsed_ms": 5}),
+            at: 2,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 3,
+            run_id: "run-order".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 2, "index": 0, "tool": "grep_search", "args": {"pattern": "foo"}}),
+            at: 3,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 4,
+            run_id: "run-order".into(),
+            kind: "tool_finished".into(),
+            data: json!({"step": 2, "index": 0, "tool": "grep_search", "ok": true, "output": "a.rs:1:foo", "elapsed_ms": 7}),
+            at: 4,
+        }));
+        assert_eq!(state.tool_blocks.active_block().unwrap().items.len(), 2);
+
+        // Mid-turn prose seals block 1 BEFORE pushing prose.
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 5,
+            run_id: "run-order".into(),
+            kind: "model_response".into(),
+            data: json!({"step": 2, "text": "MID_TURN_PROSE_MARKER"}),
+            at: 5,
+        }));
+        assert!(state.tool_blocks.active_block().is_none());
+
+        // Step 3 starts a fresh block 2 after mid-turn prose.
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 6,
+            run_id: "run-order".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 3, "index": 0, "tool": "edit_file", "args": {"path": "a.rs", "old_text": "a", "new_text": "b"}}),
+            at: 6,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 7,
+            run_id: "run-order".into(),
+            kind: "tool_finished".into(),
+            data: json!({"step": 3, "index": 0, "tool": "edit_file", "ok": true, "output": "ok", "elapsed_ms": 9}),
+            at: 7,
+        }));
+
+        // Final response seals block 2 BEFORE pushing final response.
+        state.update(Update::Finished(json!({
+            "id": "run-order",
+            "state": "completed",
+            "result": {
+                "final_response": "FINAL_RESPONSE_MARKER",
+                "files_changed": ["a.rs"]
+            }
+        })));
+        assert!(state.tool_blocks.active_block().is_none());
+
+        let lines: Vec<String> = state
+            .transcript_lines(120)
+            .into_iter()
+            .map(|l| l.into_iter().map(|s| s.text).collect::<String>())
+            .collect();
+        let pos = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle} in:\n{}", lines.join("\n")))
+        };
+        let p_read = pos("read_file");
+        let p_grep = pos("grep_search");
+        let p_mid = pos("MID_TURN_PROSE_MARKER");
+        let p_edit = pos("edit_file");
+        let p_final = pos("FINAL_RESPONSE_MARKER");
+        assert!(
+            p_read < p_grep && p_grep < p_mid && p_mid < p_edit && p_edit < p_final,
+            "chronological order violated: read={p_read}, grep={p_grep}, mid={p_mid}, edit={p_edit}, final={p_final}"
+        );
+    }
+
+    #[test]
+    fn inspector_mouse_wheel_click_follow_separation_and_divider_drag_resize() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = super::preferences::Preferences::open(dir.path()).unwrap();
+        let mut state = State::new(PromptOptions::default());
+        state.preferences = Some(super::preferences::Preferences::open(dir.path()).unwrap());
+        for i in 1..=30 {
+            state.log(&format!("prior line {i}"));
+        }
+        state.update(Update::Started {
+            id: "run-mouse".into(),
+            conversation_id: "conv-mouse".into(),
+        });
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-mouse".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "run_shell", "args": {"command": "seq 1 40"}}),
+            at: 1,
+        }));
+        let long_out = (1..=40)
+            .map(|i| format!("output-row-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 2,
+            run_id: "run-mouse".into(),
+            kind: "tool_finished".into(),
+            data: json!({"step": 1, "index": 0, "tool": "run_shell", "ok": true, "output": long_out, "elapsed_ms": 15}),
+            at: 2,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 3,
+            run_id: "run-mouse".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 2, "index": 0, "tool": "read_file", "args": {"path": "Cargo.toml"}}),
+            at: 3,
+        }));
+
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let block_id = state.tool_blocks.focused_id().unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+
+        // 1. Click tool #0 in left list -> selected=0, follow_tool=false.
+        let painted = state.painted_blocks.last().unwrap().clone();
+        let item0_row = painted
+            .row_map
+            .iter()
+            .find_map(|(r, k)| (*k == super::inspector::BlockRowKind::ToolItem(0)).then_some(*r))
+            .expect("item 0 row");
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: item0_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let painted = state.painted_blocks.last().unwrap().clone();
+        let insp_rect = painted.inspector_rect.expect("inline inspector rect");
+        let div_x = painted.divider_x.expect("inline divider x");
+
+        // 2. Right Inspector mouse wheel scrolls ONLY Inspector (scroll_from_bottom > 0, transcript scroll stays 0).
+        state.scroll_wheel_at(
+            true,
+            insp_rect.col.start + 2,
+            insp_rect.row.start + 2,
+            120,
+            24,
+        );
+        assert!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom > 0);
+        assert_eq!(state.scroll, 0);
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("[▶ Follow "));
+
+        // 3. Scroll Inspector back to bottom (scroll_from_bottom == 0): follow_tool MUST STAY false!
+        state.scroll_wheel_at(
+            false,
+            insp_rect.col.start + 2,
+            insp_rect.row.start + 2,
+            120,
+            24,
+        );
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+
+        // New tool starts -> selection must NOT jump away from tool #0!
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 4,
+            run_id: "run-mouse".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 3, "index": 0, "tool": "find_files", "args": {"pattern": "*.rs"}}),
+            at: 4,
+        }));
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+
+        // Clicking `[▶ Follow]` badge jumps straight back to latest tool #2 and re-enables live Follow!
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let (badge_row, badge_col, _, _) = state
+            .painted_blocks
+            .last()
+            .unwrap()
+            .live_badge
+            .expect("clickable Follow badge");
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: badge_col,
+            row: badge_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 2);
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
+
+        // 4. Left pane mouse wheel scrolls Transcript without touching Inspector scroll_from_bottom.
+        state.scroll_wheel_at(true, 2, insp_rect.row.start + 1, 120, 24);
+        assert!(state.scroll > 0);
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
+        state.reset_scroll();
+        state.render_frame(&mut out, 120, 24).unwrap();
+
+        // 5. Divider drag resizes width_pct clamped 35..=70 and persists to Preferences on Up.
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: div_x,
+            row: insp_rect.row.start + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.divider_drag);
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 40, // right side ~ 80/120 = 66%
+            row: insp_rect.row.start + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.layout.inspector.width_pct >= 60 && state.layout.inspector.width_pct <= 70);
+        let dragged_pct = state.layout.inspector.width_pct;
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 40,
+            row: insp_rect.row.start + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!state.divider_drag);
+        assert_eq!(prefs.inspector_config().width_pct, dragged_pct);
+    }
+
+    #[test]
+    fn inspector_keyboard_shortcuts_zoom_modal_priority_and_selection_copy() {
+        let mut state = State::new(PromptOptions::default());
+        let (mut tx, rx) = mpsc::sync_channel(16);
+        state.update(Update::Started {
+            id: "run-keys".into(),
+            conversation_id: "conv-keys".into(),
+        });
+        let big_body = (1..=50)
+            .map(|i| format!("zoom-body-line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-keys".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "args": {"path": "src/lib.rs"}}),
+            at: 1,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 2,
+            run_id: "run-keys".into(),
+            kind: "tool_finished".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "ok": true, "output": big_body, "elapsed_ms": 10}),
+            at: 2,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 3,
+            run_id: "run-keys".into(),
+            kind: "tool_approval_requested".into(),
+            data: json!({
+                "id": "ap-zoom",
+                "step": 2,
+                "calls": [{"tool": "run_shell", "args": {"command": "echo hi"}}]
+            }),
+            at: 3,
+        }));
+
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let block_id = state.tool_blocks.focused_id().unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+
+        // Pressing `→` while already in Live Feed stays pinned in Live Feed.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+
+        // Empty composer `←` from Live Feed steps to the latest (max) tool #1 (follow_tool = false),
+        // then another `←` moves to tool #0, and further `←` stays clamped at #0.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert!(state.editor.text.is_empty());
+
+        // Pressing `→` steps to last tool #1 (manual), then `→` enters Live Feed, and repeated `→` stays pinned!
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+
+        // Non-empty composer keeps `←`/`→` purely for cursor movement without altering Inspector.
+        state.editor.set("draft".into());
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+
+        // Alt+Z is removed (does not open zoom); Ctrl+O opens zoom even while composer has draft text!
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.inspector_zoom);
+        state.editor.set(String::new());
+
+        // Move back to tool #0 (50 lines): Live Feed -> Left (#1) -> Left (#0),
+        // then verify Alt+Up / Alt+PgDn scroll + Alt+L Follow toggle.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+
+        state.render_frame(&mut out, 120, 24).unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom > 0);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
+
+        // Alt+L resumes Follow -> jumps to latest tool #1; Alt+L again pins manual mode.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+
+        // Select tool #0 again (Live Feed -> Left (#1) -> Left (#0)) and verify Alt+I toggles Off <-> Inline without losing manual selection.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Off
+        );
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Inline
+        );
+
+        // Ctrl+O opens fullscreen Inspector overlay (preserving any draft text in composer).
+        state.editor.set("keep draft".into());
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+            )),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.inspector_zoom);
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("Ctrl+O/Esc close"));
+
+        // Inside Ctrl+O overlay: plain char does NOT leak to hidden composer; Up scrolls zoom;
+        // `→` switches tool; `f` toggles Follow; `Y` approves pending batch; `Esc` closes WITHOUT cancelling run!
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.editor.text, "keep draft");
+
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.inspector_zoom_scroll > 0);
+
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: true,
+                ..
+            } if approval_id == "ap-zoom"
+        ));
+
+        // Esc closes overlay WITHOUT cancelling active run and keeps composer draft intact.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.inspector_zoom);
+        assert_eq!(state.editor.text, "keep draft");
+        assert!(
+            rx.try_recv().is_err(),
+            "Esc must close overlay before cancelling run"
+        );
+        state.editor.set(String::new());
+
+        // SelectionTarget::Inspector drag selects Inspector body text (single-tool view on tool #0: Live Feed -> #1 -> #0).
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let painted = state.painted_blocks.last().unwrap().clone();
+        let rect = painted.inspector_rect.unwrap();
+        let body_row = rect.row.start + painted.inspector_header_rows;
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.col.start + 1,
+            row: body_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(state.selection_target, SelectionTarget::Inspector);
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: rect.col.start + 26,
+            row: body_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let selected_text = state.selection.as_ref().unwrap().text().unwrap_or_default();
+        assert!(
+            selected_text.contains("zoom-body-line"),
+            "expected Inspector body text, got: {selected_text:?}"
+        );
+        state.clear_selection();
+
+        // SelectionTarget::Transcript drag preserves right Inspector rendering!
+        state.log("selectable transcript text");
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let layout = state.painted_layout.unwrap();
+        let text_row = state
+            .painted_transcript
+            .iter()
+            .position(|l| {
+                l.iter()
+                    .any(|s| s.text.contains("selectable transcript text"))
+            })
+            .expect("selectable transcript row") as u16
+            + layout.transcript.start;
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: text_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(state.selection_target, SelectionTarget::Transcript);
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 22,
+            row: text_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state
+            .selection
+            .as_ref()
+            .and_then(|s| s.text())
+            .is_some_and(|t| t.contains("selectable")));
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let during_drag = String::from_utf8_lossy(&out);
+        assert!(
+            during_drag.contains("Inspector ·"),
+            "left transcript selection drag must preserve right Inspector pane"
+        );
+    }
+
+    #[test]
+    fn inspector_live_feed_and_bottom_space_expansion_fill_viewport() {
+        let mut state = State::new(PromptOptions::default());
+        state.update(Update::Started {
+            id: "run-tall".into(),
+            conversation_id: "conv-tall".into(),
+        });
+        state.push_entry("› Run checks", Entry::Prompt("Run checks".into()));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-tall".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "args": {"path": "a.rs"}}),
+            at: 1,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 2,
+            run_id: "run-tall".into(),
+            kind: "tool_finished".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "ok": true, "output": "fn alpha() {}", "elapsed_ms": 5}),
+            at: 2,
+        }));
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 3,
+            run_id: "run-tall".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 2, "index": 0, "tool": "edit_file", "args": {"path": "a.rs", "old_text": "alpha", "new_text": "beta"}}),
+            at: 3,
+        }));
+
+        // On a tall 45-row terminal with only a short prompt above, the active inline block
+        // expands to fill the empty bottom space instead of stopping at a cramped 12 rows.
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 120, 45).unwrap();
+        let painted = state.painted_blocks.last().unwrap().clone();
+        let insp_rect = painted.inspector_rect.expect("inline inspector rect");
+        assert!(
+            insp_rect.row.len >= 35,
+            "active inline block should fill empty bottom viewport space, got {} rows",
+            insp_rect.row.len
+        );
+        let rendered = super::markdown::clean(&String::from_utf8(out).unwrap());
+        assert!(rendered.contains("Live Feed"));
+        assert!(rendered.contains("fn alpha() {}"));
+        assert!(rendered.contains("- alpha"));
+        assert!(rendered.contains("+ beta"));
+        assert!(rendered.contains("[● Follow]"));
+
+        // Clicking `[● Follow]` pins current tool (switches to single-tool mode + `[▶ Follow]`).
+        let (br, bc, _, _) = painted.live_badge.expect("clickable Follow toggle");
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bc,
+            row: br,
+            modifiers: KeyModifiers::NONE,
+        });
+        let block_id = painted.block_id;
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        let mut pinned_out = Vec::new();
+        state.render_frame(&mut pinned_out, 120, 45).unwrap();
+        let pinned_str = String::from_utf8(pinned_out).unwrap();
+        assert!(pinned_str.contains("[▶ Follow]"));
+        assert!(
+            !pinned_str.contains("fn alpha() {}"),
+            "single-tool view on tool #2 must show only tool #2 without tool #1 noise"
+        );
+
+        // After the turn finishes (`after_turn == Fit`), sealed block shrinks to its compact height.
+        state.update(Update::Finished(json!({
+            "id": "run-tall",
+            "state": "completed",
+            "result": {"final_response": "All done", "files_changed": ["a.rs"]}
+        })));
+        let mut done_out = Vec::new();
+        state.render_frame(&mut done_out, 120, 45).unwrap();
+        let sealed_rect = state
+            .painted_blocks
+            .last()
+            .unwrap()
+            .inspector_rect
+            .expect("sealed inline rect");
+        assert!(
+            sealed_rect.row.len <= 5,
+            "sealed block with Fit policy should shrink to natural height, got {} rows",
+            sealed_rect.row.len
+        );
+    }
+
+    #[test]
+    fn inspector_resume_cjk_divider_alignment_and_menu_preview_revert() {
+        use crate::agent::{
+            AgentRunResult, AgentStatus, AgentStepRecord, ToolCallRequest, ToolOutput,
+        };
+        use crate::domain::{
+            AgentRecord, AgentRequest, ConversationRecord, ConversationSummary, SessionMode,
+            SessionRetention, ToolApprovalMode,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = super::preferences::Preferences::open(dir.path()).unwrap();
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().into(),
+            ..Default::default()
+        });
+        state.preferences = Some(super::preferences::Preferences::open(dir.path()).unwrap());
+        let (mut tx, _rx) = mpsc::sync_channel(16);
+
+        let make_req = |task: &str| AgentRequest {
+            environment: None,
+            task: task.into(),
+            workspace: dir.path().into(),
+            account_id: "default".into(),
+            model: None,
+            thinking: None,
+            session_mode: SessionMode::Chat,
+            no_shell: false,
+            max_steps: 4,
+            knowledge: None,
+            mcp_config: None,
+            artifacts: vec![],
+            conversation_id: Some("conv-resume-insp".into()),
+            chat_only: false,
+            permissions: None,
+            session_retention: SessionRetention::Retain,
+            tool_approval: ToolApprovalMode::Auto,
+        };
+
+        let conv = ConversationRecord {
+            summary: ConversationSummary {
+                id: "conv-resume-insp".into(),
+                workspace: dir.path().into(),
+                account_id: "default".into(),
+                session_mode: SessionMode::Chat,
+                chat_only: false,
+                model: None,
+                thinking: None,
+                state: "completed".into(),
+                turn_count: 3,
+                latest_agent_id: "t3".into(),
+                title: "Resume inspector".into(),
+                created_at: 1,
+                updated_at: 30,
+            },
+            turns: vec![
+                // Turn 1: recent full steps with CJK path + ANSI output
+                AgentRecord {
+                    id: "t1".into(),
+                    conversation_id: "conv-resume-insp".into(),
+                    state: "completed".into(),
+                    request: make_req("First turn"),
+                    result: Some(AgentRunResult {
+                        status: AgentStatus::Completed,
+                        final_response: "First done".into(),
+                        files_changed: vec!["문서/테스트.rs".into()],
+                        elapsed_ms: 100,
+                        inspector_pruned: false,
+                        steps: vec![AgentStepRecord {
+                            step: 1,
+                            model_response: String::new(),
+                            tool_calls: vec![ToolCallRequest {
+                                tool: "run_shell".into(),
+                                args: json!({"command": "echo 한글"}),
+                            }],
+                            observations: vec![ToolOutput {
+                                tool: "run_shell".into(),
+                                ok: true,
+                                output: "\x1b[31m한글결과\x1b[0m\n".into(),
+                                artifacts: vec![],
+                                elapsed_ms: 12,
+                            }],
+                            notes: vec![],
+                        }],
+                        ..Default::default()
+                    }),
+                    error: None,
+                    created_at: 1,
+                    updated_at: 10,
+                },
+                // Turn 2: cancelled turn with missing observation -> ToolStatus::Cancelled
+                AgentRecord {
+                    id: "t2".into(),
+                    conversation_id: "conv-resume-insp".into(),
+                    state: "cancelled".into(),
+                    request: make_req("Cancelled turn"),
+                    result: Some(AgentRunResult {
+                        status: AgentStatus::Cancelled,
+                        final_response: String::new(),
+                        files_changed: vec![],
+                        elapsed_ms: 50,
+                        inspector_pruned: false,
+                        steps: vec![AgentStepRecord {
+                            step: 1,
+                            model_response: String::new(),
+                            tool_calls: vec![ToolCallRequest {
+                                tool: "write_file".into(),
+                                args: json!({"path": "aborted.txt", "content": "nope"}),
+                            }],
+                            observations: vec![],
+                            notes: vec![],
+                        }],
+                        ..Default::default()
+                    }),
+                    error: None,
+                    created_at: 11,
+                    updated_at: 20,
+                },
+                // Turn 3: retention-pruned turn (inspector_pruned == true)
+                AgentRecord {
+                    id: "t3".into(),
+                    conversation_id: "conv-resume-insp".into(),
+                    state: "completed".into(),
+                    request: make_req("Old pruned turn"),
+                    result: Some(AgentRunResult {
+                        status: AgentStatus::Completed,
+                        final_response: "Old summary".into(),
+                        files_changed: vec![],
+                        elapsed_ms: 80,
+                        inspector_pruned: true,
+                        steps: vec![AgentStepRecord {
+                            step: 1,
+                            model_response: String::new(),
+                            tool_calls: vec![ToolCallRequest {
+                                tool: "edit_file".into(),
+                                args: json!({"path": "legacy.rs"}),
+                            }],
+                            observations: vec![ToolOutput {
+                                tool: "edit_file".into(),
+                                ok: true,
+                                output: String::new(),
+                                artifacts: vec![],
+                                elapsed_ms: 25,
+                            }],
+                            notes: vec![],
+                        }],
+                        ..Default::default()
+                    }),
+                    error: None,
+                    created_at: 21,
+                    updated_at: 30,
+                },
+            ],
+        };
+
+        state.load(conv);
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 110, 26).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("Details pruned after retention"));
+        assert!(
+            !rendered.contains("\x1b[31m한글결과"),
+            "raw ANSI escapes must be cleaned before rendering"
+        );
+
+        // Verify cancelled item status on turn 2's block.
+        let has_cancelled = (1..=3).any(|raw| {
+            state
+                .tool_blocks
+                .get(super::inspector::BlockId(raw))
+                .is_some_and(|b| {
+                    b.items.iter().any(|i| {
+                        i.tool == "write_file"
+                            && i.status == super::inspector::ToolStatus::Cancelled
+                    })
+                })
+        });
+        assert!(
+            has_cancelled,
+            "cancelled turn missing observation must restore as ToolStatus::Cancelled"
+        );
+
+        // Verify `/inspector` command args + interactive menu live preview & Esc revert + Enter save.
+        state.editor.set("/inspector side".into());
+        state.submit(&mut tx);
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Side
+        );
+        assert_eq!(
+            prefs.inspector_config().mode,
+            super::layout::InspectorMode::Side
+        );
+
+        state.editor.set("/inspector".into());
+        state.submit(&mut tx);
+        assert!(state.menu.is_some());
+        // Shift mode right (Side -> Off) for live preview, then Esc reverts to Side.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Off
+        );
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Side
+        );
+        assert_eq!(
+            prefs.inspector_config().mode,
+            super::layout::InspectorMode::Side
+        );
+
+        // Open menu again, shift right (Side -> Off), press Enter -> saved!
+        state.editor.set("/inspector".into());
+        state.submit(&mut tx);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Off
+        );
+        assert_eq!(
+            prefs.inspector_config().mode,
+            super::layout::InspectorMode::Off
+        );
+    }
+
+    #[test]
+    fn needs_animation_stops_when_idle_awaiting_approval_and_resumes_when_running() {
+        let mut state = State::new(PromptOptions::default());
+        assert!(!state.busy());
+        assert!(!state.needs_animation());
+
+        state.update(Update::Started {
+            id: "run-anim".into(),
+            conversation_id: "conv-anim".into(),
+        });
+        assert!(state.busy());
+        assert!(state.needs_animation());
+
+        // Pending approval with no running tools or active stream -> busy() true, needs_animation() false!
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-anim".into(),
+            kind: "tool_approval_requested".into(),
+            data: json!({
+                "id": "ap-idle",
+                "step": 1,
+                "calls": [{"tool": "run_shell", "args": {"command": "ls"}}]
+            }),
+            at: 1,
+        }));
+        assert!(state.busy());
+        assert!(!state.needs_animation());
+        state.has_unread_below = true;
+        assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::NewOutput);
+
+        // Once a tool starts running -> needs_animation() resumes!
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 2,
+            run_id: "run-anim".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "run_shell", "args": {"command": "ls"}}),
+            at: 2,
+        }));
+        assert!(state.needs_animation());
+        assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
+    }
+
+    #[test]
+    fn steady_state_repaint_avoids_full_screen_clear_and_clears_only_on_resize() {
+        let mut state = State::new(PromptOptions::default());
+        state.log("initial line");
+
+        let mut frame1 = Vec::new();
+        state.render_frame(&mut frame1, 100, 24).unwrap();
+        let s1 = String::from_utf8(frame1).unwrap();
+        assert!(
+            s1.contains("\x1b[1;1H\x1b[J"),
+            "initial frame must perform initial screen clear"
+        );
+
+        // Steady-state repaint at same dimensions must NOT emit `\x1b[J` (eliminates flicker).
+        state.log("second line");
+        let mut frame2 = Vec::new();
+        state.render_frame(&mut frame2, 100, 24).unwrap();
+        let s2 = String::from_utf8(frame2).unwrap();
+        assert!(
+            !s2.contains("\x1b[J") && !s2.contains("\x1b[2J"),
+            "steady-state repaint must update rows in place without full-screen clear"
+        );
+        assert!(s2.contains("\x1b[K"));
+
+        // Resizing terminal dimensions triggers clean full-screen clear once.
+        let mut frame3 = Vec::new();
+        state.render_frame(&mut frame3, 120, 30).unwrap();
+        let s3 = String::from_utf8(frame3).unwrap();
+        assert!(
+            s3.contains("\x1b[1;1H\x1b[J"),
+            "terminal resize must perform full-screen clear"
+        );
+    }
+
+    #[test]
+    fn side_mode_first_tool_activation_preserves_scroll_anchor_and_unread_badge() {
+        let mut state = State::new(PromptOptions::default());
+        state.layout.inspector.mode = super::layout::InspectorMode::Side;
+        for i in 1..=40 {
+            state.log(&format!(
+                "conversation entry {i:02} with plenty of prose text"
+            ));
+        }
+
+        // Before any tool block exists, Side mode keeps 100% full transcript width.
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let layout_before = state.painted_layout.unwrap();
+        assert!(layout_before.inspector_rect.is_none());
+        assert_eq!(layout_before.transcript_left.len, 120);
+
+        // User scrolls up in the conversation.
+        state.scroll_transcript(true, 10, 120, 24);
+        state.render_frame(&mut out, 120, 24).unwrap();
+        assert_eq!(state.scroll, 10);
+        assert!(!state.has_unread_below);
+
+        // First tool call activates Side split (width 120 -> transcript_left < 120) cleanly.
+        state.update(Update::Started {
+            id: "run-side-transition".into(),
+            conversation_id: "conv-side".into(),
+        });
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-side-transition".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "args": {"path": "src/main.rs"}}),
+            at: 1,
+        }));
+        out.clear();
+        state.render_frame(&mut out, 120, 24).unwrap();
+        let layout_after = state.painted_layout.unwrap();
+        assert!(layout_after.inspector_rect.is_some());
+        assert!(layout_after.transcript_left.len < 120);
+        assert!(
+            state.scroll > 0,
+            "scroll position must remain scrolled up across Side split activation"
+        );
+        assert!(
+            state.has_unread_below,
+            "new tool arrival must mark unread below across width change"
+        );
+        assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
+    }
+
+    #[test]
+    fn shift_tab_toggles_chat_and_agent_only_and_preserves_draft_and_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = Preferences::open(dir.path()).unwrap();
+        prefs
+            .set_permissions(crate::domain::ToolPermissions {
+                read: true,
+                edit: true,
+                shell: true,
+                browser: false,
+                subagent: false,
+                ast: true,
+            })
+            .unwrap();
+
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+        let (mut tx, rx) = mpsc::sync_channel(8);
+
+        let backtab =
+            event::Event::Key(event::KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        let shift_tab = event::Event::Key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        let repeat_backtab = event::Event::Key(event::KeyEvent::new_with_kind(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+            event::KeyEventKind::Repeat,
+        ));
+
+        // 1. Default CHAT -> Shift+Tab -> AGENT -> Shift+Tab -> CHAT (never YOLO), keeping draft intact.
+        assert!(!state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(!state.yolo_toggle_armed);
+        state.editor.set("keep this draft".into());
+        let logs_before = state.logs();
+
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(state.status_text(120).contains(" · AGENT · "));
+        assert_eq!(state.editor.text, "keep this draft");
+        assert_eq!(
+            state.logs(),
+            logs_before,
+            "Shift+Tab must not spam the transcript"
+        );
+
+        // Repeat events must not rapid-flip the mode.
+        super::input_loop::handle_input(&mut state, repeat_backtab, &mut tx).unwrap();
+        assert!(state.options.agent && !state.options.yolo);
+
+        // Ctrl+Shift+Tab / Alt+Shift+Tab are ignored.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            )),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.options.agent);
+
+        // Kitty-style KeyCode::Tab + SHIFT also toggles back to CHAT.
+        super::input_loop::handle_input(&mut state, shift_tab.clone(), &mut tx).unwrap();
+        assert!(!state.options.agent);
+        assert!(!state.options.yolo);
+        assert!(state.status_text(120).contains(" · CHAT · "));
+        assert_eq!(state.editor.text, "keep this draft");
+
+        // 2. Active tool block is not sealed when toggling mode mid-turn.
+        state.update(Update::Started {
+            id: "run-toggle".into(),
+            conversation_id: "conv-toggle".into(),
+        });
+        state.update(Update::Event(crate::domain::Event {
+            sequence: 1,
+            run_id: "run-toggle".into(),
+            kind: "tool_started".into(),
+            data: json!({"step": 1, "index": 0, "tool": "read_file", "args": {"path": "a.rs"}}),
+            at: 1,
+        }));
+        assert!(state.tool_blocks.active_block().is_some());
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent && !state.options.yolo);
+        assert!(
+            state.tool_blocks.active_block().is_some(),
+            "Shift+Tab must not prematurely seal an active tool block"
+        );
+        state.active = None;
+        state.phase = "ready".into();
+
+        // 3. Modals (open menu, history clear confirmation, inspector zoom) do not toggle mode;
+        //    menus use Shift+Tab to move selection upward.
+        state.menu = Some(Menu {
+            title: "Test menu".into(),
+            choices: vec![
+                Choice {
+                    label: "first".into(),
+                    value: Selection::Shell(false),
+                },
+                Choice {
+                    label: "second".into(),
+                    value: Selection::Shell(true),
+                },
+            ],
+            selected: 1,
+        });
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+        assert!(state.options.agent);
+        state.close_menu();
+
+        state.open_history_clear();
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent);
+        state.history_clear_confirmation = None;
+
+        state.inspector_zoom = true;
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent);
+        state.inspector_zoom = false;
+
+        // 4. `--agent --no-shell` preserves CLI `--no-shell` across AGENT <-> CHAT toggles.
+        let opts = PromptOptions::parse(&[
+            "-C".into(),
+            dir.path().display().to_string(),
+            "--agent".into(),
+            "--no-shell".into(),
+        ])
+        .unwrap();
+        let mut no_shell_state = State::new(opts);
+        no_shell_state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        no_shell_state.load_model_preference();
+        assert!(no_shell_state.options.agent);
+        assert!(!no_shell_state.options.yolo);
+        assert!(no_shell_state.options.no_shell);
+        assert!(!no_shell_state.options.effective_permissions().shell);
+
+        super::input_loop::handle_input(&mut no_shell_state, backtab.clone(), &mut tx).unwrap();
+        assert!(!no_shell_state.options.agent);
+        super::input_loop::handle_input(&mut no_shell_state, shift_tab, &mut tx).unwrap();
+        assert!(no_shell_state.options.agent);
+        assert!(!no_shell_state.options.yolo);
+        assert!(no_shell_state.options.no_shell);
+        assert!(!no_shell_state.options.effective_permissions().shell);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shift_tab_toggles_chat_and_yolo_only_when_explicitly_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, rx) = mpsc::sync_channel(8);
+        let backtab =
+            event::Event::Key(event::KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        // 1. Explicit CLI `--yolo` arms CHAT <-> YOLO toggle.
+        let yolo_opts = PromptOptions::parse(&[
+            "-C".into(),
+            dir.path().display().to_string(),
+            "--yolo".into(),
+        ])
+        .unwrap();
+        let mut cli_yolo = State::new(yolo_opts);
+        cli_yolo.preferences = Some(Preferences::open(dir.path()).unwrap());
+        cli_yolo.load_model_preference();
+        assert!(cli_yolo.options.agent && cli_yolo.options.yolo);
+        assert!(cli_yolo.yolo_toggle_armed);
+
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(!cli_yolo.options.agent && !cli_yolo.options.yolo);
+        assert!(cli_yolo.status_text(120).contains(" · CHAT · "));
+        cli_yolo.editor.set("quick chat".into());
+        cli_yolo.submit(&mut tx);
+        let Command::Start(chat_req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(chat_req.chat_only);
+        assert_eq!(
+            chat_req.tool_approval,
+            crate::domain::ToolApprovalMode::Unspecified
+        );
+        cli_yolo.active = None;
+        cli_yolo.pending = None;
+        cli_yolo.phase = "ready".into();
+
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(cli_yolo.options.agent && cli_yolo.options.yolo);
+        assert!(cli_yolo.status_text(120).contains(" · YOLO · "));
+        assert_eq!(
+            cli_yolo.options.effective_permissions(),
+            crate::domain::ToolPermissions::all()
+        );
+        cli_yolo.editor.set("back to yolo".into());
+        cli_yolo.submit(&mut tx);
+        let Command::Start(yolo_req, _, _) = rx.try_recv().unwrap() else {
+            panic!("expected Start");
+        };
+        assert!(!yolo_req.chat_only);
+        assert_eq!(
+            yolo_req.tool_approval,
+            crate::domain::ToolApprovalMode::Auto
+        );
+        cli_yolo.active = None;
+        cli_yolo.pending = None;
+        cli_yolo.phase = "ready".into();
+
+        // Explicit `/mode agent` disarms YOLO and resets to safe read-only default when no saved prefs exist.
+        cli_yolo.editor.set("/mode agent".into());
+        cli_yolo.submit(&mut tx);
+        assert!(cli_yolo.options.agent && !cli_yolo.options.yolo);
+        assert!(!cli_yolo.yolo_toggle_armed);
+        assert_eq!(
+            cli_yolo.options.effective_permissions(),
+            crate::domain::ToolPermissions::read_only()
+        );
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(!cli_yolo.options.agent);
+        super::input_loop::handle_input(&mut cli_yolo, backtab.clone(), &mut tx).unwrap();
+        assert!(cli_yolo.options.agent && !cli_yolo.options.yolo);
+        assert!(cli_yolo.status_text(120).contains(" · AGENT · "));
+
+        // 2. Explicit `--yolo --no-shell` does NOT arm YOLO toggle (CLI already disabled yolo).
+        let yolo_no_shell = PromptOptions::parse(&[
+            "-C".into(),
+            dir.path().display().to_string(),
+            "--yolo".into(),
+            "--no-shell".into(),
+        ])
+        .unwrap();
+        let mut constrained = State::new(yolo_no_shell);
+        assert!(constrained.options.agent && !constrained.options.yolo);
+        assert!(!constrained.yolo_toggle_armed);
+        super::input_loop::handle_input(&mut constrained, backtab.clone(), &mut tx).unwrap();
+        assert!(!constrained.options.agent);
+        super::input_loop::handle_input(&mut constrained, backtab.clone(), &mut tx).unwrap();
+        assert!(constrained.options.agent && !constrained.options.yolo);
+
+        // 3. Explicit `/mode yolo` (and `/mode` menu) arms CHAT <-> YOLO; restricting `/permissions` disarms it.
+        let mut state = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        state.preferences = Some(Preferences::open(dir.path()).unwrap());
+        state.load_model_preference();
+        state.editor.set("/mode yolo".into());
+        state.submit(&mut tx);
+        assert!(state.options.agent && state.options.yolo && state.yolo_toggle_armed);
+
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(!state.options.agent && !state.options.yolo);
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent && state.options.yolo);
+
+        // Toggle to CHAT, then restrict `/permissions readonly` -> disarms YOLO!
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(!state.options.agent);
+        state.editor.set("/permissions readonly".into());
+        state.submit(&mut tx);
+        assert!(!state.yolo_toggle_armed);
+        super::input_loop::handle_input(&mut state, backtab.clone(), &mut tx).unwrap();
+        assert!(state.options.agent && !state.options.yolo);
+        assert_eq!(
+            state.options.effective_permissions(),
+            crate::domain::ToolPermissions::read_only()
+        );
+
+        // 4. Implicit `/resume` of a prior YOLO conversation does NOT arm YOLO toggle:
+        //    Shift+Tab leaves YOLO -> CHAT -> safe AGENT (with saved permissions restored).
+        let prefs = Preferences::open(dir.path()).unwrap();
+        let saved_edit = crate::domain::ToolPermissions {
+            read: true,
+            edit: true,
+            shell: false,
+            browser: false,
+            subagent: false,
+            ast: true,
+        };
+        prefs.set_permissions(saved_edit).unwrap();
+
+        let mut resumed = State::new(PromptOptions {
+            workspace: dir.path().to_path_buf(),
+            account: "default".into(),
+            ..Default::default()
+        });
+        resumed.preferences = Some(Preferences::open(dir.path()).unwrap());
+        resumed.load_model_preference();
+
+        let yolo_turn = crate::domain::AgentRecord {
+            id: "turn-yolo".into(),
+            conversation_id: "conv-yolo".into(),
+            state: "completed".into(),
+            request: PromptOptions::parse(&[
+                "-C".into(),
+                dir.path().display().to_string(),
+                "--yolo".into(),
+            ])
+            .unwrap()
+            .agent_request("old yolo task".into(), Some("conv-yolo".into())),
+            result: Some(crate::agent::AgentRunResult {
+                status: crate::agent::AgentStatus::Completed,
+                final_response: "done".into(),
+                ..Default::default()
+            }),
+            error: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let conv =
+            crate::domain::ConversationRecord::from_turns("conv-yolo", vec![yolo_turn]).unwrap();
+        resumed.update(Update::Loaded(conv));
+        assert!(resumed.options.agent && resumed.options.yolo);
+        assert!(
+            !resumed.yolo_toggle_armed,
+            "resuming a YOLO conversation must not implicitly arm Shift+Tab YOLO toggle"
+        );
+
+        super::input_loop::handle_input(&mut resumed, backtab.clone(), &mut tx).unwrap();
+        assert!(!resumed.options.agent && !resumed.options.yolo);
+        super::input_loop::handle_input(&mut resumed, backtab, &mut tx).unwrap();
+        assert!(resumed.options.agent && !resumed.options.yolo);
+        assert_eq!(resumed.options.effective_permissions(), saved_edit);
+    }
+
+    #[test]
+    fn startup_banner_with_notice_renders_spacing_and_none_noop() {
+        let make_state = || {
+            State::new(PromptOptions {
+                workspace: std::path::PathBuf::from("/tmp/fixture-proj"),
+                account: "default".into(),
+                ..Default::default()
+            })
+        };
+
+        let mut baseline = make_state();
+        baseline.log_startup_banner_with_notice(None);
+        let base_logs = baseline.logs();
+        let base_lines: Vec<&str> = base_logs.split('\n').collect();
+        // Leading empty line, 5 banner rows (row0..row4), trailing empty line, plus final '\n'.
+        assert_eq!(base_lines.len(), 8);
+        assert_eq!(base_lines[0], "");
+        assert_eq!(base_lines[4], "/tmp/fixture-proj");
+        assert_eq!(base_lines[5], "");
+        assert_eq!(base_lines[6], "");
+        assert_eq!(base_lines[7], "");
+        let base_rendered_80 = baseline.transcript_lines(80).to_vec();
+        assert_eq!(base_rendered_80.len(), 7);
+        let base_prefix_len = base_rendered_80.len() - 1;
+        assert!(base_rendered_80[base_prefix_len].is_empty());
+        assert_eq!(baseline.transcript_lines(100).len(), 7);
+
+        let tip = super::notices::NoticeEntry {
+            id: "tip-test".into(),
+            kind: super::notices::NoticeKind::Tip,
+            title: None,
+            text: "Use /new for each task to keep context sharp; revisit via /resume.".into(),
+            url: None,
+            probability: 0.05,
+            starts_at: None,
+            expires_at: None,
+        };
+        let mut with_tip = make_state();
+        with_tip.log_startup_banner_with_notice(Some(&tip));
+        let tip_logs = with_tip.logs();
+        let tip_lines: Vec<&str> = tip_logs.split('\n').collect();
+        // row0..row4 -> blank line -> tip line -> trailing blank line.
+        assert_eq!(tip_lines.len(), 10);
+        assert_eq!(&tip_lines[..6], &base_lines[..6]);
+        assert_eq!(tip_lines[6], "");
+        assert_eq!(
+            tip_lines[7],
+            "  Tip · Use /new for each task to keep context sharp; revisit via /resume."
+        );
+        assert_eq!(tip_lines[8], "");
+        assert_eq!(tip_lines[9], "");
+        // On an 80-column terminal, the tip adds exactly 1 blank line + 1 unwrapped line.
+        let tip_rendered = with_tip.transcript_lines(80).to_vec();
+        assert_eq!(tip_rendered.len(), base_rendered_80.len() + 2);
+        assert_eq!(
+            &tip_rendered[..base_prefix_len],
+            &base_rendered_80[..base_prefix_len]
+        );
+        assert!(tip_rendered[base_prefix_len].is_empty());
+        assert_eq!(tip_rendered[base_prefix_len + 1][0].text, "  Tip · ");
+        assert_eq!(
+            tip_rendered[base_prefix_len + 1][0].face,
+            markdown::Face::ACCENT
+        );
+        assert_eq!(
+            tip_rendered[base_prefix_len + 1][1].face,
+            markdown::Face::MUTED
+        );
+        assert!(tip_rendered[base_prefix_len + 2].is_empty());
+
+        let author = super::notices::NoticeEntry {
+            id: "author-test".into(),
+            kind: super::notices::NoticeKind::Author,
+            title: Some("Synurang".into()),
+            text: "In-process gRPC/FFI bridge powering anticrumb".into(),
+            url: Some("https://github.com/ivere27/synurang".into()),
+            probability: 0.01,
+            starts_at: None,
+            expires_at: None,
+        };
+        let mut with_author = make_state();
+        with_author.log_startup_banner_with_notice(Some(&author));
+        let author_logs = with_author.logs();
+        let author_lines: Vec<&str> = author_logs.split('\n').collect();
+        // row0..row4 -> blank line -> headline -> indented URL -> trailing blank line.
+        assert_eq!(author_lines.len(), 11);
+        assert_eq!(&author_lines[..6], &base_lines[..6]);
+        assert_eq!(author_lines[6], "");
+        assert_eq!(
+            author_lines[7],
+            "  Also by author · Synurang — In-process gRPC/FFI bridge powering anticrumb"
+        );
+        assert_eq!(
+            author_lines[8],
+            "                   https://github.com/ivere27/synurang"
+        );
+        assert_eq!(author_lines[9], "");
+        assert_eq!(author_lines[10], "");
+        // On an 80-column terminal, the author notice adds 1 blank line + 2 unwrapped lines.
+        let author_rendered = with_author.transcript_lines(80).to_vec();
+        assert_eq!(author_rendered.len(), base_rendered_80.len() + 3);
+        assert_eq!(
+            &author_rendered[..base_prefix_len],
+            &base_rendered_80[..base_prefix_len]
+        );
+        assert!(author_rendered[base_prefix_len].is_empty());
+        assert_eq!(
+            author_rendered[base_prefix_len + 1][0].face,
+            markdown::Face::MUTED
+        );
+        assert_eq!(author_rendered[base_prefix_len + 1][1].text, "Synurang");
+        assert_eq!(
+            author_rendered[base_prefix_len + 1][1].face,
+            markdown::Face::TEXT
+        );
+        assert_eq!(
+            author_rendered[base_prefix_len + 1][2].face,
+            markdown::Face::MUTED
+        );
+        assert_eq!(
+            author_rendered[base_prefix_len + 2][0].text,
+            "                   https://github.com/ivere27/synurang"
+        );
+        assert_eq!(
+            author_rendered[base_prefix_len + 2][0].face,
+            markdown::Face::MUTED
+        );
+        assert!(author_rendered[base_prefix_len + 3].is_empty());
+    }
+
+    #[test]
+    fn idle_hint_renders_full_solid_rule_and_preserves_copy_badge_and_contextual_hints() {
+        let mut state = State::new(PromptOptions::default());
+        let mut out = Vec::new();
+
+        // 1. Idle state: full-width solid horizontal rule using SUBTLE face, no /help or key hints.
+        state.render_frame(&mut out, 80, 20).expect("idle frame");
+        assert_eq!(state.painted_hint.len(), 1);
+        assert_eq!(state.painted_hint[0].len(), 1);
+        assert_eq!(state.painted_hint[0][0].text, "─".repeat(80));
+        assert_eq!(state.painted_hint[0][0].face, markdown::Face::SUBTLE);
+
+        // 2. Idle state with clipboard copy badge: rule fills left side, followed by space + badge.
+        state.clipboard_notice = Some("Copied 12 chars".into());
+        out.clear();
+        state
+            .render_frame(&mut out, 80, 20)
+            .expect("idle frame with copy badge");
+        let hint_text: String = state.painted_hint[0]
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(hint_text.chars().count(), 80);
+        assert!(hint_text.starts_with("────"));
+        assert!(hint_text.ends_with(" ✓ Copied 12 chars "));
+        assert_eq!(state.painted_hint[0][0].face, markdown::Face::SUBTLE);
+        assert_eq!(
+            state.painted_hint[0].last().unwrap().face,
+            markdown::Face::HIGHLIGHT
+        );
+
+        // 3. Non-idle contextual hint (e.g. attached file) replaces the idle rule.
+        state.clipboard_notice = None;
+        state.files.push(std::path::PathBuf::from("notes.md"));
+        out.clear();
+        state
+            .render_frame(&mut out, 80, 20)
+            .expect("contextual hint frame");
+        let file_hint: String = state.painted_hint[0]
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(file_hint.contains("1 file(s): notes.md"));
+        assert!(!file_hint.contains('─'));
+    }
+
+    #[test]
+    fn footer_shows_shortcuts_hint_when_idle_and_empty_and_hides_otherwise() {
+        let mut state = State::new(PromptOptions {
+            account: "default".into(),
+            workspace: "/tmp/project".into(),
+            ..Default::default()
+        });
+        state.update(Update::Status(json!({
+            "accounts": [{"id": "default", "state": "ready"}],
+            "browser_connection": {"transport": "local", "endpoint": "", "connected": true}
+        })));
+
+        // Idle + empty composer shows `? for shortcuts` before right-aligned `  local`.
+        let idle_120 = state.status_text(120);
+        assert!(idle_120.contains("? for shortcuts  local"), "{idle_120}");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(idle_120.as_str()),
+            120
+        );
+        assert_eq!(
+            state.status_spans(120).last().unwrap().1,
+            markdown::Face::MUTED
+        );
+
+        // Even on an 80-col terminal (or 120-col with long quota), `? for shortcuts` remains visible.
+        let idle_80 = state.status_text(80);
+        assert!(idle_80.contains("? for shortcuts  local"), "{idle_80}");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(idle_80.as_str()), 80);
+
+        // Typing into the composer hides the idle shortcut hint.
+        state.editor.set("hello".into());
+        assert!(!state.status_text(120).contains("? for shortcuts"));
+        assert!(!state.status_text(120).contains("? help"));
+
+        // Clearing composer restores it; busy state hides it.
+        state.editor.set(String::new());
+        assert!(state.status_text(120).contains("? for shortcuts"));
+        state.active = Some("turn-1".into());
+        assert!(!state.status_text(120).contains("? for shortcuts"));
+        state.active = None;
+
+        // Opening the shortcuts overlay hides the footer prompt (the panel itself shows Esc/? close).
+        state.open_shortcuts();
+        assert!(!state.status_text(120).contains("? for shortcuts"));
+    }
+
+    #[test]
+    fn question_mark_toggles_shortcuts_panel_supports_wide_narrow_layout_scroll_and_mid_draft_typing(
+    ) {
+        let press = |code, modifiers| {
+            event::Event::Key(event::KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                event::KeyEventKind::Press,
+            ))
+        };
+        let mut state = State::new(PromptOptions::default());
+        let (mut tx, _) = mpsc::sync_channel(4);
+
+        // 1. Typing `?` inside non-empty draft inserts `?` normally without opening overlay.
+        state.editor.set("what".into());
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+        assert_eq!(state.editor.text, "what?");
+
+        // 2. Pressing `?` on empty composer opens the shortcuts panel (works with Shift modifier too).
+        state.editor.set(String::new());
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.shortcuts_open);
+        assert!(state.editor.text.is_empty());
+
+        // 3. Wide terminal renders 2-column grid with vertical divider `│` and all sections.
+        let mut out = Vec::new();
+        state
+            .render_frame(&mut out, 120, 30)
+            .expect("wide shortcuts frame");
+        let wide = String::from_utf8_lossy(&out);
+        assert!(wide.contains("Shortcuts"));
+        assert!(wide.contains("Composer & Editing"));
+        assert!(wide.contains("Mentions & Completion"));
+        assert!(wide.contains("Modes & Session"));
+        assert!(wide.contains("Scroll & Tool Inspector"));
+        assert!(wide.contains("Quick Commands"));
+        assert!(wide.contains("Esc / ? close"));
+        assert!(wide.contains('│'));
+
+        // 4. Plain keys inside overlay do not leak into the composer.
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.editor.text.is_empty());
+        assert!(state.shortcuts_open);
+
+        // 5. Short/narrow terminal renders 1-column scrollable overlay and responds to key + wheel scroll.
+        out.clear();
+        state
+            .render_frame(&mut out, 76, 14)
+            .expect("narrow shortcuts frame");
+        let narrow = String::from_utf8_lossy(&out);
+        assert!(narrow.contains("↑↓ scroll"));
+        assert!(!narrow.contains('│'));
+
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Down, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.shortcuts_scroll, 1);
+        state.scroll_wheel_at(false, 10, 5, 76, 14);
+        assert_eq!(state.shortcuts_scroll, 4);
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::End, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.shortcuts_scroll > 4);
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Home, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.shortcuts_scroll, 0);
+
+        // 6. Mouse clicks while shortcuts overlay is open do not select transcript underneath.
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.selection.is_none());
+
+        // 7. `?`, `Esc`, and `q` all close the panel cleanly and reset scroll.
+        state.shortcuts_scroll = 3;
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+        assert_eq!(state.shortcuts_scroll, 0);
+
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.shortcuts_open);
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Esc, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+
+        // 8. `/help` stays synchronized with the shared shortcut list (includes `?`).
+        state.editor.set("/help".into());
+        state.submit(&mut tx);
+        assert!(state.logs().contains("Toggle shortcuts panel"));
+    }
+
+    #[test]
+    fn model_menu_renders_current_marker_and_thinking_level_slider() {
+        let mut state = State::new(PromptOptions {
+            model: Some("hydrogen".into()),
+            thinking: Some("high".into()),
+            ..PromptOptions::default()
+        });
+        let (mut tx, _rx) = mpsc::sync_channel(4);
+        state.catalog = json!({
+            "models": [
+                {"mode_id": "neon", "sublabel": "4 Neon", "label": "Fast"},
+                {"mode_id": "hydrogen", "sublabel": "4 Hydrogen", "label": "Balanced", "selected": true},
+                {"mode_id": "flash", "sublabel": "3.8 Flash", "label": "Instant"}
+            ],
+            "model_thinking": {
+                "neon": [
+                    {"level": "low", "label": "Low"},
+                    {"level": "medium", "label": "Medium"},
+                    {"level": "high", "label": "High"}
+                ],
+                "hydrogen": [
+                    {"level": "low", "label": "Low"},
+                    {"level": "medium", "label": "Medium"},
+                    {"level": "high", "label": "High"},
+                    {"level": "xhigh", "label": "XHigh"}
+                ],
+                "flash": []
+            },
+            "thinking": [
+                {"level": "medium", "label": "Medium", "selected": true}
+            ]
+        });
+
+        state.open_models();
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 90, 24).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(frame.contains("Model · ↑↓ model"));
+        assert!(frame.contains("4 Hydrogen · Balanced  (current)"));
+        assert!(frame.contains("Thinking"));
+        assert!(frame.contains("●"));
+        assert!(frame.contains("◉"));
+        assert!(frame.contains("○"));
+        assert!(frame.contains("Low"));
+        assert!(frame.contains("Medium"));
+        assert!(frame.contains("High"));
+        assert!(frame.contains("XHigh"));
+
+        // Pressing Right shifts Hydrogen from High -> XHigh (no trailing hollow `○`).
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 90, 24).unwrap();
+        let at_max = String::from_utf8(out).unwrap();
+        assert!(at_max.contains("◉"));
+        assert!(!at_max.contains("○"));
+
+        // Narrow terminal falls back cleanly to 1-line compact strip showing all levels.
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 46, 24).unwrap();
+        let narrow = String::from_utf8(out).unwrap();
+        assert!(narrow.contains("Thinking"));
+        assert!(narrow.contains("[XHigh]"));
+        assert!(narrow.contains("Low"));
+
+        // Moving down to Flash (no thinking levels) shows Unavailable cleanly.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 90, 24).unwrap();
+        let flash_frame = String::from_utf8(out).unwrap();
+        assert!(flash_frame.contains("Thinking"));
+        assert!(flash_frame.contains("Unavailable"));
+    }
+
+    #[test]
+    fn tool_approval_buttons_are_clickable_and_alt_y_n_work_while_drafting() {
+        let mut state = State::new(PromptOptions::default());
+        let (mut tx, rx) = mpsc::sync_channel(8);
+        state.active = Some("run-click".into());
+        state.editor.set("typing follow-up prompt".into());
+        for (idx, id) in ["ap-1", "ap-2", "ap-3"].into_iter().enumerate() {
+            state.update(Update::Event(crate::domain::Event {
+                sequence: idx as i64 + 1,
+                run_id: "run-click".into(),
+                kind: "tool_approval_requested".into(),
+                data: json!({
+                    "id": id,
+                    "step": idx + 1,
+                    "calls": [{"tool": "run_shell", "args": {"command": "echo hi"}}]
+                }),
+                at: idx as i64 + 1,
+            }));
+        }
+
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 100, 24).unwrap();
+        let (row, approve, reject) = state
+            .approval_buttons
+            .expect("approval hitboxes must be populated");
+        let (ay_start, ay_end) = approve.expect("approve hitbox");
+        let (rn_start, rn_end) = reject.expect("reject hitbox");
+        assert!(ay_end < rn_start, "gap between Approve and Reject buttons");
+
+        // Clicking the gap between [Y] Approve and [N] Reject does not trigger approval.
+        let gap_mouse = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: ay_end,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!state.approval_mouse(gap_mouse, &mut tx));
+        assert!(rx.try_recv().is_err());
+
+        // Clicking green [Y] Approve approves ap-1 while keeping composer draft intact.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: ay_start + 1,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: true,
+                ..
+            } if approval_id == "ap-1"
+        ));
+        assert_eq!(state.editor.text, "typing follow-up prompt");
+
+        // Re-render and click red [N] Reject -> rejects ap-2 while keeping draft intact.
+        out.clear();
+        state.render_frame(&mut out, 100, 24).unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rn_start + 1,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: false,
+                ..
+            } if approval_id == "ap-2"
+        ));
+        assert_eq!(state.editor.text, "typing follow-up prompt");
+
+        // Alt+Y approves ap-3 even while draft text is in the composer.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: true,
+                ..
+            } if approval_id == "ap-3"
+        ));
+        assert_eq!(state.editor.text, "typing follow-up prompt");
+        assert!(rn_end > rn_start);
+    }
+
+    #[test]
+    fn footer_shows_peer_workspace_ascii_alerts_next_to_daemon_and_filters_self() {
+        let mut state = State::new(PromptOptions {
+            workspace: std::path::PathBuf::from("/tmp/k/a"),
+            ..PromptOptions::default()
+        });
+        state.status = json!({
+            "browser_connection": {"transport": "local", "connected": true},
+            "accounts": [{"id": "acc", "provider": "gemini-web", "state": "ready", "active": true}],
+            "workspace_alerts": [
+                {"workspace": "/tmp/k/a", "agent_id": "own", "kind": "approval", "count": 1, "updated_at": 100},
+                {"workspace": "/tmp/b", "agent_id": "ag-b", "kind": "approval", "count": 2, "updated_at": 90},
+                {"workspace": "/tmp/k/c", "agent_id": "ag-c", "kind": "failed", "count": 1, "updated_at": 80},
+                {"workspace": "/tmp/k/d", "agent_id": "ag-d", "kind": "completed", "count": 1, "updated_at": 70}
+            ]
+        });
+
+        let bar = state.status_text(120);
+        assert!(!bar.contains("?a"), "own workspace must be excluded: {bar}");
+        assert!(
+            bar.contains("?b !c +1  local"),
+            "expected peer ASCII alerts right next to daemon badge, got: {bar}"
+        );
+
+        // Duplicate basenames disambiguate with parent dir; completed shows `*`.
+        state.status["workspace_alerts"] = json!([
+            {"workspace": "/tmp/k/app", "agent_id": "ag-1", "kind": "approval", "count": 1, "updated_at": 90},
+            {"workspace": "/tmp/work/app", "agent_id": "ag-2", "kind": "completed", "count": 1, "updated_at": 80}
+        ]);
+        let dup_bar = state.status_text(120);
+        assert!(
+            dup_bar.contains("?k/app *work/app  local"),
+            "expected disambiguated basenames with `*` for completed, got: {dup_bar}"
+        );
     }
 }

@@ -1,10 +1,10 @@
-//! A login request owns one bounded, cancellable catalog refresh.
-use super::persist_probe;
-use crate::service::AccountGate;
+//! A login request owns one bounded, cancellable account sync and catalog refresh per provider.
+use super::{persist_probe, sync_discovered_accounts};
 use crate::{
     agent::CancelToken,
     domain::*,
-    provider::{Provider, ProviderContext},
+    provider::{DiscoveredAccount, Provider, ProviderContext},
+    service::BrowserGate,
     store::Store,
 };
 use std::{
@@ -34,14 +34,14 @@ pub(crate) struct Monitors {
 
 impl Monitors {
     pub fn recover(store: &Store) -> Result<()> {
-        for account in store.list::<Account>("local", "account")? {
-            if super::login_status(store, &account.id)
+        for browser in store.list_browser_profiles()? {
+            if super::provider_login_status(store, &browser.provider_id)
                 .is_some_and(|status| matches!(status.state.as_str(), "waiting" | "refreshing"))
             {
                 store.put(
-                    &account.id,
-                    "login",
-                    "current",
+                    "local",
+                    "provider_login",
+                    &browser.provider_id,
                     &LoginStatus {
                         state: "failed".into(),
                         error: "Login monitoring stopped when the browser host exited. Open login again or run /model refresh after signing in.".into(),
@@ -51,15 +51,21 @@ impl Monitors {
         }
         Ok(())
     }
-    pub fn cancel(&self, store: &Store, account: &str) -> Result<bool> {
+
+    pub fn cancel(&self, store: &Store, provider_id: &str) -> Result<bool> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = active.remove(account);
+        let previous = active.remove(provider_id);
         if let Some(watch) = &previous {
             watch.cancel.cancel();
         }
         // Serialize clearing with a monitor's final persistence, so an obsolete
-        // task cannot overwrite a new login, attachment, pause, or refresh.
-        store.put(account, "login", "current", &Option::<LoginStatus>::None)?;
+        // task cannot overwrite a new login, attachment, or refresh.
+        store.put(
+            "local",
+            "provider_login",
+            provider_id,
+            &Option::<LoginStatus>::None,
+        )?;
         Ok(previous.is_some())
     }
 
@@ -70,9 +76,14 @@ impl Monitors {
         let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            for (account, watch) in active.drain() {
+            for (provider_id, watch) in active.drain() {
                 watch.cancel.cancel();
-                let _ = store.put(&account, "login", "current", &Option::<LoginStatus>::None);
+                let _ = store.put(
+                    "local",
+                    "provider_login",
+                    &provider_id,
+                    &Option::<LoginStatus>::None,
+                );
             }
         }
         // Workers take active while completing; never join with that lock held.
@@ -81,7 +92,7 @@ impl Monitors {
         }
     }
 
-    fn begin(&self, store: &Store, account: &str) -> Result<Watch> {
+    fn begin(&self, store: &Store, provider_id: &str) -> Result<Watch> {
         let watch = Watch {
             generation: id("login"),
             cancel: CancelToken::new(),
@@ -94,40 +105,52 @@ impl Monitors {
                 "browser host is shutting down",
             ));
         }
-        if let Some(previous) = active.remove(account) {
+        if let Some(previous) = active.remove(provider_id) {
             previous.cancel.cancel();
         }
         store.put(
-            account,
-            "login",
-            "current",
+            "local",
+            "provider_login",
+            provider_id,
             &LoginStatus {
                 state: "waiting".into(),
                 error: String::new(),
             },
         )?;
-        active.insert(account.into(), watch.clone());
+        active.insert(provider_id.into(), watch.clone());
         Ok(watch)
     }
 
     pub fn start(
         self: &Arc<Self>,
         store: Store,
-        account: Account,
+        browser: BrowserProfile,
         provider: Arc<dyn Provider>,
-        gate: Arc<AccountGate>,
+        gate: Arc<BrowserGate>,
     ) -> Result<()> {
+        let multi_account = provider.info().capabilities.multi_account;
         let ready_provider = provider.clone();
+        let discover_provider = provider.clone();
         let refresh_provider = provider;
+        let discover_store = store.clone();
         let refresh_store = store.clone();
         self.start_with(
             store,
-            account,
+            browser,
+            multi_account,
             gate,
-            move |acct, cancel| ready_provider.is_login_ready(acct, cancel),
-            move |acct, cancel| {
+            move |b, cancel| ready_provider.is_login_ready(b, cancel),
+            move |b, cancel| {
+                discover_provider.discover_accounts(
+                    &ProviderContext::with_store(&discover_store),
+                    b,
+                    cancel,
+                )
+            },
+            move |b, acct, cancel| {
                 refresh_provider.discover_models(
                     &ProviderContext::with_store(&refresh_store),
+                    b,
                     acct,
                     cancel,
                 )
@@ -135,13 +158,20 @@ impl Monitors {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with(
         self: &Arc<Self>,
         store: Store,
-        account: Account,
-        gate: Arc<AccountGate>,
-        ready: impl FnMut(&Account, CancelToken) -> Result<bool> + Send + 'static,
-        refresh: impl FnMut(&Account, CancelToken) -> Result<ModelCatalogRecord> + Send + 'static,
+        browser: BrowserProfile,
+        multi_account: bool,
+        gate: Arc<BrowserGate>,
+        ready: impl FnMut(&BrowserProfile, CancelToken) -> Result<bool> + Send + 'static,
+        discover: impl FnMut(&BrowserProfile, CancelToken) -> Result<Vec<DiscoveredAccount>>
+            + Send
+            + 'static,
+        refresh: impl FnMut(&BrowserProfile, &Account, CancelToken) -> Result<ModelCatalogRecord>
+            + Send
+            + 'static,
     ) -> Result<()> {
         // Keep begin/spawn/registration indivisible with respect to shutdown.
         let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
@@ -150,20 +180,31 @@ impl Monitors {
                 let _ = workers.swap_remove(index).join();
             }
         }
-        let watch = self.begin(&store, &account.id)?;
+        let watch = self.begin(&store, &browser.provider_id)?;
         let monitors = self.clone();
         let failed_store = store.clone();
-        let failed_account = account.id.clone();
+        let failed_provider = browser.provider_id.clone();
         let failed_watch = watch.clone();
         let worker = std::thread::Builder::new()
             .name("login-models".into())
             .spawn(move || {
-                monitors.run_with(&store, &account, &watch, gate, WAIT, POLL, ready, refresh);
+                monitors.run_with(
+                    &store,
+                    &browser,
+                    multi_account,
+                    &watch,
+                    gate,
+                    WAIT,
+                    POLL,
+                    ready,
+                    discover,
+                    refresh,
+                );
             })
             .map_err(|error| {
                 self.finish(
                     &failed_store,
-                    &failed_account,
+                    &failed_provider,
                     &failed_watch,
                     "failed",
                     "Could not start login monitoring. Run /model refresh after signing in.",
@@ -174,26 +215,26 @@ impl Monitors {
         Ok(())
     }
 
-    fn current(active: &HashMap<String, Watch>, account: &str, watch: &Watch) -> bool {
+    fn current(active: &HashMap<String, Watch>, provider_id: &str, watch: &Watch) -> bool {
         !watch.cancel.is_cancelled()
             && active
-                .get(account)
+                .get(provider_id)
                 .is_some_and(|value| value.generation == watch.generation)
     }
 
-    fn finish(&self, store: &Store, account: &str, watch: &Watch, state: &str, error: &str) {
+    fn finish(&self, store: &Store, provider_id: &str, watch: &Watch, state: &str, error: &str) {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if Self::current(&active, account, watch) {
+        if Self::current(&active, provider_id, watch) {
             let _ = store.put(
-                account,
-                "login",
-                "current",
+                "local",
+                "provider_login",
+                provider_id,
                 &LoginStatus {
                     state: state.into(),
                     error: error.into(),
                 },
             );
-            active.remove(account);
+            active.remove(provider_id);
         }
     }
 
@@ -201,71 +242,49 @@ impl Monitors {
     fn run_with(
         &self,
         store: &Store,
-        expected: &Account,
+        expected: &BrowserProfile,
+        multi_account: bool,
         watch: &Watch,
-        gate: Arc<AccountGate>,
+        gate: Arc<BrowserGate>,
         timeout: Duration,
         interval: Duration,
-        mut ready: impl FnMut(&Account, CancelToken) -> Result<bool>,
-        mut refresh: impl FnMut(&Account, CancelToken) -> Result<ModelCatalogRecord>,
+        mut ready: impl FnMut(&BrowserProfile, CancelToken) -> Result<bool>,
+        mut discover: impl FnMut(&BrowserProfile, CancelToken) -> Result<Vec<DiscoveredAccount>>,
+        mut refresh: impl FnMut(&BrowserProfile, &Account, CancelToken) -> Result<ModelCatalogRecord>,
     ) {
         let deadline = Instant::now() + timeout;
         while !watch.cancel.is_cancelled() && Instant::now() < deadline {
-            let Ok(mut account) = store.get::<Account>("local", "account", &expected.id) else {
+            let Ok(browser) = store.browser_profile(&expected.provider_id) else {
                 break;
             };
-            if account.port != expected.port
-                || account.profile != expected.profile
-                || account.subprofile != expected.subprofile
-                || account.provider != expected.provider
-                || account.state == "disabled"
+            if browser.port != expected.port
+                || browser.profile != expected.profile
+                || browser.subprofile != expected.subprofile
             {
                 break;
             }
-            if ready(&account, watch.cancel.clone()).unwrap_or(false) {
-                if let Ok(_permit) = gate.clone().try_acquire_owned() {
-                    // Check generation and account identity after taking the same
-                    // gate used by turns and explicit account operations.
-                    {
-                        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-                        if !Self::current(&active, &account.id, watch) {
+            if ready(&browser, watch.cancel.clone()).unwrap_or(false) {
+                if let Ok(_permit) = gate.clone().try_write_owned() {
+                    // Re-verify generation and browser identity under the provider browser gate.
+                    let latest = {
+                        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                        if !Self::current(&active, &browser.provider_id, watch) {
                             return;
                         }
-                        let Ok(latest) = store.get::<Account>("local", "account", &account.id)
-                        else {
+                        let Ok(latest) = store.browser_profile(&expected.provider_id) else {
                             return;
                         };
                         if latest.port != expected.port
                             || latest.profile != expected.profile
                             || latest.subprofile != expected.subprofile
-                            || latest.provider != expected.provider
-                            || latest.state == "disabled"
                         {
-                            return;
-                        }
-                        account = latest;
-                        if has_cached_models(store, &account.id) {
-                            account.state = "ready".into();
-                            let status = match store.put("local", "account", &account.id, &account)
-                            {
-                                Ok(()) => LoginStatus {
-                                    state: "ready".into(),
-                                    error: String::new(),
-                                },
-                                Err(error) => LoginStatus {
-                                    state: "failed".into(),
-                                    error: refresh_failure(&error),
-                                },
-                            };
-                            let _ = store.put(&account.id, "login", "current", &status);
-                            active.remove(&account.id);
                             return;
                         }
                         if store
                             .put(
-                                &account.id,
-                                "login",
-                                "current",
+                                "local",
+                                "provider_login",
+                                &latest.provider_id,
                                 &LoginStatus {
                                     state: "refreshing".into(),
                                     error: String::new(),
@@ -275,26 +294,123 @@ impl Monitors {
                         {
                             return;
                         }
+                        latest
+                    };
+
+                    // 1. Discover and sync signed-in accounts from this provider's Chrome profile.
+                    let discovered = match discover(&latest, watch.cancel.clone()) {
+                        Ok(accounts) => accounts,
+                        Err(error) => {
+                            self.finish(
+                                store,
+                                &latest.provider_id,
+                                watch,
+                                "failed",
+                                &refresh_failure(&error),
+                            );
+                            return;
+                        }
+                    };
+
+                    let accounts = {
+                        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                        if !Self::current(&active, &latest.provider_id, watch) {
+                            return;
+                        }
+                        if !discovered.is_empty() {
+                            match sync_discovered_accounts(
+                                store,
+                                &latest.provider_id,
+                                multi_account,
+                                discovered,
+                            ) {
+                                Ok(list) => list,
+                                Err(error) => {
+                                    drop(active);
+                                    self.finish(
+                                        store,
+                                        &latest.provider_id,
+                                        watch,
+                                        "failed",
+                                        &refresh_failure(&error),
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            match store.accounts_for_provider(&latest.provider_id) {
+                                Ok(list) => list,
+                                Err(error) => {
+                                    drop(active);
+                                    self.finish(
+                                        store,
+                                        &latest.provider_id,
+                                        watch,
+                                        "failed",
+                                        &refresh_failure(&error),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    // 2. Refresh model catalogs for non-disabled accounts that don't have cached models yet.
+                    let mut first_error: Option<ServiceError> = None;
+                    for mut acct in accounts {
+                        if acct.state == "disabled" {
+                            continue;
+                        }
+                        if acct.state == "auth_required"
+                            && acct.slot.is_none()
+                            && acct.identity.is_some()
+                        {
+                            continue;
+                        }
+                        if has_cached_models(store, &acct.id) {
+                            let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                            if !Self::current(&active, &latest.provider_id, watch) {
+                                return;
+                            }
+                            if acct.state != "ready" {
+                                acct.state = "ready".into();
+                                if let Err(error) = store.put("local", "account", &acct.id, &acct) {
+                                    if first_error.is_none() {
+                                        first_error = Some(error);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        let result = refresh(&latest, &acct, watch.cancel.clone());
+                        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                        if !Self::current(&active, &latest.provider_id, watch) {
+                            return;
+                        }
+                        let persisted = persist_probe(store, &mut acct, &result);
+                        if let Some(error) = result.err().or(persisted.err()) {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
                     }
-                    let result = refresh(&account, watch.cancel.clone());
+
                     let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-                    if !Self::current(&active, &account.id, watch) {
+                    if !Self::current(&active, &latest.provider_id, watch) {
                         return;
                     }
-                    let persisted = persist_probe(store, &mut account, &result);
-                    let failure = result.as_ref().err().or(persisted.as_ref().err());
-                    let status = match failure {
+                    let status = match first_error {
                         None => LoginStatus {
                             state: "ready".into(),
                             error: String::new(),
                         },
                         Some(error) => LoginStatus {
                             state: "failed".into(),
-                            error: refresh_failure(error),
+                            error: refresh_failure(&error),
                         },
                     };
-                    let _ = store.put(&account.id, "login", "current", &status);
-                    active.remove(&account.id);
+                    let _ = store.put("local", "provider_login", &latest.provider_id, &status);
+                    active.remove(&latest.provider_id);
                     return;
                 }
             }
@@ -304,7 +420,13 @@ impl Monitors {
                 return;
             }
         }
-        self.finish(store, &expected.id, watch, "timed_out", "Sign-in was not confirmed within 10 minutes. Open login again or run /model refresh after signing in.");
+        self.finish(
+            store,
+            &expected.provider_id,
+            watch,
+            "timed_out",
+            "Sign-in was not confirmed within 10 minutes. Open login again or run /model refresh after signing in.",
+        );
     }
 }
 
@@ -346,17 +468,31 @@ fn has_cached_models(store: &Store, account_id: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
-    fn fixture() -> (tempfile::TempDir, Store, Account, Arc<Monitors>) {
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Store,
+        BrowserProfile,
+        Account,
+        Arc<Monitors>,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        let account = Account {
-            id: "fixture".into(),
-            provider: default_provider(),
-            profile: directory.path().join("profile"),
+        let browser = BrowserProfile {
+            provider_id: default_provider(),
+            profile: directory.path().join("profiles/gemini-web"),
             subprofile: None,
             port: 9222,
             headless: false,
+        };
+        store.put_browser_profile(&browser).unwrap();
+        let account = Account {
+            id: "fixture".into(),
+            provider: default_provider(),
             state: "awaiting_human".into(),
+            identity: Some("alice@gmail.com".into()),
+            label: Some("alice@gmail.com".into()),
+            slot: Some("0".into()),
         };
         store
             .put("local", "account", &account.id, &account)
@@ -369,8 +505,15 @@ mod tests {
                 &json!({"models":[{"label":"cached"}]}),
             )
             .unwrap();
-        (directory, store, account, Arc::new(Monitors::default()))
+        (
+            directory,
+            store,
+            browser,
+            account,
+            Arc::new(Monitors::default()),
+        )
     }
+
     fn empty_catalog(store: &Store, account_id: &str) {
         store
             .put(
@@ -381,6 +524,7 @@ mod tests {
             )
             .unwrap();
     }
+
     fn test_catalog(label: &str) -> ModelCatalogRecord {
         ModelCatalogRecord {
             models: vec![ModelOption {
@@ -390,18 +534,20 @@ mod tests {
             ..Default::default()
         }
     }
+
     #[test]
     fn login_only_refreshes_once_after_authenticated_page_is_ready() {
-        let (_dir, store, account, monitors) = fixture();
+        let (_dir, store, browser, account, monitors) = fixture();
         empty_catalog(&store, &account.id);
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         let mut checks = 0;
         let mut refreshes = 0;
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::from_secs(1),
             Duration::from_millis(1),
             |_, _| {
@@ -409,6 +555,13 @@ mod tests {
                 Ok(checks == 3)
             },
             |_, _| {
+                Ok(vec![DiscoveredAccount {
+                    identity: Some("alice@gmail.com".into()),
+                    label: Some("alice@gmail.com".into()),
+                    slot: Some("0".into()),
+                }])
+            },
+            |_, _, _| {
                 refreshes += 1;
                 Ok(test_catalog("fresh"))
             },
@@ -419,26 +572,29 @@ mod tests {
             "fresh"
         );
         assert_eq!(
-            super::super::login_status(&store, &account.id)
+            super::super::provider_login_status(&store, &browser.provider_id)
                 .unwrap()
                 .state,
             "ready"
         );
     }
+
     #[test]
     fn login_skips_automatic_refresh_when_models_are_already_cached() {
-        let (_dir, store, account, monitors) = fixture();
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let (_dir, store, browser, account, monitors) = fixture();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         let mut refreshes = 0;
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::from_secs(1),
             Duration::from_millis(1),
             |_, _| Ok(true),
-            |_, _| {
+            |_, _| Ok(vec![]),
+            |_, _, _| {
                 refreshes += 1;
                 Ok(test_catalog("fresh"))
             },
@@ -456,31 +612,34 @@ mod tests {
             "cached"
         );
         assert_eq!(
-            super::super::login_status(&store, &account.id)
+            super::super::provider_login_status(&store, &browser.provider_id)
                 .unwrap()
                 .state,
             "ready"
         );
     }
+
     #[test]
     fn signed_in_without_model_controls_starts_refresh_and_reports_preparation_failure() {
-        let (_dir, store, account, monitors) = fixture();
+        let (_dir, store, browser, account, monitors) = fixture();
         empty_catalog(&store, &account.id);
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         let page = json!({"url":"https://gemini.google.com/app", "signed_in":true,"editor":true,"models":false,"verification":false});
         let mut refreshes = 0;
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::from_secs(1),
             Duration::from_millis(1),
             |_, _| Ok(crate::provider::gemini::authenticated(&page)),
-            |_, _| {
+            |_, _| Ok(vec![]),
+            |_, _, _| {
                 refreshes += 1;
                 assert_eq!(
-                    super::super::login_status(&store, &account.id)
+                    super::super::provider_login_status(&store, &browser.provider_id)
                         .unwrap()
                         .state,
                     "refreshing"
@@ -493,7 +652,7 @@ mod tests {
             },
         );
         assert_eq!(refreshes, 1);
-        let status = super::super::login_status(&store, &account.id).unwrap();
+        let status = super::super::provider_login_status(&store, &browser.provider_id).unwrap();
         assert_eq!(status.state, "failed");
         assert!(status.error.contains("DeadlineExceeded at prepare"));
         assert!(status
@@ -505,21 +664,24 @@ mod tests {
             .models
             .is_empty());
     }
+
     #[test]
     fn cancelled_or_superseded_refresh_cannot_replace_the_catalog() {
-        let (_dir, store, account, monitors) = fixture();
+        let (_dir, store, browser, account, monitors) = fixture();
         empty_catalog(&store, &account.id);
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::from_secs(1),
             Duration::from_millis(1),
             |_, _| Ok(true),
-            |_, cancel| {
-                monitors.begin(&store, &account.id).unwrap();
+            |_, _| Ok(vec![]),
+            |_, _, cancel| {
+                monitors.begin(&store, &browser.provider_id).unwrap();
                 assert!(cancel.is_cancelled());
                 Ok(test_catalog("obsolete"))
             },
@@ -530,28 +692,31 @@ mod tests {
             .models
             .is_empty());
         assert_eq!(
-            super::super::login_status(&store, &account.id)
+            super::super::provider_login_status(&store, &browser.provider_id)
                 .unwrap()
                 .state,
             "waiting"
         );
-        monitors.cancel(&store, &account.id).unwrap();
-        assert!(super::super::login_status(&store, &account.id).is_none());
+        monitors.cancel(&store, &browser.provider_id).unwrap();
+        assert!(super::super::provider_login_status(&store, &browser.provider_id).is_none());
     }
+
     #[test]
     fn refresh_failure_and_login_timeout_keep_the_existing_catalog() {
-        let (_dir, store, account, monitors) = fixture();
+        let (_dir, store, browser, account, monitors) = fixture();
         empty_catalog(&store, &account.id);
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::from_secs(1),
             Duration::from_millis(1),
             |_, _| Ok(true),
-            |_, _| {
+            |_, _| Ok(vec![]),
+            |_, _, _| {
                 Err(ServiceError::new(
                     ErrorCode::UiContractChanged,
                     "models",
@@ -559,7 +724,7 @@ mod tests {
                 ))
             },
         );
-        let status = super::super::login_status(&store, &account.id).unwrap();
+        let status = super::super::provider_login_status(&store, &browser.provider_id).unwrap();
         assert_eq!(status.state, "failed");
         assert_eq!(status.error, "Automatic model refresh failed (UiContractChanged at models): UI contract changed: empty thinking menu. Retry with /model refresh.");
         assert!(store
@@ -570,24 +735,27 @@ mod tests {
         store
             .put(&account.id, "catalog", "models", &test_catalog("cached"))
             .unwrap();
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::ZERO,
             Duration::ZERO,
             |_, _| panic!("expired watcher must not inspect Chrome"),
-            |_, _| panic!("expired watcher must not refresh"),
+            |_, _| panic!("expired watcher must not discover"),
+            |_, _, _| panic!("expired watcher must not refresh"),
         );
         assert_eq!(
-            super::super::login_status(&store, &account.id)
+            super::super::provider_login_status(&store, &browser.provider_id)
                 .unwrap()
                 .state,
             "timed_out"
         );
     }
+
     #[test]
     fn automatic_failure_status_does_not_copy_non_ui_error_details() {
         for (code, message) in [
@@ -609,6 +777,7 @@ mod tests {
             assert!(status.ends_with("Retry with /model refresh."));
         }
     }
+
     #[test]
     fn automatic_failure_status_preserves_bounded_ui_diagnostics_without_controls() {
         let error = ServiceError::new(
@@ -639,27 +808,31 @@ mod tests {
         assert!(status.contains("DeadlineExceeded at prepare"));
         assert!(status.contains("editor/model controls were not ready within 120 seconds"));
     }
+
     #[test]
     fn shutdown_cancels_waiting_work_without_inspecting_or_refreshing() {
-        let (_dir, store, account, monitors) = fixture();
-        let watch = monitors.begin(&store, &account.id).unwrap();
+        let (_dir, store, browser, _account, monitors) = fixture();
+        let watch = monitors.begin(&store, &browser.provider_id).unwrap();
         monitors.cancel_all(&store);
         monitors.run_with(
             &store,
-            &account,
+            &browser,
+            true,
             &watch,
-            Arc::new(AccountGate::default()),
+            Arc::new(BrowserGate::default()),
             Duration::from_secs(1),
             Duration::from_millis(1),
             |_, _| panic!("cancelled watcher must not inspect Chrome"),
-            |_, _| panic!("cancelled watcher must not refresh"),
+            |_, _| panic!("cancelled watcher must not discover"),
+            |_, _, _| panic!("cancelled watcher must not refresh"),
         );
-        assert!(super::super::login_status(&store, &account.id).is_none());
-        assert!(monitors.begin(&store, &account.id).is_err());
+        assert!(super::super::provider_login_status(&store, &browser.provider_id).is_none());
+        assert!(monitors.begin(&store, &browser.provider_id).is_err());
     }
+
     #[test]
     fn shutdown_joins_login_and_nested_workers_before_returning() {
-        let (_dir, store, account, monitors) = fixture();
+        let (_dir, store, browser, _account, monitors) = fixture();
         let worker_exited = Arc::new(AtomicBool::new(false));
         let nested_exited = Arc::new(AtomicBool::new(false));
         let finished = worker_exited.clone();
@@ -670,8 +843,9 @@ mod tests {
         monitors
             .start_with(
                 store.clone(),
-                account.clone(),
-                Arc::new(AccountGate::default()),
+                browser.clone(),
+                true,
+                Arc::new(BrowserGate::default()),
                 move |_, cancel| {
                     let inner_cancel = cancel.clone();
                     let inner_finished = nested_finished.clone();
@@ -687,7 +861,8 @@ mod tests {
                     finished.store(true, Ordering::SeqCst);
                     Ok(false)
                 },
-                |_, _| panic!("cancelled login must not refresh"),
+                |_, _| panic!("cancelled login must not discover"),
+                |_, _, _| panic!("cancelled login must not refresh"),
             )
             .unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -712,24 +887,29 @@ mod tests {
         assert!(monitors
             .start_with(
                 store.clone(),
-                account,
-                Arc::new(AccountGate::default()),
+                browser,
+                true,
+                Arc::new(BrowserGate::default()),
                 |_, _| panic!("shutdown must prevent new workers"),
-                |_, _| unreachable!()
+                |_, _| unreachable!(),
+                |_, _, _| unreachable!()
             )
             .is_err());
         assert!(monitors.workers.lock().unwrap().is_empty());
     }
+
     #[test]
     fn a_new_login_reaps_completed_worker_handles() {
-        let (_dir, store, account, monitors) = fixture();
+        let (_dir, store, browser, _account, monitors) = fixture();
         monitors
             .start_with(
                 store.clone(),
-                account.clone(),
-                Arc::new(AccountGate::default()),
+                browser.clone(),
+                true,
+                Arc::new(BrowserGate::default()),
                 |_, _| Ok(true),
-                |_, _| Ok(ModelCatalogRecord::default()),
+                |_, _| Ok(vec![]),
+                |_, _, _| Ok(ModelCatalogRecord::default()),
             )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -740,22 +920,25 @@ mod tests {
         monitors
             .start_with(
                 store.clone(),
-                account,
-                Arc::new(AccountGate::default()),
+                browser,
+                true,
+                Arc::new(BrowserGate::default()),
                 |_, _| Ok(false),
                 |_, _| unreachable!(),
+                |_, _, _| unreachable!(),
             )
             .unwrap();
         assert_eq!(monitors.workers.lock().unwrap().len(), 1);
         monitors.cancel_all(&store);
     }
+
     #[test]
     fn restart_reports_interrupted_monitor_without_starting_work() {
-        let (_dir, store, account, monitors) = fixture();
-        monitors.begin(&store, &account.id).unwrap();
+        let (_dir, store, browser, account, monitors) = fixture();
+        monitors.begin(&store, &browser.provider_id).unwrap();
         Monitors::recover(&store).unwrap();
         assert_eq!(
-            super::super::login_status(&store, &account.id)
+            super::super::provider_login_status(&store, &browser.provider_id)
                 .unwrap()
                 .state,
             "failed"

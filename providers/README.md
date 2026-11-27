@@ -2,20 +2,26 @@
 
 The three providers below are bundled with their manifests and DOM scripts. Claude and ChatGPT are experimental.
 
-| ID | Support |
-|---|---|
-| `gemini-web` | Native Gemini integration: uploads, images, usage, and conversation management |
-| `claude-web` | Model selection, usage, and `--thinking low\|medium\|high\|extra\|max` |
-| `chatgpt-web` | Free Auto/Think (`--thinking standard\|think`) and paid model selection |
+| ID | Multi-account | Support |
+|---|---|---|
+| `gemini-web` | Yes (Google Multi-Login `/u/{slot}/app`) | Native Gemini integration: multi-account discovery, uploads, images, usage, and conversation management |
+| `claude-web` | No (single account per Chrome profile) | Model selection, usage, and `--thinking low\|medium\|high\|extra\|max` |
+| `chatgpt-web` | No (single account per Chrome profile) | Free Auto/Think (`--thinking standard\|think`) and paid model selection |
 
 ## Sign In and Run
 
 ```sh
+anticrumb login gemini-web      # signs in and discovers all signed-in Google accounts
 anticrumb login claude-web
 anticrumb --provider claude-web
+anticrumb accounts list
+anticrumb accounts use alice@gmail.com
+anticrumb accounts refresh
 ```
 
-Use any provider ID above, or `--account ID` for a saved account. In the TUI, `/provider` selects or sets up an account. For manual account/port control, see `anticrumb accounts --help`.
+Use any provider ID above, or `--account TARGET` (account ID, email, slot like `u/1`, or unique email prefix). Each provider uses one Chrome profile (`<ANTICRUMB_HOME>/profiles/<provider_id>/`). In the TUI, `/provider` selects or sets up a provider, and `/account` switches or refreshes signed-in accounts on multi-account providers. For browser window or port controls, see `anticrumb accounts --help`.
+
+Future multi-account scripted providers can enable `capabilities.multi_account = true` in `provider.json` along with `entry_url_template` and `usage_url_template` (supporting `{slot}` substitution).
 
 ## Updating DOM Scripts Without Rebuilding
 

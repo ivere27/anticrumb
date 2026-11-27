@@ -141,6 +141,15 @@ impl Backend for Echo {
 fn fixture(root: &Path) -> (Arc<Host>, Arc<Echo>) {
     let store = Store::open(root).unwrap();
     store
+        .put_browser_profile(&BrowserProfile {
+            provider_id: default_provider(),
+            profile: root.join("profile"),
+            subprofile: None,
+            port: 9222,
+            headless: true,
+        })
+        .unwrap();
+    store
         .put(
             "local",
             "account",
@@ -149,13 +158,13 @@ fn fixture(root: &Path) -> (Arc<Host>, Arc<Echo>) {
                 id: "default".into(),
                 provider: default_provider(),
                 state: "ready".into(),
-                profile: root.join("profile"),
-                subprofile: None,
-                port: 9222,
-                headless: true,
+                identity: None,
+                label: None,
+                slot: None,
             },
         )
         .unwrap();
+    store.set_active_account_id("default").unwrap();
     let echo = Arc::new(Echo {
         store: store.clone(),
         requests: Mutex::new(vec![]),
@@ -231,10 +240,30 @@ impl pb::account_service_server::AccountService for UsageFixture {
             accounts: self.accounts.clone(),
         }))
     }
-    async fn create_account(
+    async fn ensure_provider_account(
         &self,
-        _: tonic::Request<pb::CreateAccountRequest>,
+        _: tonic::Request<pb::ProviderRef>,
     ) -> std::result::Result<tonic::Response<pb::Account>, tonic::Status> {
+        Err(tonic::Status::unimplemented("usage fixture"))
+    }
+    async fn set_active_account(
+        &self,
+        _: tonic::Request<pb::AccountRef>,
+    ) -> std::result::Result<tonic::Response<pb::Account>, tonic::Status> {
+        Err(tonic::Status::unimplemented("usage fixture"))
+    }
+    async fn list_browsers(
+        &self,
+        _: tonic::Request<pb::Empty>,
+    ) -> std::result::Result<tonic::Response<pb::BrowserProfileList>, tonic::Status> {
+        Ok(tonic::Response::new(pb::BrowserProfileList {
+            browsers: Vec::new(),
+        }))
+    }
+    async fn refresh_accounts(
+        &self,
+        _: tonic::Request<pb::ProviderRef>,
+    ) -> std::result::Result<tonic::Response<pb::AccountList>, tonic::Status> {
         Err(tonic::Status::unimplemented("usage fixture"))
     }
     async fn attach_browser(
@@ -245,7 +274,7 @@ impl pb::account_service_server::AccountService for UsageFixture {
     }
     async fn open_login(
         &self,
-        _: tonic::Request<pb::AccountRef>,
+        _: tonic::Request<pb::ProviderRef>,
     ) -> std::result::Result<tonic::Response<pb::Empty>, tonic::Status> {
         Err(tonic::Status::unimplemented("usage fixture"))
     }
@@ -263,7 +292,7 @@ impl pb::account_service_server::AccountService for UsageFixture {
     }
     async fn get_browser_status(
         &self,
-        _: tonic::Request<pb::AccountRef>,
+        _: tonic::Request<pb::ProviderRef>,
     ) -> std::result::Result<tonic::Response<pb::BrowserStatus>, tonic::Status> {
         Err(tonic::Status::unimplemented("usage fixture"))
     }
@@ -449,7 +478,9 @@ async fn web_usage_respects_account_gate_without_changing_login_or_catalog() {
     let (host, echo) = fixture(directory.path());
     let store = &host.service.store;
     let login = json!({"state":"refreshing","error":""});
-    store.put("default", "login", "current", &login).unwrap();
+    store
+        .put("local", "provider_login", &default_provider(), &login)
+        .unwrap();
     let catalog = store.model_catalog("default").unwrap();
     let permit = host
         .service
@@ -469,7 +500,7 @@ async fn web_usage_respects_account_gate_without_changing_login_or_catalog() {
     assert_eq!(store.model_catalog("default").unwrap(), catalog);
     assert_eq!(
         store
-            .get::<serde_json::Value>("default", "login", "current")
+            .get::<serde_json::Value>("local", "provider_login", &default_provider())
             .unwrap(),
         login
     );
@@ -513,6 +544,7 @@ async fn web_usage_runs_concurrently_with_active_turn_while_blocking_login_and_c
         fn discover_models(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             _: &Account,
             _: CancelToken,
         ) -> Result<ModelCatalogRecord> {
@@ -521,6 +553,7 @@ async fn web_usage_runs_concurrently_with_active_turn_while_blocking_login_and_c
         fn generate(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             _: &Account,
             session: &mut Session,
             _: &TurnRequest,
@@ -536,12 +569,19 @@ async fn web_usage_runs_concurrently_with_active_turn_while_blocking_login_and_c
                 elapsed_ms: 1,
             })
         }
-        fn close_session(&self, _: &ProviderContext<'_>, _: &Account, _: &Session) -> Result<()> {
+        fn close_session(
+            &self,
+            _: &ProviderContext<'_>,
+            _: &BrowserProfile,
+            _: &Account,
+            _: &Session,
+        ) -> Result<()> {
             Ok(())
         }
         fn read_usage(
             &self,
             _: &ProviderContext<'_>,
+            _: &BrowserProfile,
             account: &Account,
             _: CancelToken,
         ) -> Result<WebUsageReport> {
@@ -556,6 +596,15 @@ async fn web_usage_runs_concurrently_with_active_turn_while_blocking_login_and_c
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
     store
+        .put_browser_profile(&BrowserProfile {
+            provider_id: "usage-fixture".into(),
+            profile: directory.path().join("profile"),
+            subprofile: None,
+            port: 9222,
+            headless: true,
+        })
+        .unwrap();
+    store
         .put(
             "local",
             "account",
@@ -564,10 +613,9 @@ async fn web_usage_runs_concurrently_with_active_turn_while_blocking_login_and_c
                 id: "default".into(),
                 provider: "usage-fixture".into(),
                 state: "ready".into(),
-                profile: directory.path().join("profile"),
-                subprofile: None,
-                port: 9222,
-                headless: true,
+                identity: None,
+                label: None,
+                slot: None,
             },
         )
         .unwrap();
@@ -1234,13 +1282,13 @@ async fn every_network_method_authenticates_before_work() {
             count += 1;
         }
     }
-    assert_eq!(count, 38);
+    assert_eq!(count, 41);
     let client = RpcClient::network(&endpoint, TOKEN, None, None)
         .await
         .unwrap();
     let mode_err = client
         .set_browser_mode(pb::SetBrowserModeRequest {
-            account_id: "default".into(),
+            provider_id: default_provider(),
             headless: true,
         })
         .await
@@ -2666,45 +2714,76 @@ async fn provider_service_registers_persists_binds_accounts_and_unregisters_at_r
     assert_eq!(fetched.name, "Claude Web");
     assert_eq!(fetched.inline_prompt_chars, Some(1234));
 
-    // Verify zero-port CreateAccount auto-allocates a free non-zero CDP port, and explicit port also works.
-    let auto_created = client
-        .create_account(pb::CreateAccountRequest {
-            id: "work-claude".into(),
-            port: 0,
-            provider: "test-claude-web".into(),
+    // Verify EnsureProviderAccount idempotently creates the provider's managed browser profile and initial account.
+    let ensured = client
+        .ensure_provider_account(pb::ProviderRef {
+            id: "test-claude-web".into(),
         })
         .await
         .unwrap();
-    assert_eq!(auto_created.provider, "test-claude-web");
-    assert!(auto_created.port >= 9222);
+    assert_eq!(ensured.provider, "test-claude-web");
+    assert_eq!(ensured.id, "test-claude");
 
-    let rest_created = anticrumb::rpc::workspace_client::presentation(
+    let rest_ensured = anticrumb::rpc::workspace_client::presentation(
         &client,
         "POST",
-        "/api/accounts",
-        Some(&json!({"id": "work-claude-2", "provider": "test-claude-web"})),
+        "/api/providers/test-claude-web/ensure-account",
+        Some(&json!({})),
     )
     .await
     .unwrap();
-    let rest_port = rest_created["port"].as_u64().unwrap();
-    assert!(rest_port >= 9222 && rest_port != u64::from(auto_created.port));
+    assert_eq!(rest_ensured["id"].as_str(), Some(ensured.id.as_str()));
+
+    let browsers = client.list_browsers(pb::Empty {}).await.unwrap().browsers;
+    let gemini_browser = browsers
+        .iter()
+        .find(|b| b.provider_id == "gemini-web")
+        .unwrap();
+    let claude_browser = browsers
+        .iter()
+        .find(|b| b.provider_id == "test-claude-web")
+        .unwrap();
+    assert!(claude_browser.port >= 9222 && claude_browser.port != gemini_browser.port);
+
+    // RefreshAccounts discovers/syncs accounts for the provider and marks the ensured account ready.
+    let refreshed = client
+        .refresh_accounts(pb::ProviderRef {
+            id: "test-claude-web".into(),
+        })
+        .await
+        .unwrap()
+        .accounts;
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].id, ensured.id);
+    assert_eq!(refreshed[0].state, "ready");
+
+    // SetActiveAccount switches the runtime default active account and is reflected in HostStatus.
+    let active = client
+        .set_active_account(pb::AccountRef {
+            account_id: ensured.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(active.id, ensured.id);
 
     let status = client.get_status(pb::Empty {}).await.unwrap();
     assert!(status.providers.iter().any(|p| p.id == "test-claude-web"));
     assert!(status.providers.iter().any(|p| p.id == "gemini-web"));
+    assert!(status
+        .browsers
+        .iter()
+        .any(|b| b.provider_id == "test-claude-web"));
     assert_eq!(
-        status
-            .accounts
-            .iter()
-            .find(|a| a.id == "work-claude")
-            .unwrap()
-            .provider,
-        "test-claude-web"
+        status.active_account_id.as_deref(),
+        Some(ensured.id.as_str())
     );
+    let claude_status = status.accounts.iter().find(|a| a.id == ensured.id).unwrap();
+    assert_eq!(claude_status.provider, "test-claude-web");
+    assert!(claude_status.active);
 
     let catalog = client
         .refresh_catalog(pb::AccountRef {
-            account_id: "work-claude".into(),
+            account_id: ensured.id.clone(),
         })
         .await
         .unwrap();
@@ -4222,6 +4301,137 @@ async fn agent_tool_approval_ask_mode_works_across_synurang_ffi_and_grpc() {
     .await
     .unwrap_err();
     assert_eq!(http_err.code, ErrorCode::InvalidRequest);
+
+    drop(ws_ffi);
+    grpc_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_agent_events_streams_ephemeral_tool_output_with_zero_sqlite_inserts() {
+    let browser_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+    let project = local_dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+
+    let (browser, echo) = fixture(browser_dir.path());
+    *echo.replies.lock().unwrap() = [
+        format!(
+            "[TOOL_CALL]\n{}\n[/TOOL_CALL]",
+            json!({
+                "tool_calls": [
+                    {
+                        "tool": "run_shell",
+                        "args": {"command": "printf 'stream-alpha\\n'; sleep 0.12; printf 'stream-beta\\n'"}
+                    }
+                ]
+            })
+        ),
+        "stream turn complete".to_string(),
+    ]
+    .into();
+
+    let options = Options {
+        root: browser_dir.path().into(),
+        listen: "127.0.0.1:0".into(),
+        self_signed: true,
+        ..Default::default()
+    };
+    let identity = options.identity().unwrap();
+    let pin = certificate_fingerprint(
+        &std::fs::read(browser_dir.path().join("tls/ca-certificate.pem")).unwrap(),
+    )
+    .unwrap();
+    let (endpoint, grpc_task) = network(browser, identity).await;
+    let workspace = relay::workspace(
+        local_dir.path(),
+        Connection::Grpc {
+            endpoint,
+            token: TOKEN.into(),
+            ca_file: None,
+            server_name: None,
+            tls_pin: Some(pin),
+        },
+    )
+    .await
+    .unwrap();
+    let ws_store = workspace.service.store.clone();
+    let ws_ffi = RpcClient::embedded(workspace, tokio::runtime::Handle::current()).unwrap();
+
+    let job = ws_ffi
+        .start_agent(pb::AgentRequest {
+            task: "Run shell command and stream live output".into(),
+            workspace: project.to_string_lossy().into_owned(),
+            account_id: "default".into(),
+            chat_only: false,
+            no_shell: false,
+            permissions: Some(pb::ToolPermissions {
+                read: true,
+                edit: false,
+                shell: true,
+                browser: false,
+                subagent: false,
+                ast: false,
+            }),
+            tool_approval: pb::ToolApprovalMode::Auto as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut stream = ws_ffi
+        .watch_agent_events(pb::EventCursor {
+            run_id: job.id.clone(),
+            after: 0,
+        })
+        .await
+        .unwrap();
+
+    let mut streamed_kinds = Vec::new();
+    let mut streamed_stdout = String::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(ev) = stream.next().await {
+            let ev = ev.unwrap();
+            if ev.kind == "tool_output_chunk" {
+                let data: serde_json::Value = serde_json::from_str(&ev.data_json).unwrap();
+                if let Some(t) = data["text"].as_str() {
+                    streamed_stdout.push_str(t);
+                }
+            }
+            streamed_kinds.push(ev.kind);
+        }
+    })
+    .await
+    .expect("watch_agent_events stream must terminate after agent_terminal");
+
+    assert!(
+        streamed_kinds.iter().any(|k| k == "tool_output_chunk"),
+        "expected live tool_output_chunk over WatchAgentEvents: {streamed_kinds:?}"
+    );
+    assert!(
+        streamed_stdout.contains("stream-alpha") && streamed_stdout.contains("stream-beta"),
+        "unexpected streamed shell output: {streamed_stdout:?}"
+    );
+    assert!(streamed_kinds.iter().any(|k| k == "tool_started"));
+    assert!(streamed_kinds.iter().any(|k| k == "tool_finished"));
+    assert!(streamed_kinds.iter().any(|k| k == "agent_terminal"));
+
+    // Verify SQLite events table has 0 INSERTs for any ephemeral kind!
+    let db_events = ws_store.events(&job.id, 0).unwrap();
+    let db_kinds: Vec<&str> = db_events.iter().map(|e| e.kind.as_str()).collect();
+    for ephemeral in [
+        "tool_output_chunk",
+        "model_chunk",
+        "browser_stage",
+        "subagent_progress",
+        "request_payload",
+        "model_input",
+    ] {
+        assert!(
+            !db_kinds.contains(&ephemeral),
+            "ephemeral event {ephemeral} must NOT be persisted in SQLite: {db_kinds:?}"
+        );
+    }
 
     drop(ws_ffi);
     grpc_task.abort();

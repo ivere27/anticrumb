@@ -195,14 +195,12 @@ pub fn run(args: &[String]) -> Result<()> {
             println!(
                 r#"anticrumb [OPTIONS] [PROMPT]              interactive coding agent
   exec [OPTIONS] PROMPT                    run a task and print the answer
-  resume [ID | --last]                     continue a conversation
-  exec resume [ID | --last] PROMPT         follow up without the TUI
 
   -m, --model ID      -C, --cd DIR          model and working directory
   --agent             --yolo                agent mode (Y/N tool review, respects /permissions) or yolo (auto-execute)
   --temp                                    anonymous temporary chat for this run
   -p, --print                              noninteractive final answer
-  -c, --continue     -r, --resume ID        reopen a conversation
+  -c, --continue      --resume [ID]        reopen a conversation
   --file PATH        -i, --image PATH       native Gemini attachment (repeatable)
   --json                                   NDJSON events for exec/--print
   --thinking LEVEL --pace LEVEL --no-shell --mcp-config FILE --knowledge ID
@@ -210,8 +208,8 @@ pub fn run(args: &[String]) -> Result<()> {
   --connect https://HOST:PORT --token STRING [--tls-pin SHA256]
 
 Type @path or @"path with spaces" to upload a file, never inline its contents.
-Interactive: /help /mode /temp /provider /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
-Enter sends; Esc interrupts; Tab completes; Alt+Enter inserts a newline.
+Interactive: /help /mode /temp /provider /account /model /usage /copy /theme /browser /browse /status /resume /new /clear /permissions /pace /prompts /exit
+Enter sends; Esc interrupts; Tab completes; Shift+Tab switches mode; Alt+Enter inserts a newline.
 
 Service and integration commands:
   update [--check] [--nightly] [--force]  install or check stable or nightly releases
@@ -223,11 +221,11 @@ Service and integration commands:
   conversations list|show|delete|resume ID
   agents list|show|cancel|steer|follow ID
   runs list|show|cancel ID     sessions list|show|close|media ID
-  login [ACCOUNT|PROVIDER] [--provider ID] sign in (auto-creates account & port if needed)
+  login [PROVIDER] [--provider ID]         sign in to a provider Chrome profile and discover accounts
   providers list|show ID|add DIR_OR_FILE [--replace] [--login]|remove ID
-  accounts list|add [ID] [PORT] [--provider ID] [--login]|attach ID PORT|show|hide|login|resolve|pause ID
-  models [--refresh] [--account ID]     doctor [--live]
-  usage [--account ID]                     web account limits and reset times
+  accounts list|use TARGET|refresh [--provider ID]|browsers|attach [PROVIDER] PORT|show|hide|login|resolve|pause
+  models [--refresh] [--account TARGET] doctor [--live]
+  usage [--account TARGET]                 web account limits and reset times
   knowledge add ID PATH [NOTEBOOK_URL]|sync ID|list|query TEXT
   artifact get ACCOUNT ID DEST
   connect opencode|codex|claude|antigravity|mcp [--install PATH]
@@ -251,19 +249,18 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
             client.close()?;
             result
         }
-        "resume" => launch_resume(&args[1..], false),
         "connect"
             if matches!(
                 args.get(1).map(String::as_str),
                 Some("--help" | "-h" | "help")
             ) =>
         {
-            println!("anticrumb connect https://HOST:PORT --token STRING\n  First connection: compare the SHA256 and emoji fingerprint with the server, then confirm.\n  --tls-pin SHA256    preverified certificate for noninteractive setup\n  --ca-file PATH      use an existing trusted CA\n  --server-name NAME override the expected TLS hostname\nanticrumb connect status | local\nanticrumb --connect URL --token STRING [TUI options]\nProvider integrations: connect opencode|codex|claude|antigravity|mcp");
+            println!("anticrumb connect https://HOST:PORT --token STRING\n  First connection: compare the SHA256 and emoji fingerprint with the server, then confirm.\n  --tls-pin SHA256    preverified certificate for noninteractive setup\n  --ca-file PATH      use an existing trusted CA\n  --server-name NAME override the expected TLS hostname\nanticrumb connect [--resume ID | TUI options]\nanticrumb connect status | local\nanticrumb --connect URL --token STRING [TUI options]\nProvider integrations: connect opencode|codex|claude|antigravity|mcp");
             Ok(())
         }
         "connect" if crate::rpc::connection::handles(&args[1..]) => {
-            if let Some(connection) = crate::rpc::connection::command(&args[1..])? {
-                crate::rpc::workspace_client::with_connection(connection, || run(&[]))
+            if let Some((connection, passthrough)) = crate::rpc::connection::command(&args[1..])? {
+                crate::rpc::workspace_client::with_connection(connection, || run(&passthrough))
             } else {
                 Ok(())
             }
@@ -318,8 +315,22 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
                 .words
                 .iter()
                 .any(|s| s == "--live" || s == "--refresh");
-            if command == "models" && !refresh && options.provider.is_none() {
-                print_json(&Store::open(&root())?.model_catalog(&options.account)?);
+            if command == "models"
+                && !refresh
+                && options.provider.is_none()
+                && crate::rpc::workspace_client::selected_connection()
+                    == crate::rpc::client::Connection::Local
+            {
+                let store = Store::open(&root())?;
+                let account_id = if options.overrides.contains("account") {
+                    store
+                        .resolve_account_query(&options.account, None)
+                        .map(|a| a.id)
+                        .unwrap_or_else(|_| options.account.clone())
+                } else {
+                    store.resolve_active_account_id()?
+                };
+                print_json(&store.model_catalog(&account_id)?);
                 return Ok(());
             }
             let client = Client::connect()?;
@@ -341,13 +352,7 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
             }
             Ok(())
         }
-        "exec" => {
-            if args.get(1).is_some_and(|s| s == "resume") {
-                launch_resume(&args[2..], true)
-            } else {
-                run_agent(PromptOptions::parse(&args[1..])?)
-            }
-        }
+        "exec" => run_agent(PromptOptions::parse(&args[1..])?),
         "chat" | "image" => chat_command(&args[1..], command == "image"),
         "conversations" | "agents" | "runs" | "sessions" => job_command(command, &args[1..]),
         "artifact" => {
@@ -386,6 +391,18 @@ fn identifier(value: &str) -> Result<&str> {
         Ok(value)
     }
 }
+fn account_query(value: &str) -> Result<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.contains("..")
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        Err(ServiceError::invalid("invalid account selector"))
+    } else {
+        Ok(trimmed)
+    }
+}
 #[derive(Default, Clone)]
 pub struct PromptOptions {
     pub(crate) account: String,
@@ -416,14 +433,14 @@ pub struct PromptOptions {
 impl PromptOptions {
     pub fn parse(args: &[String]) -> Result<Self> {
         let mut o = Self {
-            account: "default".into(),
+            account: default_account(),
             workspace: std::env::current_dir().map_err(ServiceError::storage)?,
             no_shell: true,
             permissions: ToolPermissions::read_only(),
             timeout: 120,
             ..Default::default()
         };
-        let mut iter = args.iter();
+        let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             let field = match arg.as_str() {
                 "-m" | "--model" => Some("model"),
@@ -450,7 +467,7 @@ impl PromptOptions {
                     )
                 }
                 "--account" => {
-                    o.account = identifier(
+                    o.account = account_query(
                         iter.next()
                             .ok_or_else(|| ServiceError::invalid("missing account"))?,
                     )?
@@ -482,14 +499,13 @@ impl PromptOptions {
                 "--print" | "-p" => o.print = true,
                 "--json" => o.json = true,
                 "--continue" | "-c" | "--last" => o.resume = Some("last".into()),
-                "--resume" | "-r" => {
-                    o.resume = Some(
-                        identifier(
-                            iter.next()
-                                .ok_or_else(|| ServiceError::invalid("missing conversation ID"))?,
-                        )?
-                        .into(),
-                    )
+                "--resume" => {
+                    if let Some(next) = iter.peek().filter(|v| !v.starts_with('-')) {
+                        o.resume = Some(identifier(next)?.into());
+                        iter.next();
+                    } else {
+                        o.resume = Some(String::new());
+                    }
                 }
                 "--keep-session" => o.keep = true,
                 "--detach" => return Err(ServiceError::invalid("automatic daemons stop after their last client exits; keep the command running until the task finishes")),
@@ -673,22 +689,29 @@ impl PromptOptions {
         client: &Client,
         auto_create: bool,
     ) -> Result<bool> {
-        let accounts_val = match client.request("GET", "/api/accounts", None) {
+        let status = match client.request("GET", "/api/status", None) {
             Ok(v) => v,
             Err(e) if self.overrides.contains("provider") => return Err(e),
             Err(_) => return Ok(false),
         };
-        let providers_val = client
-            .request("GET", "/api/providers", None)
-            .unwrap_or_else(|_| json!([]));
-        let accounts = accounts_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
-        let providers = providers_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let accounts = status["accounts"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let providers = status["providers"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let active_account_id = status["active_account_id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty());
         match resolve_account_from_lists(
             &mut self.account,
             &mut self.provider,
             &mut self.provider_name,
             self.overrides.contains("account"),
             self.overrides.contains("provider"),
+            active_account_id,
             accounts,
             providers,
         ) {
@@ -700,12 +723,20 @@ impl PromptOptions {
                     && !self.overrides.contains("account") =>
             {
                 let requested = self.provider.clone().unwrap_or_default();
-                let created =
-                    create_account_on_client(client, None, 0, Some(&requested), accounts)?;
+                let created = client.request(
+                    "POST",
+                    &format!("/api/providers/{requested}/ensure-account"),
+                    Some(&json!({})),
+                )?;
                 self.account = created["id"]
                     .as_str()
                     .ok_or_else(|| ServiceError::invalid("created account missing id"))?
                     .to_owned();
+                let _ = client.request(
+                    "POST",
+                    "/api/accounts/active",
+                    Some(&json!({"account_id": self.account})),
+                );
                 self.provider_name = providers
                     .iter()
                     .find(|p| p["id"].as_str() == Some(requested.as_str()))
@@ -820,26 +851,6 @@ impl PromptOptions {
                 ToolApprovalMode::Ask
             },
         }
-    }
-}
-fn launch_resume(args: &[String], print: bool) -> Result<()> {
-    let mut args = args.to_vec();
-    let explicit = if args.first().is_some_and(|a| !a.starts_with('-')) {
-        Some(args.remove(0))
-    } else {
-        None
-    };
-    let mut options = PromptOptions::parse(&args)?;
-    if let Some(id) = explicit {
-        options.resume = Some(identifier(&id)?.into());
-    }
-    if options.resume.is_none() {
-        options.resume = Some(if print { "last" } else { "" }.into());
-    }
-    if print {
-        run_agent(options)
-    } else {
-        crate::tui::run(options)
     }
 }
 fn with_temporary_unsupported_hint(
@@ -1503,38 +1514,130 @@ fn job_command(kind: &str, args: &[String]) -> Result<()> {
     print_json(&value);
     Ok(())
 }
-fn create_account_on_client(
-    client: &Client,
-    desired_id: Option<&str>,
-    port: u16,
-    provider: Option<&str>,
-    existing_accounts: &[Value],
-) -> Result<Value> {
-    let provider_id = provider.unwrap_or(crate::provider::DEFAULT_PROVIDER_ID);
-    let account_id = match desired_id {
-        Some(id) => id.to_owned(),
-        None => {
-            let used_ids: Vec<&str> = existing_accounts
-                .iter()
-                .filter_map(|a| a["id"].as_str())
-                .collect();
-            crate::provider::suggest_account_id(provider_id, &used_ids)
-        }
-    };
-    let mut body = json!({"id": account_id, "port": port});
-    if let Some(provider) = provider {
-        body["provider"] = json!(provider);
+fn find_account_in_list<'a>(
+    accounts: &'a [Value],
+    query: &str,
+    provider_filter: Option<&str>,
+) -> Option<&'a Value> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
     }
-    client.request("POST", "/api/accounts", Some(&body))
+    let q_lower = q.to_ascii_lowercase();
+    let slot_query = q_lower
+        .strip_prefix("/u/")
+        .or_else(|| q_lower.strip_prefix("u/"))
+        .unwrap_or(&q_lower);
+    let filtered: Vec<&Value> = accounts
+        .iter()
+        .filter(|a| provider_filter.is_none_or(|pid| a["provider"].as_str() == Some(pid)))
+        .collect();
+    filtered
+        .iter()
+        .copied()
+        .find(|a| a["id"].as_str() == Some(q))
+        .or_else(|| {
+            filtered.iter().copied().find(|a| {
+                a["identity"]
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(q))
+            })
+        })
+        .or_else(|| {
+            filtered.iter().copied().find(|a| {
+                a["label"]
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(q))
+            })
+        })
+        .or_else(|| {
+            filtered
+                .iter()
+                .copied()
+                .find(|a| a["slot"].as_str() == Some(slot_query))
+        })
+        .or_else(|| {
+            let prefix_matches: Vec<&Value> = filtered
+                .iter()
+                .copied()
+                .filter(|a| {
+                    a["identity"]
+                        .as_str()
+                        .and_then(|e| e.split('@').next())
+                        .is_some_and(|local| local.eq_ignore_ascii_case(q))
+                })
+                .collect();
+            (prefix_matches.len() == 1).then(|| prefix_matches[0])
+        })
 }
 
-fn wait_for_account_login(client: &Client, id: &str) -> Result<()> {
+fn resolve_provider_from_status(
+    status: &Value,
+    target: Option<&str>,
+    explicit_provider: Option<&str>,
+) -> Result<String> {
+    let accounts = status["accounts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let providers = status["providers"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if let Some(pid) = explicit_provider {
+        if !providers.is_empty() && !providers.iter().any(|p| p["id"].as_str() == Some(pid)) {
+            return Err(ServiceError::new(
+                ErrorCode::NotFound,
+                "provider",
+                format!(
+                    "provider '{pid}' is not registered. Add it with `anticrumb providers add <DIR_OR_FILE>`."
+                ),
+            ));
+        }
+        return Ok(pid.to_owned());
+    }
+    if let Some(t) = target {
+        if providers.iter().any(|p| p["id"].as_str() == Some(t)) {
+            return Ok(t.to_owned());
+        }
+        if let Some(acct) = find_account_in_list(accounts, t, None) {
+            return Ok(acct["provider"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::provider::DEFAULT_PROVIDER_ID)
+                .to_owned());
+        }
+        return Err(ServiceError::new(
+            ErrorCode::NotFound,
+            "provider",
+            format!(
+                "no registered provider or account matching '{t}'. Run `anticrumb providers list` or `anticrumb accounts list`."
+            ),
+        ));
+    }
+    let active_id = status["active_account_id"].as_str();
+    if let Some(aid) = active_id {
+        if let Some(acct) = accounts.iter().find(|a| a["id"].as_str() == Some(aid)) {
+            if let Some(pid) = acct["provider"].as_str().filter(|s| !s.is_empty()) {
+                return Ok(pid.to_owned());
+            }
+        }
+    }
+    Ok(default_provider())
+}
+
+fn wait_for_provider_login(client: &Client, provider_id: &str) -> Result<()> {
     client.request(
         "POST",
-        &format!("/api/accounts/{id}/login"),
+        &format!("/api/providers/{provider_id}/ensure-account"),
         Some(&json!({})),
     )?;
-    eprintln!("Complete sign-in in the browser. Waiting for model choices; Ctrl+C cancels.");
+    client.request(
+        "POST",
+        &format!("/api/providers/{provider_id}/login"),
+        Some(&json!({})),
+    )?;
+    eprintln!("Complete sign-in in the browser. Waiting for account discovery and models; Ctrl+C cancels.");
     let cancel = crate::agent::CancelToken::new();
     let signal = cancel.clone();
     let _ = ctrlc::set_handler(move || signal.cancel());
@@ -1548,13 +1651,36 @@ fn wait_for_account_login(client: &Client, id: &str) -> Result<()> {
             ));
         }
         let status = client.request("GET", "/api/status", None)?;
-        let login = status["accounts"]
+        let provider_accounts: Vec<&Value> = status["accounts"]
             .as_array()
-            .and_then(|accounts| accounts.iter().find(|a| a["id"] == id))
-            .map(|a| &a["login"]);
+            .map(|accounts| {
+                accounts
+                    .iter()
+                    .filter(|a| a["provider"].as_str() == Some(provider_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let login = provider_accounts.first().map(|a| &a["login"]);
         match login.and_then(|value| value["state"].as_str()) {
             Some("ready") => {
-                eprintln!("Signed in ({id}). Model choices are ready.");
+                let labels: Vec<String> = provider_accounts
+                    .iter()
+                    .map(|a| {
+                        let primary = a["identity"]
+                            .as_str()
+                            .or_else(|| a["label"].as_str())
+                            .or_else(|| a["id"].as_str())
+                            .unwrap_or("account");
+                        match a["slot"].as_str().filter(|s| !s.is_empty()) {
+                            Some(slot) => format!("{primary} (u/{slot})"),
+                            None => primary.to_owned(),
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "Signed in ({provider_id}): {}. Model choices are ready.",
+                    labels.join(", ")
+                );
                 return Ok(std::ops::ControlFlow::Break(()));
             }
             Some("failed" | "timed_out") => {
@@ -1570,71 +1696,10 @@ fn wait_for_account_login(client: &Client, id: &str) -> Result<()> {
     })
 }
 
-type AccountsAddArgs = (Option<String>, Option<u16>, Option<String>, bool);
-
-fn parse_accounts_add_args(args: &[String]) -> Result<AccountsAddArgs> {
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut provider: Option<String> = None;
-    let mut do_login = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--provider" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| ServiceError::invalid("missing provider ID"))?;
-                provider = Some(identifier(raw)?.to_owned());
-            }
-            "--login" => do_login = true,
-            s if s.starts_with('-') => {
-                return Err(ServiceError::invalid(format!(
-                    "unexpected option {s}; expected accounts add [ID] [PORT] [--provider ID] [--login]"
-                )))
-            }
-            pos => positionals.push(pos),
-        }
-    }
-    let (id, port) = match positionals.as_slice() {
-        [] => {
-            if provider.is_none() {
-                return Err(ServiceError::invalid(
-                    "accounts add [ID] [PORT] [--provider ID] [--login]",
-                ));
-            }
-            (None, None)
-        }
-        [one] => {
-            if one.chars().all(|c| c.is_ascii_digit()) {
-                let p = one
-                    .parse::<u16>()
-                    .map_err(|_| ServiceError::invalid("invalid port"))?;
-                if provider.is_none() {
-                    return Err(ServiceError::invalid(
-                        "accounts add [ID] [PORT] [--provider ID] [--login]",
-                    ));
-                }
-                (None, Some(p))
-            } else {
-                (Some(identifier(one)?.to_owned()), None)
-            }
-        }
-        [id_raw, port_raw] => {
-            let id = identifier(id_raw)?.to_owned();
-            let port = port_raw
-                .parse::<u16>()
-                .map_err(|_| ServiceError::invalid("invalid port"))?;
-            (Some(id), Some(port))
-        }
-        _ => {
-            return Err(ServiceError::invalid(
-                "accounts add [ID] [PORT] [--provider ID] [--login]",
-            ))
-        }
-    };
-    Ok((id, port, provider, do_login))
-}
-
-fn parse_login_args(args: &[String]) -> Result<(Option<String>, Option<String>)> {
+fn parse_provider_target_args(
+    args: &[String],
+    usage: &str,
+) -> Result<(Option<String>, Option<String>)> {
     let mut target: Option<String> = None;
     let mut provider: Option<String> = None;
     let mut iter = args.iter();
@@ -1648,105 +1713,67 @@ fn parse_login_args(args: &[String]) -> Result<(Option<String>, Option<String>)>
             }
             s if s.starts_with('-') => {
                 return Err(ServiceError::invalid(format!(
-                    "unexpected option {s}; expected login [ACCOUNT|PROVIDER] [--provider ID]"
+                    "unexpected option {s}; expected {usage}"
                 )))
             }
             pos => {
                 if target.is_some() {
-                    return Err(ServiceError::invalid(
-                        "login [ACCOUNT|PROVIDER] [--provider ID]",
-                    ));
+                    return Err(ServiceError::invalid(usage));
                 }
-                target = Some(identifier(pos)?.to_owned());
+                target = Some(account_query(pos)?.to_owned());
             }
         }
     }
     Ok((target, provider))
 }
 
-fn login_with_client(client: &Client, args: &[String]) -> Result<()> {
-    let (target, provider) = parse_login_args(args)?;
-    let accounts_val = client.request("GET", "/api/accounts", None)?;
-    let providers_val = client.request("GET", "/api/providers", None)?;
-    let accounts = accounts_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let providers = providers_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
-
-    let account_id = match (target.as_deref(), provider.as_deref()) {
-        (None, None) => "default".to_owned(),
-        (Some(acct), None) => {
-            if accounts.iter().any(|a| a["id"].as_str() == Some(acct)) {
-                acct.to_owned()
-            } else if providers.iter().any(|p| p["id"].as_str() == Some(acct)) {
-                ensure_account_for_provider(client, None, acct, accounts)?
-            } else {
-                return Err(ServiceError::new(
-                    ErrorCode::NotFound,
-                    "account",
-                    format!(
-                        "no account or registered provider named '{acct}'. Run `anticrumb providers list` or `anticrumb accounts list`."
-                    ),
-                ));
+fn parse_attach_args(args: &[String]) -> Result<(Option<String>, Option<String>, u16)> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut provider: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--provider" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| ServiceError::invalid("missing provider ID"))?;
+                provider = Some(identifier(raw)?.to_owned());
             }
-        }
-        (desired, Some(pid)) => {
-            if !providers.iter().any(|p| p["id"].as_str() == Some(pid)) {
-                return Err(ServiceError::new(
-                    ErrorCode::NotFound,
-                    "provider",
-                    format!(
-                        "provider '{pid}' is not registered. Add it with `anticrumb providers add <DIR_OR_FILE>`."
-                    ),
-                ));
-            }
-            ensure_account_for_provider(client, desired, pid, accounts)?
-        }
-    };
-    wait_for_account_login(client, &account_id)
-}
-
-fn ensure_account_for_provider(
-    client: &Client,
-    desired_id: Option<&str>,
-    provider_id: &str,
-    accounts: &[Value],
-) -> Result<String> {
-    if let Some(id) = desired_id {
-        if let Some(existing) = accounts.iter().find(|a| a["id"].as_str() == Some(id)) {
-            let actual = existing["provider"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(crate::provider::DEFAULT_PROVIDER_ID);
-            if actual != provider_id {
+            s if s.starts_with('-') => {
                 return Err(ServiceError::invalid(format!(
-                    "account '{id}' uses provider '{actual}', not '{provider_id}'"
-                )));
+                "unexpected option {s}; expected accounts attach [PROVIDER] [--provider ID] PORT"
+            )))
             }
-            return Ok(id.to_owned());
-        }
-    } else {
-        let matching: Vec<&Value> = accounts
-            .iter()
-            .filter(|a| a["provider"].as_str() == Some(provider_id))
-            .collect();
-        if let Some(found) = matching
-            .iter()
-            .copied()
-            .find(|a| a["state"].as_str() == Some("ready"))
-            .or_else(|| matching.into_iter().next())
-        {
-            if let Some(id) = found["id"].as_str() {
-                return Ok(id.to_owned());
-            }
+            pos => positionals.push(pos),
         }
     }
-    let created = create_account_on_client(client, desired_id, 0, Some(provider_id), accounts)?;
-    let created_id = created["id"]
-        .as_str()
-        .ok_or_else(|| ServiceError::invalid("created account missing id"))?
-        .to_owned();
-    let port = created["port"].as_u64().unwrap_or(0);
-    eprintln!("Created account '{created_id}' for provider '{provider_id}' on CDP port {port}.");
-    Ok(created_id)
+    let (target, port_raw) = match positionals.as_slice() {
+        [port_raw] => (None, *port_raw),
+        [target, port_raw] => (Some(account_query(target)?.to_owned()), *port_raw),
+        _ => {
+            return Err(ServiceError::invalid(
+                "accounts attach [PROVIDER] [--provider ID] PORT",
+            ))
+        }
+    };
+    let port = port_raw
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| ServiceError::invalid("port must be 1..65535"))?;
+    Ok((target, provider, port))
+}
+
+fn parse_login_args(args: &[String]) -> Result<(Option<String>, Option<String>)> {
+    parse_provider_target_args(args, "login [PROVIDER|ACCOUNT] [--provider ID]")
+}
+
+fn login_with_client(client: &Client, args: &[String]) -> Result<()> {
+    let (target, provider) = parse_login_args(args)?;
+    let status = client.request("GET", "/api/status", None)?;
+    let provider_id =
+        resolve_provider_from_status(&status, target.as_deref(), provider.as_deref())?;
+    wait_for_provider_login(client, &provider_id)
 }
 
 fn login_command(args: &[String]) -> Result<()> {
@@ -1758,55 +1785,87 @@ fn account_command(args: &[String]) -> Result<()> {
     let client = Client::connect()?;
     let action = args.first().map(String::as_str).unwrap_or("list");
     match action {
-        "list" | "status" => print_json(&client.request("GET", "/api/accounts", None)?),
-        "add" => {
-            let (id, port, provider, do_login) = parse_accounts_add_args(&args[1..])?;
-            let existing = if id.is_none() {
-                client
-                    .request("GET", "/api/accounts", None)?
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let created = create_account_on_client(
-                &client,
-                id.as_deref(),
-                port.unwrap_or(0),
-                provider.as_deref(),
-                &existing,
+        "list" | "status" => {
+            let status = client.request("GET", "/api/status", None)?;
+            let summary: Vec<Value> = status["accounts"]
+                .as_array()
+                .map(|accounts| {
+                    accounts
+                        .iter()
+                        .map(|a| {
+                            json!({
+                                "id": a["id"],
+                                "provider": a["provider"],
+                                "state": a["state"],
+                                "identity": a["identity"],
+                                "label": a["label"],
+                                "slot": a["slot"],
+                                "active": a["active"],
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            print_json(&summary);
+        }
+        "browsers" => print_json(&client.request("GET", "/api/browsers", None)?),
+        "use" => {
+            let target = account_query(
+                args.get(1)
+                    .ok_or_else(|| ServiceError::invalid("accounts use TARGET"))?,
             )?;
-            print_json(&created);
-            if do_login {
-                let created_id = created["id"]
-                    .as_str()
-                    .ok_or_else(|| ServiceError::invalid("created account missing id"))?;
-                wait_for_account_login(&client, created_id)?;
-            }
+            print_json(&client.request(
+                "POST",
+                "/api/accounts/active",
+                Some(&json!({"account_id": target})),
+            )?);
+        }
+        "refresh" => {
+            let (target, provider) = parse_provider_target_args(
+                &args[1..],
+                "accounts refresh [PROVIDER] [--provider ID]",
+            )?;
+            let status = client.request("GET", "/api/status", None)?;
+            let provider_id =
+                resolve_provider_from_status(&status, target.as_deref(), provider.as_deref())?;
+            print_json(&client.request(
+                "POST",
+                &format!("/api/providers/{provider_id}/refresh-accounts"),
+                Some(&json!({})),
+            )?);
         }
         "login" => login_with_client(&client, &args[1..])?,
         "attach" => {
-            let id = identifier(
-                args.get(1)
-                    .ok_or_else(|| ServiceError::invalid("accounts attach ID PORT"))?,
-            )?;
-            let port = args
-                .get(2)
-                .and_then(|p| p.parse::<u16>().ok())
-                .filter(|p| *p > 0)
-                .ok_or_else(|| ServiceError::invalid("port must be 1..65535"))?;
+            let (target, provider, port) = parse_attach_args(&args[1..])?;
+            let status = client.request("GET", "/api/status", None)?;
+            let provider_id =
+                resolve_provider_from_status(&status, target.as_deref(), provider.as_deref())?;
             print_json(&client.request(
                 "POST",
-                &format!("/api/accounts/{id}/attach"),
-                Some(&json!({"port":port})),
+                &format!("/api/providers/{provider_id}/attach"),
+                Some(&json!({"port": port})),
             )?);
         }
         "resolve" => {
-            let id = identifier(
-                args.get(1)
-                    .ok_or_else(|| ServiceError::invalid("missing account"))?,
-            )?;
+            let status = client.request("GET", "/api/status", None)?;
+            let accounts = status["accounts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let id = match args.get(1) {
+                Some(raw) => {
+                    let q = account_query(raw)?;
+                    find_account_in_list(accounts, q, None)
+                        .and_then(|a| a["id"].as_str())
+                        .unwrap_or(q)
+                        .to_owned()
+                }
+                None => status["active_account_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(default_account),
+            };
             print_json(&client.request(
                 "POST",
                 &format!("/api/accounts/{id}/resolve"),
@@ -1814,10 +1873,18 @@ fn account_command(args: &[String]) -> Result<()> {
             )?);
         }
         "pause" => {
-            let id = identifier(
+            let raw = account_query(
                 args.get(1)
-                    .ok_or_else(|| ServiceError::invalid("missing account"))?,
+                    .ok_or_else(|| ServiceError::invalid("accounts pause TARGET"))?,
             )?;
+            let status = client.request("GET", "/api/status", None)?;
+            let accounts = status["accounts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let id = find_account_in_list(accounts, raw, None)
+                .and_then(|a| a["id"].as_str())
+                .unwrap_or(raw);
             print_json(&client.request(
                 "POST",
                 &format!("/api/accounts/{id}/pause"),
@@ -1825,19 +1892,22 @@ fn account_command(args: &[String]) -> Result<()> {
             )?);
         }
         "show" | "hide" => {
-            let id = identifier(
-                args.get(1)
-                    .ok_or_else(|| ServiceError::invalid("missing account"))?,
+            let (target, provider) = parse_provider_target_args(
+                &args[1..],
+                &format!("accounts {action} [PROVIDER] [--provider ID]"),
             )?;
+            let status = client.request("GET", "/api/status", None)?;
+            let provider_id =
+                resolve_provider_from_status(&status, target.as_deref(), provider.as_deref())?;
             print_json(&client.request(
                 "POST",
-                &format!("/api/accounts/{id}/browser-mode"),
-                Some(&json!({"headless": args[0] == "hide"})),
+                &format!("/api/providers/{provider_id}/browser-mode"),
+                Some(&json!({"headless": action == "hide"})),
             )?);
         }
         _ => {
             return Err(ServiceError::invalid(
-                "accounts list|add|attach|show|hide|login|resolve|pause",
+                "accounts list|use|refresh|browsers|attach|show|hide|login|resolve|pause",
             ))
         }
     }
@@ -1902,11 +1972,7 @@ fn provider_command(args: &[String]) -> Result<()> {
                 Err(err) => return Err(err),
             }
             if do_login {
-                let accounts_val = client.request("GET", "/api/accounts", None)?;
-                let accounts = accounts_val.as_array().map(Vec::as_slice).unwrap_or(&[]);
-                let account_id =
-                    ensure_account_for_provider(&client, None, &provider_id, accounts)?;
-                wait_for_account_login(&client, &account_id)?;
+                wait_for_provider_login(&client, &provider_id)?;
             }
         }
         "remove" | "unregister" => {
@@ -1924,12 +1990,14 @@ fn provider_command(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn resolve_account_from_lists(
     account: &mut String,
     provider: &mut Option<String>,
     provider_name: &mut Option<String>,
     account_overridden: bool,
     provider_overridden: bool,
+    active_account_id: Option<&str>,
     accounts: &[Value],
     providers: &[Value],
 ) -> Result<()> {
@@ -1942,14 +2010,43 @@ fn resolve_account_from_lists(
             .map(str::to_owned)
     };
     if !provider_overridden {
-        if let Some(found_provider) = accounts
-            .iter()
-            .find(|a| a["id"].as_str() == Some(account.as_str()))
-            .and_then(|a| a["provider"].as_str())
-            .filter(|s| !s.is_empty())
-        {
-            *provider = Some(found_provider.to_owned());
-            *provider_name = find_provider_name(found_provider);
+        if !account_overridden {
+            let chosen = active_account_id
+                .and_then(|aid| accounts.iter().find(|a| a["id"].as_str() == Some(aid)))
+                .or_else(|| {
+                    accounts
+                        .iter()
+                        .find(|a| a["state"].as_str() == Some("ready"))
+                })
+                .or_else(|| accounts.first());
+            if let Some(chosen) = chosen {
+                if let Some(id) = chosen["id"].as_str().filter(|s| !s.is_empty()) {
+                    *account = id.to_owned();
+                }
+                if let Some(found_provider) = chosen["provider"].as_str().filter(|s| !s.is_empty())
+                {
+                    *provider = Some(found_provider.to_owned());
+                    *provider_name = find_provider_name(found_provider);
+                }
+            }
+            return Ok(());
+        }
+        if let Some(matched) = find_account_in_list(accounts, account, None) {
+            if let Some(id) = matched["id"].as_str().filter(|s| !s.is_empty()) {
+                *account = id.to_owned();
+            }
+            if let Some(found_provider) = matched["provider"].as_str().filter(|s| !s.is_empty()) {
+                *provider = Some(found_provider.to_owned());
+                *provider_name = find_provider_name(found_provider);
+            }
+            return Ok(());
+        }
+        if !accounts.is_empty() {
+            return Err(ServiceError::new(
+                ErrorCode::NotFound,
+                "account",
+                format!("account '{account}' does not exist. Run `anticrumb accounts list`."),
+            ));
         }
         return Ok(());
     }
@@ -1968,10 +2065,7 @@ fn resolve_account_from_lists(
         ));
     }
     if account_overridden {
-        let Some(matched) = accounts
-            .iter()
-            .find(|a| a["id"].as_str() == Some(account.as_str()))
-        else {
+        let Some(matched) = find_account_in_list(accounts, account, None) else {
             return Err(ServiceError::new(
                 ErrorCode::NotFound,
                 "account",
@@ -1987,6 +2081,9 @@ fn resolve_account_from_lists(
                 "account '{account}' uses provider '{actual}', not '{requested}'"
             )));
         }
+        if let Some(id) = matched["id"].as_str().filter(|s| !s.is_empty()) {
+            *account = id.to_owned();
+        }
         *provider_name = find_provider_name(&requested);
         return Ok(());
     }
@@ -1994,17 +2091,26 @@ fn resolve_account_from_lists(
         .iter()
         .filter(|a| a["provider"].as_str() == Some(requested.as_str()))
         .collect();
-    let chosen = matching
-        .iter()
-        .copied()
-        .find(|a| a["state"].as_str() == Some("ready"))
+    let chosen = active_account_id
+        .and_then(|aid| {
+            matching
+                .iter()
+                .copied()
+                .find(|a| a["id"].as_str() == Some(aid))
+        })
+        .or_else(|| {
+            matching
+                .iter()
+                .copied()
+                .find(|a| a["state"].as_str() == Some("ready"))
+        })
         .or_else(|| matching.into_iter().next());
     let Some(chosen) = chosen else {
         return Err(ServiceError::new(
             ErrorCode::NotFound,
             "account",
             format!(
-                "no account is registered for provider '{requested}'. Run `anticrumb login --provider {requested}` (or `anticrumb accounts add --provider {requested}`)."
+                "no account is registered for provider '{requested}'. Run `anticrumb login --provider {requested}`."
             ),
         ));
     };
@@ -2713,7 +2819,8 @@ mod tests {
         assert!(opts.overrides.contains("provider"));
 
         let accounts = vec![
-            json!({"id": "default", "provider": "gemini-web", "state": "ready"}),
+            json!({"id": "gemini-alice", "provider": "gemini-web", "state": "ready", "identity": "alice@gmail.com", "slot": "0"}),
+            json!({"id": "gemini-bob", "provider": "gemini-web", "state": "ready", "identity": "bob@gmail.com", "slot": "1"}),
             json!({"id": "claude-auth", "provider": "claude-web", "state": "auth_required"}),
             json!({"id": "claude-ready", "provider": "claude-web", "state": "ready"}),
         ];
@@ -2728,12 +2835,59 @@ mod tests {
             &mut opts.provider_name,
             opts.overrides.contains("account"),
             opts.overrides.contains("provider"),
+            Some("gemini-bob"),
             &accounts,
             &providers,
         )
         .unwrap();
         assert_eq!(opts.account, "claude-ready");
         assert_eq!(opts.provider_name.as_deref(), Some("Claude Web"));
+
+        // Omitting both --provider and --account uses the daemon active account.
+        let mut default_opts = PromptOptions::parse(&["hello".into()]).unwrap();
+        resolve_account_from_lists(
+            &mut default_opts.account,
+            &mut default_opts.provider,
+            &mut default_opts.provider_name,
+            false,
+            false,
+            Some("gemini-bob"),
+            &accounts,
+            &providers,
+        )
+        .unwrap();
+        assert_eq!(default_opts.account, "gemini-bob");
+        assert_eq!(default_opts.provider.as_deref(), Some("gemini-web"));
+
+        // --account resolves email and slot queries to canonical account id.
+        let mut by_email =
+            PromptOptions::parse(&["--account".into(), "alice@gmail.com".into()]).unwrap();
+        resolve_account_from_lists(
+            &mut by_email.account,
+            &mut by_email.provider,
+            &mut by_email.provider_name,
+            true,
+            false,
+            Some("gemini-bob"),
+            &accounts,
+            &providers,
+        )
+        .unwrap();
+        assert_eq!(by_email.account, "gemini-alice");
+
+        let mut by_slot = PromptOptions::parse(&["--account".into(), "u/1".into()]).unwrap();
+        resolve_account_from_lists(
+            &mut by_slot.account,
+            &mut by_slot.provider,
+            &mut by_slot.provider_name,
+            true,
+            false,
+            Some("gemini-alice"),
+            &accounts,
+            &providers,
+        )
+        .unwrap();
+        assert_eq!(by_slot.account, "gemini-bob");
 
         // Both --provider and --account matching works; mismatch errors cleanly.
         let mut both_ok = PromptOptions::parse(&[
@@ -2749,6 +2903,7 @@ mod tests {
             &mut both_ok.provider_name,
             true,
             true,
+            None,
             &accounts,
             &providers,
         )
@@ -2759,7 +2914,7 @@ mod tests {
             "--provider".into(),
             "claude-web".into(),
             "--account".into(),
-            "default".into(),
+            "gemini-alice".into(),
         ])
         .unwrap();
         let err = resolve_account_from_lists(
@@ -2768,6 +2923,7 @@ mod tests {
             &mut mismatch.provider_name,
             true,
             true,
+            None,
             &accounts,
             &providers,
         )
@@ -2783,12 +2939,13 @@ mod tests {
             &mut missing_acct.provider_name,
             false,
             true,
+            None,
             &accounts,
             &providers,
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
-        assert!(err.message.contains("accounts add"));
+        assert!(err.message.contains("login --provider chatgpt-web"));
     }
 
     #[test]
@@ -2855,36 +3012,18 @@ mod tests {
     }
 
     #[test]
-    fn simplified_add_and_login_parsers_handle_optional_id_port_and_flags() {
+    fn provider_attach_and_login_parsers_handle_optional_target_and_flags() {
         assert_eq!(
-            parse_accounts_add_args(&["--provider".into(), "claude-web".into(), "--login".into(),])
-                .unwrap(),
-            (None, None, Some("claude-web".into()), true)
+            parse_attach_args(&["9222".into()]).unwrap(),
+            (None, None, 9222)
         );
         assert_eq!(
-            parse_accounts_add_args(&["claude".into(), "--provider".into(), "claude-web".into(),])
-                .unwrap(),
-            (
-                Some("claude".into()),
-                None,
-                Some("claude-web".into()),
-                false
-            )
+            parse_attach_args(&["--provider".into(), "claude-web".into(), "9223".into()]).unwrap(),
+            (None, Some("claude-web".into()), 9223)
         );
         assert_eq!(
-            parse_accounts_add_args(&[
-                "claude".into(),
-                "9223".into(),
-                "--provider".into(),
-                "claude-web".into(),
-            ])
-            .unwrap(),
-            (
-                Some("claude".into()),
-                Some(9223),
-                Some("claude-web".into()),
-                false
-            )
+            parse_attach_args(&["gemini-web".into(), "9224".into()]).unwrap(),
+            (Some("gemini-web".into()), None, 9224)
         );
         assert_eq!(
             parse_login_args(&["claude-web".into()]).unwrap(),

@@ -18,6 +18,7 @@ use crate::{
     browser_host::{self as browser, TargetInfo},
     domain::{now_ms, Account, Result, ServiceError, Session, SessionMode, SessionState},
     gemini,
+    provider::AccountRoute,
     store::Store,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,10 @@ use std::{
         Mutex, OnceLock,
     },
 };
+
+/// Total live page tabs allowed across all accounts sharing a single provider Chrome instance
+/// before evicting the globally oldest idle `Worker` tab from another account.
+pub const MAX_SHARED_BROWSER_TABS: usize = 12;
 
 static WORKER_TABS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 static MASTER_TABS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
@@ -206,15 +211,20 @@ pub(crate) fn system_tab_id(store: &Store, account_id: &str) -> Option<String> {
         .map(|s| s.target_id)
 }
 
-pub(crate) fn all_worker_tab_ids(store: &Store) -> HashSet<String> {
+pub(crate) fn all_worker_tab_ids(store: &Store, extra_account: Option<&str>) -> HashSet<String> {
     let mut ids = HashSet::new();
-    for account_id in std::iter::once("default".to_owned()).chain(
-        store
-            .list::<Account>("local", "account")
-            .unwrap_or_default()
-            .into_iter()
-            .map(|a| a.id),
-    ) {
+    let mut account_ids: Vec<String> = store
+        .list::<Account>("local", "account")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    if let Some(extra) = extra_account {
+        if !extra.is_empty() && !account_ids.iter().any(|id| id == extra) {
+            account_ids.push(extra.to_owned());
+        }
+    }
+    for account_id in account_ids {
         if let Some(id) = system_tab_id(store, &account_id) {
             ids.insert(id);
         }
@@ -227,21 +237,58 @@ pub(crate) fn all_worker_tab_ids(store: &Store) -> HashSet<String> {
     ids
 }
 
+/// Collect every Master, Worker, and system tab ID belonging to OTHER accounts so one account's
+/// TabPool never adopts or steals a warm tab owned by a sibling user sharing the same Chrome.
+pub(crate) fn all_other_account_pool_tab_ids(store: &Store, account_id: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for acct in store
+        .list::<Account>("local", "account")
+        .unwrap_or_default()
+    {
+        if acct.id == account_id {
+            continue;
+        }
+        if let Some(id) = system_tab_id(store, &acct.id) {
+            ids.insert(id);
+        }
+        for slot in load_state(store, &acct.id).slots {
+            if !slot.target_id.is_empty() {
+                ids.insert(slot.target_id);
+            }
+        }
+    }
+    ids
+}
+
 /// Enroll or update a tab used by a system task (`/usage`, `/model refresh`, `/delete`) in the
 /// `Worker` pool. Returns `true` if the tab belongs to the persistent `Worker` pool (and must NOT
 /// be closed on drop), or `false` if all `Worker` slots are currently busy with active multi-agent
 /// runs so this tab is an overflow temporary tab that should be closed immediately on completion.
-pub(crate) fn record_system_tab_id(store: &Store, account_id: &str, target_id: &str) -> bool {
+pub(crate) fn record_system_tab_id(
+    store: &Store,
+    account_id: &str,
+    port: u16,
+    target_id: &str,
+) -> bool {
     let _pool_guard = pool_lock().lock().unwrap_or_else(|e| e.into_inner());
     let config = TabPoolConfig::load(Some(store));
-    let mut state = match browser::list_targets(
+    let effective_port = if port > 0 {
+        port
+    } else {
         store
             .get::<Account>("local", "account", account_id)
-            .map(|a| a.port)
-            .unwrap_or(0),
-    ) {
-        Ok(targets) => reconcile(store, account_id, &targets),
-        Err(_) => load_state(store, account_id),
+            .ok()
+            .and_then(|a| store.browser_for_account(&a).ok())
+            .map(|b| b.port)
+            .unwrap_or(0)
+    };
+    let mut state = if effective_port > 0 {
+        match browser::list_targets(effective_port) {
+            Ok(targets) => reconcile(store, account_id, &targets),
+            Err(_) => load_state(store, account_id),
+        }
+    } else {
+        load_state(store, account_id)
     };
 
     if let Some(slot) = state.slots.iter_mut().find(|s| s.target_id == target_id) {
@@ -466,37 +513,63 @@ pub(crate) struct TabPoolMatcher<'a> {
     pub is_system_page_url: &'a dyn Fn(&str) -> bool,
 }
 
-fn gemini_matcher() -> TabPoolMatcher<'static> {
-    TabPoolMatcher {
-        entry_url: browser::GEMINI_APP_URL,
-        is_reusable_url: &gemini::is_reusable_gemini_url,
-        is_chat_url: &gemini::url_has_chat_id,
-        is_system_page_url: &|url: &str| url.starts_with("https://gemini.google.com/usage"),
+pub(crate) fn gemini_matcher_for<R>(
+    route: &AccountRoute,
+    f: impl FnOnce(&TabPoolMatcher<'_>) -> R,
+) -> R {
+    let scope = route.scope.as_deref();
+    let is_reusable = |url: &str| gemini::is_reusable_gemini_url_for(url, scope);
+    let is_chat = |url: &str| gemini::url_has_chat_id(url);
+    let is_system = |url: &str| gemini::is_gemini_usage_url_for(url, scope);
+    let matcher = TabPoolMatcher {
+        entry_url: &route.entry_url,
+        is_reusable_url: &is_reusable,
+        is_chat_url: &is_chat,
+        is_system_page_url: &is_system,
+    };
+    f(&matcher)
+}
+
+#[cfg(test)]
+fn default_gemini_route() -> AccountRoute {
+    AccountRoute {
+        entry_url: gemini::gemini_app_url(Some("0")),
+        usage_url: Some(gemini::gemini_usage_url(Some("0"))),
+        scope: Some("0".into()),
     }
 }
 
 /// Find a reusable non-worker `Master` tab for persistent chat sessions matching a provider matcher.
 pub(crate) fn find_reusable_target_for(
     store: &Store,
+    account_id: &str,
     port: u16,
     matcher: &TabPoolMatcher<'_>,
 ) -> Option<TargetInfo> {
     let owned = active_session_targets(store)?;
     let busy_system = busy_system_tab_ids();
-    let worker_tabs = all_worker_tab_ids(store);
+    let worker_tabs = all_worker_tab_ids(store, Some(account_id));
+    let other_pool_tabs = all_other_account_pool_tab_ids(store, account_id);
     browser::list_targets(port).ok()?.into_iter().find(|t| {
         t.target_type == "page"
             && !owned.contains(&t.id)
             && !busy_system.contains(&t.id)
             && !worker_tabs.contains(&t.id)
+            && !other_pool_tabs.contains(&t.id)
             && (matcher.is_reusable_url)(&t.url)
     })
 }
 
 /// Find a reusable non-worker `Master` Gemini tab for persistent chat sessions.
 #[cfg(test)]
-pub(crate) fn find_reusable_gemini_target(store: &Store, port: u16) -> Option<TargetInfo> {
-    find_reusable_target_for(store, port, &gemini_matcher())
+pub(crate) fn find_reusable_gemini_target(
+    store: &Store,
+    account_id: &str,
+    port: u16,
+) -> Option<TargetInfo> {
+    gemini_matcher_for(&default_gemini_route(), |matcher| {
+        find_reusable_target_for(store, account_id, port, matcher)
+    })
 }
 
 /// Preempt an `Idle` `Worker` tab from the pool for high-priority system operations
@@ -536,6 +609,7 @@ fn find_system_target_for_locked(
     let config = TabPoolConfig::load(Some(store));
     let mut owned = active_session_targets(store)?;
     owned.extend(busy_system_tab_ids());
+    let other_pool_tabs = all_other_account_pool_tab_ids(store, account_id);
     let targets = browser::list_targets(port).ok()?;
     let state = reconcile(store, account_id, &targets);
 
@@ -544,7 +618,7 @@ fn find_system_target_for_locked(
         let is_idle_worker = state.slots.iter().any(|s| {
             s.target_id == saved_id && s.role == TabRole::Worker && s.session_id.is_none()
         });
-        if is_idle_worker && !owned.contains(&saved_id) {
+        if is_idle_worker && !owned.contains(&saved_id) && !other_pool_tabs.contains(&saved_id) {
             if let Some(found) = targets
                 .iter()
                 .find(|t| t.target_type == "page" && t.id == saved_id)
@@ -557,7 +631,10 @@ fn find_system_target_for_locked(
         .slots
         .iter()
         .filter(|s| {
-            s.role == TabRole::Worker && s.session_id.is_none() && !owned.contains(&s.target_id)
+            s.role == TabRole::Worker
+                && s.session_id.is_none()
+                && !owned.contains(&s.target_id)
+                && !other_pool_tabs.contains(&s.target_id)
         })
         .min_by_key(|s| s.last_used)
     {
@@ -580,31 +657,155 @@ fn find_system_target_for_locked(
         return None;
     }
 
-    // 3. Otherwise, adopt an untracked non-conversation page into the Worker pool.
+    // 3. Otherwise, adopt an untracked non-conversation page matching this account's route into
+    //    the Worker pool without ever taking tabs pooled by sibling accounts.
     let tracked_ids: HashSet<&str> = state.slots.iter().map(|s| s.target_id.as_str()).collect();
     targets.into_iter().find(|t| {
         t.target_type == "page"
             && !tracked_ids.contains(t.id.as_str())
             && !owned.contains(&t.id)
+            && !other_pool_tabs.contains(&t.id)
             && !(matcher.is_chat_url)(&t.url)
             && ((matcher.is_reusable_url)(&t.url) || (matcher.is_system_page_url)(&t.url))
     })
 }
 
+pub(crate) fn find_system_gemini_target_for_route(
+    store: &Store,
+    account_id: &str,
+    port: u16,
+    route: &AccountRoute,
+) -> Option<TargetInfo> {
+    gemini_matcher_for(route, |matcher| {
+        find_system_target_for(store, account_id, port, matcher)
+    })
+}
+
+pub(crate) fn reserve_system_gemini_target_for_route(
+    store: &Store,
+    account_id: &str,
+    port: u16,
+    route: &AccountRoute,
+) -> Option<(TargetInfo, SystemTabLease)> {
+    gemini_matcher_for(route, |matcher| {
+        reserve_system_target_for(store, account_id, port, matcher)
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn find_system_gemini_target(
     store: &Store,
     account_id: &str,
     port: u16,
 ) -> Option<TargetInfo> {
-    find_system_target_for(store, account_id, port, &gemini_matcher())
+    find_system_gemini_target_for_route(store, account_id, port, &default_gemini_route())
 }
 
+#[cfg(test)]
 pub(crate) fn reserve_system_gemini_target(
     store: &Store,
     account_id: &str,
     port: u16,
 ) -> Option<(TargetInfo, SystemTabLease)> {
-    reserve_system_target_for(store, account_id, port, &gemini_matcher())
+    reserve_system_gemini_target_for_route(store, account_id, port, &default_gemini_route())
+}
+
+/// Evict the globally least-recently-used idle Worker tab from another account sharing this
+/// browser whenever live page tabs reach `MAX_SHARED_BROWSER_TABS`.
+/// Master tabs, active sessions, and busy system tabs are strictly protected.
+fn evict_shared_browser_tab_if_needed(
+    store: &Store,
+    current_account_id: &str,
+    port: u16,
+    targets: &[TargetInfo],
+    owned: &HashSet<String>,
+) {
+    let live_page_ids: HashSet<&str> = targets
+        .iter()
+        .filter(|t| t.target_type == "page")
+        .map(|t| t.id.as_str())
+        .collect();
+    if live_page_ids.len() < MAX_SHARED_BROWSER_TABS {
+        return;
+    }
+    let current_provider = store
+        .get::<Account>("local", "account", current_account_id)
+        .ok()
+        .map(|a| a.provider);
+    let running_session_ids: HashSet<String> = store
+        .list::<Session>("local", "session")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| matches!(s.state, SessionState::Running | SessionState::AwaitingHuman))
+        .map(|s| s.id)
+        .collect();
+
+    let mut victim: Option<(String, String, i64)> = None;
+    for acct in store
+        .list::<Account>("local", "account")
+        .unwrap_or_default()
+    {
+        if acct.id == current_account_id {
+            continue;
+        }
+        if current_provider
+            .as_deref()
+            .is_some_and(|p| p != acct.provider)
+        {
+            continue;
+        }
+        let state = load_state(store, &acct.id);
+        for slot in state.slots {
+            if slot.role != TabRole::Worker {
+                continue;
+            }
+            if !live_page_ids.contains(slot.target_id.as_str())
+                || owned.contains(&slot.target_id)
+                || slot
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|sid| running_session_ids.contains(sid))
+            {
+                continue;
+            }
+            if victim
+                .as_ref()
+                .is_none_or(|(_, _, oldest)| slot.last_used < *oldest)
+            {
+                victim = Some((acct.id.clone(), slot.target_id.clone(), slot.last_used));
+            }
+        }
+    }
+
+    if let Some((victim_account, victim_target, _)) = victim {
+        let mut state = load_state(store, &victim_account);
+        if let Some(removed) = state
+            .slots
+            .iter()
+            .find(|s| s.target_id == victim_target)
+            .cloned()
+        {
+            if let Some(old_sid) = removed.session_id {
+                if let Ok(mut old_session) = store.get::<Session>("local", "session", &old_sid) {
+                    if old_session.target_id.as_deref() == Some(victim_target.as_str()) {
+                        old_session.target_id = None;
+                        if old_session.mode == SessionMode::Temporary
+                            && old_session.state == SessionState::Ready
+                        {
+                            old_session.state = SessionState::Invalidated;
+                        }
+                        let _ = store.put("local", "session", &old_session.id, &old_session);
+                    }
+                }
+            }
+        }
+        state.slots.retain(|s| s.target_id != victim_target);
+        let _ = save_state(store, &victim_account, &state);
+        if system_tab_id(store, &victim_account).as_deref() == Some(victim_target.as_str()) {
+            clear_system_tab_id(store, &victim_account);
+        }
+        let _ = browser::close_tab(port, &victim_target);
+    }
 }
 
 /// Acquire or allocate a `Master` (`SessionMode::Chat`) or `Worker` (`SessionMode::Temporary`)
@@ -627,7 +828,8 @@ pub(crate) fn acquire_session_tab_for(
     let mut state = reconcile(store, account_id, &targets);
     let mut owned = active_session_targets(store).unwrap_or_default();
     owned.extend(busy_system_tab_ids());
-    let worker_tabs = all_worker_tab_ids(store);
+    let worker_tabs = all_worker_tab_ids(store, Some(account_id));
+    let other_pool_tabs = all_other_account_pool_tab_ids(store, account_id);
 
     let find_reusable_target = |id: &str| -> Option<TargetInfo> {
         targets
@@ -635,6 +837,7 @@ pub(crate) fn acquire_session_tab_for(
             .find(|t| {
                 t.target_type == "page"
                     && t.id == id
+                    && !other_pool_tabs.contains(&t.id)
                     && (role == TabRole::Worker || !worker_tabs.contains(&t.id))
                     && ((matcher.is_reusable_url)(&t.url)
                         || (role == TabRole::Worker && (matcher.is_system_page_url)(&t.url)))
@@ -663,12 +866,14 @@ pub(crate) fn acquire_session_tab_for(
         return Ok((target, true));
     }
 
-    // 2. Adopt an untracked reusable provider page in Chrome before opening new tabs.
+    // 2. Adopt an untracked reusable provider page in Chrome matching this account's route
+    //    before opening new tabs (never taking tabs pooled by sibling accounts).
     let tracked_ids: HashSet<&str> = state.slots.iter().map(|s| s.target_id.as_str()).collect();
     if let Some(untracked) = targets.iter().find(|t| {
         t.target_type == "page"
             && !tracked_ids.contains(t.id.as_str())
             && !owned.contains(&t.id)
+            && !other_pool_tabs.contains(&t.id)
             && (role == TabRole::Worker || !worker_tabs.contains(&t.id))
             && (matcher.is_reusable_url)(&t.url)
     }) {
@@ -685,6 +890,7 @@ pub(crate) fn acquire_session_tab_for(
     // 3. If current tabs for this role are below role capacity, create a new tab in Chrome.
     let role_count = state.slots.iter().filter(|s| s.role == role).count();
     if role_count < config.capacity(role) {
+        evict_shared_browser_tab_if_needed(store, account_id, port, &targets, &owned);
         let created = browser::create_tab(port, matcher.entry_url)
             .map_err(|e| ServiceError::backend(e, false))?;
         state.slots.push(TabSlot {
@@ -742,8 +948,8 @@ pub(crate) fn acquire_session_tab_for(
         return Ok((target, true));
     }
 
-    // 5. Fallback: if any idle non-system tab exists, reuse it; otherwise create a tab.
-    if let Some(existing) = find_reusable_target_for(store, port, matcher) {
+    // 5. Fallback: if any idle non-system tab for this account's route exists, reuse it; otherwise create a tab.
+    if let Some(existing) = find_reusable_target_for(store, account_id, port, matcher) {
         if let Some(slot) = state.slots.iter_mut().find(|s| s.target_id == existing.id) {
             slot.role = role;
             slot.session_id = Some(session_id.to_owned());
@@ -760,6 +966,7 @@ pub(crate) fn acquire_session_tab_for(
         return Ok((existing, true));
     }
 
+    evict_shared_browser_tab_if_needed(store, account_id, port, &targets, &owned);
     let created = browser::create_tab(port, matcher.entry_url)
         .map_err(|e| ServiceError::backend(e, false))?;
     state.slots.push(TabSlot {
@@ -772,6 +979,20 @@ pub(crate) fn acquire_session_tab_for(
     Ok((created, false))
 }
 
+pub(crate) fn acquire_session_tab_for_route(
+    store: &Store,
+    account_id: &str,
+    port: u16,
+    session_id: &str,
+    mode: &SessionMode,
+    route: &AccountRoute,
+) -> Result<(TargetInfo, bool)> {
+    gemini_matcher_for(route, |matcher| {
+        acquire_session_tab_for(store, account_id, port, session_id, mode, matcher)
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn acquire_session_tab(
     store: &Store,
     account_id: &str,
@@ -779,14 +1000,22 @@ pub(crate) fn acquire_session_tab(
     session_id: &str,
     mode: &SessionMode,
 ) -> Result<(TargetInfo, bool)> {
-    acquire_session_tab_for(store, account_id, port, session_id, mode, &gemini_matcher())
+    acquire_session_tab_for_route(
+        store,
+        account_id,
+        port,
+        session_id,
+        mode,
+        &default_gemini_route(),
+    )
 }
 
 /// Release a session's tab back to the pool as `Idle` without closing the Chrome tab
 /// unless Chrome currently has more provider tabs than the configured pool maximum.
 pub(crate) fn release_session_tab_for(
     store: &Store,
-    account: &Account,
+    account_id: &str,
+    port: u16,
     session: &Session,
     matcher: &TabPoolMatcher<'_>,
 ) -> Result<()> {
@@ -795,8 +1024,8 @@ pub(crate) fn release_session_tab_for(
     };
     let _pool_guard = pool_lock().lock().unwrap_or_else(|e| e.into_inner());
     let config = TabPoolConfig::load(Some(store));
-    let targets = browser::list_targets(account.port).unwrap_or_default();
-    let mut state = reconcile(store, &account.id, &targets);
+    let targets = browser::list_targets(port).unwrap_or_default();
+    let mut state = reconcile(store, account_id, &targets);
     let role = match session.mode {
         SessionMode::Chat => TabRole::Master,
         SessionMode::Temporary => TabRole::Worker,
@@ -828,27 +1057,41 @@ pub(crate) fn release_session_tab_for(
 
     if role_tabs_count > config.capacity(role) && provider_pages_count > config.max_tabs() {
         state.slots.retain(|s| s.target_id != target_id);
-        let _ = save_state(store, &account.id, &state);
-        let _ = browser::close_tab(account.port, target_id);
+        let _ = save_state(store, account_id, &state);
+        let _ = browser::close_tab(port, target_id);
         return Ok(());
     }
 
-    let _ = save_state(store, &account.id, &state);
+    let _ = save_state(store, account_id, &state);
     Ok(())
 }
 
+pub(crate) fn release_session_tab_for_route(
+    store: &Store,
+    account_id: &str,
+    port: u16,
+    session: &Session,
+    route: &AccountRoute,
+) -> Result<()> {
+    gemini_matcher_for(route, |matcher| {
+        release_session_tab_for(store, account_id, port, session, matcher)
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn release_session_tab(
     store: &Store,
     account: &Account,
+    port: u16,
     session: &Session,
 ) -> Result<()> {
-    release_session_tab_for(store, account, session, &gemini_matcher())
+    release_session_tab_for_route(store, &account.id, port, session, &default_gemini_route())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::default_provider;
+    use crate::domain::{default_provider, BrowserProfile};
     use std::sync::{Arc, Mutex};
 
     fn media_session() -> Session {
@@ -1011,14 +1254,22 @@ mod tests {
             "url": "https://gemini.google.com/app",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/tab-sys")
         }));
+        store
+            .put_browser_profile(&BrowserProfile {
+                provider_id: crate::domain::default_provider(),
+                profile: dir.path().join("profile"),
+                subprofile: None,
+                port,
+                headless: true,
+            })
+            .unwrap();
         let account = Account {
             id: "default".into(),
             provider: crate::domain::default_provider(),
-            profile: dir.path().join("profile"),
-            subprofile: None,
-            port,
-            headless: true,
             state: "ready".into(),
+            identity: None,
+            label: None,
+            slot: None,
         };
         store.put("local", "account", "default", &account).unwrap();
 
@@ -1027,7 +1278,7 @@ mod tests {
         // 1. System task acquires an idle Worker tab -> claims tab-sys into the Worker pool
         let sys = find_system_gemini_target(&store, "default", port).unwrap();
         assert_eq!(sys.id, "tab-sys");
-        assert!(record_system_tab_id(&store, "default", &sys.id));
+        assert!(record_system_tab_id(&store, "default", port, &sys.id));
 
         // 2. Allocate Master session 1 (Workspace A) -> creates dedicated tab-created-1 (never steals Worker tab-sys)
         let (master1, reused) =
@@ -1124,7 +1375,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sys2.target.id, "tab-created-3");
-        assert!(record_system_tab_id(&store, "default", &sys2.target.id));
+        assert!(record_system_tab_id(
+            &store,
+            "default",
+            port,
+            &sys2.target.id
+        ));
         drop(sys2);
         assert!(closed_ids.lock().unwrap().is_empty());
 
@@ -1171,7 +1427,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overflow.target.id, "tab-created-4");
-        overflow.keep_persistent = record_system_tab_id(&store, "default", &overflow.target.id);
+        overflow.keep_persistent =
+            record_system_tab_id(&store, "default", port, &overflow.target.id);
         assert!(!overflow.keep_persistent);
         drop(overflow);
         assert_eq!(
@@ -1184,7 +1441,7 @@ mod tests {
         for w in [&mut s_worker1, &mut s_worker2] {
             w.state = SessionState::Closed;
             store.put("local", "session", &w.id, w).unwrap();
-            release_session_tab(&store, &account, w).unwrap();
+            release_session_tab(&store, &account, port, w).unwrap();
         }
         let preempted = find_system_gemini_target(&store, "default", port)
             .map(|t| t.id)

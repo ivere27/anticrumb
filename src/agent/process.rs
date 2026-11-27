@@ -181,6 +181,62 @@ impl CapturedProcess {
         (tail(&self.stdout, out_from), tail(&self.stderr, err_from))
     }
 
+    /// Incrementally read up to `max_bytes` raw bytes from each stream starting at
+    /// `(*stdout_off, *stderr_off)`, advancing each offset by the exact number of raw
+    /// bytes consumed.
+    ///
+    /// Incomplete multi-byte UTF-8 sequences (1..=3 trailing bytes) are deferred while
+    /// `!flush_incomplete` or when more bytes already follow in the buffer beyond `max_bytes`.
+    /// Invalid interior bytes are replaced with U+FFFD and skipped so reading never stalls.
+    /// When `flush_incomplete` is true and the buffer end is reached, trailing incomplete
+    /// bytes are emitted as U+FFFD and consumed.
+    pub fn take_output_since(
+        &self,
+        stdout_off: &mut usize,
+        stderr_off: &mut usize,
+        max_bytes: usize,
+        flush_incomplete: bool,
+    ) -> (String, String) {
+        fn take_buf(
+            buf: &SharedBuf,
+            offset: &mut usize,
+            max_bytes: usize,
+            flush_incomplete: bool,
+        ) -> String {
+            if max_bytes == 0 {
+                return String::new();
+            }
+            let Ok(guard) = buf.lock() else {
+                return String::new();
+            };
+            let start = (*offset).min(guard.len());
+            if start >= guard.len() {
+                return String::new();
+            }
+            let mut end = start.saturating_add(max_bytes).min(guard.len());
+            let mut at_buf_end = end == guard.len();
+            let (mut out, mut consumed) =
+                decode_utf8_incremental(&guard[start..end], flush_incomplete && at_buf_end);
+            // If `max_bytes` was smaller than a single valid multi-byte UTF-8 char
+            // and more bytes are already buffered, extend up to 4 bytes so callers
+            // cannot livelock on tiny chunk limits.
+            if consumed == 0 && !at_buf_end {
+                end = start.saturating_add(4).min(guard.len());
+                at_buf_end = end == guard.len();
+                let (ext_out, ext_consumed) =
+                    decode_utf8_incremental(&guard[start..end], flush_incomplete && at_buf_end);
+                out = ext_out;
+                consumed = ext_consumed;
+            }
+            *offset = start + consumed;
+            out
+        }
+        (
+            take_buf(&self.stdout, stdout_off, max_bytes, flush_incomplete),
+            take_buf(&self.stderr, stderr_off, max_bytes, flush_incomplete),
+        )
+    }
+
     /// Wait for the reader threads (call after the process exited or was killed).
     pub fn readers_finished(&self) -> bool {
         self.readers.iter().all(|h| h.is_finished())
@@ -203,6 +259,46 @@ impl Drop for CapturedProcess {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// Decode `bytes` as UTF-8, returning `(decoded_text, raw_bytes_consumed)`.
+/// Invalid interior sequences are replaced with `U+FFFD` and skipped; trailing incomplete
+/// sequences (1..=3 bytes) are deferred unless `flush_incomplete` is true.
+pub(crate) fn decode_utf8_incremental(bytes: &[u8], flush_incomplete: bool) -> (String, usize) {
+    let mut out = String::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match std::str::from_utf8(&bytes[pos..]) {
+            Ok(valid) => {
+                out.push_str(valid);
+                pos = bytes.len();
+                break;
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    let valid = std::str::from_utf8(&bytes[pos..pos + valid_len])
+                        .expect("valid UTF-8 prefix");
+                    out.push_str(valid);
+                    pos += valid_len;
+                }
+                match err.error_len() {
+                    Some(bad_len) => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        pos += bad_len;
+                    }
+                    None => {
+                        if flush_incomplete {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            pos = bytes.len();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    (out, pos)
 }
 
 #[cfg(all(test, unix))]
@@ -267,6 +363,84 @@ mod tests {
             !dir.path().join("survived").exists(),
             "redirected descendant outlived its command"
         );
+    }
+
+    #[test]
+    fn decode_utf8_incremental_defers_boundary_replaces_invalid_and_flushes_eof() {
+        // Multi-byte Korean ("한글", 3B each) + 4B emoji ("🚀") split at arbitrary boundaries.
+        let src = "안녕🚀세계".as_bytes();
+        // Cut after 2 bytes of '안' (incomplete 3B sequence) -> defers cleanly.
+        let (chunk1, n1) = decode_utf8_incremental(&src[..2], false);
+        assert_eq!(chunk1, "");
+        assert_eq!(n1, 0);
+
+        // Cut in the middle of '🚀' (3B '안' + 3B '녕' + 2B of '🚀' = 8 bytes).
+        let (chunk2, n2) = decode_utf8_incremental(&src[n1..8], false);
+        assert_eq!(chunk2, "안녕");
+        assert_eq!(n2, 6);
+
+        // Next chunk finishes '🚀' and includes 1 byte of '세'.
+        let (chunk3, n3) = decode_utf8_incremental(&src[n1 + n2..11], false);
+        assert_eq!(chunk3, "🚀");
+        assert_eq!(n3, 4);
+
+        // Final chunk completes "세계".
+        let (chunk4, n4) = decode_utf8_incremental(&src[n1 + n2 + n3..], true);
+        assert_eq!(chunk4, "세계");
+        assert_eq!(n1 + n2 + n3 + n4, src.len());
+
+        // Invalid interior bytes are replaced with U+FFFD and skipped without stalling.
+        let invalid = b"ok\xff\xfeend";
+        let (decoded, consumed) = decode_utf8_incremental(invalid, false);
+        assert_eq!(decoded, "ok\u{FFFD}\u{FFFD}end");
+        assert_eq!(consumed, invalid.len());
+
+        // Trailing incomplete sequence: deferred when !flush_incomplete, flushed as U+FFFD at EOF.
+        let dangling = b"hi\xe2\x82";
+        let (d1, c1) = decode_utf8_incremental(dangling, false);
+        assert_eq!(d1, "hi");
+        assert_eq!(c1, 2);
+        let (d2, c2) = decode_utf8_incremental(&dangling[c1..], true);
+        assert_eq!(d2, "\u{FFFD}");
+        assert_eq!(c1 + c2, dangling.len());
+    }
+
+    #[test]
+    fn captured_process_take_output_since_advances_raw_offsets_and_handles_utf8_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut proc = CapturedProcess::spawn(
+            "printf '한글🚀stdout\\n'; printf '오류🔥stderr\\n' >&2",
+            dir.path(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proc.poll_exit().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(proc.poll_exit(), Some(0));
+        proc.join_readers();
+
+        // Drain with max_bytes = 2 (smaller than 3B/4B UTF-8 chars) to verify zero livelock
+        // and exact byte-offset advancement.
+        let mut out_off = 0usize;
+        let mut err_off = 0usize;
+        let mut out_all = String::new();
+        let mut err_all = String::new();
+        for _ in 0..100 {
+            let (o, e) = proc.take_output_since(&mut out_off, &mut err_off, 2, false);
+            out_all.push_str(&o);
+            err_all.push_str(&e);
+            if out_off >= proc.stdout_len() && err_off >= proc.stderr_len() {
+                break;
+            }
+        }
+        let (o_tail, e_tail) = proc.take_output_since(&mut out_off, &mut err_off, 64, true);
+        out_all.push_str(&o_tail);
+        err_all.push_str(&e_tail);
+        assert_eq!(out_off, proc.stdout_len());
+        assert_eq!(err_off, proc.stderr_len());
+        assert_eq!(out_all, "한글🚀stdout\n");
+        assert_eq!(err_all, "오류🔥stderr\n");
     }
 }
 
@@ -344,9 +518,12 @@ impl BackgroundProcesses {
         if code.is_some() {
             e.proc.join_readers();
         }
-        let (o, er) = e.proc.output_since(e.out_cursor, e.err_cursor);
-        e.out_cursor += o.len();
-        e.err_cursor += er.len();
+        let (o, er) = e.proc.take_output_since(
+            &mut e.out_cursor,
+            &mut e.err_cursor,
+            MAX_CAPTURE_BYTES,
+            code.is_some(),
+        );
         let mut report = format!(
             "process #{id} `{}` ({}s)\n",
             e.command,

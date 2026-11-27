@@ -823,21 +823,32 @@ fn live_browser_control_searches_wikipedia_and_probes_google() {
     }
     let _guard = BrowserGuard(port, prev_home);
 
-    let account = anticrumb::domain::Account {
-        id: "live-test".into(),
-        provider: "gemini-web".into(),
-        profile: temp.path().join("accounts/live-test/profile"),
+    let browser_profile = anticrumb::domain::BrowserProfile {
+        provider_id: "gemini-web".into(),
+        profile: temp.path().join("profiles/gemini-web"),
         subprofile: None,
         port,
         headless: true,
+    };
+    let account = anticrumb::domain::Account {
+        id: "live-test".into(),
+        provider: "gemini-web".into(),
         state: "ready".into(),
+        identity: None,
+        label: None,
+        slot: None,
     };
     let registry = anticrumb::browser_control::BrowserControlRegistry::default();
     let call = |args: Value| {
         let mut args = args;
         args["timeout_ms"] = json!(60000);
         let request = anticrumb::browser_control::request(&args, &account.id, "live-test").unwrap();
-        registry.execute(&account, &request, anticrumb::agent::CancelToken::new())
+        registry.execute(
+            &browser_profile,
+            &account,
+            &request,
+            anticrumb::agent::CancelToken::new(),
+        )
     };
     let opened =
         call(json!({"action":"open","url":"https://en.wikipedia.org/wiki/Main_Page"})).unwrap();

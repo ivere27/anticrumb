@@ -11,19 +11,19 @@ anticrumb --agent  # Agent mode (coding tools, respects /permissions)
 anticrumb --yolo   # Agent mode with all permissions (file, shell & sub-agents)
 ```
 
-Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) and `/temp` (`/temp on` / `/temp off`, persisted across launches) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
+Enter `/browser login` and sign in to Google in Chrome. Models load automatically; type your prompt to begin. Press `Shift+Tab` to toggle between Chat and Agent mode (or Chat and Agent `--yolo` when explicitly launched with `--yolo` or switched via `/mode yolo`), or use `/mode` (`/mode chat`, `/mode agent`, or `/mode yolo`) and `/temp` (`/temp on` / `/temp off`, persisted across launches) to switch modes at runtime. For Claude or ChatGPT, see [provider setup](../providers/README.md).
 
 ## CLI & Non-Interactive Commands
 
 ```sh
 anticrumb --agent -C ./project 'Investigate the failing tests'
 anticrumb exec --yolo --json -C ./project 'Fix the reported bug'
-anticrumb resume --last -C ./project
-anticrumb exec resume AGENT_ID 'Add a regression test'
+anticrumb --last -C ./project
+anticrumb exec --resume AGENT_ID 'Add a regression test'
 anticrumb agents list
 ```
 
-Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `--temp` (enable anonymous temporary chat for this run), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `-r/--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
+Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `--temp` (enable anonymous temporary chat for this run), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
 
 For browser commands, worker delegation, and external MCP setup, see [Tools](tools.md).
 
@@ -35,11 +35,12 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 | `/temp [on\|off]` | Enable or disable anonymous temporary chat (no server history; saved across restarts) |
 | `/model` | Pick a cached model (Up/Down) and thinking level (Left/Right) |
 | `/model refresh` | Discover models through Chrome |
-| `/provider` | Select or set up a provider account |
-| `/browser` | Inspect browser and sign-in state |
-| `/browser login`, `/browser refresh` | Open sign-in or verify the current session |
+| `/provider` | Select or set up a provider |
+| `/account [TARGET\|refresh]` | Switch between signed-in accounts on a multi-account provider (e.g. Gemini Multi-Login) or rescan Chrome |
+| `/browser` | Inspect provider browser and sign-in state |
+| `/browser login`, `/browser refresh` | Open provider sign-in (discovers accounts) or verify the current account |
 | `/browse COMMAND` | Control web pages; `/browse help` lists commands |
-| `/usage` | Read Gemini account limits and reset times |
+| `/usage` | Read web usage limits and reset times for the active account |
 | `/cache` | Show workspace and browser cache usage, reclaimable space, and last cleanup |
 | `/cache prune [DAYS] [--dry-run]` | Clean eligible cache files; default retention is 7 days |
 | `/status` | Refresh daemon and browser health |
@@ -52,6 +53,7 @@ For browser commands, worker delegation, and external MCP setup, see [Tools](too
 | Enter while running | Queue a steering message, optionally with `@file` |
 | Esc / Ctrl-C | Cancel work or selection; Ctrl-C clears an idle draft, then exits on a second press |
 | Tab | Complete commands and file paths |
+| Shift-Tab | Toggle Chat / Agent mode (Chat / Agent `--yolo` only when explicitly launched with `--yolo` or set via `/mode yolo`) |
 | Ctrl/Alt-Left or Right, Alt-B/F | Move by word or path component |
 | Alt-Enter / Shift-Enter / Ctrl-J | Insert a newline |
 | Alt-E | Expand folded pasted text |
@@ -68,7 +70,10 @@ anticrumb exec -C ./project 'Review @git:diff+ and suggest tests'
 anticrumb exec -C ./project 'Review @git:HEAD~1 and check for regressions'
 anticrumb exec -C ./project 'Review @git:HEAD~1+ with AST context'
 anticrumb image 'Draw a minimalist rust gear icon'
-anticrumb artifact get default ARTIFACT_ID ./result.webp
+anticrumb artifact get gemini ARTIFACT_ID ./result.webp
+anticrumb accounts list
+anticrumb accounts use alice@gmail.com
+anticrumb accounts refresh
 ```
 
 - `@path`, `@git:diff`, `@git:diff+`, `@git:staged`, `@git:staged+`, `@git:<commit>`, `@git:<commit>+`, `--file PATH`, and `-i/--image PATH` upload through the provider: 100 MiB per file, 10 files per conversation. `@git:diff`, `@git:staged`, and `@git:<commit>` (commit SHA, `HEAD`, `HEAD~1`, branch, or tag) generate temporary patch attachments (`git-diff.patch` / `git-staged.patch` / `git-<sha>.patch`) directly from the workspace git repository. `@git:diff+`, `@git:staged+`, and `@git:<commit>+` run the **[3-Layer Hybrid Git+AST Diff pipeline](git-diff-hybrid.md)** (`git-diff+.patch`, `git-staged+.patch`, or `git-<sha>+.patch`) without truncating production code (logging an advisory warning when output exceeds `512 KiB`, or `ANTICRUMB_PATCH_BUDGET_KIB`):
@@ -157,6 +162,7 @@ The gateway exposes OpenAI Chat/Responses, Anthropic Messages, and Gemini APIs o
 | `CHROME_BIN` | Chrome/Chromium executable |
 | `ANTICRUMB_ALLOW_PRIVATE_FETCH` | `1` enables [private/local browsing](tools.md#web-and-browser-tools) |
 | `ANTICRUMB_PATCH_BUDGET_KIB` | Advisory KiB warning threshold for `@git:diff+`/`@git:staged+`/`@git:<commit>+` (default `512`, clamped `16`–`16384`; warns without truncating) |
+| `ANTICRUMB_NO_NOTICE` | `1` or `true` disables optional startup tips and author project notices in the interactive TUI |
 
 Set browser environment variables on the browser host before starting its daemon. Client-side changes do not reconfigure a running browser host.
 

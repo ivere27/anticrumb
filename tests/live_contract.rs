@@ -251,7 +251,8 @@ async fn check(service: Arc<Service>, backend: Arc<Observed>, store: Store) -> R
     let bytes = store.artifact_bytes("default", &recovered[0])?.1;
     // Gemini changes C2PA provenance metadata when an image is downloaded again.
     // Compare decoded pixels, retaining the requirement that A differs from B.
-    let port = store.get::<Account>("local", "account", "default")?.port;
+    let account = store.get::<Account>("local", "account", "default")?;
+    let port = store.browser_for_account(&account)?.port;
     let fingerprints = decoded_image_fingerprints(port, &[&original, &other, &bytes])?;
     let matches_original = fingerprints[0] == fingerprints[2];
     let matches_other = fingerprints[1] == fingerprints[2];
@@ -315,14 +316,21 @@ async fn live_gemini_prompt_followup_workers_and_optional_media() {
             max: 0.into(),
         });
         let service = Service::new(store.clone(), backend.clone())?;
-        let account = Account {
-            id: "default".into(),
-            provider: default_provider(),
+        let browser_profile = BrowserProfile {
+            provider_id: default_provider(),
             profile: PathBuf::from(meta.user_data_dir),
             subprofile: Some(meta.profile_dir),
             port,
             headless: meta.headless,
+        };
+        store.put_browser_profile(&browser_profile)?;
+        let account = Account {
+            id: "default".into(),
+            provider: default_provider(),
             state: "ready".into(),
+            identity: None,
+            label: None,
+            slot: None,
         };
         store.put("local", "account", "default", &account)?;
         tab_pool::set_worker_tabs(Some(&store), 2);

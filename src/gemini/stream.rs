@@ -176,45 +176,54 @@ impl GeminiTab {
         mut updates: Option<&mut F>,
     ) -> Result<AskResult, String> {
         self.check()?;
-        self.cdp.call("Page.bringToFront", json!({}))?;
-        let initial = self.probe()?["response_count"].as_u64().unwrap_or(0);
-        if self.action("prepare", json!({}))?["ok"] != true {
-            return Err("UI contract changed: composer is not empty or ready".into());
-        }
-        let _ = self.human_click("editor", json!({}))?;
-        self.human_pause(30, 75)?;
-        self.cdp.call("Input.insertText", json!({"text":prompt}))?;
-        let input_ready = Instant::now() + Duration::from_secs(5);
-        loop {
-            let checked = self.action("verify_input", json!({"text":prompt}))?;
-            if checked["ok"] == true {
-                break;
+        let (initial, mut events) = {
+            // Serialize only the short window where Chrome foreground focus and text insertion
+            // are shared across accounts in the same browser; never hold across streaming wait.
+            let input_lock = self.input_lock.clone();
+            let _input_guard = input_lock
+                .as_ref()
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+            self.cdp.call("Page.bringToFront", json!({}))?;
+            let initial = self.probe()?["response_count"].as_u64().unwrap_or(0);
+            if self.action("prepare", json!({}))?["ok"] != true {
+                return Err("UI contract changed: composer is not empty or ready".into());
             }
-            if Instant::now() >= input_ready {
-                return Err(format!(
-                    "UI contract changed: inserted prompt differs (expected {} chars, observed {})",
-                    prompt.chars().count(),
-                    checked["actual_length"]
-                ));
+            let _ = self.human_click("editor", json!({}))?;
+            self.human_pause(30, 75)?;
+            self.cdp.call("Input.insertText", json!({"text":prompt}))?;
+            let input_ready = Instant::now() + Duration::from_secs(5);
+            loop {
+                let checked = self.action("verify_input", json!({"text":prompt}))?;
+                if checked["ok"] == true {
+                    break;
+                }
+                if Instant::now() >= input_ready {
+                    return Err(format!(
+                        "UI contract changed: inserted prompt differs (expected {} chars, observed {})",
+                        prompt.chars().count(),
+                        checked["actual_length"]
+                    ));
+                }
+                self.pause_jitter(25, 55)?;
             }
-            self.pause_jitter(25, 55)?;
-        }
-        self.cdp
-            .call("Runtime.addBinding", json!({"name":"geminiCdpChanged"}))?;
-        self.eval(&crate::adapter::script("observer.js")?)?;
-        let mut events = self.cdp.subscribe();
-        self.human_pause(70, 160)?;
-        let mut sent = false;
-        for _ in 0..20 {
-            if self.human_click("send", json!({}))?["ok"] == true {
-                sent = true;
-                break;
+            self.cdp
+                .call("Runtime.addBinding", json!({"name":"geminiCdpChanged"}))?;
+            self.eval(&crate::adapter::script("observer.js")?)?;
+            let events = self.cdp.subscribe();
+            self.human_pause(70, 160)?;
+            let mut sent = false;
+            for _ in 0..20 {
+                if self.human_click("send", json!({}))?["ok"] == true {
+                    sent = true;
+                    break;
+                }
+                self.pause_jitter(50, 95)?;
             }
-            self.pause_jitter(50, 95)?;
-        }
-        if !sent {
-            return Err("UI contract changed: send control is disabled".into());
-        }
+            if !sent {
+                return Err("UI contract changed: send control is disabled".into());
+            }
+            (initial, events)
+        };
         let mut emitted = String::new();
         let mut stable = String::new();
         let mut since = Instant::now();

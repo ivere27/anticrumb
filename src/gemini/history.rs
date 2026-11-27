@@ -6,7 +6,7 @@ use crate::{
     agent::CancelToken,
     browser_host as browser,
     cdp::CdpClient,
-    domain::{Account, ErrorCode, Result, ServiceError},
+    domain::{Account, BrowserProfile, ErrorCode, Result, ServiceError},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -561,27 +561,34 @@ fn parse_page(body: &str, requested: Option<String>) -> std::result::Result<Page
 
 /// Collect every conversation from an independently opened account tab. Caller
 /// must hold the account gate. This function never invokes a deletion control.
-pub fn list_web_conversations(account: &Account, cancel: CancelToken) -> Result<Vec<String>> {
-    list_web_conversations_at(account, cancel, browser::GEMINI_APP_URL)
+pub fn list_web_conversations(
+    browser_profile: &BrowserProfile,
+    account: &Account,
+    cancel: CancelToken,
+) -> Result<Vec<String>> {
+    let start_url = super::url::gemini_app_url(account.slot.as_deref());
+    list_web_conversations_at(browser_profile, account, cancel, &start_url)
 }
 
 pub(super) fn list_web_conversations_at(
-    account: &Account,
+    browser_profile: &BrowserProfile,
+    _account: &Account,
     cancel: CancelToken,
     start_url: &str,
 ) -> Result<Vec<String>> {
-    validate_start_url(start_url)?;
+    let scope = validate_start_url(start_url)?;
     cancel.check().map_err(failure)?;
-    let host = browser::ensure_browser(&browser::LaunchOptions::headless_account(
-        account, start_url,
+    let host = browser::ensure_browser(&browser::LaunchOptions::headless_browser(
+        browser_profile,
+        start_url,
     ))
     .map_err(failure)?;
     let reusable = browser::list_targets(host.port).ok().and_then(|targets| {
         targets.into_iter().find(|t| {
             t.target_type == "page"
                 && !super::url_has_chat_id(&t.url)
-                && (super::is_reusable_gemini_url(&t.url)
-                    || t.url.starts_with("https://gemini.google.com/usage"))
+                && (super::url::is_reusable_gemini_url_for(&t.url, Some(&scope))
+                    || super::url::is_gemini_usage_url_for(&t.url, Some(&scope)))
         })
     });
     let tab = super::SystemGeminiTab::acquire_persistent(host.port, reusable, "about:blank")

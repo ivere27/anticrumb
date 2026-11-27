@@ -1,11 +1,12 @@
 //! Terminal frame, status bar, and subagent banner rendering.
 use super::{
-    commands::Selection,
+    commands::{Selection, ShortcutSection, SHORTCUT_QUICK_COMMANDS, SHORTCUT_SECTIONS},
     debug_log::DebugLogger,
-    layout::FrameLayout,
+    inspector::{self, BlockId, BlockRowKind, PaintedInspectorPane, PaintedToolBlock},
+    layout::{ColSpan, FrameLayout, Rect, RowSpan},
     markdown::{self, Face, Span},
     reducer::{PendingToolApproval, SelectionTarget, State, SubagentView},
-    transcript::clip,
+    transcript::{clip, BlockSpan},
     usage,
 };
 use crate::domain::*;
@@ -61,6 +62,161 @@ fn clip_spans(parts: Vec<(String, Face)>, max_width: usize) -> Vec<(String, Face
 
 pub(super) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+const SHORTCUTS_TWO_COL_MIN_WIDTH: usize = 96;
+
+fn shortcut_section_lines(section: &ShortcutSection, col_w: usize) -> Vec<markdown::Line> {
+    if col_w == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::with_capacity(section.items.len() + 1);
+    let mut heading = Vec::new();
+    let title = clip(&format!(" {}", section.title), col_w);
+    let title_w = title.width();
+    if !title.is_empty() {
+        heading.push(Span {
+            text: title,
+            face: Face::HEADING,
+        });
+    }
+    if let Some(sub) = section.subtitle {
+        let sub_text = format!("  ({sub})");
+        let rem = col_w.saturating_sub(title_w);
+        if rem >= sub_text.width() {
+            heading.push(Span {
+                text: sub_text,
+                face: Face::MUTED,
+            });
+        }
+    }
+    rows.push(heading);
+
+    let key_face = if section.highlight_key {
+        Face::HIGHLIGHT_BOLD
+    } else {
+        Face::ACCENT_BOLD
+    };
+    let key_col = if col_w >= 42 {
+        15
+    } else {
+        12.min(col_w.saturating_sub(4))
+    };
+    for &(key, desc) in section.items {
+        let mut line = Vec::new();
+        let mut used = 0usize;
+        if col_w >= 2 {
+            line.push(Span {
+                text: "  ".into(),
+                face: Face::TEXT,
+            });
+            used = 2;
+        }
+        let key_budget = col_w.saturating_sub(used);
+        let clipped_key = clip(key, key_budget);
+        let kw = clipped_key.width();
+        if !clipped_key.is_empty() {
+            line.push(Span {
+                text: clipped_key,
+                face: key_face,
+            });
+            used += kw;
+        }
+        let pad_len = key_col
+            .saturating_sub(kw)
+            .saturating_add(1)
+            .min(col_w.saturating_sub(used));
+        if pad_len > 0 {
+            line.push(Span {
+                text: " ".repeat(pad_len),
+                face: Face::TEXT,
+            });
+            used += pad_len;
+        }
+        let desc_budget = col_w.saturating_sub(used);
+        if desc_budget > 0 {
+            let clipped_desc = clip(desc, desc_budget);
+            if !clipped_desc.is_empty() {
+                line.push(Span {
+                    text: clipped_desc,
+                    face: Face::TEXT,
+                });
+            }
+        }
+        rows.push(line);
+    }
+    rows
+}
+
+fn shortcuts_panel_rows(width: usize) -> Vec<markdown::Line> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if width >= SHORTCUTS_TWO_COL_MIN_WIDTH {
+        let left_w = width.saturating_sub(1) / 2;
+        let right_w = width.saturating_sub(left_w + 1);
+        let mut left_rows = Vec::new();
+        for (i, section) in SHORTCUT_SECTIONS[..2].iter().enumerate() {
+            if i > 0 {
+                left_rows.push(Vec::new());
+            }
+            left_rows.extend(shortcut_section_lines(section, left_w));
+        }
+        let mut right_rows = Vec::new();
+        for (i, section) in SHORTCUT_SECTIONS[2..].iter().enumerate() {
+            if i > 0 {
+                right_rows.push(Vec::new());
+            }
+            right_rows.extend(shortcut_section_lines(section, right_w));
+        }
+        right_rows.push(Vec::new());
+        right_rows.extend(shortcut_section_lines(&SHORTCUT_QUICK_COMMANDS, right_w));
+
+        let total = left_rows.len().max(right_rows.len());
+        let mut combined = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut row = Vec::new();
+            let mut lw = 0usize;
+            if let Some(l) = left_rows.get(i) {
+                for span in l {
+                    lw += span.text.width();
+                    row.push(span.clone());
+                }
+            }
+            if lw < left_w {
+                row.push(Span {
+                    text: " ".repeat(left_w - lw),
+                    face: Face::TEXT,
+                });
+            }
+            row.push(Span {
+                text: "│".into(),
+                face: Face::SUBTLE,
+            });
+            if let Some(r) = right_rows.get(i) {
+                row.extend(r.iter().cloned());
+            }
+            combined.push(row);
+        }
+        combined
+    } else {
+        let mut rows = Vec::new();
+        for (i, section) in SHORTCUT_SECTIONS.iter().enumerate() {
+            if i > 0 {
+                rows.push(Vec::new());
+            }
+            rows.extend(shortcut_section_lines(section, width));
+        }
+        rows.push(Vec::new());
+        rows.extend(shortcut_section_lines(&SHORTCUT_QUICK_COMMANDS, width));
+        rows
+    }
+}
+
+pub(super) fn shortcuts_panel_metrics(width: usize, avail_rows: usize) -> (usize, usize) {
+    let total = shortcuts_panel_rows(width).len();
+    let visible = total.min(avail_rows.saturating_sub(1));
+    (total, visible)
+}
+
 impl State {
     fn spinner(&self) -> &'static str {
         SPINNER_FRAMES[(self.started.elapsed().as_millis() / 120 % 10) as usize]
@@ -72,6 +228,85 @@ impl State {
             .into_iter()
             .map(|(text, _)| text)
             .collect()
+    }
+
+    fn peer_workspace_alert_spans(&self) -> Vec<(String, Face)> {
+        let Some(alerts) = self.status["workspace_alerts"].as_array() else {
+            return Vec::new();
+        };
+        if alerts.is_empty() {
+            return Vec::new();
+        }
+        let own_raw = self.options.workspace.to_string_lossy().into_owned();
+        let own_canon = std::fs::canonicalize(&self.options.workspace)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+
+        let mut peers: Vec<(&str, &str)> = Vec::new();
+        for alert in alerts {
+            let Some(ws) = alert["workspace"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if ws == own_raw || own_canon.as_deref() == Some(ws) {
+                continue;
+            }
+            let Some(kind) = alert["kind"].as_str() else {
+                continue;
+            };
+            if !matches!(kind, "approval" | "attention" | "failed" | "completed") {
+                continue;
+            }
+            peers.push((ws, kind));
+        }
+        if peers.is_empty() {
+            return Vec::new();
+        }
+
+        let basename = |ws: &str| -> String {
+            std::path::Path::new(ws)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ws.to_owned())
+        };
+        let mut name_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for &(ws, _) in &peers {
+            *name_counts.entry(basename(ws)).or_insert(0) += 1;
+        }
+        let nickname = |ws: &str| -> String {
+            let base = basename(ws);
+            if name_counts.get(&base).copied().unwrap_or(0) > 1 {
+                if let Some(parent) = std::path::Path::new(ws)
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                {
+                    return clip(&format!("{parent}/{base}"), 14);
+                }
+            }
+            clip(&base, 12)
+        };
+
+        let shown = peers.len().min(2);
+        let mut out = Vec::new();
+        for (idx, &(ws, kind)) in peers.iter().take(shown).enumerate() {
+            if idx > 0 {
+                out.push((" ".into(), Face::MUTED));
+            }
+            let (icon, face) = match kind {
+                "approval" => ("?", Face::ACCENT_BOLD),
+                "attention" | "failed" => ("!", Face::DANGER_BOLD),
+                "completed" => ("*", Face::HIGHLIGHT_BOLD),
+                _ => continue,
+            };
+            out.push((format!("{icon}{}", nickname(ws)), face));
+        }
+        if peers.len() > shown {
+            out.push((format!(" +{}", peers.len() - shown), Face::MUTED));
+        }
+        out
     }
 
     pub(super) fn status_spans(&self, width: usize) -> Vec<(String, Face)> {
@@ -161,21 +396,18 @@ impl State {
             }
         };
         let daemon_text = match (daemon, self.daemon_remote_addr()) {
-            ("remote" | "remote/offline", Some(addr)) => format!("D:{daemon}({addr})"),
-            _ => format!("D:{daemon}"),
+            ("remote" | "remote/offline", Some(addr)) => format!("{daemon}({addr})"),
+            _ => daemon.to_owned(),
         };
         let priority_w = spans_width(&parts);
 
         push_sep(&mut parts);
         parts.push((
-            format!(
-                "M:{}",
-                clip(self.model_label(), if width < 100 { 12 } else { 24 })
-            ),
+            clip(self.model_label(), if width < 100 { 12 } else { 24 }),
             Face::ACCENT,
         ));
         parts.push((" · ".into(), Face::MUTED));
-        parts.push((format!("E:{}", clip(self.thinking_label(), 8)), Face::MUTED));
+        parts.push((clip(self.thinking_label(), 8), Face::MUTED));
         parts.push((" · ".into(), Face::MUTED));
         if !self.options.agent {
             parts.push(("CHAT".into(), Face::ACCENT));
@@ -200,10 +432,7 @@ impl State {
             ));
         }
         parts.push((" · ".into(), Face::MUTED));
-        parts.push((
-            format!("W:{}", clip(&path, if width < 100 { 10 } else { 32 })),
-            Face::TEXT,
-        ));
+        parts.push((clip(&path, if width < 100 { 10 } else { 32 }), Face::TEXT));
         parts.push((" · ".into(), Face::MUTED));
         parts.push((
             format!("U:{}/{}c T:?", self.in_chars, self.out_chars),
@@ -242,14 +471,9 @@ impl State {
             "awaiting_human" | "auth_required" => Face::DANGER_BOLD,
             _ => Face::MUTED,
         };
-        let acct_label = if self.provider_id() == crate::provider::DEFAULT_PROVIDER_ID {
-            format!("{}:{acct_state}", self.options.account)
-        } else {
-            format!(
-                "{}/{}:{acct_state}",
-                self.provider_id(),
-                self.options.account
-            )
+        let acct_label = match self.account_slot() {
+            Some(slot) => format!("{}/u/{slot}:{acct_state}", self.provider_id()),
+            None => format!("{}:{acct_state}", self.provider_id()),
         };
         parts.push((" · ".into(), Face::MUTED));
         parts.push((acct_label, acct_face));
@@ -257,8 +481,21 @@ impl State {
         if width == 0 {
             return Vec::new();
         }
+        let peer_alerts = self.peer_workspace_alert_spans();
         let right_text = clip(&daemon_text, width);
-        let right_w = right_text.width();
+        let mut right_parts: Vec<(String, Face)> = Vec::new();
+        if !peer_alerts.is_empty() {
+            let alert_budget = width.saturating_sub(right_text.width() + 2);
+            if alert_budget >= 3 {
+                let clipped_alerts = clip_spans(peer_alerts, alert_budget);
+                if !clipped_alerts.is_empty() {
+                    right_parts.extend(clipped_alerts);
+                    right_parts.push(("  ".into(), Face::MUTED));
+                }
+            }
+        }
+        right_parts.push((right_text, daemon_face));
+        let right_w = spans_width(&right_parts);
         let reserved_right = right_w + 2;
         if priority_w > 0 && priority_w + reserved_right > width {
             let left_max = priority_w.min(width);
@@ -267,22 +504,54 @@ impl State {
             if left_w + 2 + right_w <= width {
                 let pad = width - left_w - right_w;
                 left.push((" ".repeat(pad), Face::MUTED));
-                left.push((right_text, daemon_face));
+                left.extend(right_parts);
                 return left;
             }
             return clip_spans(parts, width);
         }
         let left_max = width.saturating_sub(reserved_right);
         if left_max == 0 {
-            return vec![(right_text, daemon_face)];
+            return right_parts;
         }
-        let mut left = clip_spans(parts, left_max);
+        let full_left_w = spans_width(&parts);
+        let chosen_hint: Option<&'static str> = if self.show_footer_shortcut_hint() {
+            const CANDIDATES: [&str; 3] = ["? for shortcuts", "? shortcuts", "? help"];
+            if full_left_w <= left_max {
+                let spare = width.saturating_sub(full_left_w + right_w);
+                CANDIDATES
+                    .into_iter()
+                    .find(|label| spare >= label.len() + 4)
+            } else {
+                let min_left = priority_w.max(44);
+                CANDIDATES.into_iter().find(|label| {
+                    let reserve = label.len() + 4 + right_w;
+                    width >= reserve && width - reserve >= min_left
+                })
+            }
+        } else {
+            None
+        };
+        let effective_left_max = match chosen_hint {
+            Some(label) => width.saturating_sub(right_w + label.len() + 4),
+            None => left_max,
+        };
+        let mut left = clip_spans(parts, effective_left_max);
         let left_w = spans_width(&left);
-        let pad = width.saturating_sub(left_w + right_w);
-        if pad > 0 {
-            left.push((" ".repeat(pad), Face::MUTED));
+        if let Some(label) = chosen_hint {
+            let pad_before_hint = width.saturating_sub(left_w + label.len() + 2 + right_w);
+            if pad_before_hint > 0 {
+                left.push((" ".repeat(pad_before_hint), Face::MUTED));
+            }
+            left.push((label.into(), Face::MUTED));
+            left.push(("  ".into(), Face::MUTED));
+            left.extend(right_parts);
+        } else {
+            let pad = width.saturating_sub(left_w + right_w);
+            if pad > 0 {
+                left.push((" ".repeat(pad), Face::MUTED));
+            }
+            left.extend(right_parts);
         }
-        left.push((right_text, daemon_face));
         left
     }
 
@@ -299,7 +568,7 @@ impl State {
         let (rows, cursor) = self
             .editor
             .layout(FrameLayout::editor_width(usize::from(width)));
-        let layout = FrameLayout::compute(
+        let layout = FrameLayout::compute_with_inspector(
             &self.layout,
             width,
             height,
@@ -307,6 +576,7 @@ impl State {
             cursor,
             self.mention_panel_rows(),
             self.subagents.len(),
+            !self.tool_blocks.is_empty(),
         )?;
         Some((layout, rows))
     }
@@ -397,9 +667,267 @@ impl State {
             0
         };
         if title_width < w {
-            queue!(out, terminal::Clear(ClearType::UntilNewLine)).map_err(ServiceError::storage)?;
+            queue!(
+                out,
+                style::SetBackgroundColor(self.theme.background),
+                terminal::Clear(ClearType::UntilNewLine)
+            )
+            .map_err(ServiceError::storage)?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_clipped_padded_cell(
+        out: &mut impl Write,
+        col: u16,
+        y: u16,
+        line: &[Span],
+        leading_space: bool,
+        max_width: usize,
+        pad_to: usize,
+        theme: crate::tui::theme::Theme,
+    ) -> Result<()> {
+        if max_width == 0 {
+            return Ok(());
+        }
+        queue!(out, cursor::MoveTo(col, y)).map_err(ServiceError::storage)?;
+        markdown::write_clipped_padded_line(out, line, leading_space, max_width, pad_to, theme)
+            .map_err(ServiceError::storage)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_inspector_pane_rect(
+        &self,
+        out: &mut impl Write,
+        layout: FrameLayout,
+        rect: Rect,
+        block_id: BlockId,
+        scroll_override: Option<usize>,
+        zoom_mode: bool,
+        spinner: &str,
+        selection_matches: bool,
+    ) -> Result<Option<PaintedInspectorPane>> {
+        let vis_len = usize::from(rect.row.len);
+        let col_len = usize::from(rect.col.len);
+        if vis_len == 0 || col_len == 0 {
+            return Ok(None);
+        }
+        let Some(block) = self.tool_blocks.get(block_id) else {
+            return Ok(None);
+        };
+        let inner_w = col_len.saturating_sub(1).max(1);
+        let detail = self
+            .tool_blocks
+            .detail_lines(block_id, inner_w, &self.highlights);
+        let header_rows: u16 = 1;
+        let (body_rows, has_footer) = if vis_len >= 3 {
+            (vis_len - 2, true)
+        } else if vis_len == 2 {
+            (1, false)
+        } else {
+            (0, false)
+        };
+        let max_scroll = detail.len().saturating_sub(body_rows.max(1));
+        let eff_scroll = scroll_override
+            .unwrap_or(block.scroll_from_bottom)
+            .min(max_scroll);
+        let body_end = detail.len().saturating_sub(eff_scroll);
+        let body_start = body_end.saturating_sub(body_rows);
+
+        // Row 0: Sticky header
+        let y0 = rect.row.start;
+        let row0_w = Self::safe_row_width(y0, layout.width, layout.height)
+            .saturating_sub(usize::from(rect.col.start))
+            .min(col_len);
+        let header_line = if zoom_mode {
+            let mut h = inspector::inspector_header_line(block, row0_w, spinner);
+            if let Some(first) = h.first_mut() {
+                if let Some(rest) = first.text.strip_prefix(" Inspector") {
+                    first.text = format!(" Inspector [Zoom]{rest}");
+                }
+            }
+            inspector::clip_rendered_line(&h, row0_w)
+        } else {
+            inspector::inspector_header_line(block, row0_w, spinner)
+        };
+        Self::write_clipped_padded_cell(
+            out,
+            rect.col.start,
+            y0,
+            &header_line,
+            false,
+            row0_w,
+            row0_w,
+            self.theme,
+        )?;
+
+        // Body rows (1..1+body_rows) — streamed zero-alloc directly from cached detail lines.
+        for i in 0..body_rows {
+            let y = rect.row.start + header_rows + i as u16;
+            let row_w = Self::safe_row_width(y, layout.width, layout.height)
+                .saturating_sub(usize::from(rect.col.start))
+                .min(col_len);
+            let abs_idx = body_start + i;
+            let (src_slice, leading_space): (&[Span], bool) = match detail.get(abs_idx) {
+                Some(src_line) => (src_line.as_slice(), true),
+                None => (&[], false),
+            };
+            Self::write_clipped_padded_cell(
+                out,
+                rect.col.start,
+                y,
+                src_slice,
+                leading_space,
+                row_w,
+                row_w,
+                self.theme,
+            )?;
+            if selection_matches {
+                if let Some((col_off, selected)) = self
+                    .selection
+                    .as_ref()
+                    .filter(|_| self.selection_target == SelectionTarget::Inspector)
+                    .and_then(|sel| sel.fragment_spans(abs_idx))
+                {
+                    let draw_col = col_off.saturating_add(1);
+                    if !selected.is_empty() && draw_col < row_w {
+                        let clipped_sel = inspector::clip_rendered_line(
+                            &selected,
+                            row_w.saturating_sub(draw_col),
+                        );
+                        queue!(out, cursor::MoveTo(rect.col.start + draw_col as u16, y))
+                            .map_err(ServiceError::storage)?;
+                        markdown::write_selection(out, &clipped_sel, self.theme)
+                            .map_err(ServiceError::storage)?;
+                    }
+                }
+            }
+        }
+
+        // Bottom status/scroll footer row
+        let mut live_badge = None;
+        let has_active_block = self.tool_blocks.active_block().is_some();
+        if has_footer {
+            let yf = rect.row.end().saturating_sub(1);
+            let row_w = Self::safe_row_width(yf, layout.width, layout.height)
+                .saturating_sub(usize::from(rect.col.start))
+                .min(col_len);
+            let (footer_line, badge_cols) = if zoom_mode {
+                let pct = if max_scroll == 0 {
+                    100
+                } else {
+                    ((body_end * 100) / detail.len().max(1)).clamp(1, 100)
+                };
+                let (right, bface, action) = if block.active {
+                    if !block.follow_tool {
+                        let label = if eff_scroll > 0 {
+                            format!("[▶ Follow {pct}%]")
+                        } else {
+                            "[▶ Follow]".to_owned()
+                        };
+                        (
+                            label,
+                            Face::ACCENT_BOLD,
+                            Some(inspector::InspectorBadgeAction::ToggleFollow),
+                        )
+                    } else if eff_scroll > 0 {
+                        (
+                            format!("[↓ Live {pct}%]"),
+                            Face::ACCENT_BOLD,
+                            Some(inspector::InspectorBadgeAction::JumpToBottom),
+                        )
+                    } else {
+                        (
+                            "[● Follow]".to_owned(),
+                            Face::HIGHLIGHT,
+                            Some(inspector::InspectorBadgeAction::ToggleFollow),
+                        )
+                    }
+                } else if has_active_block {
+                    (
+                        "[▶ Follow]".to_owned(),
+                        Face::ACCENT_BOLD,
+                        Some(inspector::InspectorBadgeAction::ToggleFollow),
+                    )
+                } else if eff_scroll > 0 {
+                    (
+                        format!("[↓ Bottom {pct}%]"),
+                        Face::ACCENT_BOLD,
+                        Some(inspector::InspectorBadgeAction::JumpToBottom),
+                    )
+                } else {
+                    (format!("[{pct}%]"), Face::MUTED, None)
+                };
+                let right_clean = clip(&right, row_w);
+                let right_w = right_clean.width();
+                let left_hint = clip(
+                    " ←/→ tool · ↑↓/PgUp/PgDn scroll · f follow · Ctrl+O/Esc close",
+                    row_w.saturating_sub(right_w + 1),
+                );
+                let left_w = left_hint.width();
+                let pad = row_w.saturating_sub(left_w + right_w);
+                let mut line = Vec::new();
+                if !left_hint.is_empty() {
+                    line.push(Span {
+                        text: left_hint,
+                        face: Face::MUTED,
+                    });
+                }
+                if pad > 0 {
+                    line.push(Span {
+                        text: " ".repeat(pad),
+                        face: Face::MUTED,
+                    });
+                }
+                let bstart = left_w + pad;
+                if !right_clean.is_empty() {
+                    line.push(Span {
+                        text: right_clean,
+                        face: bface,
+                    });
+                }
+                let hit = action.map(|act| (bstart, bstart + right_w, act));
+                (line, hit)
+            } else {
+                inspector::inspector_footer_line(
+                    block,
+                    has_active_block,
+                    detail.len(),
+                    body_rows,
+                    row_w,
+                )
+            };
+            Self::write_clipped_padded_cell(
+                out,
+                rect.col.start,
+                yf,
+                &footer_line,
+                false,
+                row_w,
+                row_w,
+                self.theme,
+            )?;
+            live_badge = badge_cols.map(|(s, e, act)| {
+                (
+                    yf,
+                    rect.col.start.saturating_add(s as u16),
+                    rect.col.start.saturating_add(e as u16),
+                    act,
+                )
+            });
+        }
+
+        Ok(Some(PaintedInspectorPane {
+            block_id,
+            rect,
+            header_rows,
+            body_rows,
+            body_start,
+            detail_lines: detail,
+            live_badge,
+        }))
     }
 
     pub(super) fn render_transcript(
@@ -408,6 +936,8 @@ impl State {
         layout: FrameLayout,
         full_clear: bool,
     ) -> Result<()> {
+        self.painted_blocks.clear();
+        self.painted_inspector = None;
         if layout.transcript.len == 0 {
             self.painted_transcript.clear();
             self.painted_all_transcript.clear();
@@ -417,62 +947,309 @@ impl State {
             return Ok(());
         }
         let w = usize::from(layout.width);
+        let left_w = usize::from(layout.transcript_left.len);
+        let side_rect = layout.inspector_rect;
+        let side_divider = layout.divider_x;
         let viewport = usize::from(layout.transcript.len);
+        let spinner = self.spinner();
         let transcript_selection = self
             .selection
             .as_ref()
             .filter(|_| self.selection_target == SelectionTarget::Transcript);
-        let (start, effective_scroll, painted, all_snapshot) = if let Some(selection) =
-            transcript_selection
-        {
-            let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
-            let eff = selection.lines.len().saturating_sub(end);
-            (start, eff, selection.lines[start..end].to_vec(), None)
-        } else {
-            // Release the previous snapshot first so the cache appends in place.
-            self.painted_all_transcript.clear();
-            let all = self.transcript.lines(&self.stream, w);
-            self.sync_scroll_anchor(all.len(), all.evicted_lines(), w, all.visible_stream_len());
-            let (start, end) = self.selection_view_range(all.len(), viewport);
-            let eff = all.len().saturating_sub(end);
-            let painted = all.slice(start, end);
-            (start, eff, painted, Some(all))
-        };
-        for (row, line) in painted.iter().enumerate() {
-            let y = layout.transcript.start + row as u16;
-            queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
-            markdown::write_line(out, line, self.theme).map_err(ServiceError::storage)?;
-            let line_width: usize = line.iter().map(|s| s.text.width()).sum();
-            if line_width < w {
-                queue!(out, terminal::Clear(ClearType::UntilNewLine))
-                    .map_err(ServiceError::storage)?;
+        let (start, effective_scroll, painted, all_snapshot, inline_split, block_spans) =
+            if let Some(selection) = transcript_selection {
+                let (start, end) = self.selection_view_range(selection.lines.len(), viewport);
+                let eff = selection.lines.len().saturating_sub(end);
+                let inline_split = if self.layout.inspector.mode
+                    == super::layout::InspectorMode::Inline
+                {
+                    super::layout::HorizontalSplit::compute(layout.width, &self.layout.inspector)
+                } else {
+                    None
+                };
+                let spans: Vec<BlockSpan> =
+                    self.painted_all_transcript.block_spans().cloned().collect();
+                (
+                    start,
+                    eff,
+                    selection.lines[start..end].to_vec(),
+                    None,
+                    inline_split,
+                    spans,
+                )
+            } else {
+                // Release the previous snapshot first so the cache appends in place.
+                self.painted_all_transcript.clear();
+                let (all, inline_split, _) = self.transcript_lines_for(layout, spinner);
+                let anchor_w = if side_rect.is_some() { left_w } else { w };
+                self.sync_scroll_anchor(
+                    all.len(),
+                    all.evicted_lines(),
+                    anchor_w,
+                    all.visible_stream_len(),
+                );
+                let (start, end) = self.selection_view_range(all.len(), viewport);
+                let eff = all.len().saturating_sub(end);
+                let painted = all.slice(start, end);
+                let spans: Vec<BlockSpan> = all.block_spans().cloned().collect();
+                (start, eff, painted, Some(all), inline_split, spans)
+            };
+
+        let end = start + painted.len();
+
+        // Build per-row lookup for inline split blocks (virtual row -> (block_id, BlockRowKind)).
+        // Also collect visible block hit-test records.
+        let mut inline_row_owner: Vec<Option<(BlockId, BlockRowKind)>> = vec![None; painted.len()];
+        for span in &block_spans {
+            if span.end_line <= start || span.start_line >= end {
+                continue;
             }
+            let content_end = if span.has_bottom_border {
+                span.end_line.saturating_sub(1)
+            } else {
+                span.end_line
+            };
+            let vis_vstart = span.start_line.max(start);
+            let vis_vend = content_end.min(end);
+            if vis_vstart >= vis_vend {
+                continue;
+            }
+            let Some(block) = self.tool_blocks.get(span.block_id) else {
+                continue;
+            };
+            let is_inline_split = inline_split.is_some() && !block.is_collapsed();
+            let mut row_map = Vec::with_capacity(vis_vend - vis_vstart);
+            for vrow in vis_vstart..vis_vend {
+                let rel_in_span = vrow - span.start_line;
+                let rel_in_view = vrow - start;
+                let y = layout.transcript.start + rel_in_view as u16;
+                let kind = span
+                    .row_kinds
+                    .get(rel_in_span)
+                    .copied()
+                    .unwrap_or(BlockRowKind::Padding);
+                row_map.push((y, kind));
+                if is_inline_split {
+                    inline_row_owner[rel_in_view] = Some((span.block_id, kind));
+                }
+            }
+            let vis_row_start = layout.transcript.start + (vis_vstart - start) as u16;
+            let vis_row_end = layout.transcript.start + (vis_vend - start) as u16;
+            let (left_col_end, inspector_rect, divider_x) =
+                if let (true, Some(split)) = (is_inline_split, inline_split) {
+                    (
+                        split.left.end(),
+                        Some(Rect {
+                            col: split.right,
+                            row: RowSpan {
+                                start: vis_row_start,
+                                len: vis_row_end.saturating_sub(vis_row_start),
+                            },
+                        }),
+                        Some(split.divider_x),
+                    )
+                } else {
+                    (layout.transcript_left.end(), None, side_divider)
+                };
+            self.painted_blocks.push(PaintedToolBlock {
+                block_id: span.block_id,
+                vis_row_start,
+                vis_row_end,
+                left_col_start: 0,
+                left_col_end,
+                inspector_rect,
+                divider_x,
+                row_map,
+                live_badge: None,
+                inspector_header_rows: 1,
+                inspector_body_rows: 0,
+                inspector_body_start: 0,
+                inspector_detail_lines: None,
+            });
+        }
+
+        // Paint transcript rows (left column when side_rect or inline split owns the row).
+        for (row, cached_line) in painted.iter().enumerate() {
+            let y = layout.transcript.start + row as u16;
+            let row_safe_w = Self::safe_row_width(y, layout.width, layout.height);
+            let inline_owner = inline_row_owner[row];
+            let (col_limit, preserve_right) = if side_rect.is_some() {
+                (left_w.min(row_safe_w), true)
+            } else if inline_owner.is_some() {
+                (
+                    inline_split
+                        .map_or(row_safe_w, |s| usize::from(s.left.len))
+                        .min(row_safe_w),
+                    true,
+                )
+            } else {
+                (row_safe_w, false)
+            };
+
+            // For visible ToolItem rows, paint the live selection marker `›` directly
+            // during viewport compositing so moving selection incurs 0 LineCache invalidations.
+            let live_item_line: Option<markdown::Line> =
+                if self.selection_target != SelectionTarget::Transcript || self.selection.is_none()
+                {
+                    let owner = inline_owner.or_else(|| {
+                        self.painted_blocks.iter().find_map(|pb| {
+                            (y >= pb.vis_row_start && y < pb.vis_row_end).then(|| {
+                                pb.row_map
+                                    .iter()
+                                    .find(|(r, _)| *r == y)
+                                    .map(|(_, k)| (pb.block_id, *k))
+                            })?
+                        })
+                    });
+                    if let Some((bid, BlockRowKind::ToolItem(idx))) = owner {
+                        self.tool_blocks.get(bid).and_then(|block| {
+                            let item = block.items.get(idx)?;
+                            let selected =
+                                idx == block.selected.min(block.items.len().saturating_sub(1));
+                            Some(inspector::render_tool_item_row(
+                                item, selected, col_limit, spinner,
+                            ))
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            let line = live_item_line.as_ref().unwrap_or(cached_line);
+
+            if preserve_right {
+                Self::write_clipped_padded_cell(
+                    out, 0, y, line, false, col_limit, col_limit, self.theme,
+                )?;
+            } else {
+                queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
+                let line_width =
+                    markdown::write_clipped_padded_line(out, line, false, col_limit, 0, self.theme)
+                        .map_err(ServiceError::storage)?;
+                if line_width < w {
+                    queue!(
+                        out,
+                        style::SetBackgroundColor(self.theme.background),
+                        terminal::Clear(ClearType::UntilNewLine)
+                    )
+                    .map_err(ServiceError::storage)?;
+                }
+            }
+
             if let Some((column, selected)) = self
                 .selection
                 .as_ref()
                 .filter(|_| self.selection_target == SelectionTarget::Transcript)
                 .and_then(|selection| selection.fragment_spans(start + row))
             {
-                if !selected.is_empty() {
-                    queue!(out, cursor::MoveTo(column.min(w - 1) as u16, y))
-                        .map_err(ServiceError::storage)?;
-                    markdown::write_selection(out, &selected, self.theme)
-                        .map_err(ServiceError::storage)?;
+                if !selected.is_empty() && column < col_limit {
+                    let clipped_sel =
+                        inspector::clip_rendered_line(&selected, col_limit.saturating_sub(column));
+                    if !clipped_sel.is_empty() {
+                        queue!(out, cursor::MoveTo(column as u16, y))
+                            .map_err(ServiceError::storage)?;
+                        markdown::write_selection(out, &clipped_sel, self.theme)
+                            .map_err(ServiceError::storage)?;
+                    }
                 }
             }
         }
-        if !full_clear {
+
+        // Clear trailing unused transcript rows on the left (or full width if no side pane).
+        if !full_clear || side_rect.is_some() {
             let clear_from = usize::from(layout.transcript.start) + painted.len();
             for row in clear_from..usize::from(layout.transcript.end()) {
+                let y = row as u16;
+                if side_rect.is_some() {
+                    Self::write_clipped_padded_cell(
+                        out,
+                        0,
+                        y,
+                        &[],
+                        false,
+                        left_w,
+                        left_w,
+                        self.theme,
+                    )?;
+                } else if !full_clear {
+                    queue!(
+                        out,
+                        cursor::MoveTo(0, y),
+                        style::SetBackgroundColor(self.theme.background),
+                        terminal::Clear(ClearType::UntilNewLine)
+                    )
+                    .map_err(ServiceError::storage)?;
+                }
+            }
+        }
+
+        // Paint inline sticky split dividers & right Inspectors.
+        if let Some(split) = inline_split {
+            let active_inline_sel = self.painted_inline_inspector_target;
+            let block_count = self.painted_blocks.len();
+            for idx in 0..block_count {
+                let (block_id, rect_opt) = {
+                    let pb = &self.painted_blocks[idx];
+                    (pb.block_id, pb.inspector_rect)
+                };
+                let Some(rect) = rect_opt else {
+                    continue;
+                };
+                for y in rect.row.start..rect.row.end() {
+                    queue!(
+                        out,
+                        cursor::MoveTo(split.divider_x, y),
+                        style::Print("│".with(self.theme.subtle).on(self.theme.background))
+                    )
+                    .map_err(ServiceError::storage)?;
+                }
+                let sel_matches = active_inline_sel == Some(block_id);
+                if let Some(pane) = self.render_inspector_pane_rect(
+                    out,
+                    layout,
+                    rect,
+                    block_id,
+                    None,
+                    false,
+                    spinner,
+                    sel_matches,
+                )? {
+                    let pb = &mut self.painted_blocks[idx];
+                    pb.live_badge = pane.live_badge;
+                    pb.inspector_header_rows = pane.header_rows;
+                    pb.inspector_body_rows = pane.body_rows;
+                    pb.inspector_body_start = pane.body_start;
+                    pb.inspector_detail_lines = Some(pane.detail_lines);
+                }
+            }
+        }
+
+        // Paint Side docked mode vertical divider & focused right Inspector.
+        if let (Some(rect), Some(div_x)) = (side_rect, side_divider) {
+            for y in layout.transcript.start..layout.transcript.end() {
                 queue!(
                     out,
-                    cursor::MoveTo(0, row as u16),
-                    style::SetBackgroundColor(self.theme.background),
-                    terminal::Clear(ClearType::UntilNewLine)
+                    cursor::MoveTo(div_x, y),
+                    style::Print("│".with(self.theme.subtle).on(self.theme.background))
                 )
                 .map_err(ServiceError::storage)?;
             }
+            if let Some(focused_id) = self.tool_blocks.focused_id() {
+                let sel_matches = self.painted_inline_inspector_target.is_none();
+                self.painted_inspector = self.render_inspector_pane_rect(
+                    out,
+                    layout,
+                    rect,
+                    focused_id,
+                    None,
+                    false,
+                    spinner,
+                    sel_matches,
+                )?;
+            }
         }
+
         if let Some(all) = all_snapshot {
             self.painted_all_transcript = all;
         }
@@ -486,6 +1263,39 @@ impl State {
         self.painted_transcript = painted;
         self.painted_size = (layout.width, layout.height);
         self.painted_layout = Some(layout);
+        Ok(())
+    }
+
+    fn render_inspector_zoom_overlay(
+        &mut self,
+        out: &mut impl Write,
+        layout: FrameLayout,
+    ) -> Result<()> {
+        if !self.inspector_zoom || layout.transcript.len == 0 {
+            return Ok(());
+        }
+        let Some(focused_id) = self.tool_blocks.focused_id() else {
+            self.inspector_zoom = false;
+            return Ok(());
+        };
+        let rect = Rect {
+            col: ColSpan {
+                start: 0,
+                len: layout.width,
+            },
+            row: layout.transcript,
+        };
+        let spinner = self.spinner();
+        self.painted_inspector = self.render_inspector_pane_rect(
+            out,
+            layout,
+            rect,
+            focused_id,
+            Some(self.inspector_zoom_scroll),
+            true,
+            spinner,
+            true,
+        )?;
         Ok(())
     }
 
@@ -707,20 +1517,20 @@ impl State {
         }
 
         let mut hint_is_live = false;
-        let hint = if self.history_clear_confirmation.is_some() {
-            " Type DELETE + Enter to confirm · Esc cancels".into()
+        let hint: Option<String> = if self.history_clear_confirmation.is_some() {
+            Some(" Type DELETE + Enter to confirm · Esc cancels".into())
         } else if self.selection.is_some() {
-            " Drag to select · Release to copy · Esc cancels".into()
+            Some(" Drag to select · Release to copy · Esc cancels".into())
         } else if let Some(notice) = resume_notice {
-            format!(" {notice}")
+            Some(format!(" {notice}"))
         } else if self.history_index < self.history.len() {
-            format!(
+            Some(format!(
                 " History {}/{} · ↑↓ edit/history · Enter send",
                 self.history_index + 1,
                 self.history.len()
-            )
+            ))
         } else if !self.files.is_empty() {
-            format!(
+            Some(format!(
                 " {} file(s): {} · Enter to send",
                 self.files.len(),
                 self.files
@@ -728,9 +1538,9 @@ impl State {
                     .map(|f| f.file_name().unwrap_or_default().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )
+            ))
         } else if let Some(c) = &self.completion {
-            format!(
+            Some(format!(
                 " Tab → {}",
                 c.values
                     .iter()
@@ -738,7 +1548,7 @@ impl State {
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join("  ")
-            )
+            ))
         } else if self.busy() {
             hint_is_live = true;
             let spinner = self.spinner();
@@ -768,13 +1578,45 @@ impl State {
                 ""
             };
             if !suffix.is_empty() && w > live_text.width() + suffix.width() + 5 {
-                format!(" {spinner} {live_text}{suffix}")
+                Some(format!(" {spinner} {live_text}{suffix}"))
             } else {
-                format!(" {spinner} {live_text}")
+                Some(format!(" {spinner} {live_text}"))
             }
         } else {
-            " Alt+Enter newline · ↑↓ edit/history · Alt+E expand paste · Wheel/PgUp scroll · /help"
-                .into()
+            None
+        };
+        let Some(hint) = hint else {
+            let mut line = Vec::new();
+            if let Some((badge, badge_face)) = right_badge {
+                let badge_clipped = clip(&badge, safe_w);
+                let badge_w = badge_clipped.width();
+                let rule_w = safe_w.saturating_sub(badge_w + 1);
+                if rule_w > 0 {
+                    line.push(Span {
+                        text: "─".repeat(rule_w),
+                        face: Face::SUBTLE,
+                    });
+                }
+                let pad = safe_w.saturating_sub(rule_w + badge_w);
+                if pad > 0 {
+                    line.push(Span {
+                        text: " ".repeat(pad),
+                        face: Face::MUTED,
+                    });
+                }
+                if !badge_clipped.is_empty() {
+                    line.push(Span {
+                        text: badge_clipped,
+                        face: badge_face,
+                    });
+                }
+            } else if safe_w > 0 {
+                line.push(Span {
+                    text: "─".repeat(safe_w),
+                    face: Face::SUBTLE,
+                });
+            }
+            return (line, None);
         };
         let hint_face = if hint_is_live {
             Face::ACCENT
@@ -826,6 +1668,7 @@ impl State {
     pub(super) fn render_hint(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
         if layout.hint.len == 0 {
             self.scroll_bottom_button = None;
+            self.approval_buttons = None;
             if self.selection.is_none() {
                 self.painted_hint.clear();
             }
@@ -851,6 +1694,26 @@ impl State {
             (line, button)
         };
         self.scroll_bottom_button = button.map(|(start, end)| (layout.hint.start, start, end));
+        self.approval_buttons = if !hint_selected
+            && !self.tool_approvals.is_empty()
+            && self.history_clear_confirmation.is_none()
+        {
+            let mut col = 0u16;
+            let mut approve = None;
+            let mut reject = None;
+            for span in &line {
+                let sw = span.text.width() as u16;
+                if approve.is_none() && span.text.starts_with("[Y]") && sw > 0 {
+                    approve = Some((col, col.saturating_add(sw)));
+                } else if reject.is_none() && span.text.starts_with("[N]") && sw > 0 {
+                    reject = Some((col, col.saturating_add(sw)));
+                }
+                col = col.saturating_add(sw);
+            }
+            (approve.is_some() || reject.is_some()).then_some((layout.hint.start, approve, reject))
+        } else {
+            None
+        };
         let rendered_width: usize = line.iter().map(|s| s.text.width()).sum();
         queue!(out, cursor::MoveTo(0, layout.hint.start)).map_err(ServiceError::storage)?;
         markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
@@ -1209,40 +2072,168 @@ impl State {
             match row {
                 0 => vec![
                     (" 31   ", Face::MUTED),
-                    ("fn", Face::ACCENT_BOLD),
-                    (" summarize", Face::HEADING),
-                    ("(users: &[User]) -> ", Face::TEXT),
-                    ("String", Face::CODE),
+                    ("fn", Face::syntax(markdown::SyntaxRole::Keyword)),
+                    (" ", Face::TEXT),
+                    ("summarize", Face::syntax(markdown::SyntaxRole::Function)),
+                    ("(users: &[", Face::TEXT),
+                    ("User", Face::syntax(markdown::SyntaxRole::Type)),
+                    ("]) -> ", Face::TEXT),
+                    ("String", Face::syntax(markdown::SyntaxRole::Type)),
                     (" {", Face::TEXT),
                 ],
-                1 => vec![
-                    (" 32 ", Face::MUTED),
-                    (
-                        "-   let active = users.iter().filter(|u| u.ok).count();",
-                        Face::DANGER,
-                    ),
-                ],
-                2 => vec![
-                    (" 32 ", Face::MUTED),
-                    (
-                        "+   let n = users.iter().filter(|u| u.is_active()).count();",
-                        Face::HIGHLIGHT,
-                    ),
-                ],
+                1 => {
+                    let bg = markdown::DiffBg::Removed;
+                    vec![
+                        (" 32 ", Face::MUTED),
+                        ("- ", Face::DANGER_BOLD.with_diff_bg(bg)),
+                        (
+                            "  ",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "let",
+                            Face::syntax(markdown::SyntaxRole::Keyword).with_diff_bg(bg),
+                        ),
+                        (
+                            " active = users.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "iter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "().",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "filter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "(|u| u.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "ok",
+                            Face::syntax(markdown::SyntaxRole::Property).with_diff_bg(bg),
+                        ),
+                        (
+                            ").",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "count",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "();",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                    ]
+                }
+                2 => {
+                    let bg = markdown::DiffBg::Added;
+                    vec![
+                        (" 32 ", Face::MUTED),
+                        ("+ ", Face::HIGHLIGHT_BOLD.with_diff_bg(bg)),
+                        (
+                            "  ",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "let",
+                            Face::syntax(markdown::SyntaxRole::Keyword).with_diff_bg(bg),
+                        ),
+                        (
+                            " n = users.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "iter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "().",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "filter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "(|u| u.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "is_active()",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            ").",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "count",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "();",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                    ]
+                }
                 3 => vec![
                     (" 33     ", Face::MUTED),
-                    ("let", Face::ACCENT),
+                    ("let", Face::syntax(markdown::SyntaxRole::Keyword)),
                     (" label = ", Face::TEXT),
-                    ("\"active\"", Face::CODE),
-                    (";", Face::TEXT),
+                    ("\"active\"", Face::syntax(markdown::SyntaxRole::String)),
+                    ("; ", Face::TEXT),
+                    ("// badge", Face::syntax(markdown::SyntaxRole::Comment)),
                 ],
-                4 => vec![
-                    (" 34 ", Face::MUTED),
-                    (
-                        "+   format!(\"{n} {label}: {}\", names.join(\", \"))",
-                        Face::HIGHLIGHT,
-                    ),
-                ],
+                4 => {
+                    let bg = markdown::DiffBg::Added;
+                    vec![
+                        (" 34 ", Face::MUTED),
+                        ("+ ", Face::HIGHLIGHT_BOLD.with_diff_bg(bg)),
+                        (
+                            "  ",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "format!",
+                            Face::syntax(markdown::SyntaxRole::Macro).with_diff_bg(bg),
+                        ),
+                        (
+                            "(",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "\"{n} {label}: {}\"",
+                            Face::syntax(markdown::SyntaxRole::String).with_diff_bg(bg),
+                        ),
+                        (
+                            ", names.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "join",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "(",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "\", \"",
+                            Face::syntax(markdown::SyntaxRole::String).with_diff_bg(bg),
+                        ),
+                        (
+                            "))",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                    ]
+                }
                 5 => vec![(" 35   }", Face::MUTED)],
                 _ => Vec::new(),
             }
@@ -1251,17 +2242,186 @@ impl State {
             .into_iter()
             .next()
             .unwrap_or_default();
-        let rendered_width: usize = line.iter().map(|s| s.text.width()).sum();
-        markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
-        if rendered_width < width {
-            queue!(
-                out,
-                style::SetBackgroundColor(self.theme.background),
-                terminal::Clear(ClearType::UntilNewLine)
-            )
+        markdown::write_clipped_padded_line(out, &line, false, width, width, self.theme)
             .map_err(ServiceError::storage)?;
-        }
         Ok(())
+    }
+
+    fn model_thinking_rows(
+        model: &super::model_picker::ModelChoice,
+        width: usize,
+        allow_two_rows: bool,
+    ) -> Vec<markdown::Line> {
+        let n = model.levels.len();
+        if n == 0 || width == 0 {
+            return Vec::new();
+        }
+        let selected = model.selected.min(n - 1);
+        if n == 1 {
+            let level = &model.levels[0];
+            let mut parts: Vec<(String, Face)> = vec![("  Thinking  ".into(), Face::MUTED)];
+            if level.id.is_none() {
+                parts.push((level.label.clone(), Face::MUTED));
+            } else {
+                parts.push(("◉ ".into(), Face::HIGHLIGHT_BOLD));
+                parts.push((level.label.clone(), Face::HIGHLIGHT_BOLD));
+                parts.push(("  (only option)".into(), Face::MUTED));
+            }
+            let clipped = clip_spans(parts, width);
+            return vec![clipped
+                .into_iter()
+                .map(|(text, face)| Span { text, face })
+                .collect()];
+        }
+
+        let left_arrow_face = if selected > 0 {
+            Face::ACCENT
+        } else {
+            Face::SUBTLE
+        };
+        let right_arrow_face = if selected + 1 < n {
+            Face::ACCENT
+        } else {
+            Face::SUBTLE
+        };
+
+        // 2-row visual slider:
+        //   Thinking  ◂      ●━━━━━━━━━━●━━━━━━━━━━◉──────────○      ▸
+        //                   Low       Medium      High       XHigh
+        if allow_two_rows {
+            let prefix_w = 12usize; // "  Thinking  "
+            let left_pad = 3usize; // gap between `◂` and first label left edge
+            let right_pad = 3usize; // gap between last label right edge and `▸`
+            let max_label_w = model
+                .levels
+                .iter()
+                .map(|l| l.label.width())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let min_step = max_label_w + 2;
+            let overhead = prefix_w + 1 + left_pad + right_pad + 1;
+            let avail_for_track = width.saturating_sub(overhead).min(56);
+            let min_needed = (n - 1) * min_step + max_label_w;
+            if avail_for_track >= min_needed {
+                let step =
+                    (avail_for_track.saturating_sub(max_label_w) / (n - 1)).clamp(min_step, 14);
+                let first_center = prefix_w + 1 + left_pad + max_label_w / 2;
+                let centers: Vec<usize> = (0..n).map(|i| first_center + i * step).collect();
+                let last_center = *centers.last().unwrap();
+                let right_chevron_col = last_center + (max_label_w - max_label_w / 2) + right_pad;
+
+                let mut track = Vec::new();
+                track.push(Span {
+                    text: "  Thinking  ".into(),
+                    face: Face::MUTED,
+                });
+                track.push(Span {
+                    text: "◂".into(),
+                    face: left_arrow_face,
+                });
+                let pre_nodes = first_center.saturating_sub(prefix_w + 1);
+                if pre_nodes > 0 {
+                    track.push(Span {
+                        text: " ".repeat(pre_nodes),
+                        face: Face::MUTED,
+                    });
+                }
+                for i in 0..n {
+                    let (node, node_face) = if i == selected {
+                        ("◉", Face::HIGHLIGHT_BOLD)
+                    } else if i < selected {
+                        ("●", Face::ACCENT)
+                    } else {
+                        ("○", Face::MUTED)
+                    };
+                    track.push(Span {
+                        text: node.into(),
+                        face: node_face,
+                    });
+                    if i + 1 < n {
+                        let seg_len = step.saturating_sub(1);
+                        let (seg_ch, seg_face) = if i < selected {
+                            ("━", Face::ACCENT)
+                        } else {
+                            ("─", Face::SUBTLE)
+                        };
+                        track.push(Span {
+                            text: seg_ch.repeat(seg_len),
+                            face: seg_face,
+                        });
+                    }
+                }
+                let post_nodes = right_chevron_col.saturating_sub(last_center + 1);
+                if post_nodes > 0 {
+                    track.push(Span {
+                        text: " ".repeat(post_nodes),
+                        face: Face::MUTED,
+                    });
+                }
+                if right_chevron_col < width {
+                    track.push(Span {
+                        text: "▸".into(),
+                        face: right_arrow_face,
+                    });
+                }
+
+                let mut labels = Vec::new();
+                let mut cursor_col = 0usize;
+                for (i, level) in model.levels.iter().enumerate() {
+                    let lw = level.label.width();
+                    let ideal_start = centers[i].saturating_sub(lw / 2);
+                    let start = if i == 0 {
+                        ideal_start
+                    } else {
+                        ideal_start.max(cursor_col + 1)
+                    };
+                    if start >= width {
+                        break;
+                    }
+                    if start > cursor_col {
+                        labels.push(Span {
+                            text: " ".repeat(start - cursor_col),
+                            face: Face::MUTED,
+                        });
+                    }
+                    let clipped_label = clip(&level.label, width - start);
+                    let cw = clipped_label.width();
+                    labels.push(Span {
+                        text: clipped_label,
+                        face: if i == selected {
+                            Face::HIGHLIGHT_BOLD
+                        } else {
+                            Face::MUTED
+                        },
+                    });
+                    cursor_col = start + cw;
+                }
+                return vec![track, labels];
+            }
+        }
+
+        // Compact 1-row fallback for narrow terminals or tight vertical space.
+        let mut parts: Vec<(String, Face)> = vec![
+            ("  Thinking  ".into(), Face::MUTED),
+            ("◂ ".into(), left_arrow_face),
+        ];
+        for (i, level) in model.levels.iter().enumerate() {
+            if i > 0 {
+                parts.push((" · ".into(), Face::SUBTLE));
+            }
+            if i == selected {
+                parts.push((format!("[{}]", level.label), Face::HIGHLIGHT_BOLD));
+            } else {
+                parts.push((level.label.clone(), Face::MUTED));
+            }
+        }
+        parts.push((" ▸".into(), right_arrow_face));
+        let clipped = clip_spans(parts, width);
+        vec![clipped
+            .into_iter()
+            .map(|(text, face)| Span { text, face })
+            .collect()]
     }
 
     fn render_menu_overlay(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
@@ -1271,8 +2431,98 @@ impl State {
         let w = usize::from(layout.width);
         let anchor = layout.transcript.end();
         let top_bound = layout.transcript.start + u16::from(layout.header.len > 0);
-        let max = usize::from(anchor.saturating_sub(top_bound)).min(8);
+        let avail_total = usize::from(anchor.saturating_sub(top_bound));
+        let max = avail_total.min(8);
         if max == 0 {
+            return Ok(());
+        }
+        let is_model_menu = matches!(
+            menu.choices.first().map(|c| &c.value),
+            Some(Selection::Model(_))
+        );
+        if is_model_menu {
+            let selected_model = match menu.choices.get(menu.selected).map(|c| &c.value) {
+                Some(Selection::Model(m)) => Some(m),
+                _ => None,
+            };
+            let allow_two_rows = avail_total >= 5;
+            let thinking_rows = selected_model
+                .map(|m| Self::model_thinking_rows(m, w, allow_two_rows))
+                .unwrap_or_default();
+            let has_divider = !thinking_rows.is_empty() && avail_total >= thinking_rows.len() + 3;
+            let footer_rows = usize::from(has_divider) + thinking_rows.len();
+            let list_cap = avail_total.saturating_sub(1 + footer_rows).clamp(1, 8);
+            let visible_count = menu.choices.len().min(list_cap);
+            let start = menu
+                .selected
+                .saturating_sub(visible_count.saturating_sub(1));
+            let total_height = 1 + visible_count + footer_rows;
+            let top = anchor.saturating_sub(total_height as u16);
+
+            queue!(
+                out,
+                cursor::MoveTo(0, top),
+                style::SetBackgroundColor(self.theme.background),
+                terminal::Clear(ClearType::CurrentLine),
+                style::Print(clip(&format!(" {}", menu.title), w).with(self.theme.accent))
+            )
+            .map_err(ServiceError::storage)?;
+
+            for (i, choice) in menu
+                .choices
+                .iter()
+                .skip(start)
+                .take(visible_count)
+                .enumerate()
+            {
+                let y = top + 1 + i as u16;
+                let selected = start + i == menu.selected;
+                let is_current = matches!(
+                    &choice.value,
+                    Selection::Model(model) if model.is_current
+                );
+                let marker = if selected { "›" } else { " " };
+                let label_text = if is_current {
+                    format!(" {marker} {}  (current)", choice.label)
+                } else {
+                    format!(" {marker} {}", choice.label)
+                };
+                let text = clip(&label_text, w);
+                queue!(
+                    out,
+                    cursor::MoveTo(0, y),
+                    style::SetBackgroundColor(self.theme.background),
+                    terminal::Clear(ClearType::CurrentLine),
+                    style::Print(if selected {
+                        text.with(self.theme.selected_text)
+                            .on(self.theme.selected_background)
+                    } else if is_current {
+                        text.with(self.theme.accent).on(self.theme.background)
+                    } else {
+                        text.with(self.theme.text).on(self.theme.background)
+                    })
+                )
+                .map_err(ServiceError::storage)?;
+            }
+
+            let mut footer_y = top + 1 + visible_count as u16;
+            if has_divider {
+                queue!(
+                    out,
+                    cursor::MoveTo(0, footer_y),
+                    style::SetBackgroundColor(self.theme.background),
+                    terminal::Clear(ClearType::CurrentLine)
+                )
+                .map_err(ServiceError::storage)?;
+                footer_y += 1;
+            }
+            for row_line in &thinking_rows {
+                let rendered_w: usize = row_line.iter().map(|s| s.text.width()).sum();
+                queue!(out, cursor::MoveTo(0, footer_y)).map_err(ServiceError::storage)?;
+                markdown::write_line(out, row_line, self.theme).map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, footer_y, rendered_w, layout, self.theme)?;
+                footer_y += 1;
+            }
             return Ok(());
         }
         let is_theme_menu = matches!(
@@ -1374,7 +2624,11 @@ impl State {
                         if self.resume_menu.is_some()
                             || matches!(
                                 menu.choices.first().map(|c| &c.value),
-                                Some(Selection::Model(_))
+                                Some(
+                                    Selection::Model(_)
+                                        | Selection::Inspector { .. }
+                                        | Selection::Permission { .. }
+                                )
                             )
                         {
                             ""
@@ -1418,6 +2672,105 @@ impl State {
                 })
             )
             .map_err(ServiceError::storage)?;
+        }
+        Ok(())
+    }
+
+    fn render_shortcuts_overlay(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+        if !self.shortcuts_open
+            || self.menu.is_some()
+            || self.history_clear_confirmation.is_some()
+            || self.inspector_zoom
+            || layout.transcript.len < 2
+        {
+            return Ok(());
+        }
+        let anchor = layout.transcript.end();
+        let avail_rows = usize::from(layout.transcript.len);
+        let safe_w = Self::safe_row_width(layout.transcript.start, layout.width, layout.height);
+        if safe_w == 0 {
+            return Ok(());
+        }
+        let rows = shortcuts_panel_rows(safe_w);
+        let total_body = rows.len();
+        let visible_body = total_body.min(avail_rows.saturating_sub(1));
+        if visible_body == 0 {
+            return Ok(());
+        }
+        let max_scroll = total_body.saturating_sub(visible_body);
+        let scroll = self.shortcuts_scroll.min(max_scroll);
+        let panel_height = 1 + visible_body;
+        let top = anchor.saturating_sub(panel_height as u16);
+
+        // Top border row: `─ Shortcuts ─────────────── [range · ↑↓ scroll · ]Esc / ? close ─`
+        let header_w = Self::safe_row_width(top, layout.width, layout.height);
+        let title = " Shortcuts ";
+        let controls = if max_scroll > 0 {
+            format!(
+                " {}-{}/{} · ↑↓ scroll · Esc/? close ",
+                scroll + 1,
+                scroll + visible_body,
+                total_body
+            )
+        } else {
+            " Esc / ? close ".to_owned()
+        };
+        let mut header_line: markdown::Line = Vec::new();
+        let title_w = title.width();
+        let ctrl_w = controls.width();
+        if header_w >= title_w + ctrl_w + 4 {
+            let mid_rules = header_w - title_w - ctrl_w - 2;
+            header_line.push(Span {
+                text: "─".into(),
+                face: Face::SUBTLE,
+            });
+            header_line.push(Span {
+                text: title.into(),
+                face: Face::ACCENT_BOLD,
+            });
+            header_line.push(Span {
+                text: "─".repeat(mid_rules),
+                face: Face::SUBTLE,
+            });
+            header_line.push(Span {
+                text: controls,
+                face: Face::MUTED,
+            });
+            header_line.push(Span {
+                text: "─".into(),
+                face: Face::SUBTLE,
+            });
+        } else if header_w >= title_w + 2 {
+            let right_rules = header_w - title_w - 1;
+            header_line.push(Span {
+                text: "─".into(),
+                face: Face::SUBTLE,
+            });
+            header_line.push(Span {
+                text: title.into(),
+                face: Face::ACCENT_BOLD,
+            });
+            header_line.push(Span {
+                text: "─".repeat(right_rules),
+                face: Face::SUBTLE,
+            });
+        } else {
+            header_line.push(Span {
+                text: clip(" Shortcuts", header_w),
+                face: Face::ACCENT_BOLD,
+            });
+        }
+        let header_rendered_w: usize = header_line.iter().map(|s| s.text.width()).sum();
+        queue!(out, cursor::MoveTo(0, top)).map_err(ServiceError::storage)?;
+        markdown::write_line(out, &header_line, self.theme).map_err(ServiceError::storage)?;
+        Self::pad_and_clear_row(out, top, header_rendered_w, layout, self.theme)?;
+
+        for (i, line) in rows.iter().skip(scroll).take(visible_body).enumerate() {
+            let y = top + 1 + i as u16;
+            let rendered_w: usize = line.iter().map(|s| s.text.width()).sum();
+            queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
+            markdown::write_line(out, line, self.theme).map_err(ServiceError::storage)?;
+            Self::pad_and_clear_row(out, y, rendered_w, layout, self.theme)?;
         }
         Ok(())
     }
@@ -1498,8 +2851,12 @@ impl State {
             markdown::write_line(out, sub_line, self.theme).map_err(ServiceError::storage)?;
             let sub_width: usize = sub_line.iter().map(|s| s.text.width()).sum();
             if sub_width < w {
-                queue!(out, terminal::Clear(ClearType::UntilNewLine))
-                    .map_err(ServiceError::storage)?;
+                queue!(
+                    out,
+                    style::SetBackgroundColor(self.theme.background),
+                    terminal::Clear(ClearType::UntilNewLine)
+                )
+                .map_err(ServiceError::storage)?;
             }
             if subagents_selected {
                 if let Some((column, selected)) = self
@@ -1629,7 +2986,10 @@ impl State {
             self.clear_selection();
             return Ok(());
         };
-        let full_clear = self.selection.is_none();
+        // Only clear the whole screen on the initial frame or after a terminal resize.
+        // Steady-state frames overwrite every row in place with ClearType::UntilNewLine so
+        // terminals without DEC Mode 2026 (or large frames split across PTY reads) never flash.
+        let full_clear = self.selection.is_none() && self.painted_size != (width, height);
         queue!(
             out,
             terminal::BeginSynchronizedUpdate,
@@ -1650,10 +3010,12 @@ impl State {
         }
         self.render_header(out, layout)?;
         self.render_transcript(out, layout, full_clear)?;
+        self.render_inspector_zoom_overlay(out, layout)?;
         self.render_hint(out, layout)?;
         self.render_composer(out, layout, &editor_rows)?;
         self.render_completion(out, layout)?;
         self.render_menu_overlay(out, layout)?;
+        self.render_shortcuts_overlay(out, layout)?;
         let cursor_position = self
             .render_history_clear_overlay(out, layout)?
             .unwrap_or(layout.cursor);

@@ -2,7 +2,7 @@
 use anticrumb::{
     agent::CancelToken,
     browser_control::{self, BrowserControlRegistry},
-    domain::Account,
+    domain::{Account, BrowserProfile},
 };
 use serde_json::json;
 use std::{io::Write, process::ExitCode};
@@ -15,14 +15,20 @@ fn main() -> ExitCode {
         !anticrumb::web::allow_private_env(),
         "This diagnostic requires the default public browsing policy"
     );
-    let account = Account {
-        id: "browser-diagnostic".into(),
-        provider: "gemini-web".into(),
+    let browser_profile = BrowserProfile {
+        provider_id: "gemini-web".into(),
         profile: std::env::temp_dir().join("anticrumb-unused-diagnostic-profile"),
         subprofile: None,
         port: 0,
         headless: true,
+    };
+    let account = Account {
+        id: "browser-diagnostic".into(),
+        provider: "gemini-web".into(),
         state: "ready".into(),
+        identity: None,
+        label: None,
+        slot: None,
     };
     let registry = BrowserControlRegistry::default();
     let mut failed = false;
@@ -32,7 +38,7 @@ fn main() -> ExitCode {
         json!({"action":"tabs"}),
     ] {
         let request = browser_control::request(&args, &account.id, "diagnostic").unwrap();
-        match registry.execute(&account, &request, CancelToken::new()) {
+        match registry.execute(&browser_profile, &account, &request, CancelToken::new()) {
             Ok(response) => {
                 println!(
                     "{}: active={}, tabs={}, message={}",

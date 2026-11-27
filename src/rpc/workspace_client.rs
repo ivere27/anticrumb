@@ -455,37 +455,53 @@ pub async fn presentation(
                 .await?;
             Ok(json!({"unregistered": true}))
         }
+        ("GET", ["api", "browsers"]) => Ok(json!(rpc.list_browsers(pb::Empty {}).await?.browsers)),
         ("GET", ["api", "accounts"]) => Ok(json!(rpc.list_accounts(pb::Empty {}).await?.accounts)),
-        ("POST", ["api", "accounts"]) => {
-            let port = match value.get("port") {
-                None | Some(Value::Null) => 0,
-                Some(v) => v
-                    .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .filter(|n| *n <= u32::from(u16::MAX))
-                    .ok_or_else(|| ServiceError::invalid("invalid port"))?,
-            };
-            Ok(json!(
-                rpc.create_account(pb::CreateAccountRequest {
-                    id: value["id"]
-                        .as_str()
-                        .ok_or_else(|| ServiceError::invalid("missing account id"))?
-                        .into(),
-                    port,
-                    provider: value["provider"]
-                        .as_str()
-                        .unwrap_or(crate::provider::DEFAULT_PROVIDER_ID)
-                        .into(),
-                })
-                .await?
-            ))
+        ("POST", ["api", "accounts", "active"]) => {
+            let target = value["account_id"]
+                .as_str()
+                .ok_or_else(|| ServiceError::invalid("missing account_id"))?;
+            Ok(json!(rpc.set_active_account(account(target)).await?))
         }
+        ("POST", ["api", "providers", id, "ensure-account"]) => Ok(json!(
+            rpc.ensure_provider_account(pb::ProviderRef { id: (*id).into() })
+                .await?
+        )),
+        ("POST", ["api", "providers", id, "refresh-accounts"]) => Ok(json!(
+            rpc.refresh_accounts(pb::ProviderRef { id: (*id).into() })
+                .await?
+                .accounts
+        )),
+        ("GET", ["api", "providers", id, "browser"]) => Ok(json!(
+            rpc.get_browser_status(pb::ProviderRef { id: (*id).into() })
+                .await?
+        )),
+        ("POST", ["api", "providers", id, "login"]) => {
+            rpc.open_login(pb::ProviderRef { id: (*id).into() }).await?;
+            Ok(json!({"opened": true}))
+        }
+        ("POST", ["api", "providers", id, "browser-mode"]) => Ok(json!(
+            rpc.set_browser_mode(pb::SetBrowserModeRequest {
+                provider_id: (*id).into(),
+                headless: value["headless"]
+                    .as_bool()
+                    .ok_or_else(|| ServiceError::invalid("invalid headless flag"))?
+            })
+            .await?
+        )),
+        ("POST", ["api", "providers", id, "attach"]) => Ok(json!(
+            rpc.attach_browser(pb::AttachBrowserRequest {
+                provider_id: (*id).into(),
+                port: value["port"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| ServiceError::invalid("invalid port"))?
+            })
+            .await?
+        )),
         ("GET", ["api", "accounts", id, "models"]) => {
             serde_json::to_value(codec::catalog_from(rpc.get_catalog(account(id)).await?))
                 .map_err(ServiceError::storage)
-        }
-        ("GET", ["api", "accounts", id, "browser"]) => {
-            Ok(json!(rpc.get_browser_status(account(id)).await?))
         }
         ("GET", ["api", "accounts", id, "usage"]) => {
             Ok(json!(rpc.get_web_usage(account(id)).await?))
@@ -500,32 +516,9 @@ pub async fn presentation(
             serde_json::to_value(codec::catalog_from(rpc.refresh_catalog(account(id)).await?))
                 .map_err(ServiceError::storage)
         }
-        ("POST", ["api", "accounts", id, "login"]) => {
-            rpc.open_login(account(id)).await?;
-            Ok(json!({"opened":true}))
-        }
-        ("POST", ["api", "accounts", id, "browser-mode"]) => Ok(json!(
-            rpc.set_browser_mode(pb::SetBrowserModeRequest {
-                account_id: (*id).into(),
-                headless: value["headless"]
-                    .as_bool()
-                    .ok_or_else(|| ServiceError::invalid("invalid headless flag"))?
-            })
-            .await?
-        )),
         ("POST", ["api", "accounts", id, "pause"]) => {
             Ok(json!(rpc.pause_account(account(id)).await?))
         }
-        ("POST", ["api", "accounts", id, "attach"]) => Ok(json!(
-            rpc.attach_browser(pb::AttachBrowserRequest {
-                account_id: (*id).into(),
-                port: value["port"]
-                    .as_u64()
-                    .and_then(|v| u32::try_from(v).ok())
-                    .ok_or_else(|| ServiceError::invalid("invalid port"))?
-            })
-            .await?
-        )),
         ("POST", ["api", "runs"]) => {
             let request: TurnRequest =
                 serde_json::from_value(value).map_err(ServiceError::storage)?;
@@ -585,9 +578,20 @@ pub async fn presentation(
                         .ok_or_else(|| ServiceError::invalid("missing artifact data"))?,
                 )
                 .map_err(ServiceError::storage)?;
+            let target_account = match value["account_id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+            {
+                Some(id) => id.to_owned(),
+                None => rpc
+                    .get_status(pb::Empty {})
+                    .await?
+                    .active_account_id
+                    .unwrap_or_else(default_account),
+            };
             Ok(json!(
                 rpc.put_artifact_bytes(
-                    value["account_id"].as_str().unwrap_or("default"),
+                    &target_account,
                     value["name"].as_str().unwrap_or("upload.bin"),
                     value["mime"].as_str().unwrap_or("application/octet-stream"),
                     bytes,
@@ -701,13 +705,14 @@ pub async fn presentation(
             .await?
         )),
         ("GET", ["v1", "models"]) => {
-            let catalog = rpc.get_catalog(account("default")).await?;
+            let status = rpc.get_status(pb::Empty {}).await?;
+            let active_id = status.active_account_id.unwrap_or_else(default_account);
+            let catalog = rpc.get_catalog(account(&active_id)).await?;
             let provider = if catalog.provider.is_empty() {
-                rpc.list_accounts(pb::Empty {})
-                    .await?
+                status
                     .accounts
                     .into_iter()
-                    .find(|a| a.id == "default")
+                    .find(|a| a.id == active_id)
                     .map(|a| a.provider)
                     .filter(|p| !p.is_empty())
                     .unwrap_or_else(default_provider)

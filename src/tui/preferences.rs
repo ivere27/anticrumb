@@ -1,4 +1,5 @@
 use super::editor::Draft;
+use super::layout::InspectorConfig;
 use crate::{domain::*, store::Store};
 use std::path::Path;
 
@@ -112,6 +113,16 @@ impl Preferences {
     }
     pub fn set_temporary(&self, temporary: bool) -> Result<()> {
         self.store.put("ui", "settings", "temporary", &temporary)
+    }
+    pub fn inspector_config(&self) -> InspectorConfig {
+        self.store
+            .get::<InspectorConfig>("ui", "settings", "inspector")
+            .unwrap_or_default()
+            .normalized()
+    }
+    pub fn set_inspector_config(&self, config: &InspectorConfig) -> Result<()> {
+        let normalized = config.normalized();
+        self.store.put("ui", "settings", "inspector", &normalized)
     }
     pub fn permissions(&self) -> Option<ToolPermissions> {
         if let Ok(perms) = self
@@ -269,5 +280,58 @@ mod tests {
             vec![m1, m2]
         );
         assert!(a.recent_mentions(Path::new("/two")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspector_config_persists_clamps_and_handles_partial_json() {
+        use super::super::layout::{AfterTurnPolicy, InspectorConfig, InspectorMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = Preferences::open(dir.path()).unwrap();
+        let b = Preferences::open(dir.path()).unwrap();
+        assert_eq!(a.inspector_config(), InspectorConfig::default());
+
+        let custom = InspectorConfig {
+            mode: InspectorMode::Side,
+            width_pct: 64,
+            after_turn: AfterTurnPolicy::Collapse,
+            follow: false,
+            min_split_width: 112,
+        };
+        a.set_inspector_config(&custom).unwrap();
+        assert_eq!(b.inspector_config(), custom);
+        assert_eq!(
+            Preferences::open(dir.path()).unwrap().inspector_config(),
+            custom
+        );
+
+        // Out-of-range values are clamped on write and read.
+        a.set_inspector_config(&InspectorConfig {
+            mode: InspectorMode::Inline,
+            width_pct: 99,
+            after_turn: AfterTurnPolicy::Keep,
+            follow: true,
+            min_split_width: 20,
+        })
+        .unwrap();
+        let clamped = b.inspector_config();
+        assert_eq!(clamped.width_pct, 70);
+        assert_eq!(clamped.min_split_width, 73);
+
+        // Partial JSON recovers defaults for omitted fields via #[serde(default)].
+        a.store
+            .put(
+                "ui",
+                "settings",
+                "inspector",
+                &serde_json::json!({"mode": "off"}),
+            )
+            .unwrap();
+        let partial = b.inspector_config();
+        assert_eq!(partial.mode, InspectorMode::Off);
+        assert_eq!(partial.width_pct, 55);
+        assert_eq!(partial.after_turn, AfterTurnPolicy::Fit);
+        assert!(partial.follow);
+        assert_eq!(partial.min_split_width, 100);
     }
 }

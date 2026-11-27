@@ -174,7 +174,7 @@ impl GeminiTab {
         }
     }
 
-    pub fn list_models_and_thinking(
+    fn list_models_and_thinking_unlocked(
         &mut self,
     ) -> Result<(Vec<ModelOption>, Vec<ThinkingOption>), String> {
         let models = self.menu()?;
@@ -194,6 +194,16 @@ impl GeminiTab {
             .collect();
         self.close_overlays();
         Ok((models, thinking))
+    }
+
+    pub fn list_models_and_thinking(
+        &mut self,
+    ) -> Result<(Vec<ModelOption>, Vec<ThinkingOption>), String> {
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        self.list_models_and_thinking_unlocked()
     }
 
     fn thinking_menu(&mut self) -> Result<Option<Vec<ModelOption>>, String> {
@@ -411,7 +421,7 @@ impl GeminiTab {
             }
         }
         self.close_overlays();
-        let (_, thinking) = self.list_models_and_thinking()?;
+        let (_, thinking) = self.list_models_and_thinking_unlocked()?;
         if !thinking
             .iter()
             .any(|level| level.level == selected.mode_id && level.selected)
@@ -421,10 +431,23 @@ impl GeminiTab {
         Ok(())
     }
 
-    pub fn select_model(&mut self, query: &str) -> Result<ModelOption, String> {
+    fn select_model_unlocked(&mut self, query: &str) -> Result<ModelOption, String> {
         let menu = self.menu()?;
         self.select_model_from_menu(menu, query, false)
             .map(|(option, _)| option)
+    }
+
+    fn select_thinking_unlocked(&mut self, query: &str) -> Result<(), String> {
+        self.menu()?;
+        self.select_thinking_from_open_menu(query)
+    }
+
+    pub fn select_model(&mut self, query: &str) -> Result<ModelOption, String> {
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        self.select_model_unlocked(query)
     }
 
     pub fn select_model_and_thinking(
@@ -432,10 +455,17 @@ impl GeminiTab {
         model: Option<&str>,
         thinking: Option<&str>,
     ) -> Result<(), String> {
+        if model.is_none() && thinking.is_none() {
+            return Ok(());
+        }
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         match (model, thinking) {
             (None, None) => Ok(()),
-            (Some(model), None) => self.select_model(model).map(|_| ()),
-            (None, Some(thinking)) => self.select_thinking(thinking),
+            (Some(model), None) => self.select_model_unlocked(model).map(|_| ()),
+            (None, Some(thinking)) => self.select_thinking_unlocked(thinking),
             (Some(model), Some(thinking)) => {
                 let menu = self.menu()?;
                 let (selected_model, mut menu_open) =
@@ -462,7 +492,11 @@ impl GeminiTab {
     }
 
     pub fn model_catalog(&mut self) -> Result<ModelCatalog, String> {
-        let (models, thinking) = self.list_models_and_thinking()?;
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let (models, thinking) = self.list_models_and_thinking_unlocked()?;
         let mut selected = models.iter().filter(|m| m.selected);
         let original = selected
             .next()
@@ -476,13 +510,13 @@ impl GeminiTab {
         model_thinking.insert(original.clone(), thinking.clone());
         let result = (|| {
             for model in models.iter().filter(|m| !m.locked && m.mode_id != original) {
-                self.select_model(&model.mode_id)?;
-                let (_, levels) = self.list_models_and_thinking()?;
+                self.select_model_unlocked(&model.mode_id)?;
+                let (_, levels) = self.list_models_and_thinking_unlocked()?;
                 model_thinking.insert(model.mode_id.clone(), levels);
             }
             Ok::<_, String>(())
         })();
-        let restore = self.select_model(&original);
+        let restore = self.select_model_unlocked(&original);
         result?;
         restore?;
         Ok(ModelCatalog {
@@ -493,8 +527,11 @@ impl GeminiTab {
     }
 
     pub fn select_thinking(&mut self, query: &str) -> Result<(), String> {
-        self.menu()?;
-        self.select_thinking_from_open_menu(query)
+        let input_lock = self.input_lock.clone();
+        let _input_guard = input_lock
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        self.select_thinking_unlocked(query)
     }
 }
 

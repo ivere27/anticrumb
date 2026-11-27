@@ -66,7 +66,7 @@ fn island(rows: &str) -> String {
 
 #[test]
 #[ignore = "requires a local Chrome CDP endpoint; fixture only, no account website requests"]
-fn usage_percentages_preserve_localized_text_and_unknown_counts() {
+fn usage_percentages_normalize_known_testids_and_preserve_reset_text() {
     let mut page = Page::new();
     for (label, used, expected, reset) in [
         ("Current usage", "0% used", Some(0.0), "Resets at 5:41 AM"),
@@ -82,6 +82,7 @@ fn usage_percentages_preserve_localized_text_and_unknown_counts() {
             Some(12.5),
             "Resets at 5:41 AM",
         ),
+        ("현재 사용량", "0% 사용됨", Some(0.0), "오후 1:39에 초기화"),
         (
             "الاستخدام الحالي",
             "١٢٫٥٪ مستخدم",
@@ -99,18 +100,20 @@ fn usage_percentages_preserve_localized_text_and_unknown_counts() {
         ("Current usage", "Not reported", None, "Resets later"),
     ] {
         let rows = format!(
-            "{}{}",
+            "{}{}{}",
             row(label, used, reset),
-            r#"<li data-testid="weekly-usage"><strong>Weekly limit</strong>
-            <strong>0% used</strong><time>Resets next week</time></li>"#
+            r#"<li data-testid="weekly-usage"><strong>주간 한도</strong>
+            <strong>0% 사용됨</strong><time>11월 28일 오후 10:39에 초기화</time></li>"#,
+            r#"<li data-testid="custom-usage"><strong>Custom quota</strong>
+            <strong>10% used</strong><span>Resets next month</span></li>"#
         );
         let usage = page.read(&island(&rows));
         assert_eq!(usage["state"], "ready", "{usage}");
         let report = &usage["usage"];
         assert_eq!(report["plan"], "Fixture plan");
-        assert_eq!(report["limits"].as_array().unwrap().len(), 2);
+        assert_eq!(report["limits"].as_array().unwrap().len(), 3);
         let current = &report["limits"][0];
-        assert_eq!(current["label"], label);
+        assert_eq!(current["label"], "Current usage");
         assert_eq!(current["used"], used.replace("&lt;", "<"));
         assert_eq!(current["used_percent"].as_f64(), expected);
         assert_eq!(current["reset"], reset);
@@ -124,7 +127,13 @@ fn usage_percentages_preserve_localized_text_and_unknown_counts() {
         );
         assert!(current["remaining"].is_null());
         assert!(current["limit"].is_null());
+        assert_eq!(report["limits"][1]["label"], "Weekly limit");
         assert_eq!(report["limits"][1]["used_percent"], 0.0);
+        assert_eq!(
+            report["limits"][1]["reset"],
+            "11월 28일 오후 10:39에 초기화"
+        );
+        assert_eq!(report["limits"][2]["label"], "Custom quota");
         assert_eq!(report["updated_label"], "Updated just now");
         assert!(report["timezone"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(!report.to_string().contains("decorative-reset"));
