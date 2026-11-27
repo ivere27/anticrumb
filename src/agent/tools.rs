@@ -146,6 +146,8 @@ pub type SpawnAgentFn =
 /// Incremental live-output callback for streaming tools (e.g., `run_shell`).
 pub type ToolOutputFn = Arc<dyn Fn(OutputStream, &str) + Send + Sync>;
 
+type ReadCache = Arc<Mutex<BTreeMap<(PathBuf, usize, usize), String>>>;
+
 pub struct ToolContext {
     pub environment: Option<std::collections::BTreeMap<String, String>>,
     pub workspace_root: PathBuf,
@@ -166,7 +168,7 @@ pub struct ToolContext {
     pub on_output: Option<ToolOutputFn>,
     /// Whether `read_file` should elide repeated reads of unchanged file ranges in persistent sessions.
     pub dedup_reads: bool,
-    read_cache: Arc<Mutex<BTreeMap<(PathBuf, usize, usize), String>>>,
+    read_cache: ReadCache,
     changed_files: Arc<Mutex<BTreeSet<String>>>,
 }
 
@@ -539,8 +541,7 @@ impl ToolRegistry {
             let (tx, rx) = std::sync::mpsc::channel::<BatchMsg>();
             std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(end - idx);
-                for i in idx..end {
-                    let call = &calls[i];
+                for (i, call) in calls.iter().enumerate().take(end).skip(idx) {
                     let worker_tx = tx.clone();
                     let existing_cb = ctx.on_output.clone();
                     let out_tx = worker_tx.clone();

@@ -242,6 +242,12 @@ impl ToolApprovalGate {
         }
     }
 
+    pub fn pending_count(&self) -> usize {
+        let (lock, _) = &*self.inner;
+        let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.values().filter(|v| v.is_none()).count()
+    }
+
     /// Block until `approval_id` is resolved with `Some(true|false)` or `None` if cancelled
     /// or unregistered.
     pub fn wait(&self, approval_id: &str, cancel: &CancelToken) -> Option<bool> {

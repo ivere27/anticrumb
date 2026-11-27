@@ -173,7 +173,11 @@ fn status_needs_fast_poll(status: &Value) -> bool {
     });
     let cleanup_active = status["chat_cleanup"]["pending"].as_u64().unwrap_or(0) > 0
         || status["chat_cleanup"]["running"].as_u64().unwrap_or(0) > 0;
-    account_waiting || cleanup_active
+    let has_workspace_alerts = status["workspace_alerts"]
+        .as_array()
+        .is_some_and(|alerts| !alerts.is_empty());
+    let has_other_active_agents = status["active_agents"].as_u64().unwrap_or(0) > 0;
+    account_waiting || cleanup_active || has_workspace_alerts || has_other_active_agents
 }
 
 fn status_poll_interval(active: bool, status_fast: bool, history_active: bool) -> Duration {

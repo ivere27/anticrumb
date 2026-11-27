@@ -466,36 +466,44 @@ impl State {
     pub(super) fn open_models(&mut self) {
         let mut choices = Vec::new();
         let mut selected = 0;
+        let mut matched_current = false;
         if let Some(models) = self.catalog["models"].as_array() {
             for model in models.iter().filter(|m| m["locked"] != true) {
                 let Some(id) = model["mode_id"].as_str() else {
                     continue;
                 };
-                if self.options.model.as_deref() == Some(id)
-                    || (self.options.model.is_none() && model["selected"] == true)
-                {
+                let is_current = self.options.model.as_deref() == Some(id)
+                    || (self.options.model.is_none() && model["selected"] == true);
+                if is_current {
                     selected = choices.len();
+                    matched_current = true;
                 }
                 let levels = self.catalog["model_thinking"]
                     .get(id)
                     .unwrap_or(&Value::Null);
                 choices.push(Choice {
                     label: model_picker::title(model),
-                    value: Selection::Model(ModelChoice::new(
-                        Some(id.into()),
-                        levels,
-                        self.options.thinking.as_deref(),
-                    )),
+                    value: Selection::Model(
+                        ModelChoice::new(Some(id.into()), levels, self.options.thinking.as_deref())
+                            .with_current(is_current),
+                    ),
                 });
             }
         }
+        let default_is_current = !matched_current && self.options.model.is_none();
+        if default_is_current {
+            selected = choices.len();
+        }
         choices.push(Choice {
             label: "Web default".into(),
-            value: Selection::Model(ModelChoice::new(
-                None,
-                &self.catalog["thinking"],
-                self.options.thinking.as_deref(),
-            )),
+            value: Selection::Model(
+                ModelChoice::new(
+                    None,
+                    &self.catalog["thinking"],
+                    self.options.thinking.as_deref(),
+                )
+                .with_current(default_is_current),
+            ),
         });
         self.menu = Some(Menu {
             title: "Model · ↑↓ model · ←→ thinking · Enter apply · Esc cancel".into(),

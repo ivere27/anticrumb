@@ -544,7 +544,7 @@ mod unix_pty {
                 ("NO_COLOR", None),
             ],
         );
-        pty.wait_for("W:project");
+        pty.wait_for("project");
 
         // Insert a visible marker after actual terminal escape sequences. Each
         // independent draft checks cursor placement without submitting a turn.
@@ -684,7 +684,7 @@ mod unix_pty {
             "anticrumb {}",
             anticrumb::build_info::display_version()
         ));
-        pty.wait_for("W:project");
+        pty.wait_for("project");
         pty.send("/copy\r");
         pty.wait_for("No assistant response to copy yet.");
         assert!(!copied_file.exists());
@@ -713,8 +713,8 @@ mod unix_pty {
         pty.send("\x1b[B\x1b[C\x1b[C\x1b[C");
         pty.wait_for("Ultra");
         pty.send("\x1b[B\x1b[C\x1b[C\x1b[D\r");
-        let selected = pty.wait_for("M:4.0 Argon");
-        assert!(selected.contains("E:Medium"));
+        let selected = pty.wait_for("4.0 Argon");
+        assert!(selected.contains("Medium"));
         pty.send("/model\r");
         pty.wait_for("Quick answers");
         assert_eq!(observations()["model_probes"], 1);
@@ -758,8 +758,8 @@ mod unix_pty {
         pty.resize(48);
         pty.wait_for("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm");
         pty.resize(110);
-        let restored = pty.wait_for("M:4.0 Argon");
-        assert!(frame(&restored).contains("E:Medium"));
+        let restored = pty.wait_for("4.0 Argon");
+        assert!(frame(&restored).contains("Medium"));
         assert!(frame(&restored).contains("? for shortcuts"));
         assert_eq!(observations()["web_usage_queries"], 1);
         assert_eq!(observations()["model_probes"], 2);
@@ -998,7 +998,7 @@ mod unix_pty {
         drop(pty);
 
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &base_env);
-        let reopened = pty.wait_for("W:project");
+        let reopened = pty.wait_for("project");
         assert!(reopened.contains("48;2;46;52;64"));
         pty.send("\x1b[A");
         let history = pty.wait_for("History");
@@ -1111,7 +1111,7 @@ mod unix_pty {
             "anticrumb {}",
             anticrumb::build_info::display_version()
         ));
-        pty.wait_for("W:project");
+        pty.wait_for("project");
         pty.send("/resume\r");
         pty.wait_for("No saved conversations in this directory.");
         assert_eq!(
@@ -1187,7 +1187,7 @@ mod unix_pty {
             ("DISPLAY", None),
         ];
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &ssh_env);
-        let reopened = pty.wait_for("W:project");
+        let reopened = pty.wait_for("project");
         assert!(!frame(&reopened).contains("Gemini history cleanup"));
         pty.send("/status\r");
         pty.wait_for("completed · 2 chats deleted");
@@ -1258,14 +1258,14 @@ mod unix_pty {
         ];
 
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &env);
-        pty.wait_for("W:project");
+        pty.wait_for("project");
 
         // Build enough transcript lines to scroll off-screen (26 rows total -> 23 transcript rows).
         pty.send("/help\r");
         let help = pty.wait_for("exact Gemini token usage");
         // Scroll up first so there is off-screen content below the viewport too.
         pty.send("\x1b[<64;10;5M\x1b[<64;10;5M\x1b[<64;10;5M");
-        let scrolled = pty.wait_for("W:project");
+        let scrolled = pty.wait_for("project");
         let top_row_text = screen_row(&scrolled, 1).trim_end().to_string();
         let last_help_line = screen_row(&help, 22).trim_end().to_string();
         assert!(!top_row_text.is_empty());
@@ -1319,15 +1319,15 @@ mod unix_pty {
         pty.send("\x15");
 
         // 4. Status bar (footer, row 26 in 26-row terminal) selection copies status text.
-        let status_row = screen_row(&pty.wait_for("W:project"), 26);
-        let project_byte = status_row.find("W:project").unwrap();
+        let status_row = screen_row(&pty.wait_for("project"), 26);
+        let project_byte = status_row.find("project").unwrap();
         let project_pos = cells(&status_row[..project_byte]) + 1;
-        let project_end = project_pos + cells("W:project") - 1;
+        let project_end = project_pos + cells("project") - 1;
         pty.send(&format!(
             "\x1b[<0;{project_pos};26M\x1b[<32;{project_end};26M\x1b[<0;{project_end};26m"
         ));
         pty.wait_for("characters to clipboard.");
-        assert_eq!(fs::read_to_string(&copied_file).unwrap(), "W:project");
+        assert_eq!(fs::read_to_string(&copied_file).unwrap(), "project");
 
         // 5. Scrolling up shows centered "[ ↓ Jump to bottom ]" above prompt, and clicking it jumps back to bottom.
         pty.send("\x1b[<64;10;5M\x1b[<64;10;5M");
@@ -1377,7 +1377,7 @@ mod unix_pty {
             ("NO_COLOR", None),
         ];
         let mut pty = PtyHarness::spawn(&binary, &state, &workspace, &env);
-        pty.wait_for("W:project");
+        pty.wait_for("project");
 
         // Typing `@` shows >5 matches with `more`, and typing `dd` narrows matches without shifting composer row.
         pty.send("@");
@@ -1458,7 +1458,7 @@ mod unix_pty {
 
         // Session 1: starts in non-temp CHAT mode, enables Temp via `/temp` menu, submits turn.
         let mut pty1 = PtyHarness::spawn(&binary, &state, &workspace, &env);
-        let initial_out = pty1.wait_for("W:project");
+        let initial_out = pty1.wait_for("project");
         let row26_initial = screen_row(&initial_out, 26);
         assert!(row26_initial.contains("CHAT"));
         assert!(!row26_initial.contains("TEMP"));
@@ -1483,10 +1483,10 @@ mod unix_pty {
         // persists normal mode back to disk.
         let mut pty2 = PtyHarness::spawn(&binary, &state, &workspace, &env);
         let relaunched_out = pty2.wait_for("TEMP");
-        let relaunched_out = if screen_row(&relaunched_out, 26).contains("W:project") {
+        let relaunched_out = if screen_row(&relaunched_out, 26).contains("project") {
             relaunched_out
         } else {
-            pty2.wait_for("W:project")
+            pty2.wait_for("project")
         };
         assert!(!frame(&relaunched_out).contains("Describe a task to begin."));
         assert!(screen_row(&relaunched_out, 26).contains("CHAT · TEMP"));
@@ -1511,7 +1511,7 @@ mod unix_pty {
 
         // Session 3: relaunched without flags stays in persisted non-temp mode.
         let mut pty3 = PtyHarness::spawn(&binary, &state, &workspace, &env);
-        let persisted_off_out = pty3.wait_for("W:project");
+        let persisted_off_out = pty3.wait_for("project");
         let row26_off = screen_row(&persisted_off_out, 26);
         assert!(row26_off.contains("CHAT"));
         assert!(!row26_off.contains("TEMP"));
@@ -1524,10 +1524,10 @@ mod unix_pty {
         // Session 4: relaunched with `--temp` enables temporary mode for this run over saved `/temp off`.
         let mut pty4 = PtyHarness::spawn_with_args(&binary, &state, &workspace, &["--temp"], &env);
         let override_out = pty4.wait_for("TEMP");
-        let override_out = if screen_row(&override_out, 26).contains("W:project") {
+        let override_out = if screen_row(&override_out, 26).contains("project") {
             override_out
         } else {
-            pty4.wait_for("W:project")
+            pty4.wait_for("project")
         };
         assert!(screen_row(&override_out, 26).contains("CHAT · TEMP"));
         pty4.send("fifth cli temp override prompt\r");
@@ -1561,7 +1561,7 @@ mod unix_pty {
 
         // Session 1: default CHAT mode toggles CHAT <-> AGENT via Shift+Tab (CSI Z = `\x1b[Z`).
         let mut pty1 = PtyHarness::spawn(&binary, &state, &workspace, &env);
-        let init1 = pty1.wait_for("W:project");
+        let init1 = pty1.wait_for("project");
         assert!(screen_row(&init1, 26).contains("CHAT"));
 
         pty1.send("\x1b[Z");
@@ -1616,7 +1616,7 @@ mod unix_pty {
 
         // Session 2: explicit `--yolo` CLI launch arms CHAT <-> YOLO immediately.
         let mut pty2 = PtyHarness::spawn_with_args(&binary, &state, &workspace, &["--yolo"], &env);
-        let init2 = pty2.wait_for("W:project");
+        let init2 = pty2.wait_for("project");
         assert!(screen_row(&init2, 26).contains(" · YOLO · "));
 
         pty2.send("\x1b[Z");

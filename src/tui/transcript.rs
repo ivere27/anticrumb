@@ -709,11 +709,17 @@ impl Transcript {
                 cache.stream_pending_highlight = false;
             } else {
                 let prose = crate::tool_codec::visible_prose(stream);
-                cache.visible_stream_len = prose.len();
-                let (rendered_stream, needs_hl) =
-                    markdown::lines_with_highlights(&prose, w, Some(highlights), false);
-                cache.stream = Rc::new(rendered_stream);
-                cache.stream_pending_highlight = needs_hl;
+                if prose.trim().is_empty() {
+                    cache.stream = Rc::new(Vec::new());
+                    cache.visible_stream_len = 0;
+                    cache.stream_pending_highlight = false;
+                } else {
+                    cache.visible_stream_len = prose.len();
+                    let (rendered_stream, needs_hl) =
+                        markdown::lines_with_highlights(&prose, w, Some(highlights), false);
+                    cache.stream = Rc::new(rendered_stream);
+                    cache.stream_pending_highlight = needs_hl;
+                }
             }
             cache.stream_highlight_rev = hl_rev;
             cache.stream_text.clear();
@@ -1018,6 +1024,83 @@ mod tests {
         t.clear();
         assert_eq!(t.lines("", 60).visible_stream_len(), 0);
         assert_eq!(t.lines("", 60).evicted_lines(), 0);
+    }
+
+    #[test]
+    fn tool_call_only_or_blank_stream_emits_no_phantom_blank_line() {
+        let t = Transcript::default();
+        let mut blocks = ToolBlockStore::default();
+        blocks.on_tool_started(1, 0, "run_shell".into(), json!({"command": "ls"}), true);
+        blocks.on_tool_finished(1, 0, "run_shell", true, "ok".into(), 5);
+        let empty_approvals = VecDeque::new();
+        let hl = HighlightCache::default();
+        let split =
+            HorizontalSplit::compute(120, &super::super::layout::InspectorConfig::default())
+                .expect("inline split at 120 cols");
+        let split_key = SplitCacheKey {
+            block_left_width: usize::from(split.left.len),
+            split_active: true,
+            inline_split_left: split.left.len,
+            inline_split_right: split.right.len,
+            after_turn: AfterTurnPolicy::Fit,
+            min_block_rows: inspector::sealed_expanded_block_rows(24),
+        };
+
+        let baseline = t.lines_with_blocks(
+            "",
+            120,
+            &blocks,
+            &empty_approvals,
+            split_key,
+            Some(split),
+            24,
+            "⠋",
+            &hl,
+        );
+        for hidden_stream in [
+            "[TOOL_CALL",
+            "[TOOL_CALL]\n{\"tool\":\"read\"}",
+            "\n[TOOL_CALL]\n{\"tool\":\"read\"}\n[/TOOL_CALL]\n",
+            "   \n  ",
+        ] {
+            let rendered = t.lines_with_blocks(
+                hidden_stream,
+                120,
+                &blocks,
+                &empty_approvals,
+                split_key,
+                Some(split),
+                24,
+                "⠋",
+                &hl,
+            );
+            assert_eq!(
+                rendered.len(),
+                baseline.len(),
+                "hidden stream {hidden_stream:?} must not append a phantom blank row"
+            );
+            assert_eq!(rendered.visible_stream_len(), 0);
+            assert_eq!(
+                rendered.to_vec().last(),
+                baseline.to_vec().last(),
+                "active block bottom border must stay anchored for {hidden_stream:?}"
+            );
+        }
+
+        // Non-empty prose still renders normally.
+        let with_prose = t.lines_with_blocks(
+            "Checking file\n[TOOL_CALL]\n{\"tool\":\"read\"}",
+            120,
+            &blocks,
+            &empty_approvals,
+            split_key,
+            Some(split),
+            24,
+            "⠋",
+            &hl,
+        );
+        assert!(with_prose.visible_stream_len() > 0);
+        assert_ne!(with_prose.to_vec().last(), baseline.to_vec().last());
     }
 
     #[test]

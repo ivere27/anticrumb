@@ -129,6 +129,17 @@ impl ScrollBottomBadge {
     }
 }
 
+pub type ApprovalButtonsHitbox = (u16, Option<(u16, u16)>, Option<(u16, u16)>);
+
+struct InspectorSelectionTarget {
+    rect: super::layout::Rect,
+    header_rows: u16,
+    body_rows: usize,
+    body_start: usize,
+    lines: Vec<markdown::Line>,
+    inline_target: Option<BlockId>,
+}
+
 pub(super) struct State {
     pub options: PromptOptions,
     /// Whether `Shift+Tab` toggles `CHAT <-> YOLO` instead of `CHAT <-> AGENT`.
@@ -202,6 +213,7 @@ pub(super) struct State {
     pub painted_size: (u16, u16),
     pub painted_layout: Option<FrameLayout>,
     pub scroll_bottom_button: Option<(u16, u16, u16)>,
+    pub approval_buttons: Option<ApprovalButtonsHitbox>,
     pub layout: LayoutConfig,
     pub tool_blocks: ToolBlockStore,
     pub highlights: HighlightCache,
@@ -312,6 +324,7 @@ impl State {
             painted_size: (0, 0),
             painted_layout: None,
             scroll_bottom_button: None,
+            approval_buttons: None,
             layout: LayoutConfig::default(),
             tool_blocks: ToolBlockStore::default(),
             highlights: HighlightCache::default(),
@@ -3552,6 +3565,45 @@ impl State {
         self.divider_drag = false;
         self.painted_layout = None;
         self.scroll_bottom_button = None;
+        self.approval_buttons = None;
+    }
+
+    pub(super) fn approval_mouse(
+        &mut self,
+        mouse: event::MouseEvent,
+        sink: &mut dyn EffectSink,
+    ) -> bool {
+        if self.tool_approvals.is_empty()
+            || self.menu.is_some()
+            || self.history_clear_confirmation.is_some()
+            || self.shortcuts_open
+        {
+            return false;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return false;
+        }
+        let Some((row, approve, reject)) = self.approval_buttons else {
+            return false;
+        };
+        if mouse.row != row {
+            return false;
+        }
+        let decision = if approve.is_some_and(|(s, e)| mouse.column >= s && mouse.column < e) {
+            Some(true)
+        } else if reject.is_some_and(|(s, e)| mouse.column >= s && mouse.column < e) {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(approved) = decision else {
+            return false;
+        };
+        self.clear_selection();
+        self.last_click = None;
+        self.clipboard_notice = None;
+        self.respond_tool_approval(approved, sink);
+        true
     }
 
     pub(super) fn scroll_wheel(&mut self, up: bool, width: usize, height: usize) {
@@ -3897,13 +3949,16 @@ impl State {
     fn start_inspector_selection(
         &mut self,
         mouse: event::MouseEvent,
-        rect: super::layout::Rect,
-        header_rows: u16,
-        body_rows: usize,
-        body_start: usize,
-        lines: Vec<markdown::Line>,
-        inline_target: Option<BlockId>,
+        target: InspectorSelectionTarget,
     ) {
+        let InspectorSelectionTarget {
+            rect,
+            header_rows,
+            body_rows,
+            body_start,
+            lines,
+            inline_target,
+        } = target;
         let body_top = rect.row.start.saturating_add(header_rows);
         let body_bottom = body_top.saturating_add(body_rows as u16);
         if body_rows == 0 || mouse.row < body_top || mouse.row >= body_bottom {
@@ -4029,28 +4084,19 @@ impl State {
 
                 // 3. Alt+Z fullscreen zoom overlay body selection.
                 if self.inspector_zoom {
-                    if let Some((rect, header_rows, body_rows, body_start, lines)) =
-                        self.painted_inspector.as_ref().and_then(|pane| {
-                            pane.rect.contains(mouse.column, mouse.row).then(|| {
-                                (
-                                    pane.rect,
-                                    pane.header_rows,
-                                    pane.body_rows,
-                                    pane.body_start,
-                                    (*pane.detail_lines).clone(),
-                                )
-                            })
+                    if let Some(target) = self.painted_inspector.as_ref().and_then(|pane| {
+                        pane.rect.contains(mouse.column, mouse.row).then(|| {
+                            InspectorSelectionTarget {
+                                rect: pane.rect,
+                                header_rows: pane.header_rows,
+                                body_rows: pane.body_rows,
+                                body_start: pane.body_start,
+                                lines: (*pane.detail_lines).clone(),
+                                inline_target: None,
+                            }
                         })
-                    {
-                        self.start_inspector_selection(
-                            mouse,
-                            rect,
-                            header_rows,
-                            body_rows,
-                            body_start,
-                            lines,
-                            None,
-                        );
+                    }) {
+                        self.start_inspector_selection(mouse, target);
                     } else {
                         self.clear_selection();
                         self.last_click = None;
@@ -4059,62 +4105,49 @@ impl State {
                 }
 
                 // 4. Side mode right Inspector selection.
-                if let Some((block_id, rect, header_rows, body_rows, body_start, lines)) =
-                    self.painted_inspector.as_ref().and_then(|pane| {
-                        pane.rect.contains(mouse.column, mouse.row).then(|| {
-                            (
-                                pane.block_id,
-                                pane.rect,
-                                pane.header_rows,
-                                pane.body_rows,
-                                pane.body_start,
-                                (*pane.detail_lines).clone(),
-                            )
-                        })
+                if let Some((block_id, target)) = self.painted_inspector.as_ref().and_then(|pane| {
+                    pane.rect.contains(mouse.column, mouse.row).then(|| {
+                        (
+                            pane.block_id,
+                            InspectorSelectionTarget {
+                                rect: pane.rect,
+                                header_rows: pane.header_rows,
+                                body_rows: pane.body_rows,
+                                body_start: pane.body_start,
+                                lines: (*pane.detail_lines).clone(),
+                                inline_target: None,
+                            },
+                        )
                     })
-                {
+                }) {
                     self.tool_blocks.set_focused(block_id);
-                    self.start_inspector_selection(
-                        mouse,
-                        rect,
-                        header_rows,
-                        body_rows,
-                        body_start,
-                        lines,
-                        None,
-                    );
+                    self.start_inspector_selection(mouse, target);
                     return None;
                 }
 
                 // 5. Inline ToolBlock right Inspector selection or left list item / collapse click.
-                if let Some((block_id, rect, header_rows, body_rows, body_start, lines)) =
-                    self.painted_blocks.iter().find_map(|pb| {
-                        let rect = pb.inspector_rect?;
-                        rect.contains(mouse.column, mouse.row).then(|| {
-                            (
-                                pb.block_id,
+                if let Some((block_id, target)) = self.painted_blocks.iter().find_map(|pb| {
+                    let rect = pb.inspector_rect?;
+                    rect.contains(mouse.column, mouse.row).then(|| {
+                        (
+                            pb.block_id,
+                            InspectorSelectionTarget {
                                 rect,
-                                pb.inspector_header_rows,
-                                pb.inspector_body_rows,
-                                pb.inspector_body_start,
-                                pb.inspector_detail_lines
+                                header_rows: pb.inspector_header_rows,
+                                body_rows: pb.inspector_body_rows,
+                                body_start: pb.inspector_body_start,
+                                lines: pb
+                                    .inspector_detail_lines
                                     .as_ref()
                                     .map(|d| (**d).clone())
                                     .unwrap_or_default(),
-                            )
-                        })
+                                inline_target: Some(pb.block_id),
+                            },
+                        )
                     })
-                {
+                }) {
                     self.tool_blocks.set_focused(block_id);
-                    self.start_inspector_selection(
-                        mouse,
-                        rect,
-                        header_rows,
-                        body_rows,
-                        body_start,
-                        lines,
-                        Some(block_id),
-                    );
+                    self.start_inspector_selection(mouse, target);
                     return None;
                 }
 

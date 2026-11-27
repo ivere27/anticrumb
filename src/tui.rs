@@ -625,7 +625,7 @@ mod tests {
             .logs()
             .contains("Daemon: remote https://browser.example:50051 · connected"));
         let remote_footer = state.status_text(100);
-        assert!(remote_footer.ends_with("D:remote(browser.example:50051)"));
+        assert!(remote_footer.ends_with("remote(browser.example:50051)"));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(remote_footer.as_str()),
             100
@@ -648,7 +648,7 @@ mod tests {
         state.editor.set("unfinished work".into());
         state.update(Update::StatusDisconnected);
         let offline_footer = state.status_text(100);
-        assert!(offline_footer.ends_with("D:remote/offline(browser.example:50051)"));
+        assert!(offline_footer.ends_with("remote/offline(browser.example:50051)"));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(offline_footer.as_str()),
             100
@@ -692,7 +692,7 @@ mod tests {
             }
         })));
         let connected = state.status_text(110);
-        assert!(connected.ends_with("  D:remote(192.168.1.10:50051)"));
+        assert!(connected.ends_with("  remote(192.168.1.10:50051)"));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(connected.as_str()),
             110
@@ -712,7 +712,7 @@ mod tests {
             }
         })));
         let remote_down = state.status_text(110);
-        assert!(remote_down.ends_with("  D:remote/offline(192.168.1.10:50051)"));
+        assert!(remote_down.ends_with("  remote/offline(192.168.1.10:50051)"));
         assert_eq!(
             state.status_spans(110).last().unwrap().1,
             markdown::Face::DANGER_BOLD
@@ -731,7 +731,7 @@ mod tests {
             footer_ansi.contains(&danger_fg),
             "disconnected daemon badge must use theme danger color"
         );
-        assert!(footer_ansi.contains("D:remote/offline(192.168.1.10:50051)"));
+        assert!(footer_ansi.contains("remote/offline(192.168.1.10:50051)"));
 
         // IPv6 endpoint and local disconnect also align right and use danger color.
         state.update(Update::Status(json!({
@@ -741,7 +741,7 @@ mod tests {
                 "connected": true
             }
         })));
-        assert!(state.status_text(110).ends_with("  D:remote([::1]:50051)"));
+        assert!(state.status_text(110).ends_with("  remote([::1]:50051)"));
 
         state.update(Update::Status(json!({
             "browser_connection": {
@@ -750,13 +750,13 @@ mod tests {
                 "connected": true
             }
         })));
-        assert!(state.status_text(110).ends_with("  D:local"));
+        assert!(state.status_text(110).ends_with("  local"));
         assert_eq!(
             state.status_spans(110).last().unwrap().1,
             markdown::Face::MUTED
         );
         state.update(Update::StatusDisconnected);
-        assert!(state.status_text(110).ends_with("  D:local/offline"));
+        assert!(state.status_text(110).ends_with("  local/offline"));
         assert_eq!(
             state.status_spans(110).last().unwrap().1,
             markdown::Face::DANGER_BOLD
@@ -775,7 +775,7 @@ mod tests {
             .starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm"));
         // When right-aligned daemon badge is omitted on narrow terminals, remaining space renders left items.
         let narrow_52 = state.status_text(52);
-        assert!(narrow_52.starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm · M:"));
+        assert!(narrow_52.starts_with("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm · "));
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(narrow_52.as_str()),
             52
@@ -800,7 +800,7 @@ mod tests {
             .logs()
             .contains("Daemon: remote https://100.121.6.125:50051/ (🦍🐆🦇🐪) · connected"));
         let footer = state.status_text(110);
-        assert!(footer.ends_with("  D:remote(100.121.6.125:50051)"));
+        assert!(footer.ends_with("  remote(100.121.6.125:50051)"));
         assert!(!footer.contains("🦍"));
 
         state.update(Update::StatusDisconnected);
@@ -1180,15 +1180,15 @@ mod tests {
         };
         let mut state = State::new(options);
         state.options.model = Some("chosen".into());
-        assert!(state.status_text(100).contains("M:chosen"));
+        assert!(state.status_text(100).contains("chosen"));
         state.active_model = Some("actual".into());
         state.in_chars = 123;
         state.out_chars = 45;
         let footer = state.status_text(100);
-        assert!(footer.contains("M:actual"));
-        assert!(footer.contains("W:work"));
+        assert!(footer.contains("actual"));
+        assert!(footer.contains("work"));
         assert!(footer.contains("U:123/45c T:?"));
-        assert!(!footer.contains("M:chosen"));
+        assert!(!footer.contains("chosen"));
     }
 
     #[test]
@@ -3515,7 +3515,7 @@ mod tests {
         let msg = super::input_loop::exit_conversation_message("job-normal", &state);
         assert_eq!(
             msg,
-            "Session saved. Continue with: anticrumb resume job-normal"
+            "Session saved. Continue with: anticrumb --resume job-normal"
         );
 
         // 2. Run `/new` then send a temporary turn, toggle `/temp off` right before exit ->
@@ -3541,7 +3541,7 @@ mod tests {
         let msg_active_temp = super::input_loop::exit_conversation_message("job-temp", &state);
         assert_eq!(
             msg_active_temp,
-            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb resume job-temp"
+            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb --resume job-temp"
         );
 
         // 3. gRPC remote session with temporary mode includes the temporary note too.
@@ -3551,7 +3551,7 @@ mod tests {
         let msg_grpc_temp = super::input_loop::exit_conversation_message("job-temp", &state);
         assert_eq!(
             msg_grpc_temp,
-            "Session saved (temporary mode: not stored on provider server). Reconnect with `anticrumb connect`, then use `/resume job-temp`."
+            "Session saved (temporary mode: not stored on provider server). Continue with: anticrumb connect --resume job-temp"
         );
     }
 
@@ -5805,7 +5805,34 @@ mod tests {
         assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
         assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
 
-        // Empty composer `←` switches to previous tool #0 (follow_tool = false).
+        // Pressing `→` while already in Live Feed stays pinned in Live Feed.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+
+        // Empty composer `←` from Live Feed steps to the latest (max) tool #1 (follow_tool = false),
+        // then another `←` moves to tool #0, and further `←` stays clamped at #0.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -5816,7 +5843,7 @@ mod tests {
         assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
         assert!(state.editor.text.is_empty());
 
-        // Pressing `→` steps to last tool #1 (still manual), then `→` once more re-engages live Follow!
+        // Pressing `→` steps to last tool #1 (manual), then `→` enters Live Feed, and repeated `→` stays pinned!
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
@@ -5832,6 +5859,15 @@ mod tests {
         )
         .unwrap();
         assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
 
         // Non-empty composer keeps `←`/`→` purely for cursor movement without altering Inspector.
         state.editor.set("draft".into());
@@ -5854,7 +5890,16 @@ mod tests {
         assert!(!state.inspector_zoom);
         state.editor.set(String::new());
 
-        // Move back to tool #0 (50 lines) and verify Alt+Up / Alt+PgDn scroll + Alt+L Follow toggle.
+        // Move back to tool #0 (50 lines): Live Feed -> Left (#1) -> Left (#0),
+        // then verify Alt+Up / Alt+PgDn scroll + Alt+L Follow toggle.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -5892,7 +5937,14 @@ mod tests {
         assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
         assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
 
-        // Select tool #0 again and verify Alt+I toggles Off <-> Inline without losing manual selection.
+        // Select tool #0 again (Live Feed -> Left (#1) -> Left (#0)) and verify Alt+I toggles Off <-> Inline without losing manual selection.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -6001,13 +6053,21 @@ mod tests {
         );
         state.editor.set(String::new());
 
-        // SelectionTarget::Inspector drag selects Inspector body text (single-tool view on tool #0).
+        // SelectionTarget::Inspector drag selects Inspector body text (single-tool view on tool #0: Live Feed -> #1 -> #0).
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             &mut tx,
         )
         .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 1);
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 0);
         out.clear();
         state.render_frame(&mut out, 120, 24).unwrap();
         let painted = state.painted_blocks.last().unwrap().clone();
@@ -7054,9 +7114,9 @@ mod tests {
             "browser_connection": {"transport": "local", "endpoint": "", "connected": true}
         })));
 
-        // Idle + empty composer shows `? for shortcuts` before right-aligned `  D:local`.
+        // Idle + empty composer shows `? for shortcuts` before right-aligned `  local`.
         let idle_120 = state.status_text(120);
-        assert!(idle_120.contains("? for shortcuts  D:local"), "{idle_120}");
+        assert!(idle_120.contains("? for shortcuts  local"), "{idle_120}");
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(idle_120.as_str()),
             120
@@ -7068,7 +7128,7 @@ mod tests {
 
         // Even on an 80-col terminal (or 120-col with long quota), `? for shortcuts` remains visible.
         let idle_80 = state.status_text(80);
-        assert!(idle_80.contains("? for shortcuts  D:local"), "{idle_80}");
+        assert!(idle_80.contains("? for shortcuts  local"), "{idle_80}");
         assert_eq!(unicode_width::UnicodeWidthStr::width(idle_80.as_str()), 80);
 
         // Typing into the composer hides the idle shortcut hint.
@@ -7234,5 +7294,228 @@ mod tests {
         state.editor.set("/help".into());
         state.submit(&mut tx);
         assert!(state.logs().contains("Toggle shortcuts panel"));
+    }
+
+    #[test]
+    fn model_menu_renders_current_marker_and_thinking_level_slider() {
+        let mut state = State::new(PromptOptions {
+            model: Some("hydrogen".into()),
+            thinking: Some("high".into()),
+            ..PromptOptions::default()
+        });
+        let (mut tx, _rx) = mpsc::sync_channel(4);
+        state.catalog = json!({
+            "models": [
+                {"mode_id": "neon", "sublabel": "4 Neon", "label": "Fast"},
+                {"mode_id": "hydrogen", "sublabel": "4 Hydrogen", "label": "Balanced", "selected": true},
+                {"mode_id": "flash", "sublabel": "3.8 Flash", "label": "Instant"}
+            ],
+            "model_thinking": {
+                "neon": [
+                    {"level": "low", "label": "Low"},
+                    {"level": "medium", "label": "Medium"},
+                    {"level": "high", "label": "High"}
+                ],
+                "hydrogen": [
+                    {"level": "low", "label": "Low"},
+                    {"level": "medium", "label": "Medium"},
+                    {"level": "high", "label": "High"},
+                    {"level": "xhigh", "label": "XHigh"}
+                ],
+                "flash": []
+            },
+            "thinking": [
+                {"level": "medium", "label": "Medium", "selected": true}
+            ]
+        });
+
+        state.open_models();
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 90, 24).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(frame.contains("Model · ↑↓ model"));
+        assert!(frame.contains("4 Hydrogen · Balanced  (current)"));
+        assert!(frame.contains("Thinking"));
+        assert!(frame.contains("●"));
+        assert!(frame.contains("◉"));
+        assert!(frame.contains("○"));
+        assert!(frame.contains("Low"));
+        assert!(frame.contains("Medium"));
+        assert!(frame.contains("High"));
+        assert!(frame.contains("XHigh"));
+
+        // Pressing Right shifts Hydrogen from High -> XHigh (no trailing hollow `○`).
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 90, 24).unwrap();
+        let at_max = String::from_utf8(out).unwrap();
+        assert!(at_max.contains("◉"));
+        assert!(!at_max.contains("○"));
+
+        // Narrow terminal falls back cleanly to 1-line compact strip showing all levels.
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 46, 24).unwrap();
+        let narrow = String::from_utf8(out).unwrap();
+        assert!(narrow.contains("Thinking"));
+        assert!(narrow.contains("[XHigh]"));
+        assert!(narrow.contains("Low"));
+
+        // Moving down to Flash (no thinking levels) shows Unavailable cleanly.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut tx,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 90, 24).unwrap();
+        let flash_frame = String::from_utf8(out).unwrap();
+        assert!(flash_frame.contains("Thinking"));
+        assert!(flash_frame.contains("Unavailable"));
+    }
+
+    #[test]
+    fn tool_approval_buttons_are_clickable_and_alt_y_n_work_while_drafting() {
+        let mut state = State::new(PromptOptions::default());
+        let (mut tx, rx) = mpsc::sync_channel(8);
+        state.active = Some("run-click".into());
+        state.editor.set("typing follow-up prompt".into());
+        for (idx, id) in ["ap-1", "ap-2", "ap-3"].into_iter().enumerate() {
+            state.update(Update::Event(crate::domain::Event {
+                sequence: idx as i64 + 1,
+                run_id: "run-click".into(),
+                kind: "tool_approval_requested".into(),
+                data: json!({
+                    "id": id,
+                    "step": idx + 1,
+                    "calls": [{"tool": "run_shell", "args": {"command": "echo hi"}}]
+                }),
+                at: idx as i64 + 1,
+            }));
+        }
+
+        let mut out = Vec::new();
+        state.render_frame(&mut out, 100, 24).unwrap();
+        let (row, approve, reject) = state
+            .approval_buttons
+            .expect("approval hitboxes must be populated");
+        let (ay_start, ay_end) = approve.expect("approve hitbox");
+        let (rn_start, rn_end) = reject.expect("reject hitbox");
+        assert!(ay_end < rn_start, "gap between Approve and Reject buttons");
+
+        // Clicking the gap between [Y] Approve and [N] Reject does not trigger approval.
+        let gap_mouse = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: ay_end,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!state.approval_mouse(gap_mouse, &mut tx));
+        assert!(rx.try_recv().is_err());
+
+        // Clicking green [Y] Approve approves ap-1 while keeping composer draft intact.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: ay_start + 1,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: true,
+                ..
+            } if approval_id == "ap-1"
+        ));
+        assert_eq!(state.editor.text, "typing follow-up prompt");
+
+        // Re-render and click red [N] Reject -> rejects ap-2 while keeping draft intact.
+        out.clear();
+        state.render_frame(&mut out, 100, 24).unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rn_start + 1,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: false,
+                ..
+            } if approval_id == "ap-2"
+        ));
+        assert_eq!(state.editor.text, "typing follow-up prompt");
+
+        // Alt+Y approves ap-3 even while draft text is in the composer.
+        super::input_loop::handle_input(
+            &mut state,
+            event::Event::Key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT)),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::ApproveTool {
+                approval_id,
+                approved: true,
+                ..
+            } if approval_id == "ap-3"
+        ));
+        assert_eq!(state.editor.text, "typing follow-up prompt");
+        assert!(rn_end > rn_start);
+    }
+
+    #[test]
+    fn footer_shows_peer_workspace_ascii_alerts_next_to_daemon_and_filters_self() {
+        let mut state = State::new(PromptOptions {
+            workspace: std::path::PathBuf::from("/tmp/k/a"),
+            ..PromptOptions::default()
+        });
+        state.status = json!({
+            "browser_connection": {"transport": "local", "connected": true},
+            "accounts": [{"id": "acc", "provider": "gemini-web", "state": "ready", "active": true}],
+            "workspace_alerts": [
+                {"workspace": "/tmp/k/a", "agent_id": "own", "kind": "approval", "count": 1, "updated_at": 100},
+                {"workspace": "/tmp/b", "agent_id": "ag-b", "kind": "approval", "count": 2, "updated_at": 90},
+                {"workspace": "/tmp/k/c", "agent_id": "ag-c", "kind": "failed", "count": 1, "updated_at": 80},
+                {"workspace": "/tmp/k/d", "agent_id": "ag-d", "kind": "completed", "count": 1, "updated_at": 70}
+            ]
+        });
+
+        let bar = state.status_text(120);
+        assert!(!bar.contains("?a"), "own workspace must be excluded: {bar}");
+        assert!(
+            bar.contains("?b !c +1  local"),
+            "expected peer ASCII alerts right next to daemon badge, got: {bar}"
+        );
+
+        // Duplicate basenames disambiguate with parent dir; completed shows `*`.
+        state.status["workspace_alerts"] = json!([
+            {"workspace": "/tmp/k/app", "agent_id": "ag-1", "kind": "approval", "count": 1, "updated_at": 90},
+            {"workspace": "/tmp/work/app", "agent_id": "ag-2", "kind": "completed", "count": 1, "updated_at": 80}
+        ]);
+        let dup_bar = state.status_text(120);
+        assert!(
+            dup_bar.contains("?k/app *work/app  local"),
+            "expected disambiguated basenames with `*` for completed, got: {dup_bar}"
+        );
     }
 }

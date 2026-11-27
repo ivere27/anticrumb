@@ -230,6 +230,85 @@ impl State {
             .collect()
     }
 
+    fn peer_workspace_alert_spans(&self) -> Vec<(String, Face)> {
+        let Some(alerts) = self.status["workspace_alerts"].as_array() else {
+            return Vec::new();
+        };
+        if alerts.is_empty() {
+            return Vec::new();
+        }
+        let own_raw = self.options.workspace.to_string_lossy().into_owned();
+        let own_canon = std::fs::canonicalize(&self.options.workspace)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+
+        let mut peers: Vec<(&str, &str)> = Vec::new();
+        for alert in alerts {
+            let Some(ws) = alert["workspace"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if ws == own_raw || own_canon.as_deref() == Some(ws) {
+                continue;
+            }
+            let Some(kind) = alert["kind"].as_str() else {
+                continue;
+            };
+            if !matches!(kind, "approval" | "attention" | "failed" | "completed") {
+                continue;
+            }
+            peers.push((ws, kind));
+        }
+        if peers.is_empty() {
+            return Vec::new();
+        }
+
+        let basename = |ws: &str| -> String {
+            std::path::Path::new(ws)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ws.to_owned())
+        };
+        let mut name_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for &(ws, _) in &peers {
+            *name_counts.entry(basename(ws)).or_insert(0) += 1;
+        }
+        let nickname = |ws: &str| -> String {
+            let base = basename(ws);
+            if name_counts.get(&base).copied().unwrap_or(0) > 1 {
+                if let Some(parent) = std::path::Path::new(ws)
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                {
+                    return clip(&format!("{parent}/{base}"), 14);
+                }
+            }
+            clip(&base, 12)
+        };
+
+        let shown = peers.len().min(2);
+        let mut out = Vec::new();
+        for (idx, &(ws, kind)) in peers.iter().take(shown).enumerate() {
+            if idx > 0 {
+                out.push((" ".into(), Face::MUTED));
+            }
+            let (icon, face) = match kind {
+                "approval" => ("?", Face::ACCENT_BOLD),
+                "attention" | "failed" => ("!", Face::DANGER_BOLD),
+                "completed" => ("*", Face::HIGHLIGHT_BOLD),
+                _ => continue,
+            };
+            out.push((format!("{icon}{}", nickname(ws)), face));
+        }
+        if peers.len() > shown {
+            out.push((format!(" +{}", peers.len() - shown), Face::MUTED));
+        }
+        out
+    }
+
     pub(super) fn status_spans(&self, width: usize) -> Vec<(String, Face)> {
         let path = if width >= 130 {
             self.options.workspace.display().to_string()
@@ -317,21 +396,18 @@ impl State {
             }
         };
         let daemon_text = match (daemon, self.daemon_remote_addr()) {
-            ("remote" | "remote/offline", Some(addr)) => format!("D:{daemon}({addr})"),
-            _ => format!("D:{daemon}"),
+            ("remote" | "remote/offline", Some(addr)) => format!("{daemon}({addr})"),
+            _ => daemon.to_owned(),
         };
         let priority_w = spans_width(&parts);
 
         push_sep(&mut parts);
         parts.push((
-            format!(
-                "M:{}",
-                clip(self.model_label(), if width < 100 { 12 } else { 24 })
-            ),
+            clip(self.model_label(), if width < 100 { 12 } else { 24 }),
             Face::ACCENT,
         ));
         parts.push((" · ".into(), Face::MUTED));
-        parts.push((format!("E:{}", clip(self.thinking_label(), 8)), Face::MUTED));
+        parts.push((clip(self.thinking_label(), 8), Face::MUTED));
         parts.push((" · ".into(), Face::MUTED));
         if !self.options.agent {
             parts.push(("CHAT".into(), Face::ACCENT));
@@ -356,10 +432,7 @@ impl State {
             ));
         }
         parts.push((" · ".into(), Face::MUTED));
-        parts.push((
-            format!("W:{}", clip(&path, if width < 100 { 10 } else { 32 })),
-            Face::TEXT,
-        ));
+        parts.push((clip(&path, if width < 100 { 10 } else { 32 }), Face::TEXT));
         parts.push((" · ".into(), Face::MUTED));
         parts.push((
             format!("U:{}/{}c T:?", self.in_chars, self.out_chars),
@@ -408,8 +481,21 @@ impl State {
         if width == 0 {
             return Vec::new();
         }
+        let peer_alerts = self.peer_workspace_alert_spans();
         let right_text = clip(&daemon_text, width);
-        let right_w = right_text.width();
+        let mut right_parts: Vec<(String, Face)> = Vec::new();
+        if !peer_alerts.is_empty() {
+            let alert_budget = width.saturating_sub(right_text.width() + 2);
+            if alert_budget >= 3 {
+                let clipped_alerts = clip_spans(peer_alerts, alert_budget);
+                if !clipped_alerts.is_empty() {
+                    right_parts.extend(clipped_alerts);
+                    right_parts.push(("  ".into(), Face::MUTED));
+                }
+            }
+        }
+        right_parts.push((right_text, daemon_face));
+        let right_w = spans_width(&right_parts);
         let reserved_right = right_w + 2;
         if priority_w > 0 && priority_w + reserved_right > width {
             let left_max = priority_w.min(width);
@@ -418,14 +504,14 @@ impl State {
             if left_w + 2 + right_w <= width {
                 let pad = width - left_w - right_w;
                 left.push((" ".repeat(pad), Face::MUTED));
-                left.push((right_text, daemon_face));
+                left.extend(right_parts);
                 return left;
             }
             return clip_spans(parts, width);
         }
         let left_max = width.saturating_sub(reserved_right);
         if left_max == 0 {
-            return vec![(right_text, daemon_face)];
+            return right_parts;
         }
         let full_left_w = spans_width(&parts);
         let chosen_hint: Option<&'static str> = if self.show_footer_shortcut_hint() {
@@ -458,13 +544,13 @@ impl State {
             }
             left.push((label.into(), Face::MUTED));
             left.push(("  ".into(), Face::MUTED));
-            left.push((right_text, daemon_face));
+            left.extend(right_parts);
         } else {
             let pad = width.saturating_sub(left_w + right_w);
             if pad > 0 {
                 left.push((" ".repeat(pad), Face::MUTED));
             }
-            left.push((right_text, daemon_face));
+            left.extend(right_parts);
         }
         left
     }
@@ -1582,6 +1668,7 @@ impl State {
     pub(super) fn render_hint(&mut self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
         if layout.hint.len == 0 {
             self.scroll_bottom_button = None;
+            self.approval_buttons = None;
             if self.selection.is_none() {
                 self.painted_hint.clear();
             }
@@ -1607,6 +1694,26 @@ impl State {
             (line, button)
         };
         self.scroll_bottom_button = button.map(|(start, end)| (layout.hint.start, start, end));
+        self.approval_buttons = if !hint_selected
+            && !self.tool_approvals.is_empty()
+            && self.history_clear_confirmation.is_none()
+        {
+            let mut col = 0u16;
+            let mut approve = None;
+            let mut reject = None;
+            for span in &line {
+                let sw = span.text.width() as u16;
+                if approve.is_none() && span.text.starts_with("[Y]") && sw > 0 {
+                    approve = Some((col, col.saturating_add(sw)));
+                } else if reject.is_none() && span.text.starts_with("[N]") && sw > 0 {
+                    reject = Some((col, col.saturating_add(sw)));
+                }
+                col = col.saturating_add(sw);
+            }
+            (approve.is_some() || reject.is_some()).then_some((layout.hint.start, approve, reject))
+        } else {
+            None
+        };
         let rendered_width: usize = line.iter().map(|s| s.text.width()).sum();
         queue!(out, cursor::MoveTo(0, layout.hint.start)).map_err(ServiceError::storage)?;
         markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
@@ -2140,6 +2247,183 @@ impl State {
         Ok(())
     }
 
+    fn model_thinking_rows(
+        model: &super::model_picker::ModelChoice,
+        width: usize,
+        allow_two_rows: bool,
+    ) -> Vec<markdown::Line> {
+        let n = model.levels.len();
+        if n == 0 || width == 0 {
+            return Vec::new();
+        }
+        let selected = model.selected.min(n - 1);
+        if n == 1 {
+            let level = &model.levels[0];
+            let mut parts: Vec<(String, Face)> = vec![("  Thinking  ".into(), Face::MUTED)];
+            if level.id.is_none() {
+                parts.push((level.label.clone(), Face::MUTED));
+            } else {
+                parts.push(("◉ ".into(), Face::HIGHLIGHT_BOLD));
+                parts.push((level.label.clone(), Face::HIGHLIGHT_BOLD));
+                parts.push(("  (only option)".into(), Face::MUTED));
+            }
+            let clipped = clip_spans(parts, width);
+            return vec![clipped
+                .into_iter()
+                .map(|(text, face)| Span { text, face })
+                .collect()];
+        }
+
+        let left_arrow_face = if selected > 0 {
+            Face::ACCENT
+        } else {
+            Face::SUBTLE
+        };
+        let right_arrow_face = if selected + 1 < n {
+            Face::ACCENT
+        } else {
+            Face::SUBTLE
+        };
+
+        // 2-row visual slider:
+        //   Thinking  ◂      ●━━━━━━━━━━●━━━━━━━━━━◉──────────○      ▸
+        //                   Low       Medium      High       XHigh
+        if allow_two_rows {
+            let prefix_w = 12usize; // "  Thinking  "
+            let left_pad = 3usize; // gap between `◂` and first label left edge
+            let right_pad = 3usize; // gap between last label right edge and `▸`
+            let max_label_w = model
+                .levels
+                .iter()
+                .map(|l| l.label.width())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let min_step = max_label_w + 2;
+            let overhead = prefix_w + 1 + left_pad + right_pad + 1;
+            let avail_for_track = width.saturating_sub(overhead).min(56);
+            let min_needed = (n - 1) * min_step + max_label_w;
+            if avail_for_track >= min_needed {
+                let step =
+                    (avail_for_track.saturating_sub(max_label_w) / (n - 1)).clamp(min_step, 14);
+                let first_center = prefix_w + 1 + left_pad + max_label_w / 2;
+                let centers: Vec<usize> = (0..n).map(|i| first_center + i * step).collect();
+                let last_center = *centers.last().unwrap();
+                let right_chevron_col = last_center + (max_label_w - max_label_w / 2) + right_pad;
+
+                let mut track = Vec::new();
+                track.push(Span {
+                    text: "  Thinking  ".into(),
+                    face: Face::MUTED,
+                });
+                track.push(Span {
+                    text: "◂".into(),
+                    face: left_arrow_face,
+                });
+                let pre_nodes = first_center.saturating_sub(prefix_w + 1);
+                if pre_nodes > 0 {
+                    track.push(Span {
+                        text: " ".repeat(pre_nodes),
+                        face: Face::MUTED,
+                    });
+                }
+                for i in 0..n {
+                    let (node, node_face) = if i == selected {
+                        ("◉", Face::HIGHLIGHT_BOLD)
+                    } else if i < selected {
+                        ("●", Face::ACCENT)
+                    } else {
+                        ("○", Face::MUTED)
+                    };
+                    track.push(Span {
+                        text: node.into(),
+                        face: node_face,
+                    });
+                    if i + 1 < n {
+                        let seg_len = step.saturating_sub(1);
+                        let (seg_ch, seg_face) = if i < selected {
+                            ("━", Face::ACCENT)
+                        } else {
+                            ("─", Face::SUBTLE)
+                        };
+                        track.push(Span {
+                            text: seg_ch.repeat(seg_len),
+                            face: seg_face,
+                        });
+                    }
+                }
+                let post_nodes = right_chevron_col.saturating_sub(last_center + 1);
+                if post_nodes > 0 {
+                    track.push(Span {
+                        text: " ".repeat(post_nodes),
+                        face: Face::MUTED,
+                    });
+                }
+                if right_chevron_col < width {
+                    track.push(Span {
+                        text: "▸".into(),
+                        face: right_arrow_face,
+                    });
+                }
+
+                let mut labels = Vec::new();
+                let mut cursor_col = 0usize;
+                for (i, level) in model.levels.iter().enumerate() {
+                    let lw = level.label.width();
+                    let ideal_start = centers[i].saturating_sub(lw / 2);
+                    let start = if i == 0 {
+                        ideal_start
+                    } else {
+                        ideal_start.max(cursor_col + 1)
+                    };
+                    if start >= width {
+                        break;
+                    }
+                    if start > cursor_col {
+                        labels.push(Span {
+                            text: " ".repeat(start - cursor_col),
+                            face: Face::MUTED,
+                        });
+                    }
+                    let clipped_label = clip(&level.label, width - start);
+                    let cw = clipped_label.width();
+                    labels.push(Span {
+                        text: clipped_label,
+                        face: if i == selected {
+                            Face::HIGHLIGHT_BOLD
+                        } else {
+                            Face::MUTED
+                        },
+                    });
+                    cursor_col = start + cw;
+                }
+                return vec![track, labels];
+            }
+        }
+
+        // Compact 1-row fallback for narrow terminals or tight vertical space.
+        let mut parts: Vec<(String, Face)> = vec![
+            ("  Thinking  ".into(), Face::MUTED),
+            ("◂ ".into(), left_arrow_face),
+        ];
+        for (i, level) in model.levels.iter().enumerate() {
+            if i > 0 {
+                parts.push((" · ".into(), Face::SUBTLE));
+            }
+            if i == selected {
+                parts.push((format!("[{}]", level.label), Face::HIGHLIGHT_BOLD));
+            } else {
+                parts.push((level.label.clone(), Face::MUTED));
+            }
+        }
+        parts.push((" ▸".into(), right_arrow_face));
+        let clipped = clip_spans(parts, width);
+        vec![clipped
+            .into_iter()
+            .map(|(text, face)| Span { text, face })
+            .collect()]
+    }
+
     fn render_menu_overlay(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
         let Some(menu) = &self.menu else {
             return Ok(());
@@ -2147,8 +2431,98 @@ impl State {
         let w = usize::from(layout.width);
         let anchor = layout.transcript.end();
         let top_bound = layout.transcript.start + u16::from(layout.header.len > 0);
-        let max = usize::from(anchor.saturating_sub(top_bound)).min(8);
+        let avail_total = usize::from(anchor.saturating_sub(top_bound));
+        let max = avail_total.min(8);
         if max == 0 {
+            return Ok(());
+        }
+        let is_model_menu = matches!(
+            menu.choices.first().map(|c| &c.value),
+            Some(Selection::Model(_))
+        );
+        if is_model_menu {
+            let selected_model = match menu.choices.get(menu.selected).map(|c| &c.value) {
+                Some(Selection::Model(m)) => Some(m),
+                _ => None,
+            };
+            let allow_two_rows = avail_total >= 5;
+            let thinking_rows = selected_model
+                .map(|m| Self::model_thinking_rows(m, w, allow_two_rows))
+                .unwrap_or_default();
+            let has_divider = !thinking_rows.is_empty() && avail_total >= thinking_rows.len() + 3;
+            let footer_rows = usize::from(has_divider) + thinking_rows.len();
+            let list_cap = avail_total.saturating_sub(1 + footer_rows).clamp(1, 8);
+            let visible_count = menu.choices.len().min(list_cap);
+            let start = menu
+                .selected
+                .saturating_sub(visible_count.saturating_sub(1));
+            let total_height = 1 + visible_count + footer_rows;
+            let top = anchor.saturating_sub(total_height as u16);
+
+            queue!(
+                out,
+                cursor::MoveTo(0, top),
+                style::SetBackgroundColor(self.theme.background),
+                terminal::Clear(ClearType::CurrentLine),
+                style::Print(clip(&format!(" {}", menu.title), w).with(self.theme.accent))
+            )
+            .map_err(ServiceError::storage)?;
+
+            for (i, choice) in menu
+                .choices
+                .iter()
+                .skip(start)
+                .take(visible_count)
+                .enumerate()
+            {
+                let y = top + 1 + i as u16;
+                let selected = start + i == menu.selected;
+                let is_current = matches!(
+                    &choice.value,
+                    Selection::Model(model) if model.is_current
+                );
+                let marker = if selected { "›" } else { " " };
+                let label_text = if is_current {
+                    format!(" {marker} {}  (current)", choice.label)
+                } else {
+                    format!(" {marker} {}", choice.label)
+                };
+                let text = clip(&label_text, w);
+                queue!(
+                    out,
+                    cursor::MoveTo(0, y),
+                    style::SetBackgroundColor(self.theme.background),
+                    terminal::Clear(ClearType::CurrentLine),
+                    style::Print(if selected {
+                        text.with(self.theme.selected_text)
+                            .on(self.theme.selected_background)
+                    } else if is_current {
+                        text.with(self.theme.accent).on(self.theme.background)
+                    } else {
+                        text.with(self.theme.text).on(self.theme.background)
+                    })
+                )
+                .map_err(ServiceError::storage)?;
+            }
+
+            let mut footer_y = top + 1 + visible_count as u16;
+            if has_divider {
+                queue!(
+                    out,
+                    cursor::MoveTo(0, footer_y),
+                    style::SetBackgroundColor(self.theme.background),
+                    terminal::Clear(ClearType::CurrentLine)
+                )
+                .map_err(ServiceError::storage)?;
+                footer_y += 1;
+            }
+            for row_line in &thinking_rows {
+                let rendered_w: usize = row_line.iter().map(|s| s.text.width()).sum();
+                queue!(out, cursor::MoveTo(0, footer_y)).map_err(ServiceError::storage)?;
+                markdown::write_line(out, row_line, self.theme).map_err(ServiceError::storage)?;
+                Self::pad_and_clear_row(out, footer_y, rendered_w, layout, self.theme)?;
+                footer_y += 1;
+            }
             return Ok(());
         }
         let is_theme_menu = matches!(

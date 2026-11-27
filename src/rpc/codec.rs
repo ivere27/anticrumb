@@ -1175,6 +1175,11 @@ pub fn status_from(status: pb::HostStatus) -> Value {
         .map(provider_info_from)
         .collect();
     let usage = status.usage.unwrap_or_default();
+    let workspace_alerts: Vec<_> = status
+        .workspace_alerts
+        .into_iter()
+        .map(workspace_alert_from)
+        .collect();
     json!({
         "server_id": status.server_id,
         "runtime": status.runtime,
@@ -1187,7 +1192,43 @@ pub fn status_from(status: pb::HostStatus) -> Value {
         "usage": usage,
         "providers": providers,
         "browser_connection": status.browser_connection,
-        "chat_cleanup": status.chat_cleanup
+        "chat_cleanup": status.chat_cleanup,
+        "workspace_alerts": workspace_alerts
+    })
+}
+
+pub(crate) fn workspace_alert_to(
+    alert: crate::agent_service::WorkspaceAlertRecord,
+) -> pb::WorkspaceAlert {
+    let kind = match alert.kind {
+        crate::agent_service::WorkspaceAlertKind::Approval => pb::WorkspaceAlertKind::Approval,
+        crate::agent_service::WorkspaceAlertKind::Attention => pb::WorkspaceAlertKind::Attention,
+        crate::agent_service::WorkspaceAlertKind::Failed => pb::WorkspaceAlertKind::Failed,
+        crate::agent_service::WorkspaceAlertKind::Completed => pb::WorkspaceAlertKind::Completed,
+    };
+    pb::WorkspaceAlert {
+        workspace: alert.workspace,
+        agent_id: alert.agent_id,
+        kind: kind as i32,
+        count: alert.count,
+        updated_at: alert.updated_at,
+    }
+}
+
+fn workspace_alert_from(alert: pb::WorkspaceAlert) -> Value {
+    let kind = match pb::WorkspaceAlertKind::try_from(alert.kind) {
+        Ok(pb::WorkspaceAlertKind::Approval) => "approval",
+        Ok(pb::WorkspaceAlertKind::Attention) => "attention",
+        Ok(pb::WorkspaceAlertKind::Failed) => "failed",
+        Ok(pb::WorkspaceAlertKind::Completed) => "completed",
+        _ => "unspecified",
+    };
+    json!({
+        "workspace": alert.workspace,
+        "agent_id": alert.agent_id,
+        "kind": kind,
+        "count": alert.count,
+        "updated_at": alert.updated_at
     })
 }
 

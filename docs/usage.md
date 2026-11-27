@@ -18,12 +18,12 @@ Enter `/browser login` and sign in to Google in Chrome. Models load automaticall
 ```sh
 anticrumb --agent -C ./project 'Investigate the failing tests'
 anticrumb exec --yolo --json -C ./project 'Fix the reported bug'
-anticrumb resume --last -C ./project
-anticrumb exec resume AGENT_ID 'Add a regression test'
+anticrumb --last -C ./project
+anticrumb exec --resume AGENT_ID 'Add a regression test'
 anticrumb agents list
 ```
 
-Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `--temp` (enable anonymous temporary chat for this run), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `-r/--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
+Common flags: `--agent` (agent mode respecting `/permissions`), `--yolo` (agent mode with all permissions), `--chat` (chat mode, default), `--temp` (enable anonymous temporary chat for this run), `-m/--model`, `--thinking`, `-C/--cd`, `-c/--continue`, `--resume`, `--workers`, `--no-shell`, `--json`. Use `anticrumb --help` or a subcommand's `--help` for full options.
 
 For browser commands, worker delegation, and external MCP setup, see [Tools](tools.md).
 

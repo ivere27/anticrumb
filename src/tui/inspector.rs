@@ -1146,7 +1146,8 @@ impl ToolBlockStore {
             self.content_rev = self.content_rev.wrapping_add(1);
             return None;
         }
-        let plain = if let Some(block) = self.blocks.get_mut(&id) {
+        let plain = {
+            let block = self.blocks.get_mut(&id)?;
             if cancel_incomplete {
                 for item in &mut block.items {
                     if matches!(item.status, ToolStatus::Pending | ToolStatus::Running) {
@@ -1161,8 +1162,6 @@ impl ToolBlockStore {
                 block.collapsed = true;
             }
             block.plain_summary()
-        } else {
-            return None;
         };
         // Newly sealed blocks are appended incrementally to Transcript::items by the caller,
         // so prior sealed LineCache items stay intact without a full transcript re-wrap.
@@ -1325,17 +1324,38 @@ impl ToolBlockStore {
                     layout_changed = true;
                 }
                 let last_idx = block.items.len().saturating_sub(1);
-                if next && block.active && !block.follow_tool && block.selected >= last_idx {
-                    // Pressing next (`→`) past the final tool re-engages live Follow.
-                    block.follow_tool = true;
+                let has_feed = block.items.len() > 1 || block.active;
+                if next {
+                    if block.follow_tool && has_feed {
+                        // Already in Live Feed / Feed: stay pinned at the live tail.
+                        let moved = layout_changed
+                            || block.selected != last_idx
+                            || block.scroll_from_bottom != 0;
+                        block.selected = last_idx;
+                        block.scroll_from_bottom = 0;
+                        moved
+                    } else if has_feed && block.selected >= last_idx {
+                        // Pressing `→` past the final tool enters Live Feed / Feed.
+                        block.follow_tool = true;
+                        block.selected = last_idx;
+                        block.scroll_from_bottom = 0;
+                        true
+                    } else {
+                        let next_idx = (block.selected + 1).min(last_idx);
+                        block.follow_tool = false;
+                        block.scroll_from_bottom = 0;
+                        let moved = next_idx != block.selected || layout_changed;
+                        block.selected = next_idx;
+                        moved
+                    }
+                } else if block.follow_tool {
+                    // Pressing `←` from Live Feed / Feed steps to the latest (max) tool.
+                    block.follow_tool = false;
+                    block.selected = last_idx;
                     block.scroll_from_bottom = 0;
                     true
                 } else {
-                    let next_idx = if next {
-                        (block.selected + 1).min(last_idx)
-                    } else {
-                        block.selected.saturating_sub(1)
-                    };
+                    let next_idx = block.selected.saturating_sub(1);
                     block.follow_tool = false;
                     block.scroll_from_bottom = 0;
                     let moved = next_idx != block.selected || layout_changed;

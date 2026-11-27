@@ -195,14 +195,12 @@ pub fn run(args: &[String]) -> Result<()> {
             println!(
                 r#"anticrumb [OPTIONS] [PROMPT]              interactive coding agent
   exec [OPTIONS] PROMPT                    run a task and print the answer
-  resume [ID | --last]                     continue a conversation
-  exec resume [ID | --last] PROMPT         follow up without the TUI
 
   -m, --model ID      -C, --cd DIR          model and working directory
   --agent             --yolo                agent mode (Y/N tool review, respects /permissions) or yolo (auto-execute)
   --temp                                    anonymous temporary chat for this run
   -p, --print                              noninteractive final answer
-  -c, --continue     -r, --resume ID        reopen a conversation
+  -c, --continue      --resume [ID]        reopen a conversation
   --file PATH        -i, --image PATH       native Gemini attachment (repeatable)
   --json                                   NDJSON events for exec/--print
   --thinking LEVEL --pace LEVEL --no-shell --mcp-config FILE --knowledge ID
@@ -251,19 +249,18 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
             client.close()?;
             result
         }
-        "resume" => launch_resume(&args[1..], false),
         "connect"
             if matches!(
                 args.get(1).map(String::as_str),
                 Some("--help" | "-h" | "help")
             ) =>
         {
-            println!("anticrumb connect https://HOST:PORT --token STRING\n  First connection: compare the SHA256 and emoji fingerprint with the server, then confirm.\n  --tls-pin SHA256    preverified certificate for noninteractive setup\n  --ca-file PATH      use an existing trusted CA\n  --server-name NAME override the expected TLS hostname\nanticrumb connect status | local\nanticrumb --connect URL --token STRING [TUI options]\nProvider integrations: connect opencode|codex|claude|antigravity|mcp");
+            println!("anticrumb connect https://HOST:PORT --token STRING\n  First connection: compare the SHA256 and emoji fingerprint with the server, then confirm.\n  --tls-pin SHA256    preverified certificate for noninteractive setup\n  --ca-file PATH      use an existing trusted CA\n  --server-name NAME override the expected TLS hostname\nanticrumb connect [--resume ID | TUI options]\nanticrumb connect status | local\nanticrumb --connect URL --token STRING [TUI options]\nProvider integrations: connect opencode|codex|claude|antigravity|mcp");
             Ok(())
         }
         "connect" if crate::rpc::connection::handles(&args[1..]) => {
-            if let Some(connection) = crate::rpc::connection::command(&args[1..])? {
-                crate::rpc::workspace_client::with_connection(connection, || run(&[]))
+            if let Some((connection, passthrough)) = crate::rpc::connection::command(&args[1..])? {
+                crate::rpc::workspace_client::with_connection(connection, || run(&passthrough))
             } else {
                 Ok(())
             }
@@ -355,13 +352,7 @@ Home: ANTICRUMB_HOME (default ~/.anticrumb: profile/, accounts/, workspace/, ser
             }
             Ok(())
         }
-        "exec" => {
-            if args.get(1).is_some_and(|s| s == "resume") {
-                launch_resume(&args[2..], true)
-            } else {
-                run_agent(PromptOptions::parse(&args[1..])?)
-            }
-        }
+        "exec" => run_agent(PromptOptions::parse(&args[1..])?),
         "chat" | "image" => chat_command(&args[1..], command == "image"),
         "conversations" | "agents" | "runs" | "sessions" => job_command(command, &args[1..]),
         "artifact" => {
@@ -449,7 +440,7 @@ impl PromptOptions {
             timeout: 120,
             ..Default::default()
         };
-        let mut iter = args.iter();
+        let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             let field = match arg.as_str() {
                 "-m" | "--model" => Some("model"),
@@ -508,14 +499,13 @@ impl PromptOptions {
                 "--print" | "-p" => o.print = true,
                 "--json" => o.json = true,
                 "--continue" | "-c" | "--last" => o.resume = Some("last".into()),
-                "--resume" | "-r" => {
-                    o.resume = Some(
-                        identifier(
-                            iter.next()
-                                .ok_or_else(|| ServiceError::invalid("missing conversation ID"))?,
-                        )?
-                        .into(),
-                    )
+                "--resume" => {
+                    if let Some(next) = iter.peek().filter(|v| !v.starts_with('-')) {
+                        o.resume = Some(identifier(next)?.into());
+                        iter.next();
+                    } else {
+                        o.resume = Some(String::new());
+                    }
                 }
                 "--keep-session" => o.keep = true,
                 "--detach" => return Err(ServiceError::invalid("automatic daemons stop after their last client exits; keep the command running until the task finishes")),
@@ -861,26 +851,6 @@ impl PromptOptions {
                 ToolApprovalMode::Ask
             },
         }
-    }
-}
-fn launch_resume(args: &[String], print: bool) -> Result<()> {
-    let mut args = args.to_vec();
-    let explicit = if args.first().is_some_and(|a| !a.starts_with('-')) {
-        Some(args.remove(0))
-    } else {
-        None
-    };
-    let mut options = PromptOptions::parse(&args)?;
-    if let Some(id) = explicit {
-        options.resume = Some(identifier(&id)?.into());
-    }
-    if options.resume.is_none() {
-        options.resume = Some(if print { "last" } else { "" }.into());
-    }
-    if print {
-        run_agent(options)
-    } else {
-        crate::tui::run(options)
     }
 }
 fn with_temporary_unsupported_hint(

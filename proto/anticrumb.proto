@@ -327,6 +327,22 @@ message ChatCleanupStatus {
   string last_error = 6;
 }
 
+enum WorkspaceAlertKind {
+  WORKSPACE_ALERT_KIND_UNSPECIFIED = 0;
+  WORKSPACE_ALERT_KIND_APPROVAL = 1;
+  WORKSPACE_ALERT_KIND_ATTENTION = 2;
+  WORKSPACE_ALERT_KIND_FAILED = 3;
+  WORKSPACE_ALERT_KIND_COMPLETED = 4;
+}
+
+message WorkspaceAlert {
+  string workspace = 1;
+  string agent_id = 2;
+  WorkspaceAlertKind kind = 3;
+  uint32 count = 4;
+  int64 updated_at = 5;
+}
+
 message HostStatus {
   string server_id = 1;
   // Local daemon process and IPC diagnostics, populated only on local IPC.
@@ -340,6 +356,8 @@ message HostStatus {
   Usage usage = 8;
   uint32 active_agents = 9; // Active agents in the selected workspace store.
   ChatCleanupStatus chat_cleanup = 10;
+  // Cross-workspace attention alerts owned by the local workspace daemon.
+  repeated WorkspaceAlert workspace_alerts = 11;
 }
 
 message PruneRequest {

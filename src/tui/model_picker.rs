@@ -24,6 +24,7 @@ pub struct ModelChoice {
     pub id: Option<String>,
     pub levels: Vec<Level>,
     pub selected: usize,
+    pub is_current: bool,
 }
 impl ModelChoice {
     pub fn new(id: Option<String>, values: &Value, current: Option<&str>) -> Self {
@@ -61,7 +62,12 @@ impl ModelChoice {
             id,
             levels,
             selected,
+            is_current: false,
         }
+    }
+    pub fn with_current(mut self, is_current: bool) -> Self {
+        self.is_current = is_current;
+        self
     }
     pub fn shift(&mut self, right: bool) {
         if self.levels.len() <= 1 {

@@ -270,11 +270,12 @@ pub(super) fn handle_input(
                         state.toggle_inspector_follow();
                     }
                     KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
-                        if !ctrl && !alt && !state.tool_approvals.is_empty() =>
+                        if !ctrl
+                            && !alt
+                            && !state.tool_approvals.is_empty()
+                            && key.kind == event::KeyEventKind::Press =>
                     {
-                        if key.kind == event::KeyEventKind::Press {
-                            state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
-                        }
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
                     }
                     _ => {}
                 }
@@ -350,6 +351,13 @@ pub(super) fn handle_input(
             // Priority 2: Tool Inspector Alt+* shortcuts MUST precede catch-all Char/Up/Down/PgUp/PgDn.
             if alt && !ctrl {
                 match key.code {
+                    KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
+                        if !state.tool_approvals.is_empty()
+                            && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                        return Ok(false);
+                    }
                     KeyCode::Char('i' | 'I') => {
                         state.toggle_inspector_mode();
                         return Ok(false);
@@ -595,7 +603,7 @@ pub(super) fn handle_input(
                     width.into(),
                     height.into(),
                 );
-            } else if !state.completion_mouse(mouse, sink) {
+            } else if !state.completion_mouse(mouse, sink) && !state.approval_mouse(mouse, sink) {
                 if let Some(text) = state.transcript_mouse(mouse) {
                     state.copy_text(&text, true, sink);
                 }
@@ -913,14 +921,12 @@ pub(super) fn exit_conversation_message(id: &str, state: &State) -> String {
         } else {
             ""
         };
-        format!(
-            "Session saved{temp_note}. Reconnect with `anticrumb connect`, then use `/resume {id}`."
-        )
+        format!("Session saved{temp_note}. Continue with: anticrumb connect --resume {id}")
     } else if temporary {
         format!(
-            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb resume {id}"
+            "Local conversation saved (temporary mode: not stored on provider server). Continue with: anticrumb --resume {id}"
         )
     } else {
-        format!("Session saved. Continue with: anticrumb resume {id}")
+        format!("Session saved. Continue with: anticrumb --resume {id}")
     }
 }

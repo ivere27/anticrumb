@@ -15,6 +15,113 @@ pub use crate::domain::AgentRequest;
 const LIVE_EVENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const LIVE_EVENT_TTL: Duration = Duration::from_secs(30);
 const DURABLE_TOOL_EVENT_OUTPUT_MAX: usize = 2048;
+const COMPLETED_ALERT_TTL: Duration = Duration::from_secs(15);
+const FAILED_ALERT_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceAlertKind {
+    Approval,
+    Attention,
+    Failed,
+    Completed,
+}
+
+impl WorkspaceAlertKind {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Approval => 0,
+            Self::Attention => 1,
+            Self::Failed => 2,
+            Self::Completed => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceAlertRecord {
+    pub workspace: String,
+    pub agent_id: String,
+    pub kind: WorkspaceAlertKind,
+    pub count: u32,
+    pub updated_at: i64,
+}
+
+#[derive(Clone)]
+struct TerminalAlertEntry {
+    record: WorkspaceAlertRecord,
+    recorded_at: Instant,
+    ttl: Duration,
+}
+
+#[derive(Default)]
+struct WorkspaceAlertTracker {
+    active_workspaces: HashMap<String, String>,
+    terminal: HashMap<String, TerminalAlertEntry>,
+}
+
+impl WorkspaceAlertTracker {
+    fn on_start(&mut self, job_id: &str, workspace: &Path) {
+        let ws = workspace.to_string_lossy().into_owned();
+        self.terminal.remove(&ws);
+        self.active_workspaces.insert(job_id.to_owned(), ws);
+    }
+
+    fn on_finish(
+        &mut self,
+        job_id: &str,
+        workspace: &Path,
+        state: &str,
+        error: Option<&ServiceError>,
+    ) {
+        let ws = self
+            .active_workspaces
+            .remove(job_id)
+            .unwrap_or_else(|| workspace.to_string_lossy().into_owned());
+        self.prune_expired();
+        let (kind, ttl) = match state {
+            "completed" => (WorkspaceAlertKind::Completed, COMPLETED_ALERT_TTL),
+            "failed" => {
+                let is_attention = error.is_some_and(|e| {
+                    matches!(
+                        e.code,
+                        ErrorCode::AuthRequired | ErrorCode::VerificationRequired
+                    )
+                });
+                (
+                    if is_attention {
+                        WorkspaceAlertKind::Attention
+                    } else {
+                        WorkspaceAlertKind::Failed
+                    },
+                    FAILED_ALERT_TTL,
+                )
+            }
+            _ => {
+                self.terminal.remove(&ws);
+                return;
+            }
+        };
+        self.terminal.insert(
+            ws.clone(),
+            TerminalAlertEntry {
+                record: WorkspaceAlertRecord {
+                    workspace: ws,
+                    agent_id: job_id.to_owned(),
+                    kind,
+                    count: 1,
+                    updated_at: now_ms(),
+                },
+                recorded_at: Instant::now(),
+                ttl,
+            },
+        );
+    }
+
+    fn prune_expired(&mut self) {
+        self.terminal
+            .retain(|_, entry| entry.recorded_at.elapsed() < entry.ttl);
+    }
+}
 
 struct LiveEventEntry {
     event: Event,
@@ -566,6 +673,7 @@ pub struct AgentManager {
     failures: Mutex<HashMap<String, AgentRecord>>,
     worker_gates: Mutex<HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>>,
     live_events: Arc<Mutex<HashMap<String, LiveEventLog>>>,
+    alerts: Mutex<WorkspaceAlertTracker>,
     stopping: std::sync::atomic::AtomicBool,
 }
 impl AgentManager {
@@ -587,6 +695,7 @@ impl AgentManager {
             failures: Mutex::new(HashMap::new()),
             worker_gates: Mutex::new(HashMap::new()),
             live_events: Arc::new(Mutex::new(HashMap::new())),
+            alerts: Mutex::new(WorkspaceAlertTracker::default()),
             stopping: false.into(),
         }))
     }
@@ -843,9 +952,55 @@ impl AgentManager {
             .unwrap_or(u32::MAX))
     }
 
+    pub(crate) fn workspace_alerts(&self) -> Result<Vec<WorkspaceAlertRecord>> {
+        let active_pending: Vec<(String, u32)> = {
+            let controls = self.controls.lock().map_err(ServiceError::storage)?;
+            controls
+                .iter()
+                .filter_map(|(job_id, ctrl)| {
+                    let count = ctrl.approvals.pending_count();
+                    (count > 0).then(|| (job_id.clone(), count.try_into().unwrap_or(u32::MAX)))
+                })
+                .collect()
+        };
+        let mut tracker = self.alerts.lock().map_err(ServiceError::storage)?;
+        tracker.prune_expired();
+        let mut by_workspace: HashMap<String, WorkspaceAlertRecord> = tracker
+            .terminal
+            .iter()
+            .map(|(ws, entry)| (ws.clone(), entry.record.clone()))
+            .collect();
+        let now = now_ms();
+        for (job_id, count) in active_pending {
+            let Some(ws) = tracker.active_workspaces.get(&job_id).cloned() else {
+                continue;
+            };
+            by_workspace.insert(
+                ws.clone(),
+                WorkspaceAlertRecord {
+                    workspace: ws,
+                    agent_id: job_id,
+                    kind: WorkspaceAlertKind::Approval,
+                    count,
+                    updated_at: now,
+                },
+            );
+        }
+        let mut list: Vec<WorkspaceAlertRecord> = by_workspace.into_values().collect();
+        list.sort_by(|a, b| {
+            a.kind
+                .priority()
+                .cmp(&b.kind.priority())
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        });
+        Ok(list)
+    }
+
     fn finish_agent_job(&self, job_id: &str, mut terminal: AgentRecord, lease: Option<fs::File>) {
         let state = terminal.state.clone();
         let error = terminal.error.clone();
+        let workspace = terminal.request.workspace.clone();
         // Hold `controls` across lease release, terminal event/state persistence,
         // and control removal so a caller polling `GetAgent` cannot observe the
         // terminal state and race ahead into `start()`/`delete()` while this
@@ -871,6 +1026,10 @@ impl AgentManager {
                 log.finish(job_id, &state, error.as_ref());
             }
             reap_live_events(&mut logs);
+        }
+        {
+            let mut tracker = self.alerts.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.on_finish(job_id, &workspace, &state, error.as_ref());
         }
         controls.remove(job_id);
     }
@@ -935,6 +1094,10 @@ impl AgentManager {
             },
         )?;
         controls.insert(id.clone(), control.clone());
+        {
+            let mut tracker = self.alerts.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.on_start(&id, &request.workspace);
+        }
         drop(artifact_lease);
         drop(controls);
         let stale_workspace_sessions = if has_workspace_lease {
@@ -2958,5 +3121,61 @@ mod tests {
         );
         assert!(received.iter().any(|e| e.kind == "tool_started"));
         assert!(received.iter().any(|e| e.kind == "agent_terminal"));
+    }
+
+    #[test]
+    fn workspace_alerts_track_live_approvals_and_terminal_outcomes_with_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manager = AgentManager::new(store).unwrap();
+        let ws_a = dir.path().join("a");
+        let ws_b = dir.path().join("b");
+        let ws_c = dir.path().join("c");
+        fs::create_dir_all(&ws_a).unwrap();
+        fs::create_dir_all(&ws_b).unwrap();
+        fs::create_dir_all(&ws_c).unwrap();
+
+        // Register active job in ws_b with a pending approval.
+        let ctrl_b = manager.new_run_control("job-b");
+        ctrl_b.approvals.register("apr-1");
+        manager
+            .controls
+            .lock()
+            .unwrap()
+            .insert("job-b".into(), ctrl_b.clone());
+        manager.alerts.lock().unwrap().on_start("job-b", &ws_b);
+
+        // Finish jobs in ws_a (completed) and ws_c (failed).
+        manager.alerts.lock().unwrap().on_start("job-a", &ws_a);
+        manager
+            .alerts
+            .lock()
+            .unwrap()
+            .on_finish("job-a", &ws_a, "completed", None);
+        manager.alerts.lock().unwrap().on_start("job-c", &ws_c);
+        manager.alerts.lock().unwrap().on_finish(
+            "job-c",
+            &ws_c,
+            "failed",
+            Some(&ServiceError::new(ErrorCode::Internal, "agent", "boom")),
+        );
+
+        let alerts = manager.workspace_alerts().unwrap();
+        assert_eq!(alerts.len(), 3);
+        assert_eq!(alerts[0].kind, WorkspaceAlertKind::Approval);
+        assert_eq!(alerts[0].workspace, ws_b.to_string_lossy());
+        assert_eq!(alerts[0].count, 1);
+        assert_eq!(alerts[1].kind, WorkspaceAlertKind::Failed);
+        assert_eq!(alerts[1].workspace, ws_c.to_string_lossy());
+        assert_eq!(alerts[2].kind, WorkspaceAlertKind::Completed);
+        assert_eq!(alerts[2].workspace, ws_a.to_string_lossy());
+
+        // Resolving approval removes ws_b's approval alert immediately; restarting ws_a clears its completed alert.
+        assert!(manager.approve_tool("job-b", "apr-1", true).is_ok());
+        manager.alerts.lock().unwrap().on_start("job-a-2", &ws_a);
+        let after = manager.workspace_alerts().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].kind, WorkspaceAlertKind::Failed);
+        assert_eq!(after[0].workspace, ws_c.to_string_lossy());
     }
 }

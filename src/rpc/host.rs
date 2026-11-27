@@ -929,6 +929,15 @@ impl Host {
                     chat_cleanup: Some(codec::chat_cleanup_to(crate::service::cleanup::status(
                         store
                     )?)),
+                    workspace_alerts: self
+                        .agents
+                        .as_ref()
+                        .map(|agents| agents.workspace_alerts())
+                        .transpose()?
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(codec::workspace_alert_to)
+                        .collect(),
                 })
             }
             "/anticrumb.v1.PlatformService/PruneCache" => {
