@@ -2,6 +2,7 @@
 use super::{
     clipboard,
     commands::{complete, Choice, Selection},
+    highlight::HighlightWorker,
     layout::FrameLayout,
     mentions::MentionSearchHandle,
     platform,
@@ -665,9 +666,11 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     let (commands, rx) = tokio::sync::mpsc::channel(32);
     let (tx, mut updates) = tokio::sync::mpsc::channel(128);
     let mention_search = MentionSearchHandle::spawn(tx.clone());
+    let highlight_worker = HighlightWorker::spawn(tx.clone());
     worker_guard.task = Some(runtime.spawn(worker(client, rx, tx)));
     let mut terminal = Terminal::enter()?;
     let mut state = State::new(options);
+    state.highlights.attach_worker(highlight_worker);
     if let crate::rpc::client::Connection::Grpc {
         endpoint, tls_pin, ..
     } = crate::rpc::workspace_client::selected_connection()
@@ -884,6 +887,7 @@ pub fn run_with_client(mut options: PromptOptions, client: Client) -> Result<()>
     // Bounded by INPUT_POLL; must finish before raw mode is disabled.
     let _ = reader.join();
     drop(terminal);
+    state.highlights.detach_worker();
     drop(mention_search);
     drop(commands);
     drop(updates);

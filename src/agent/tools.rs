@@ -885,7 +885,7 @@ enum GrepMode {
 
 /// ripgrep `--smart-case`: case-sensitive only when the pattern contains an uppercase
 /// literal. Escapes (`\S`, `\W`) and Unicode class names (`\p{Lu}`, `\pL`) are ignored.
-fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
+pub(crate) fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
     if fixed {
         return pattern.chars().any(char::is_uppercase);
     }
@@ -908,6 +908,30 @@ fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
         }
     }
     false
+}
+
+/// Compiles a ripgrep-compatible regex with smart-case and literal fallback on invalid regex
+/// (matching `GrepSearchTool::execute` semantics for Inspector search-match highlighting).
+pub(crate) fn compile_grep_regex(pattern: &str, fixed: bool) -> Option<regex::Regex> {
+    if pattern.is_empty() {
+        return None;
+    }
+    let case_sensitive = pattern_has_uppercase(pattern, fixed);
+    let build = |src: &str| {
+        regex::RegexBuilder::new(src)
+            .case_insensitive(!case_sensitive)
+            .multi_line(true)
+            .crlf(true)
+            .size_limit(2 << 20)
+            .build()
+    };
+    if fixed {
+        build(&regex::escape(pattern)).ok()
+    } else {
+        build(pattern)
+            .ok()
+            .or_else(|| build(&regex::escape(pattern)).ok())
+    }
 }
 
 fn clip_grep_line(line: &str) -> String {

@@ -141,6 +141,33 @@ impl SupportedLanguage {
         }
     }
 
+    /// Resolves a Markdown fenced-code info tag (e.g. `rs`, `rust,no_run`, `py`, `ts`, `tsx`,
+    /// `golang`, `c++`, `shell`, `jsonc`) to a supported Tree-sitter language.
+    pub fn from_fence_tag(info: &str) -> Option<Self> {
+        let token = info
+            .trim()
+            .split(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | ';' | '{' | ':'))
+            .next()?
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if token.is_empty() {
+            return None;
+        }
+        Self::from_name(&token).or(match token.as_str() {
+            "rs" => Some(Self::Rust),
+            "py" | "py3" | "python3" | "pyi" => Some(Self::Python),
+            "js" | "jsx" | "mjs" | "cjs" | "node" => Some(Self::JavaScript),
+            "ts" | "mts" | "cts" => Some(Self::TypeScript),
+            "golang" => Some(Self::Go),
+            "h" => Some(Self::Cpp),
+            "cc" | "cxx" | "hpp" | "hh" | "hxx" | "cc++" => Some(Self::Cpp),
+            "shell" | "zsh" | "ksh" | "ash" | "console" | "shellsession" => Some(Self::Bash),
+            "rb" => Some(Self::Ruby),
+            "jsonc" | "json5" | "jsonl" => Some(Self::Json),
+            _ => None,
+        })
+    }
+
     /// Canonical lowercase identifier used in `extensions.json` and diagnostics.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -196,6 +223,26 @@ impl SupportedLanguage {
             Self::Ruby => ts_grammars::ruby::LANGUAGE.into(),
             Self::Json => ts_grammars::json::LANGUAGE.into(),
             Self::Dart => ts_grammars::dart::LANGUAGE.into(),
+        }
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    pub fn highlights_query(&self) -> &'static str {
+        match self {
+            Self::Rust => ts_grammars::rust::highlights_query(),
+            Self::Python => ts_grammars::python::highlights_query(),
+            Self::JavaScript => ts_grammars::javascript::highlights_query(),
+            Self::TypeScript => ts_grammars::typescript::highlights_query(),
+            Self::Tsx => ts_grammars::tsx::highlights_query(),
+            Self::Go => ts_grammars::go::highlights_query(),
+            Self::C => ts_grammars::c::highlights_query(),
+            Self::Cpp => ts_grammars::cpp::highlights_query(),
+            Self::Java => ts_grammars::java::highlights_query(),
+            Self::CSharp => ts_grammars::csharp::highlights_query(),
+            Self::Bash => ts_grammars::bash::highlights_query(),
+            Self::Ruby => ts_grammars::ruby::highlights_query(),
+            Self::Json => ts_grammars::json::highlights_query(),
+            Self::Dart => ts_grammars::dart::highlights_query(),
         }
     }
 }

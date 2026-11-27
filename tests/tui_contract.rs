@@ -758,7 +758,9 @@ mod unix_pty {
         pty.resize(48);
         pty.wait_for("Left:≈75% @5:41am Wk:≈100% @Nov 20 3:41pm");
         pty.resize(110);
-        pty.wait_for("W:project");
+        let restored = pty.wait_for("M:4.0 Argon");
+        assert!(frame(&restored).contains("E:Medium"));
+        assert!(frame(&restored).contains("? for shortcuts"));
         assert_eq!(observations()["web_usage_queries"], 1);
         assert_eq!(observations()["model_probes"], 2);
         assert_eq!(observations()["tasks"].as_array().unwrap().len(), 0);
@@ -787,13 +789,24 @@ mod unix_pty {
         pty.send("\r");
         pty.wait_for("Tool permissions saved: read, ast, shell.");
         pty.send("Read @\"a b.txt\"\r");
-        pty.wait_for("Attachment turn 1 completed.");
-        let highlighted = pty.wait_for("let answer = 42;");
+        let highlighted = pty.wait_for("0 file(s) changed");
+        assert!(frame(&highlighted).contains("Attachment turn 1 completed."));
+        assert!(frame(&highlighted).contains("let answer = 42;"));
         assert!(highlighted.contains("\x1b[1mImportant result"));
         assert!(highlighted.contains("\x1b[3memphasis"));
         assert!(highlighted.contains("\x1b[38;2;136;192;208mfile_name.rs"));
         assert!(!highlighted.contains("**Important result**"));
         assert!(!highlighted.contains("```rust"));
+        #[cfg(feature = "tree-sitter")]
+        {
+            let syntax_frame = if highlighted.contains("\x1b[38;2;129;161;193mlet") {
+                highlighted.clone()
+            } else {
+                pty.wait_for("\x1b[38;2;129;161;193mlet")
+            };
+            assert!(frame(&syntax_frame).contains("let answer = 42;"));
+            assert!(syntax_frame.contains("\x1b[38;2;180;142;173m42"));
+        }
 
         let table_rows: Vec<String> = (1..24).map(|r| screen_row(&highlighted, r)).collect();
         let header = table_rows
@@ -1110,7 +1123,8 @@ mod unix_pty {
         assert!(screen_row(&confirmation, 21).contains("Account: default"));
         assert!(screen_row(&confirmation, 22).contains("Includes chats created outside anticrumb."));
         pty.send("\r");
-        pty.wait_for("Alt+Enter newline");
+        let cancelled_enter = pty.wait_for("────────");
+        assert!(!frame(&cancelled_enter).contains("Delete ALL Gemini chats?"));
         assert_eq!(
             observations()["history_clear_requests"],
             serde_json::json!([])
@@ -1124,7 +1138,8 @@ mod unix_pty {
             serde_json::json!([])
         );
         pty.send("\x1b");
-        pty.wait_for("Alt+Enter newline");
+        let cancelled_esc = pty.wait_for("────────");
+        assert!(!frame(&cancelled_esc).contains("Delete ALL Gemini chats?"));
         pty.send("/browser clear-history\r");
         pty.wait_for("Delete ALL Gemini chats?");
         pty.send("\x1b[200~DELETE\n\x1b[201~");
@@ -1329,8 +1344,9 @@ mod unix_pty {
             "expected centered button near col 55, got {btn_col} in {hint_row_text:?}"
         );
         pty.send(&format!("\x1b[<0;{btn_col};24M\x1b[<0;{btn_col};24m"));
-        let jumped = pty.wait_for("Alt+Enter newline");
+        let jumped = pty.wait_for("────────");
         assert!(frame(&jumped).contains("exact Gemini token usage"));
+        assert!(!frame(&jumped).contains("[ ↓ Jump to bottom ]"));
 
         pty.send("/exit\r");
         assert_eq!(pty.wait_exit(), 0);
@@ -1409,8 +1425,9 @@ mod unix_pty {
         pty.send("\x15@doc");
         pty.wait_for("docs/building.md");
         pty.send("\x1b");
-        let dismissed = pty.wait_for("Alt+Enter newline");
-        assert!(frame(&dismissed).contains("> @doc"));
+        let dismissed = pty.wait_for("────────");
+        assert!(screen_row(&dismissed, 25).contains("> @doc"));
+        assert!(!frame(&dismissed).contains("docs/building.md"));
 
         // Burst `@a\t` still completes immediately even before waiting for async frames.
         pty.send("\x15@a\t");

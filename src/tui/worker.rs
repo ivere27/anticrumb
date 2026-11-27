@@ -54,6 +54,11 @@ pub(super) enum Update {
         matches: Vec<super::mentions::MentionMatch>,
         total: usize,
     },
+    #[cfg_attr(not(feature = "tree-sitter"), allow(dead_code))]
+    HighlightReady {
+        key: super::highlight::HighlightKey,
+        doc: Option<std::sync::Arc<super::highlight::HighlightedDoc>>,
+    },
 }
 
 pub(super) enum Command {

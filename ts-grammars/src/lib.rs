@@ -53,10 +53,19 @@ fn decompress_tables(compressed: &[u8]) -> (Box<[u16]>, Box<[u16]>) {
     (parse_table, small_parse_table)
 }
 
+fn decompress_text(compressed: &[u8]) -> String {
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut raw = String::new();
+    decoder
+        .read_to_string(&mut raw)
+        .expect("bundled tree-sitter highlight query zlib stream must be valid UTF-8");
+    raw
+}
+
 macro_rules! define_grammar {
-    ($mod_name:ident, $c_with_tables:ident, $tables_rel:literal) => {
+    ($mod_name:ident, $c_with_tables:ident, $tables_rel:literal, $highlights_rel:literal) => {
         pub mod $mod_name {
-            use super::{decompress_tables, LanguageFn, OnceLock, SyncConstPtr};
+            use super::{decompress_tables, decompress_text, LanguageFn, OnceLock, SyncConstPtr};
 
             extern "C" {
                 fn $c_with_tables(
@@ -67,6 +76,9 @@ macro_rules! define_grammar {
 
             static LOADED: OnceLock<SyncConstPtr> = OnceLock::new();
             static COMPRESSED_TABLES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), $tables_rel));
+            static HIGHLIGHTS_QUERY: OnceLock<String> = OnceLock::new();
+            static COMPRESSED_HIGHLIGHTS: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), $highlights_rel));
 
             unsafe extern "C" fn load_language() -> *const () {
                 let loaded = LOADED.get_or_init(|| {
@@ -87,6 +99,12 @@ macro_rules! define_grammar {
             }
 
             pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(load_language) };
+
+            pub fn highlights_query() -> &'static str {
+                HIGHLIGHTS_QUERY
+                    .get_or_init(|| decompress_text(COMPRESSED_HIGHLIGHTS))
+                    .as_str()
+            }
         }
     };
 }
@@ -192,6 +210,114 @@ mod tests {
 
         for &(name, lang, src) in samples {
             assert_parses_clean(name, lang, src);
+        }
+    }
+
+    #[test]
+    fn all_14_highlight_queries_compile_and_capture() {
+        use tree_sitter::{Query, QueryCursor, StreamingIterator};
+
+        let samples: &[(&str, LanguageFn, &str, &str)] = &[
+            (
+                "rust",
+                rust::LANGUAGE,
+                rust::highlights_query(),
+                "pub fn add(a: i32) -> i32 { /* ok */ a + 1 }\n",
+            ),
+            (
+                "python",
+                python::LANGUAGE,
+                python::highlights_query(),
+                "def add(a: int) -> int:\n    return a + 1\n",
+            ),
+            (
+                "javascript",
+                javascript::LANGUAGE,
+                javascript::highlights_query(),
+                "export function add(a) { return <span>{a + 1}</span>; }\n",
+            ),
+            (
+                "typescript",
+                typescript::LANGUAGE,
+                typescript::highlights_query(),
+                "export interface Item { id: number; }\nexport function add(a: number): number { return a + 1; }\n",
+            ),
+            (
+                "tsx",
+                tsx::LANGUAGE,
+                tsx::highlights_query(),
+                "export const Badge = ({ label }: { label: string }) => <span>{label}</span>;\n",
+            ),
+            (
+                "go",
+                go::LANGUAGE,
+                go::highlights_query(),
+                "package main\nfunc add(a int) int { return a + 1 }\n",
+            ),
+            (
+                "c",
+                c::LANGUAGE,
+                c::highlights_query(),
+                "#include <stdio.h>\nint add(int a) { return a + 1; }\n",
+            ),
+            (
+                "cpp",
+                cpp::LANGUAGE,
+                cpp::highlights_query(),
+                "template <typename T> T add(T a) { return a + 1; }\n",
+            ),
+            (
+                "java",
+                java::LANGUAGE,
+                java::highlights_query(),
+                "public class Calc { int add(int a) { return a + 1; } }\n",
+            ),
+            (
+                "csharp",
+                csharp::LANGUAGE,
+                csharp::highlights_query(),
+                "public class Calc { public int Add(int a) => a + 1; }\n",
+            ),
+            (
+                "bash",
+                bash::LANGUAGE,
+                bash::highlights_query(),
+                "if [ -f foo ]; then echo \"hi\"; fi\n",
+            ),
+            (
+                "ruby",
+                ruby::LANGUAGE,
+                ruby::highlights_query(),
+                "class Calc\n  def add(a)\n    a + 1\n  end\nend\n",
+            ),
+            (
+                "json",
+                json::LANGUAGE,
+                json::highlights_query(),
+                "{\"ok\": true, \"count\": 42}\n",
+            ),
+            (
+                "dart",
+                dart::LANGUAGE,
+                dart::highlights_query(),
+                "final class Ok<T> { final T value; const Ok(this.value); }\n",
+            ),
+        ];
+
+        for &(name, lang_fn, query_src, code) in samples {
+            let language: tree_sitter::Language = lang_fn.into();
+            let query = Query::new(&language, query_src)
+                .unwrap_or_else(|e| panic!("{name}: highlight query failed to compile: {e}"));
+            let mut parser = Parser::new();
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(code, None).unwrap();
+            let mut cursor = QueryCursor::new();
+            let mut captures = cursor.captures(&query, tree.root_node(), code.as_bytes());
+            let mut count = 0usize;
+            while captures.next().is_some() {
+                count += 1;
+            }
+            assert!(count > 0, "{name}: highlight query produced zero captures");
         }
     }
 

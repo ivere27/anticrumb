@@ -637,7 +637,9 @@ impl State {
             return Ok(None);
         };
         let inner_w = col_len.saturating_sub(1).max(1);
-        let detail = self.tool_blocks.detail_lines(block_id, inner_w);
+        let detail = self
+            .tool_blocks
+            .detail_lines(block_id, inner_w, &self.highlights);
         let header_rows: u16 = 1;
         let (body_rows, has_footer) = if vis_len >= 3 {
             (vis_len - 2, true)
@@ -1968,40 +1970,168 @@ impl State {
             match row {
                 0 => vec![
                     (" 31   ", Face::MUTED),
-                    ("fn", Face::ACCENT_BOLD),
-                    (" summarize", Face::HEADING),
-                    ("(users: &[User]) -> ", Face::TEXT),
-                    ("String", Face::CODE),
+                    ("fn", Face::syntax(markdown::SyntaxRole::Keyword)),
+                    (" ", Face::TEXT),
+                    ("summarize", Face::syntax(markdown::SyntaxRole::Function)),
+                    ("(users: &[", Face::TEXT),
+                    ("User", Face::syntax(markdown::SyntaxRole::Type)),
+                    ("]) -> ", Face::TEXT),
+                    ("String", Face::syntax(markdown::SyntaxRole::Type)),
                     (" {", Face::TEXT),
                 ],
-                1 => vec![
-                    (" 32 ", Face::MUTED),
-                    (
-                        "-   let active = users.iter().filter(|u| u.ok).count();",
-                        Face::DANGER,
-                    ),
-                ],
-                2 => vec![
-                    (" 32 ", Face::MUTED),
-                    (
-                        "+   let n = users.iter().filter(|u| u.is_active()).count();",
-                        Face::HIGHLIGHT,
-                    ),
-                ],
+                1 => {
+                    let bg = markdown::DiffBg::Removed;
+                    vec![
+                        (" 32 ", Face::MUTED),
+                        ("- ", Face::DANGER_BOLD.with_diff_bg(bg)),
+                        (
+                            "  ",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "let",
+                            Face::syntax(markdown::SyntaxRole::Keyword).with_diff_bg(bg),
+                        ),
+                        (
+                            " active = users.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "iter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "().",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "filter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "(|u| u.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "ok",
+                            Face::syntax(markdown::SyntaxRole::Property).with_diff_bg(bg),
+                        ),
+                        (
+                            ").",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "count",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "();",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                    ]
+                }
+                2 => {
+                    let bg = markdown::DiffBg::Added;
+                    vec![
+                        (" 32 ", Face::MUTED),
+                        ("+ ", Face::HIGHLIGHT_BOLD.with_diff_bg(bg)),
+                        (
+                            "  ",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "let",
+                            Face::syntax(markdown::SyntaxRole::Keyword).with_diff_bg(bg),
+                        ),
+                        (
+                            " n = users.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "iter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "().",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "filter",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "(|u| u.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "is_active()",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            ").",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "count",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "();",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                    ]
+                }
                 3 => vec![
                     (" 33     ", Face::MUTED),
-                    ("let", Face::ACCENT),
+                    ("let", Face::syntax(markdown::SyntaxRole::Keyword)),
                     (" label = ", Face::TEXT),
-                    ("\"active\"", Face::CODE),
-                    (";", Face::TEXT),
+                    ("\"active\"", Face::syntax(markdown::SyntaxRole::String)),
+                    ("; ", Face::TEXT),
+                    ("// badge", Face::syntax(markdown::SyntaxRole::Comment)),
                 ],
-                4 => vec![
-                    (" 34 ", Face::MUTED),
-                    (
-                        "+   format!(\"{n} {label}: {}\", names.join(\", \"))",
-                        Face::HIGHLIGHT,
-                    ),
-                ],
+                4 => {
+                    let bg = markdown::DiffBg::Added;
+                    vec![
+                        (" 34 ", Face::MUTED),
+                        ("+ ", Face::HIGHLIGHT_BOLD.with_diff_bg(bg)),
+                        (
+                            "  ",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "format!",
+                            Face::syntax(markdown::SyntaxRole::Macro).with_diff_bg(bg),
+                        ),
+                        (
+                            "(",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "\"{n} {label}: {}\"",
+                            Face::syntax(markdown::SyntaxRole::String).with_diff_bg(bg),
+                        ),
+                        (
+                            ", names.",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "join",
+                            Face::syntax(markdown::SyntaxRole::Function).with_diff_bg(bg),
+                        ),
+                        (
+                            "(",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                        (
+                            "\", \"",
+                            Face::syntax(markdown::SyntaxRole::String).with_diff_bg(bg),
+                        ),
+                        (
+                            "))",
+                            Face::syntax(markdown::SyntaxRole::Plain).with_diff_bg(bg),
+                        ),
+                    ]
+                }
                 5 => vec![(" 35   }", Face::MUTED)],
                 _ => Vec::new(),
             }
@@ -2010,16 +2140,8 @@ impl State {
             .into_iter()
             .next()
             .unwrap_or_default();
-        let rendered_width: usize = line.iter().map(|s| s.text.width()).sum();
-        markdown::write_line(out, &line, self.theme).map_err(ServiceError::storage)?;
-        if rendered_width < width {
-            queue!(
-                out,
-                style::SetBackgroundColor(self.theme.background),
-                terminal::Clear(ClearType::UntilNewLine)
-            )
+        markdown::write_clipped_padded_line(out, &line, false, width, width, self.theme)
             .map_err(ServiceError::storage)?;
-        }
         Ok(())
     }
 

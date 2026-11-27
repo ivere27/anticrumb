@@ -1,15 +1,19 @@
 //! Tool Inspector domain model, state transitions, lazy detail rendering, and layout helpers.
 use super::{
+    highlight::{self, HighlightCache, HighlightLang, HighlightedDoc, Lookup},
     layout::{AfterTurnPolicy, HorizontalSplit, Rect},
-    markdown::{self, Face, Span},
+    markdown::{self, DiffBg, Face, Span},
     reducer::PendingToolApproval,
     transcript::clip,
 };
-use crate::agent::{AgentStepRecord, OutputStream};
+use crate::{
+    agent::{AgentStepRecord, OutputStream},
+    tree_sitter_diff::SupportedLanguage,
+};
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::cell::Cell;
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
+use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc, time::Instant};
 use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LIVE_BYTES: usize = 64 * 1024;
@@ -552,8 +556,12 @@ struct DetailCacheKey {
 #[derive(Default)]
 struct DetailCache {
     key: Option<DetailCacheKey>,
+    highlight_rev: u64,
+    had_pending: bool,
     lines: Rc<Vec<markdown::Line>>,
 }
+
+type ItemCacheEntry = (u64, usize, u64, bool, Rc<Vec<markdown::Line>>);
 
 pub(super) struct ToolBlockStore {
     blocks: HashMap<BlockId, ToolBlock>,
@@ -566,9 +574,9 @@ pub(super) struct ToolBlockStore {
     payload_bytes: usize,
     max_payload_bytes: usize,
     detail_cache: RefCell<DetailCache>,
-    /// Per-item wrapped-lines cache keyed by `(block_id, item_idx) -> (item_rev, width, lines)`.
+    /// Per-item wrapped-lines cache keyed by `(block_id, item_idx) -> (item_rev, width, hl_rev, had_pending, lines)`.
     /// Prevents re-wrapping completed earlier tools on every live `tool_output_chunk` in Feed mode.
-    item_detail_cache: RefCell<HashMap<(BlockId, usize), (u64, usize, Rc<Vec<markdown::Line>>)>>,
+    item_detail_cache: RefCell<HashMap<(BlockId, usize), ItemCacheEntry>>,
     #[cfg(test)]
     detail_cache_hits: Cell<u64>,
     #[cfg(test)]
@@ -1488,25 +1496,32 @@ impl ToolBlockStore {
     }
 
     /// Return cached wrapped lines for a single `(block_id, item_idx)` at `inner_width`,
-    /// wrapping at most once per `(item.rev, inner_width)`.
+    /// wrapping at most once per `(item.rev, inner_width)` (plus once more when pending async
+    /// syntax highlights arrive).
     fn cached_item_lines(
         &self,
         block_id: BlockId,
         idx: usize,
         item: &ToolItem,
         inner_width: usize,
-    ) -> Rc<Vec<markdown::Line>> {
+        highlights: &HighlightCache,
+    ) -> (Rc<Vec<markdown::Line>>, bool) {
+        let hl_rev = highlights.rev();
         {
             let map = self.item_detail_cache.borrow();
-            if let Some((rev, w, lines)) = map.get(&(block_id, idx)) {
-                if *rev == item.rev && *w == inner_width {
-                    return Rc::clone(lines);
+            if let Some((rev, w, cached_hl_rev, had_pending, lines)) = map.get(&(block_id, idx)) {
+                if *rev == item.rev
+                    && *w == inner_width
+                    && (!*had_pending || *cached_hl_rev == hl_rev)
+                {
+                    return (Rc::clone(lines), *had_pending);
                 }
             }
         }
         #[cfg(test)]
         self.item_wrap_count.set(self.item_wrap_count.get() + 1);
-        let rendered = Rc::new(render_item_detail_lines(item, inner_width));
+        let (rendered_vec, had_pending) = render_item_detail_lines(item, inner_width, highlights);
+        let rendered = Rc::new(rendered_vec);
         let mut map = self.item_detail_cache.borrow_mut();
         if map.len() >= ITEM_CACHE_CAP && !map.contains_key(&(block_id, idx)) {
             map.retain(|(bid, _), _| *bid == block_id);
@@ -1516,9 +1531,15 @@ impl ToolBlockStore {
         }
         map.insert(
             (block_id, idx),
-            (item.rev, inner_width, Rc::clone(&rendered)),
+            (
+                item.rev,
+                inner_width,
+                hl_rev,
+                had_pending,
+                Rc::clone(&rendered),
+            ),
         );
-        rendered
+        (rendered, had_pending)
     }
 
     /// Lazily wrap and cache detail lines for `block_id`.
@@ -1529,10 +1550,12 @@ impl ToolBlockStore {
         &self,
         block_id: BlockId,
         inner_width: usize,
+        highlights: &HighlightCache,
     ) -> Rc<Vec<markdown::Line>> {
         const MAX_FEED_ITEMS: usize = 8;
 
         let inner_width = inner_width.max(1);
+        let hl_rev = highlights.rev();
         let Some(block) = self.blocks.get(&block_id) else {
             return Rc::new(Vec::new());
         };
@@ -1562,7 +1585,7 @@ impl ToolBlockStore {
         };
         {
             let cache = self.detail_cache.borrow();
-            if cache.key == Some(key) {
+            if cache.key == Some(key) && (!cache.had_pending || cache.highlight_rev == hl_rev) {
                 #[cfg(test)]
                 self.detail_cache_hits.set(self.detail_cache_hits.get() + 1);
                 return Rc::clone(&cache.lines);
@@ -1571,13 +1594,17 @@ impl ToolBlockStore {
         #[cfg(test)]
         self.detail_cache_misses
             .set(self.detail_cache_misses.get() + 1);
-        let rendered = if feed_mode {
-            Rc::new(self.render_block_feed_lines(block, inner_width, MAX_FEED_ITEMS))
+        let (rendered, had_pending) = if feed_mode {
+            let (lines, pending) =
+                self.render_block_feed_lines(block, inner_width, MAX_FEED_ITEMS, highlights);
+            (Rc::new(lines), pending)
         } else {
-            self.cached_item_lines(block_id, selected_idx, item, inner_width)
+            self.cached_item_lines(block_id, selected_idx, item, inner_width, highlights)
         };
         let mut cache = self.detail_cache.borrow_mut();
         cache.key = Some(key);
+        cache.highlight_rev = hl_rev;
+        cache.had_pending = had_pending;
         cache.lines = Rc::clone(&rendered);
         rendered
     }
@@ -1587,14 +1614,16 @@ impl ToolBlockStore {
         block: &ToolBlock,
         width: usize,
         max_items: usize,
-    ) -> Vec<markdown::Line> {
+        highlights: &HighlightCache,
+    ) -> (Vec<markdown::Line>, bool) {
         let w = width.max(1);
         let total = block.items.len();
         if total == 0 {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let start_idx = total.saturating_sub(max_items);
         let mut out = Vec::new();
+        let mut any_pending = false;
         if start_idx > 0 {
             out.extend(markdown::literal(
                 &format!("… ({start_idx} earlier tool(s) · press ←/→ or click in list to inspect)"),
@@ -1640,7 +1669,8 @@ impl ToolBlockStore {
 
             // Per-item cached lines (0 re-wraps of completed items); abbreviate only very long
             // items in Live Feed so RAM/CPU stay lean while single-tool selection (`←/→`) shows 100%.
-            let item_lines = self.cached_item_lines(block.id, idx, item, w);
+            let (item_lines, pending) = self.cached_item_lines(block.id, idx, item, w, highlights);
+            any_pending |= pending;
             let is_latest = idx + 1 == total;
             let (max_lines, head_keep, tail_keep) = if is_latest {
                 (FEED_LATEST_MAX_LINES, FEED_LATEST_HEAD, FEED_LATEST_TAIL)
@@ -1664,7 +1694,7 @@ impl ToolBlockStore {
                 }
             }
         }
-        out
+        (out, any_pending)
     }
 
     #[cfg(test)]
@@ -1737,6 +1767,7 @@ pub(super) fn render_block_left(
     viewport: usize,
     active_min_rows: Option<usize>,
     spinner: &str,
+    highlights: &HighlightCache,
 ) -> RenderedBlockLeft {
     let w = left_width.max(1);
     if block.is_collapsed() {
@@ -1770,7 +1801,7 @@ pub(super) fn render_block_left(
         row_kinds.push(BlockRowKind::ToolItem(idx));
 
         if !split_active && item.status == ToolStatus::Pending {
-            let preview_lines = render_single_col_approval_preview(item, w);
+            let preview_lines = render_single_col_approval_preview(item, w, highlights);
             for pl in preview_lines {
                 lines.push(pl);
                 row_kinds.push(BlockRowKind::Preview);
@@ -1960,9 +1991,16 @@ pub(super) fn render_tool_item_row(
     clip_line_spans(&refs, width)
 }
 
-fn render_single_col_approval_preview(item: &ToolItem, width: usize) -> Vec<markdown::Line> {
+fn render_single_col_approval_preview(
+    item: &ToolItem,
+    width: usize,
+    highlights: &HighlightCache,
+) -> Vec<markdown::Line> {
     let call_val = json!({ "tool": item.tool, "args": item.args });
     let preview = crate::cli::describe_tool_approval_call(&call_val);
+    let path_lang = item.args["path"]
+        .as_str()
+        .and_then(|p| SupportedLanguage::from_path(Path::new(p)));
     let mut out = Vec::new();
     if !preview.detail.is_empty() && (preview.detail_muted || preview.detail.contains('(')) {
         let face = if preview.detail_muted {
@@ -1977,25 +2015,59 @@ fn render_single_col_approval_preview(item: &ToolItem, width: usize) -> Vec<mark
         ));
     }
     for block in preview.blocks {
-        let face = match block.kind {
-            crate::cli::ToolPreviewKind::Removed => Face::DANGER,
-            crate::cli::ToolPreviewKind::Added => Face::HIGHLIGHT,
-            crate::cli::ToolPreviewKind::Code | crate::cli::ToolPreviewKind::Command => Face::CODE,
-            crate::cli::ToolPreviewKind::Muted => Face::MUTED,
+        let (face, diff_bg, block_lang) = match block.kind {
+            crate::cli::ToolPreviewKind::Removed => (
+                Face::DANGER.with_diff_bg(DiffBg::Removed),
+                DiffBg::Removed,
+                path_lang,
+            ),
+            crate::cli::ToolPreviewKind::Added => (
+                Face::HIGHLIGHT.with_diff_bg(DiffBg::Added),
+                DiffBg::Added,
+                path_lang,
+            ),
+            crate::cli::ToolPreviewKind::Code => (Face::CODE, DiffBg::None, path_lang),
+            crate::cli::ToolPreviewKind::Command => {
+                (Face::CODE, DiffBg::None, Some(SupportedLanguage::Bash))
+            }
+            crate::cli::ToolPreviewKind::Muted => (Face::MUTED, DiffBg::None, None),
         };
-        let all_lines: Vec<&str> = block.text.lines().collect();
+        let cleaned = markdown::clean_cow(&block.text);
+        let hl_doc = block_lang.and_then(|lang| {
+            match highlights.lookup_or_schedule(HighlightLang::Code(lang), &cleaned) {
+                Lookup::Ready(doc) => Some(doc),
+                Lookup::Pending | Lookup::Unsupported => None,
+            }
+        });
+        let token_lines = hl_doc.as_deref().and_then(HighlightedDoc::code_lines);
+        let all_lines: Vec<&str> = cleaned.split('\n').collect();
         let cap = block.max_lines.min(6);
-        if all_lines.is_empty() {
+        if all_lines.is_empty() || (all_lines.len() == 1 && all_lines[0].is_empty()) {
             out.push(clip_line_spans(
                 &[(block.prefix, face), ("(empty)", Face::MUTED)],
                 width,
             ));
         } else {
-            for line in all_lines.iter().take(cap) {
-                out.push(clip_line_spans(
-                    &[(block.prefix, face), (*line, face)],
-                    width,
-                ));
+            for (idx, line) in all_lines.iter().take(cap).enumerate() {
+                if let Some(tokens) = token_lines.and_then(|tl| tl.get(idx)) {
+                    let prefix_face = match block.kind {
+                        crate::cli::ToolPreviewKind::Removed => {
+                            Face::DANGER_BOLD.with_diff_bg(DiffBg::Removed)
+                        }
+                        crate::cli::ToolPreviewKind::Added => {
+                            Face::HIGHLIGHT_BOLD.with_diff_bg(DiffBg::Added)
+                        }
+                        _ => face,
+                    };
+                    let mut parts = vec![(block.prefix, prefix_face)];
+                    parts.extend(highlight::line_spans(line, tokens, diff_bg));
+                    out.push(clip_line_spans(&parts, width));
+                } else {
+                    out.push(clip_line_spans(
+                        &[(block.prefix, face), (*line, face)],
+                        width,
+                    ));
+                }
             }
             if all_lines.len() > cap {
                 let rem = format!("… ({} more line(s))", all_lines.len() - cap);
@@ -2235,66 +2307,193 @@ fn push_span(out: &mut markdown::Line, text: &str, face: Face) {
     }
 }
 
-fn push_numbered_code(out: &mut Vec<markdown::Line>, text: &str, start_line: usize, width: usize) {
-    let cleaned = markdown::clean(text);
+fn lookup_code_doc(
+    lang: Option<SupportedLanguage>,
+    cleaned: &str,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) -> Option<Arc<HighlightedDoc>> {
+    let lang = lang?;
+    match highlights.lookup_or_schedule(HighlightLang::Code(lang), cleaned) {
+        Lookup::Ready(doc) => Some(doc),
+        Lookup::Pending => {
+            *had_pending = true;
+            None
+        }
+        Lookup::Unsupported => None,
+    }
+}
+
+fn push_highlighted_plain_code(
+    out: &mut Vec<markdown::Line>,
+    text: &str,
+    fallback_face: Face,
+    width: usize,
+    lang: Option<SupportedLanguage>,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) {
+    let cleaned = markdown::clean_cow(text);
+    let doc = lookup_code_doc(lang, &cleaned, highlights, had_pending);
+    let token_lines = doc.as_deref().and_then(HighlightedDoc::code_lines);
+    for (i, raw_line) in cleaned.split('\n').enumerate() {
+        if let Some(tokens) = token_lines.and_then(|tl| tl.get(i)) {
+            let parts = highlight::line_spans(raw_line, tokens, DiffBg::None);
+            out.extend(markdown::spans(&parts, width));
+        } else {
+            out.extend(markdown::literal(raw_line, fallback_face, width));
+        }
+    }
+}
+
+fn push_numbered_code(
+    out: &mut Vec<markdown::Line>,
+    text: &str,
+    start_line: usize,
+    width: usize,
+    lang: Option<SupportedLanguage>,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) {
+    let cleaned = markdown::clean_cow(text);
+    let doc = lookup_code_doc(lang, &cleaned, highlights, had_pending);
+    let token_lines = doc.as_deref().and_then(HighlightedDoc::code_lines);
     for (i, raw_line) in cleaned.split('\n').enumerate() {
         let line_no = start_line + i;
         let prefix = format!("{line_no:>4} │ ");
-        out.extend(markdown::prefixed(
-            &prefix,
-            Face::MUTED,
-            raw_line,
-            Face::CODE,
-            width,
-        ));
+        if let Some(tokens) = token_lines.and_then(|tl| tl.get(i)) {
+            let parts = highlight::line_spans(raw_line, tokens, DiffBg::None);
+            out.extend(markdown::prefixed_spans(
+                &prefix,
+                Face::MUTED,
+                &parts,
+                width,
+            ));
+        } else {
+            out.extend(markdown::prefixed(
+                &prefix,
+                Face::MUTED,
+                raw_line,
+                Face::CODE,
+                width,
+            ));
+        }
     }
 }
 
 /// Renders `read_file` / `find_symbol` output: if lines already have `N | code` numbering
 /// from `ReadFileTool`, style the existing gutter cleanly without double-numbering and style
 /// trailing `... [N more line(s)...]` continuation hints in `Face::MUTED`.
+#[allow(clippy::too_many_arguments)]
 fn push_prenumbered_or_plain_code(
     out: &mut Vec<markdown::Line>,
     text: &str,
     start_line: usize,
     width: usize,
+    lang: Option<SupportedLanguage>,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
 ) {
-    let cleaned = markdown::clean(text);
+    let cleaned = markdown::clean_cow(text);
     let has_own_nums = cleaned.lines().next().is_some_and(|l| {
         l.split_once(" | ").is_some_and(|(num, _)| {
             !num.trim().is_empty() && num.trim().bytes().all(|b| b.is_ascii_digit())
         })
     });
     if !has_own_nums {
-        push_numbered_code(out, &cleaned, start_line, width);
+        push_numbered_code(
+            out,
+            &cleaned,
+            start_line,
+            width,
+            lang,
+            highlights,
+            had_pending,
+        );
         return;
     }
+
+    enum ReadRow<'a> {
+        Continuation(&'a str),
+        Numbered { num: &'a str, code: &'a str },
+        Raw(&'a str),
+    }
+
+    let mut rows = Vec::new();
+    let mut pure_code_lines = Vec::new();
     for raw_line in cleaned.split('\n') {
         if raw_line.starts_with("... [") {
-            out.extend(markdown::literal(raw_line, Face::MUTED, width));
+            rows.push(ReadRow::Continuation(raw_line));
         } else if let Some((num, code)) = raw_line.split_once(" | ") {
             let trimmed = num.trim();
             if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
-                let prefix = format!("{trimmed:>4} │ ");
-                out.extend(markdown::prefixed(
-                    &prefix,
-                    Face::MUTED,
-                    code,
-                    Face::CODE,
-                    width,
-                ));
+                pure_code_lines.push(code);
+                rows.push(ReadRow::Numbered { num: trimmed, code });
             } else {
-                out.extend(markdown::literal(raw_line, Face::CODE, width));
+                pure_code_lines.push(raw_line);
+                rows.push(ReadRow::Raw(raw_line));
             }
         } else {
-            out.extend(markdown::literal(raw_line, Face::CODE, width));
+            pure_code_lines.push(raw_line);
+            rows.push(ReadRow::Raw(raw_line));
+        }
+    }
+
+    let doc = if lang.is_some() && !pure_code_lines.is_empty() {
+        let joined = pure_code_lines.join("\n");
+        lookup_code_doc(lang, &joined, highlights, had_pending)
+    } else {
+        None
+    };
+    let token_lines = doc.as_deref().and_then(HighlightedDoc::code_lines);
+    let mut code_idx = 0usize;
+    for row in rows {
+        match row {
+            ReadRow::Continuation(raw_line) => {
+                out.extend(markdown::literal(raw_line, Face::MUTED, width));
+            }
+            ReadRow::Numbered { num, code } => {
+                let prefix = format!("{num:>4} │ ");
+                if let Some(tokens) = token_lines.and_then(|tl| tl.get(code_idx)) {
+                    let parts = highlight::line_spans(code, tokens, DiffBg::None);
+                    out.extend(markdown::prefixed_spans(
+                        &prefix,
+                        Face::MUTED,
+                        &parts,
+                        width,
+                    ));
+                } else {
+                    out.extend(markdown::prefixed(
+                        &prefix,
+                        Face::MUTED,
+                        code,
+                        Face::CODE,
+                        width,
+                    ));
+                }
+                code_idx += 1;
+            }
+            ReadRow::Raw(raw_line) => {
+                if let Some(tokens) = token_lines.and_then(|tl| tl.get(code_idx)) {
+                    let parts = highlight::line_spans(raw_line, tokens, DiffBg::None);
+                    out.extend(markdown::spans(&parts, width));
+                } else {
+                    out.extend(markdown::literal(raw_line, Face::CODE, width));
+                }
+                code_idx += 1;
+            }
         }
     }
 }
 
-fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line> {
+fn render_item_detail_lines(
+    item: &ToolItem,
+    width: usize,
+    highlights: &HighlightCache,
+) -> (Vec<markdown::Line>, bool) {
     let w = width.max(1);
     let mut out = Vec::new();
+    let mut had_pending = false;
     if item.payload_pruned {
         let target = item.target_summary();
         if !target.is_empty() {
@@ -2323,13 +2522,14 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
             Face::MUTED,
             w,
         ));
-        return out;
+        return (out, false);
     }
 
     let args = &item.args;
     match item.tool.as_str() {
         "edit_file" => {
             let path = args["path"].as_str().unwrap_or("");
+            let lang = SupportedLanguage::from_path(Path::new(path));
             let replace_all = args["replace_all"].as_bool().unwrap_or(false);
             let meta = if replace_all {
                 format!("{path} (replace_all)")
@@ -2340,31 +2540,40 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 out.extend(markdown::literal(&meta, Face::ACCENT_BOLD, w));
             }
             if let Some(old_text) = args["old_text"].as_str() {
-                for line in markdown::clean(old_text).split('\n') {
-                    out.extend(markdown::prefixed(
-                        "- ",
-                        Face::DANGER_BOLD,
-                        line,
-                        Face::DANGER,
-                        w,
-                    ));
+                let cleaned = markdown::clean_cow(old_text);
+                let doc = lookup_code_doc(lang, &cleaned, highlights, &mut had_pending);
+                let token_lines = doc.as_deref().and_then(HighlightedDoc::code_lines);
+                let gutter_face = Face::DANGER_BOLD.with_diff_bg(DiffBg::Removed);
+                let plain_face = Face::DANGER.with_diff_bg(DiffBg::Removed);
+                for (i, line) in cleaned.split('\n').enumerate() {
+                    if let Some(tokens) = token_lines.and_then(|tl| tl.get(i)) {
+                        let parts = highlight::line_spans(line, tokens, DiffBg::Removed);
+                        out.extend(markdown::prefixed_spans("- ", gutter_face, &parts, w));
+                    } else {
+                        out.extend(markdown::prefixed("- ", gutter_face, line, plain_face, w));
+                    }
                 }
             }
             if let Some(new_text) = args["new_text"].as_str() {
-                for line in markdown::clean(new_text).split('\n') {
-                    out.extend(markdown::prefixed(
-                        "+ ",
-                        Face::HIGHLIGHT_BOLD,
-                        line,
-                        Face::HIGHLIGHT,
-                        w,
-                    ));
+                let cleaned = markdown::clean_cow(new_text);
+                let doc = lookup_code_doc(lang, &cleaned, highlights, &mut had_pending);
+                let token_lines = doc.as_deref().and_then(HighlightedDoc::code_lines);
+                let gutter_face = Face::HIGHLIGHT_BOLD.with_diff_bg(DiffBg::Added);
+                let plain_face = Face::HIGHLIGHT.with_diff_bg(DiffBg::Added);
+                for (i, line) in cleaned.split('\n').enumerate() {
+                    if let Some(tokens) = token_lines.and_then(|tl| tl.get(i)) {
+                        let parts = highlight::line_spans(line, tokens, DiffBg::Added);
+                        out.extend(markdown::prefixed_spans("+ ", gutter_face, &parts, w));
+                    } else {
+                        out.extend(markdown::prefixed("+ ", gutter_face, line, plain_face, w));
+                    }
                 }
             }
             append_output_section(&mut out, item, w, "Result");
         }
         "write_file" => {
             let path = args["path"].as_str().unwrap_or("");
+            let lang = SupportedLanguage::from_path(Path::new(path));
             let content = args["content"].as_str().unwrap_or("");
             let line_count = content.lines().count();
             out.extend(markdown::literal(
@@ -2373,12 +2582,13 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 w,
             ));
             if !content.is_empty() {
-                push_numbered_code(&mut out, content, 1, w);
+                push_numbered_code(&mut out, content, 1, w, lang, highlights, &mut had_pending);
             }
             append_output_section(&mut out, item, w, "Result");
         }
         "read_file" => {
             let mut meta = item.target_summary();
+            let lang = SupportedLanguage::from_path(Path::new(&meta));
             let parsed_read = item.output.as_deref().and_then(parse_read_file_header);
             if let Some(range) = item.read_file_range_label() {
                 if !meta.is_empty() {
@@ -2394,14 +2604,30 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                     out.extend(markdown::literal(parsed.header_note, Face::MUTED, w));
                 }
                 if !parsed.body.is_empty() {
-                    push_prenumbered_or_plain_code(&mut out, parsed.body, parsed.start as usize, w);
+                    push_prenumbered_or_plain_code(
+                        &mut out,
+                        parsed.body,
+                        parsed.start as usize,
+                        w,
+                        lang,
+                        highlights,
+                        &mut had_pending,
+                    );
                 }
             } else if let Some(output) = &item.output {
                 if item.ok == Some(false) {
                     out.extend(markdown::literal(output, Face::DANGER, w));
                 } else {
                     let start = args["start_line"].as_u64().unwrap_or(1) as usize;
-                    push_prenumbered_or_plain_code(&mut out, output, start, w);
+                    push_prenumbered_or_plain_code(
+                        &mut out,
+                        output,
+                        start,
+                        w,
+                        lang,
+                        highlights,
+                        &mut had_pending,
+                    );
                 }
             } else {
                 out.extend(markdown::literal(
@@ -2435,7 +2661,7 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 if item.ok == Some(false) {
                     out.extend(markdown::literal(output, Face::DANGER, w));
                 } else {
-                    render_ast_find_symbol(&mut out, output, w);
+                    render_ast_find_symbol(&mut out, output, w, highlights, &mut had_pending);
                 }
             } else {
                 out.extend(markdown::literal(
@@ -2451,15 +2677,28 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
         }
         "run_shell" => {
             let cmd = args["command"].as_str().unwrap_or("");
-            for (idx, line) in markdown::clean(cmd).split('\n').enumerate() {
+            let cleaned_cmd = markdown::clean_cow(cmd);
+            let cmd_doc = lookup_code_doc(
+                Some(SupportedLanguage::Bash),
+                &cleaned_cmd,
+                highlights,
+                &mut had_pending,
+            );
+            let cmd_tokens = cmd_doc.as_deref().and_then(HighlightedDoc::code_lines);
+            for (idx, line) in cleaned_cmd.split('\n').enumerate() {
                 let pfx = if idx == 0 { "$ " } else { "  " };
-                out.extend(markdown::prefixed(
-                    pfx,
-                    Face::ACCENT_BOLD,
-                    line,
-                    Face::CODE_BOLD,
-                    w,
-                ));
+                if let Some(tokens) = cmd_tokens.and_then(|tl| tl.get(idx)) {
+                    let parts = highlight::line_spans(line, tokens, DiffBg::None);
+                    out.extend(markdown::prefixed_spans(pfx, Face::ACCENT_BOLD, &parts, w));
+                } else {
+                    out.extend(markdown::prefixed(
+                        pfx,
+                        Face::ACCENT_BOLD,
+                        line,
+                        Face::CODE_BOLD,
+                        w,
+                    ));
+                }
             }
             let mut shell_opts = Vec::new();
             if let Some(cwd) = args["cwd"].as_str().filter(|s| !s.is_empty()) {
@@ -2473,25 +2712,42 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
             }
             if let Some(output) = &item.output {
                 if !output.is_empty() {
-                    let mut in_stderr = false;
-                    for raw_line in markdown::clean(output).split('\n') {
-                        if raw_line.starts_with("STDERR:") || raw_line == "--- stderr ---" {
-                            in_stderr = true;
-                            out.extend(markdown::literal(raw_line, Face::DANGER_BOLD, w));
-                            continue;
-                        } else if raw_line.starts_with("STDOUT:") || raw_line == "--- stdout ---" {
-                            in_stderr = false;
-                            out.extend(markdown::literal(raw_line, Face::MUTED, w));
-                            continue;
-                        }
-                        let face = if in_stderr
-                            || item.ok == Some(false) && raw_line.starts_with("error")
+                    let cleaned_out = markdown::clean_cow(output);
+                    if item.ok != Some(false) && highlight::looks_like_unified_diff(&cleaned_out) {
+                        let doc = match highlights
+                            .lookup_or_schedule(HighlightLang::UnifiedDiff, &cleaned_out)
                         {
-                            Face::DANGER
-                        } else {
-                            Face::TEXT
+                            Lookup::Ready(doc) => Some(doc),
+                            Lookup::Pending => {
+                                had_pending = true;
+                                None
+                            }
+                            Lookup::Unsupported => None,
                         };
-                        out.extend(markdown::literal(raw_line, face, w));
+                        highlight::push_unified_diff(&mut out, &cleaned_out, doc.as_deref(), w);
+                    } else {
+                        let mut in_stderr = false;
+                        for raw_line in cleaned_out.split('\n') {
+                            if raw_line.starts_with("STDERR:") || raw_line == "--- stderr ---" {
+                                in_stderr = true;
+                                out.extend(markdown::literal(raw_line, Face::DANGER_BOLD, w));
+                                continue;
+                            } else if raw_line.starts_with("STDOUT:")
+                                || raw_line == "--- stdout ---"
+                            {
+                                in_stderr = false;
+                                out.extend(markdown::literal(raw_line, Face::MUTED, w));
+                                continue;
+                            }
+                            let face = if in_stderr
+                                || item.ok == Some(false) && raw_line.starts_with("error")
+                            {
+                                Face::DANGER
+                            } else {
+                                Face::TEXT
+                            };
+                            out.extend(markdown::literal(raw_line, face, w));
+                        }
                     }
                 } else if !item.live_chunks.is_empty() {
                     append_live_chunks(&mut out, item, w);
@@ -2504,13 +2760,29 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
         }
         "start_process" | "process_output" | "stop_process" => {
             if let Some(cmd) = args["command"].as_str() {
-                out.extend(markdown::prefixed(
-                    "$ ",
-                    Face::ACCENT_BOLD,
-                    cmd,
-                    Face::CODE_BOLD,
-                    w,
-                ));
+                let cleaned_cmd = markdown::clean_cow(cmd);
+                let cmd_doc = lookup_code_doc(
+                    Some(SupportedLanguage::Bash),
+                    &cleaned_cmd,
+                    highlights,
+                    &mut had_pending,
+                );
+                let cmd_tokens = cmd_doc.as_deref().and_then(HighlightedDoc::code_lines);
+                for (idx, line) in cleaned_cmd.split('\n').enumerate() {
+                    let pfx = if idx == 0 { "$ " } else { "  " };
+                    if let Some(tokens) = cmd_tokens.and_then(|tl| tl.get(idx)) {
+                        let parts = highlight::line_spans(line, tokens, DiffBg::None);
+                        out.extend(markdown::prefixed_spans(pfx, Face::ACCENT_BOLD, &parts, w));
+                    } else {
+                        out.extend(markdown::prefixed(
+                            pfx,
+                            Face::ACCENT_BOLD,
+                            line,
+                            Face::CODE_BOLD,
+                            w,
+                        ));
+                    }
+                }
             } else if let Some(pid) = args["id"].as_u64() {
                 let wait = args["wait_secs"]
                     .as_u64()
@@ -2572,12 +2844,13 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 out.extend(markdown::literal(&meta.join(" · "), Face::MUTED, w));
             }
             if let Some(output) = &item.output {
-                let face = if item.ok == Some(false) {
-                    Face::DANGER
+                if item.ok == Some(false) {
+                    out.extend(markdown::literal(output, Face::DANGER, w));
+                } else if item.tool == "grep_search" {
+                    render_grep_search(&mut out, args, output, w, highlights, &mut had_pending);
                 } else {
-                    Face::TEXT
-                };
-                out.extend(markdown::literal(output, face, w));
+                    out.extend(markdown::literal(output, Face::TEXT, w));
+                }
             }
         }
         "code_outline" | "find_references" => {
@@ -2605,9 +2878,9 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 if item.ok == Some(false) {
                     out.extend(markdown::literal(output, Face::DANGER, w));
                 } else if item.tool == "code_outline" {
-                    render_ast_code_outline(&mut out, output, w);
+                    render_ast_code_outline(&mut out, output, w, highlights, &mut had_pending);
                 } else {
-                    render_ast_find_references(&mut out, output, w);
+                    render_ast_find_references(&mut out, output, w, highlights, &mut had_pending);
                 }
             } else {
                 out.extend(markdown::literal(
@@ -2646,7 +2919,15 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
             if item.tool == "browser_control" && args.as_object().is_some_and(|m| m.len() > 1) {
                 let pretty =
                     serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
-                out.extend(markdown::literal(&pretty, Face::MUTED, w));
+                push_highlighted_plain_code(
+                    &mut out,
+                    &pretty,
+                    Face::MUTED,
+                    w,
+                    Some(SupportedLanguage::Json),
+                    highlights,
+                    &mut had_pending,
+                );
             }
             append_output_section(&mut out, item, w, "Response");
         }
@@ -2681,7 +2962,15 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 out.extend(markdown::literal("Arguments", Face::MUTED, w));
                 let pretty =
                     serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
-                out.extend(markdown::literal(&pretty, Face::CODE, w));
+                push_highlighted_plain_code(
+                    &mut out,
+                    &pretty,
+                    Face::CODE,
+                    w,
+                    Some(SupportedLanguage::Json),
+                    highlights,
+                    &mut had_pending,
+                );
             }
             append_output_section(&mut out, item, w, "Output");
         }
@@ -2690,7 +2979,257 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
     if out.is_empty() {
         out.extend(markdown::literal("(no details)", Face::MUTED, w));
     }
+    (out, had_pending)
+}
+
+fn split_grep_content_line(raw_line: &str, allow_context: bool) -> Option<(&str, bool, &str)> {
+    let bytes = raw_line.as_bytes();
+    let digit_end = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digit_end == 0 || digit_end >= bytes.len() {
+        return None;
+    }
+    match bytes[digit_end] {
+        b':' => Some((&raw_line[..digit_end], true, &raw_line[digit_end + 1..])),
+        b'-' if allow_context => Some((&raw_line[..digit_end], false, &raw_line[digit_end + 1..])),
+        _ => None,
+    }
+}
+
+/// Splits `base` spans (which partition `0..line.len()`) to overlay `Face::SEARCH_MATCH`
+/// onto every non-empty regex match without altering text or wrap geometry.
+fn overlay_search_matches<'a>(
+    line: &'a str,
+    base: Vec<(&'a str, Face)>,
+    re: &regex::Regex,
+) -> Vec<(&'a str, Face)> {
+    let matches: Vec<(usize, usize)> = re
+        .find_iter(line)
+        .filter(|m| m.start() < m.end())
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    if matches.is_empty() {
+        return base;
+    }
+    let mut out = Vec::with_capacity(base.len() + matches.len() * 2);
+    let mut m_idx = 0usize;
+    let mut seg_start = 0usize;
+    for (seg, face) in base {
+        let seg_end = seg_start + seg.len();
+        while m_idx < matches.len() && matches[m_idx].1 <= seg_start {
+            m_idx += 1;
+        }
+        let mut pos = seg_start;
+        while pos < seg_end {
+            if m_idx >= matches.len() {
+                out.push((&line[pos..seg_end], face));
+                break;
+            }
+            let (ms, me) = matches[m_idx];
+            if ms >= seg_end {
+                out.push((&line[pos..seg_end], face));
+                break;
+            }
+            if ms > pos {
+                out.push((&line[pos..ms], face));
+                pos = ms;
+            }
+            let ov_end = me.min(seg_end);
+            if ov_end > pos {
+                out.push((&line[pos..ov_end], Face::SEARCH_MATCH));
+                pos = ov_end;
+            }
+            if me <= seg_end {
+                m_idx += 1;
+            }
+        }
+        seg_start = seg_end;
+    }
     out
+}
+
+/// Structured rendering for `grep_search`:
+/// - Highlights matched pattern substrings immediately with `Face::SEARCH_MATCH` (smart-case / regex / fixed_strings).
+/// - Groups code lines per file header for async parallel Tree-sitter syntax highlighting.
+fn render_grep_search(
+    out: &mut Vec<markdown::Line>,
+    args: &Value,
+    output: &str,
+    width: usize,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) {
+    let cleaned = markdown::clean_cow(output);
+    let mode = args["output_mode"].as_str().unwrap_or("content");
+    if mode == "files_with_matches" || mode == "files" {
+        for raw_line in cleaned.split('\n') {
+            if raw_line.is_empty() {
+                out.push(Vec::new());
+            } else if raw_line.starts_with('[')
+                || raw_line.starts_with("Found ")
+                || raw_line.starts_with("No matches ")
+            {
+                out.extend(markdown::literal(raw_line, Face::MUTED, width));
+            } else {
+                out.extend(markdown::literal(raw_line, Face::ACCENT, width));
+            }
+        }
+        return;
+    }
+    if mode == "count" {
+        for raw_line in cleaned.split('\n') {
+            if raw_line.is_empty() {
+                out.push(Vec::new());
+            } else if raw_line.starts_with('[')
+                || raw_line.starts_with("Found ")
+                || raw_line.starts_with("No matches ")
+            {
+                out.extend(markdown::literal(raw_line, Face::MUTED, width));
+            } else if let Some((path, count)) = raw_line.rsplit_once(':') {
+                if !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()) {
+                    out.extend(markdown::spans(
+                        &[
+                            (path, Face::ACCENT_BOLD),
+                            (":", Face::MUTED),
+                            (count, Face::HIGHLIGHT_BOLD),
+                        ],
+                        width,
+                    ));
+                } else {
+                    out.extend(markdown::literal(raw_line, Face::TEXT, width));
+                }
+            } else {
+                out.extend(markdown::literal(raw_line, Face::TEXT, width));
+            }
+        }
+        return;
+    }
+
+    let pattern = args["pattern"].as_str().unwrap_or("");
+    let fixed = args["fixed_strings"].as_bool().unwrap_or(false);
+    let allow_context = args["context"].as_u64().unwrap_or(0) > 0;
+    let re = crate::agent::tools::compile_grep_regex(pattern, fixed);
+
+    enum GrepRow<'a> {
+        Empty,
+        Notice(&'a str),
+        GroupSep,
+        FileHeader(&'a str),
+        CodeLine {
+            num: &'a str,
+            is_match: bool,
+            code: &'a str,
+        },
+    }
+
+    let raw_lines: Vec<&str> = cleaned.split('\n').collect();
+    let mut rows = Vec::with_capacity(raw_lines.len());
+    let mut section_docs: Vec<Option<Arc<HighlightedDoc>>> = Vec::new();
+    let mut line_lookup: Vec<Option<(usize, usize)>> = vec![None; raw_lines.len()];
+    let mut cur_lang: Option<SupportedLanguage> = None;
+    let mut cur_code: Vec<(usize, &str)> = Vec::new();
+    let mut saw_file_header = false;
+
+    let flush_code = |lang: Option<SupportedLanguage>,
+                      code_lines: &mut Vec<(usize, &str)>,
+                      docs: &mut Vec<Option<Arc<HighlightedDoc>>>,
+                      lookup: &mut [Option<(usize, usize)>],
+                      pending: &mut bool| {
+        if code_lines.is_empty() {
+            return;
+        }
+        let sec_id = docs.len();
+        let joined = code_lines
+            .iter()
+            .map(|(_, s)| *s)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let doc = lookup_code_doc(lang, &joined, highlights, pending);
+        for (sub_idx, (line_idx, _)) in code_lines.drain(..).enumerate() {
+            lookup[line_idx] = Some((sec_id, sub_idx));
+        }
+        docs.push(doc);
+    };
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
+        if raw_line.is_empty() {
+            rows.push(GrepRow::Empty);
+        } else if raw_line.starts_with('[')
+            || raw_line.starts_with("Found ")
+            || raw_line.starts_with("No matches ")
+        {
+            rows.push(GrepRow::Notice(raw_line));
+        } else if allow_context && saw_file_header && raw_line == "--" {
+            rows.push(GrepRow::GroupSep);
+        } else if let Some((num, is_match, code)) =
+            split_grep_content_line(raw_line, allow_context && saw_file_header)
+        {
+            cur_code.push((idx, code));
+            rows.push(GrepRow::CodeLine {
+                num,
+                is_match,
+                code,
+            });
+        } else {
+            flush_code(
+                cur_lang,
+                &mut cur_code,
+                &mut section_docs,
+                &mut line_lookup,
+                had_pending,
+            );
+            saw_file_header = true;
+            cur_lang = SupportedLanguage::from_path(Path::new(raw_line.trim()));
+            rows.push(GrepRow::FileHeader(raw_line));
+        }
+    }
+    flush_code(
+        cur_lang,
+        &mut cur_code,
+        &mut section_docs,
+        &mut line_lookup,
+        had_pending,
+    );
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        match row {
+            GrepRow::Empty => out.push(Vec::new()),
+            GrepRow::Notice(s) => out.extend(markdown::literal(s, Face::MUTED, width)),
+            GrepRow::GroupSep => out.extend(markdown::literal("--", Face::SUBTLE, width)),
+            GrepRow::FileHeader(s) => out.extend(markdown::literal(s, Face::ACCENT_BOLD, width)),
+            GrepRow::CodeLine {
+                num,
+                is_match,
+                code,
+            } => {
+                let (prefix, prefix_face, fallback_face) = if is_match {
+                    (format!("{num:>4} │ "), Face::ACCENT, Face::TEXT)
+                } else {
+                    (format!("{num:>4} · "), Face::SUBTLE, Face::MUTED)
+                };
+                let tokens = line_lookup[idx].and_then(|(sec_id, sub_idx)| {
+                    section_docs[sec_id]
+                        .as_deref()
+                        .and_then(HighlightedDoc::code_lines)
+                        .and_then(|tl| tl.get(sub_idx))
+                });
+                let base_spans = match tokens {
+                    Some(tokens) => highlight::line_spans(code, tokens, DiffBg::None),
+                    None if code.is_empty() => Vec::new(),
+                    None => vec![(code, fallback_face)],
+                };
+                let final_spans = match (is_match, re.as_ref()) {
+                    (true, Some(regex)) => overlay_search_matches(code, base_spans, regex),
+                    _ => base_spans,
+                };
+                out.extend(markdown::prefixed_spans(
+                    &prefix,
+                    prefix_face,
+                    &final_spans,
+                    width,
+                ));
+            }
+        }
+    }
 }
 
 fn is_line_span_token(tok: &str) -> bool {
@@ -2708,11 +3247,89 @@ fn is_line_span_token(tok: &str) -> bool {
     }
 }
 
+fn parse_outline_header_lang(header: &str) -> Option<SupportedLanguage> {
+    if let Some((path, rest)) = header.split_once(" (") {
+        if let Some(lang_tok) = rest.split(',').next() {
+            if let Some(lang) = SupportedLanguage::from_name(lang_tok) {
+                return Some(lang);
+            }
+        }
+        return SupportedLanguage::from_path(Path::new(path.trim()));
+    }
+    None
+}
+
 /// Structured rendering for `code_outline` (`<file> (lang, N lines)` headers,
 /// `<indent><start-end>  <signature>  // <doc>` entries, and `[...]` folding notices).
-fn render_ast_code_outline(out: &mut Vec<markdown::Line>, output: &str, width: usize) {
+fn render_ast_code_outline(
+    out: &mut Vec<markdown::Line>,
+    output: &str,
+    width: usize,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) {
     let cleaned = markdown::clean_cow(output);
-    for raw_line in cleaned.split('\n') {
+    let raw_lines: Vec<&str> = cleaned.split('\n').collect();
+
+    // Pre-collect per-file signature batches so each file's outline signatures highlight in 1 job.
+    let mut section_docs: Vec<Option<Arc<HighlightedDoc>>> = Vec::new();
+    let mut line_lookup: Vec<Option<(usize, usize)>> = vec![None; raw_lines.len()];
+    let mut cur_lang: Option<SupportedLanguage> = None;
+    let mut cur_sigs: Vec<(usize, &str)> = Vec::new();
+    let flush_sigs = |lang: Option<SupportedLanguage>,
+                      sigs: &mut Vec<(usize, &str)>,
+                      docs: &mut Vec<Option<Arc<HighlightedDoc>>>,
+                      lookup: &mut [Option<(usize, usize)>],
+                      pending: &mut bool| {
+        if sigs.is_empty() {
+            return;
+        }
+        let sec_id = docs.len();
+        let joined = sigs.iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
+        let doc = lookup_code_doc(lang, &joined, highlights, pending);
+        for (sub_idx, (line_idx, _)) in sigs.drain(..).enumerate() {
+            lookup[line_idx] = Some((sec_id, sub_idx));
+        }
+        docs.push(doc);
+    };
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
+        if raw_line.is_empty()
+            || raw_line.starts_with('[')
+            || raw_line.starts_with("No definitions")
+            || raw_line.starts_with("No supported source")
+        {
+            continue;
+        }
+        let trimmed_start = raw_line.trim_start_matches(' ');
+        let indent_len = raw_line.len() - trimmed_start.len();
+        if let Some((span_tok, rest)) = trimmed_start.split_once("  ") {
+            if is_line_span_token(span_tok) {
+                let sig = rest.split_once("  // ").map_or(rest, |(s, _)| s);
+                cur_sigs.push((idx, sig));
+                continue;
+            }
+        }
+        if indent_len == 0 && raw_line.contains(" lines") && raw_line.ends_with(')') {
+            flush_sigs(
+                cur_lang,
+                &mut cur_sigs,
+                &mut section_docs,
+                &mut line_lookup,
+                had_pending,
+            );
+            cur_lang = parse_outline_header_lang(raw_line);
+        }
+    }
+    flush_sigs(
+        cur_lang,
+        &mut cur_sigs,
+        &mut section_docs,
+        &mut line_lookup,
+        had_pending,
+    );
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
         if raw_line.is_empty() {
             out.push(Vec::new());
             continue;
@@ -2729,16 +3346,33 @@ fn render_ast_code_outline(out: &mut Vec<markdown::Line>, output: &str, width: u
         if let Some((span_tok, rest)) = trimmed_start.split_once("  ") {
             if is_line_span_token(span_tok) {
                 let prefix = &raw_line[..indent_len + span_tok.len() + 2];
+                let tokens = line_lookup[idx].and_then(|(sec_id, sub_idx)| {
+                    section_docs[sec_id]
+                        .as_deref()
+                        .and_then(HighlightedDoc::code_lines)
+                        .and_then(|tl| tl.get(sub_idx))
+                });
                 if let Some((sig, doc)) = rest.split_once("  // ") {
-                    out.extend(markdown::spans(
-                        &[
-                            (prefix, Face::MUTED),
-                            (sig, Face::CODE),
-                            ("  // ", Face::MUTED),
-                            (doc, Face::MUTED),
-                        ],
-                        width,
-                    ));
+                    if let Some(tokens) = tokens {
+                        let mut parts = vec![(prefix, Face::MUTED)];
+                        parts.extend(highlight::line_spans(sig, tokens, DiffBg::None));
+                        parts.push(("  // ", Face::MUTED));
+                        parts.push((doc, Face::MUTED));
+                        out.extend(markdown::spans(&parts, width));
+                    } else {
+                        out.extend(markdown::spans(
+                            &[
+                                (prefix, Face::MUTED),
+                                (sig, Face::CODE),
+                                ("  // ", Face::MUTED),
+                                (doc, Face::MUTED),
+                            ],
+                            width,
+                        ));
+                    }
+                } else if let Some(tokens) = tokens {
+                    let parts = highlight::line_spans(rest, tokens, DiffBg::None);
+                    out.extend(markdown::prefixed_spans(prefix, Face::MUTED, &parts, width));
                 } else {
                     out.extend(markdown::prefixed(
                         prefix,
@@ -2761,9 +3395,69 @@ fn render_ast_code_outline(out: &mut Vec<markdown::Line>, output: &str, width: u
 
 /// Structured rendering for `find_symbol` (summary header, `path:span  Parent::child` headers,
 /// single-gutter `N │ code` bodies with NO double line-numbering, and `[...]` notices).
-fn render_ast_find_symbol(out: &mut Vec<markdown::Line>, output: &str, width: usize) {
+fn render_ast_find_symbol(
+    out: &mut Vec<markdown::Line>,
+    output: &str,
+    width: usize,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) {
     let cleaned = markdown::clean_cow(output);
-    for raw_line in cleaned.split('\n') {
+    let raw_lines: Vec<&str> = cleaned.split('\n').collect();
+
+    // Group `N | code` body runs under each `<path>:<span-lines>` header for multi-line parsing.
+    let mut section_docs: Vec<Option<Arc<HighlightedDoc>>> = Vec::new();
+    let mut line_lookup: Vec<Option<(usize, usize)>> = vec![None; raw_lines.len()];
+    let mut cur_lang: Option<SupportedLanguage> = None;
+    let mut cur_body: Vec<(usize, &str)> = Vec::new();
+    let flush_body = |lang: Option<SupportedLanguage>,
+                      body: &mut Vec<(usize, &str)>,
+                      docs: &mut Vec<Option<Arc<HighlightedDoc>>>,
+                      lookup: &mut [Option<(usize, usize)>],
+                      pending: &mut bool| {
+        if body.is_empty() {
+            return;
+        }
+        let sec_id = docs.len();
+        let joined = body.iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
+        let doc = lookup_code_doc(lang, &joined, highlights, pending);
+        for (sub_idx, (line_idx, _)) in body.drain(..).enumerate() {
+            lookup[line_idx] = Some((sec_id, sub_idx));
+        }
+        docs.push(doc);
+    };
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
+        if let Some((num, code)) = raw_line.split_once(" | ") {
+            let trimmed = num.trim();
+            if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                cur_body.push((idx, code));
+                continue;
+            }
+        }
+        let loc_part = raw_line.split_once("  ").map_or(raw_line, |(loc, _)| loc);
+        if let Some((path_str, span)) = loc_part.rsplit_once(':') {
+            if !path_str.is_empty() && is_line_span_token(span) {
+                flush_body(
+                    cur_lang,
+                    &mut cur_body,
+                    &mut section_docs,
+                    &mut line_lookup,
+                    had_pending,
+                );
+                cur_lang = SupportedLanguage::from_path(Path::new(path_str.trim()));
+            }
+        }
+    }
+    flush_body(
+        cur_lang,
+        &mut cur_body,
+        &mut section_docs,
+        &mut line_lookup,
+        had_pending,
+    );
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
         if raw_line.is_empty() {
             out.push(Vec::new());
             continue;
@@ -2780,13 +3474,29 @@ fn render_ast_find_symbol(out: &mut Vec<markdown::Line>, output: &str, width: us
             let trimmed = num.trim();
             if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
                 let prefix = format!("{trimmed:>4} │ ");
-                out.extend(markdown::prefixed(
-                    &prefix,
-                    Face::MUTED,
-                    code,
-                    Face::CODE,
-                    width,
-                ));
+                let tokens = line_lookup[idx].and_then(|(sec_id, sub_idx)| {
+                    section_docs[sec_id]
+                        .as_deref()
+                        .and_then(HighlightedDoc::code_lines)
+                        .and_then(|tl| tl.get(sub_idx))
+                });
+                if let Some(tokens) = tokens {
+                    let parts = highlight::line_spans(code, tokens, DiffBg::None);
+                    out.extend(markdown::prefixed_spans(
+                        &prefix,
+                        Face::MUTED,
+                        &parts,
+                        width,
+                    ));
+                } else {
+                    out.extend(markdown::prefixed(
+                        &prefix,
+                        Face::MUTED,
+                        code,
+                        Face::CODE,
+                        width,
+                    ));
+                }
                 continue;
             }
         }
@@ -2842,9 +3552,73 @@ fn render_ast_find_symbol(out: &mut Vec<markdown::Line>, output: &str, width: us
 
 /// Structured rendering for `find_references` (summary header, file group headers,
 /// `  <line> [<enclosing_scope>]  <call_line>` entries, and `[...]` notices).
-fn render_ast_find_references(out: &mut Vec<markdown::Line>, output: &str, width: usize) {
+fn render_ast_find_references(
+    out: &mut Vec<markdown::Line>,
+    output: &str,
+    width: usize,
+    highlights: &HighlightCache,
+    had_pending: &mut bool,
+) {
     let cleaned = markdown::clean_cow(output);
-    for raw_line in cleaned.split('\n') {
+    let raw_lines: Vec<&str> = cleaned.split('\n').collect();
+
+    let mut section_docs: Vec<Option<Arc<HighlightedDoc>>> = Vec::new();
+    let mut line_lookup: Vec<Option<(usize, usize)>> = vec![None; raw_lines.len()];
+    let mut cur_lang: Option<SupportedLanguage> = None;
+    let mut cur_calls: Vec<(usize, &str)> = Vec::new();
+    let flush_calls = |lang: Option<SupportedLanguage>,
+                       calls: &mut Vec<(usize, &str)>,
+                       docs: &mut Vec<Option<Arc<HighlightedDoc>>>,
+                       lookup: &mut [Option<(usize, usize)>],
+                       pending: &mut bool| {
+        if calls.is_empty() {
+            return;
+        }
+        let sec_id = docs.len();
+        let joined = calls.iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
+        let doc = lookup_code_doc(lang, &joined, highlights, pending);
+        for (sub_idx, (line_idx, _)) in calls.drain(..).enumerate() {
+            lookup[line_idx] = Some((sec_id, sub_idx));
+        }
+        docs.push(doc);
+    };
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
+        if raw_line.is_empty()
+            || raw_line.starts_with('[')
+            || raw_line.starts_with("Found ")
+            || raw_line.starts_with("No references")
+        {
+            continue;
+        }
+        if let Some(after_indent) = raw_line.strip_prefix("  ") {
+            if let Some((line_tok, after_num)) = after_indent.split_once(" [") {
+                if !line_tok.is_empty() && line_tok.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Some((_, call_rest)) = after_num.split_once("]  ") {
+                        cur_calls.push((idx, call_rest));
+                    }
+                }
+            }
+        } else {
+            flush_calls(
+                cur_lang,
+                &mut cur_calls,
+                &mut section_docs,
+                &mut line_lookup,
+                had_pending,
+            );
+            cur_lang = SupportedLanguage::from_path(Path::new(raw_line.trim()));
+        }
+    }
+    flush_calls(
+        cur_lang,
+        &mut cur_calls,
+        &mut section_docs,
+        &mut line_lookup,
+        had_pending,
+    );
+
+    for (idx, &raw_line) in raw_lines.iter().enumerate() {
         if raw_line.is_empty() {
             out.push(Vec::new());
             continue;
@@ -2862,14 +3636,29 @@ fn render_ast_find_references(out: &mut Vec<markdown::Line>, output: &str, width
                     if let Some((scope, call_rest)) = after_num.split_once("]  ") {
                         let line_prefix = format!("{line_tok:>4} │ ");
                         let scope_badge = format!("[{scope}] ");
-                        out.extend(markdown::spans(
-                            &[
+                        let tokens = line_lookup[idx].and_then(|(sec_id, sub_idx)| {
+                            section_docs[sec_id]
+                                .as_deref()
+                                .and_then(HighlightedDoc::code_lines)
+                                .and_then(|tl| tl.get(sub_idx))
+                        });
+                        if let Some(tokens) = tokens {
+                            let mut parts = vec![
                                 (line_prefix.as_str(), Face::MUTED),
                                 (scope_badge.as_str(), Face::ACCENT),
-                                (call_rest, Face::CODE),
-                            ],
-                            width,
-                        ));
+                            ];
+                            parts.extend(highlight::line_spans(call_rest, tokens, DiffBg::None));
+                            out.extend(markdown::spans(&parts, width));
+                        } else {
+                            out.extend(markdown::spans(
+                                &[
+                                    (line_prefix.as_str(), Face::MUTED),
+                                    (scope_badge.as_str(), Face::ACCENT),
+                                    (call_rest, Face::CODE),
+                                ],
+                                width,
+                            ));
+                        }
                         continue;
                     }
                 }
@@ -3031,6 +3820,7 @@ mod tests {
     #[test]
     fn lazy_detail_cache_hits_and_invalidates_on_rev_or_width_change() {
         let mut store = ToolBlockStore::default();
+        let hl = HighlightCache::default();
         let block_id = store.on_tool_started(
             1,
             0,
@@ -3038,19 +3828,19 @@ mod tests {
             json!({"command": "cargo test"}),
             true,
         );
-        let a = store.detail_lines(block_id, 50);
-        let b = store.detail_lines(block_id, 50);
+        let a = store.detail_lines(block_id, 50, &hl);
+        let b = store.detail_lines(block_id, 50, &hl);
         assert!(Rc::ptr_eq(&a, &b));
         assert_eq!(store.detail_cache_stats(), (1, 1));
 
         // Streaming chunk bumps rev -> invalidates cache
         store.on_tool_output_chunk(1, 0, OutputStream::Stdout, "running tests\n");
-        let c = store.detail_lines(block_id, 50);
+        let c = store.detail_lines(block_id, 50, &hl);
         assert!(!Rc::ptr_eq(&a, &c));
         assert_eq!(store.detail_cache_stats(), (1, 2));
 
         // Width change invalidates cache
-        let d = store.detail_lines(block_id, 40);
+        let d = store.detail_lines(block_id, 40, &hl);
         assert!(!Rc::ptr_eq(&c, &d));
         assert_eq!(store.detail_cache_stats(), (1, 3));
     }
@@ -3058,6 +3848,7 @@ mod tests {
     #[test]
     fn payload_budget_prunes_oldest_sealed_block_keeping_headers() {
         let mut store = ToolBlockStore::default();
+        let hl = HighlightCache::default();
         store.set_max_payload_bytes_for_test(200);
 
         let b1 = store.on_tool_started(1, 0, "run_shell".into(), json!({"command": "cmd1"}), true);
@@ -3076,7 +3867,7 @@ mod tests {
         assert!(store.payload_bytes() <= 200);
         assert!(!store.get(b2).unwrap().pruned);
 
-        let pruned_view = store.detail_lines(b1, 50);
+        let pruned_view = store.detail_lines(b1, 50, &hl);
         let text: String = pruned_view
             .iter()
             .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
@@ -3172,8 +3963,9 @@ mod tests {
             "{hdr_after:?}"
         );
 
+        let hl = HighlightCache::default();
         let body_text: String = store
-            .detail_lines(b, 80)
+            .detail_lines(b, 80, &hl)
             .iter()
             .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
@@ -3257,9 +4049,10 @@ mod tests {
             true,
         );
 
+        let hl = HighlightCache::default();
         // First Feed render wraps both items once (wrap_count == 2), abbreviates the 80-line
         // earlier item in Live Feed to keep CPU/RAM light, keeping head & tail visible.
-        let feed1 = store.detail_lines(b, 60);
+        let feed1 = store.detail_lines(b, 60, &hl);
         assert_eq!(store.item_wrap_count(), 2);
         let text1: String = feed1
             .iter()
@@ -3275,7 +4068,7 @@ mod tests {
         // Streaming 5 live chunks into item #1 MUST NOT re-wrap completed item #0 (only +1 wrap per chunk)!
         for c in 1..=5 {
             store.on_tool_output_chunk(2, 0, OutputStream::Stdout, &format!("chunk-{c}\n"));
-            let _ = store.detail_lines(b, 60);
+            let _ = store.detail_lines(b, 60, &hl);
         }
         assert_eq!(
             store.item_wrap_count(),
@@ -3285,7 +4078,7 @@ mod tests {
 
         // Selecting item #0 directly (Single-Tool view) shows 100% of all 80 lines with 0 re-wraps!
         store.select_item(b, 0);
-        let single = store.detail_lines(b, 60);
+        let single = store.detail_lines(b, 60, &hl);
         assert_eq!(
             store.item_wrap_count(),
             2 + 5,
@@ -3367,7 +4160,8 @@ mod tests {
             "Found 1 definition(s) of 'Grep::execute':\nsrc/lib.rs:40-42  Grep::execute  // Runs grep\n  40 | fn execute() {\n  41 |     run()\n  42 | }\n... [10 more line(s); call read_file with start_line=43]".into(),
             8,
         );
-        let sym_lines = store.detail_lines(b, 90);
+        let hl = HighlightCache::default();
+        let sym_lines = store.detail_lines(b, 90, &hl);
         let sym_text: String = sym_lines
             .iter()
             .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
@@ -3405,7 +4199,7 @@ mod tests {
             5,
         );
         store.select_item(b, 1);
-        let outline_lines = store.detail_lines(b, 90);
+        let outline_lines = store.detail_lines(b, 90, &hl);
         assert!(
             outline_lines.iter().any(|l| l
                 .iter()
@@ -3438,7 +4232,7 @@ mod tests {
             7,
         );
         store.select_item(b, 2);
-        let ref_lines = store.detail_lines(b, 90);
+        let ref_lines = store.detail_lines(b, 90, &hl);
         assert!(
             ref_lines.iter().any(|l| l
                 .iter()
@@ -3452,6 +4246,286 @@ mod tests {
                 && l.iter()
                     .any(|s| s.text.contains("grep.execute()") && s.face == Face::CODE)),
             "find_references rows should highlight enclosing scope and call line"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn inspector_async_highlighting_renders_plain_first_then_upgrades_without_reflow() {
+        use super::super::{highlight::HighlightWorker, markdown::SyntaxRole, worker::Update};
+        use std::time::Duration;
+
+        let plain_of = |lines: &[markdown::Line]| -> String {
+            lines
+                .iter()
+                .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let mut hl = HighlightCache::default();
+        hl.attach_worker(HighlightWorker::spawn(tx));
+
+        let mut store = ToolBlockStore::default();
+        // 0: read_file (Rust with pre-numbered ReadFileTool output)
+        let b = store.on_tool_started(
+            1,
+            0,
+            "read_file".into(),
+            json!({"path": "src/demo.rs", "start_line": 10, "end_line": 12}),
+            false,
+        );
+        store.on_tool_finished(
+            1,
+            0,
+            "read_file",
+            true,
+            "File: src/demo.rs (lines 10..=12 of 50)\n  10 | pub fn greet(name: &str) -> String {\n  11 |     // greeting\n  12 |     format!(\"hi {name}\")\n... [38 more line(s)]".into(),
+            4,
+        );
+        // 1: edit_file (Rust diff with old_text + new_text)
+        store.on_tool_started(
+            1,
+            1,
+            "edit_file".into(),
+            json!({
+                "path": "src/demo.rs",
+                "old_text": "let old = 1;",
+                "new_text": "let new = \"two\";"
+            }),
+            false,
+        );
+        // 2: write_file (Python)
+        store.on_tool_started(
+            1,
+            2,
+            "write_file".into(),
+            json!({
+                "path": "scripts/run.py",
+                "content": "def main():\n    return \"ok\"\n"
+            }),
+            false,
+        );
+        // 3: run_shell with unified diff output (`git diff`)
+        store.on_tool_started(
+            1,
+            3,
+            "run_shell".into(),
+            json!({"command": "git diff src/demo.rs"}),
+            false,
+        );
+        store.on_tool_finished(
+            1,
+            3,
+            "run_shell",
+            true,
+            "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs\n@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = \"hi\";".into(),
+            9,
+        );
+
+        // Capture immediate plain first-frame outputs (schedules all items in background).
+        let mut before = Vec::new();
+        for idx in 0..4 {
+            store.select_item(b, idx);
+            let lines = store.detail_lines(b, 50, &hl);
+            assert!(
+                lines
+                    .iter()
+                    .flatten()
+                    .all(|s| s.face.syntax == SyntaxRole::None),
+                "first paint for item {idx} must be instant plain text without blocking"
+            );
+            before.push((lines.len(), plain_of(&lines)));
+        }
+
+        // Wait for parallel background worker jobs to finish and apply into HighlightCache.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            while let Ok(Update::HighlightReady { key, doc }) = rx.try_recv() {
+                hl.apply_result(key, doc);
+            }
+            if hl.rev() >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Re-render every item: exact same line count and plain text (ZERO reflow), now syntax-colored!
+        for (idx, (before_len, before_text)) in before.iter().enumerate() {
+            store.select_item(b, idx);
+            let after = store.detail_lines(b, 50, &hl);
+            assert_eq!(
+                after.len(),
+                *before_len,
+                "item {idx} wrapped line count must stay identical after highlight"
+            );
+            assert_eq!(
+                plain_of(&after),
+                *before_text,
+                "item {idx} text must stay identical after highlight"
+            );
+            assert!(
+                after.iter().flatten().any(
+                    |s| s.face.syntax != SyntaxRole::None && s.face.syntax != SyntaxRole::Plain
+                ),
+                "item {idx} must now contain semantic syntax tokens"
+            );
+        }
+
+        // Specifically verify edit_file keeps DiffBg::Removed / DiffBg::Added alongside syntax roles.
+        store.select_item(b, 1);
+        let edit_lines = store.detail_lines(b, 50, &hl);
+        assert!(
+            edit_lines.iter().flatten().any(|s| s.text == "let"
+                && s.face.syntax == SyntaxRole::Keyword
+                && s.face.diff_bg == DiffBg::Removed),
+            "edit_file removed line must have Keyword fg + Removed diff bg"
+        );
+        assert!(
+            edit_lines.iter().flatten().any(|s| s.text.contains("two")
+                && s.face.syntax == SyntaxRole::String
+                && s.face.diff_bg == DiffBg::Added),
+            "edit_file added line must have String fg + Added diff bg"
+        );
+    }
+
+    #[test]
+    fn grep_search_highlights_matched_substrings_immediately_and_overlays_async_syntax() {
+        let plain_of = |lines: &[markdown::Line]| -> String {
+            lines
+                .iter()
+                .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut store = ToolBlockStore::default();
+        let b = store.on_tool_started(
+            1,
+            0,
+            "grep_search".into(),
+            json!({"pattern": "render_\\w+", "path": "src", "context": 1}),
+            false,
+        );
+        store.on_tool_finished(
+            1,
+            0,
+            "grep_search",
+            true,
+            concat!(
+                "Found 2 match(es) in 1 file(s):\n",
+                "src/tui/render.rs\n",
+                "10-pub fn setup() {}\n",
+                "11:pub fn render_frame() { render_footer(); }\n",
+                "--\n",
+                "42:    // call render_header\n",
+                "[stopped at head_limit=50; more results may exist - narrow pattern/path/glob]"
+            )
+            .into(),
+            6,
+        );
+
+        // Attach async worker (real TUI flow): frame 1 STILL renders plain + Face::SEARCH_MATCH
+        // immediately without blocking, and schedules background Tree-sitter highlighting.
+        #[cfg(feature = "tree-sitter")]
+        let (mut hl, mut rx) = {
+            use super::super::highlight::HighlightWorker;
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let mut cache = HighlightCache::default();
+            cache.attach_worker(HighlightWorker::spawn(tx));
+            (cache, rx)
+        };
+        #[cfg(not(feature = "tree-sitter"))]
+        let hl = HighlightCache::default();
+
+        let first = store.detail_lines(b, 80, &hl);
+        let first_text = plain_of(&first);
+        assert!(first_text.contains("src/tui/render.rs"), "{first_text}");
+        assert!(
+            first_text.contains("  11 │ pub fn render_frame() { render_footer(); }"),
+            "{first_text}"
+        );
+        assert!(
+            first_text.contains("  10 · pub fn setup() {}"),
+            "{first_text}"
+        );
+        let matched_texts: Vec<&str> = first
+            .iter()
+            .flatten()
+            .filter(|s| s.face == Face::SEARCH_MATCH)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            matched_texts,
+            vec!["render_frame", "render_footer", "render_header"]
+        );
+
+        // Once async Tree-sitter worker finishes: non-matched code upgrades to syntax colors
+        // while matched substrings remain Face::SEARCH_MATCH with ZERO reflow!
+        #[cfg(feature = "tree-sitter")]
+        {
+            use super::super::{markdown::SyntaxRole, worker::Update};
+            use std::time::Duration;
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && hl.rev() == 0 {
+                while let Ok(Update::HighlightReady { key, doc }) = rx.try_recv() {
+                    hl.apply_result(key, doc);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(hl.rev() > 0);
+            let second = store.detail_lines(b, 80, &hl);
+            assert_eq!(second.len(), first.len(), "no reflow on syntax upgrade");
+            assert_eq!(plain_of(&second), first_text, "exact text preserved");
+            assert!(
+                second
+                    .iter()
+                    .flatten()
+                    .any(|s| s.text == "fn" && s.face.syntax == SyntaxRole::Keyword),
+                "surrounding Rust tokens must be syntax highlighted"
+            );
+            let matched_after: Vec<&str> = second
+                .iter()
+                .flatten()
+                .filter(|s| s.face == Face::SEARCH_MATCH)
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(
+                matched_after,
+                vec!["render_frame", "render_footer", "render_header"]
+            );
+        }
+
+        // Smart-case + fixed_strings
+        store.on_tool_started(
+            1,
+            1,
+            "grep_search".into(),
+            json!({"pattern": "Foo[0]", "fixed_strings": true}),
+            false,
+        );
+        store.on_tool_finished(
+            1,
+            1,
+            "grep_search",
+            true,
+            "Found 1 match(es) in 1 file(s):\nnotes.txt\n3:value = Foo[0] and foo[0]".into(),
+            2,
+        );
+        store.select_item(b, 1);
+        let fixed_lines = store.detail_lines(b, 80, &hl);
+        let fixed_matches: Vec<&str> = fixed_lines
+            .iter()
+            .flatten()
+            .filter(|s| s.face == Face::SEARCH_MATCH)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            fixed_matches,
+            vec!["Foo[0]"],
+            "smart-case uppercase literal must match Foo[0] only"
         );
     }
 }

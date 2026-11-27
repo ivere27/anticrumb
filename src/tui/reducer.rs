@@ -4,6 +4,7 @@ use super::{
     commands::{Choice, Completion, HistoryClearConfirmation, Menu, Selection},
     debug_log::DebugLogger,
     editor::{Draft, Editor},
+    highlight::HighlightCache,
     inspector::{
         self, BlockId, BlockRowKind, InspectorBadgeAction, PaintedInspectorPane, PaintedToolBlock,
         ToolBlockStore,
@@ -203,6 +204,7 @@ pub(super) struct State {
     pub scroll_bottom_button: Option<(u16, u16, u16)>,
     pub layout: LayoutConfig,
     pub tool_blocks: ToolBlockStore,
+    pub highlights: HighlightCache,
     pub inspector_zoom: bool,
     pub inspector_zoom_scroll: usize,
     pub shortcuts_open: bool,
@@ -312,6 +314,7 @@ impl State {
             scroll_bottom_button: None,
             layout: LayoutConfig::default(),
             tool_blocks: ToolBlockStore::default(),
+            highlights: HighlightCache::default(),
             inspector_zoom: false,
             inspector_zoom_scroll: 0,
             shortcuts_open: false,
@@ -1869,6 +1872,7 @@ impl State {
         self.clear_painted_regions();
         self.transcript.clear();
         self.tool_blocks.clear();
+        self.highlights.clear();
         let state_str = conversation.summary.state.as_str();
         let state_face = match state_str {
             "completed" | "ready" => Face::HIGHLIGHT_BOLD,
@@ -2278,6 +2282,9 @@ impl State {
                     .mention
                     .as_mut()
                     .is_some_and(|mention| mention.apply_results(id, &query, matches, total));
+            }
+            Update::HighlightReady { key, doc } => {
+                return self.highlights.apply_result(key, doc);
             }
         }
         true
@@ -3006,9 +3013,11 @@ impl State {
             let width = self.painted_size.0.max(80);
             let split = HorizontalSplit::compute(width, &self.layout.inspector);
             let right_w = split.map_or(usize::from(width), |s| usize::from(s.right.len));
-            let detail = self
-                .tool_blocks
-                .detail_lines(block_id, right_w.saturating_sub(1).max(1));
+            let detail = self.tool_blocks.detail_lines(
+                block_id,
+                right_w.saturating_sub(1).max(1),
+                &self.highlights,
+            );
             let rows = self.painted_layout.map_or(10, |l| {
                 usize::from(l.transcript.len).saturating_sub(2).max(1)
             });
@@ -3027,9 +3036,11 @@ impl State {
             (pane.detail_lines.len(), pane.body_rows)
         } else {
             let width = self.painted_size.0.max(80);
-            let detail = self
-                .tool_blocks
-                .detail_lines(block_id, usize::from(width).saturating_sub(2).max(1));
+            let detail = self.tool_blocks.detail_lines(
+                block_id,
+                usize::from(width).saturating_sub(2).max(1),
+                &self.highlights,
+            );
             let rows = self.painted_layout.map_or(16, |l| {
                 usize::from(l.transcript.len).saturating_sub(2).max(1)
             });
@@ -3100,6 +3111,7 @@ impl State {
             inline_split,
             viewport,
             spinner,
+            &self.highlights,
         );
         (lines, inline_split, split_key)
     }
@@ -3276,6 +3288,7 @@ impl State {
                     None,
                     viewport,
                     "⠋",
+                    &self.highlights,
                 );
                 (
                     all.len(),
@@ -3713,10 +3726,7 @@ impl State {
     }
 
     pub(super) fn transcript_mouse(&mut self, mouse: event::MouseEvent) -> Option<String> {
-        if self.menu.is_some()
-            || self.history_clear_confirmation.is_some()
-            || self.shortcuts_open
-        {
+        if self.menu.is_some() || self.history_clear_confirmation.is_some() || self.shortcuts_open {
             self.clear_selection();
             self.divider_drag = false;
             self.last_click = None;

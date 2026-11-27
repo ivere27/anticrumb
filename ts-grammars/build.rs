@@ -33,6 +33,7 @@ struct GrammarSpec {
     c_symbol: &'static str,
     has_scanner: bool,
     language_fn: LanguageFn,
+    highlight_queries: &'static [&'static str],
 }
 
 const GRAMMARS: &[GrammarSpec] = &[
@@ -43,6 +44,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_rust",
         has_scanner: true,
         language_fn: tree_sitter_rust::LANGUAGE,
+        highlight_queries: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "python",
@@ -51,6 +53,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_python",
         has_scanner: true,
         language_fn: tree_sitter_python::LANGUAGE,
+        highlight_queries: &[tree_sitter_python::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "javascript",
@@ -59,6 +62,10 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_javascript",
         has_scanner: true,
         language_fn: tree_sitter_javascript::LANGUAGE,
+        highlight_queries: &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+        ],
     },
     GrammarSpec {
         name: "typescript",
@@ -67,6 +74,10 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_typescript",
         has_scanner: true,
         language_fn: tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        highlight_queries: &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        ],
     },
     GrammarSpec {
         name: "tsx",
@@ -75,6 +86,11 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_tsx",
         has_scanner: true,
         language_fn: tree_sitter_typescript::LANGUAGE_TSX,
+        highlight_queries: &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        ],
     },
     GrammarSpec {
         name: "go",
@@ -83,6 +99,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_go",
         has_scanner: false,
         language_fn: tree_sitter_go::LANGUAGE,
+        highlight_queries: &[tree_sitter_go::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "c",
@@ -91,6 +108,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_c",
         has_scanner: false,
         language_fn: tree_sitter_c::LANGUAGE,
+        highlight_queries: &[tree_sitter_c::HIGHLIGHT_QUERY],
     },
     GrammarSpec {
         name: "cpp",
@@ -99,6 +117,10 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_cpp",
         has_scanner: true,
         language_fn: tree_sitter_cpp::LANGUAGE,
+        highlight_queries: &[
+            tree_sitter_c::HIGHLIGHT_QUERY,
+            tree_sitter_cpp::HIGHLIGHT_QUERY,
+        ],
     },
     GrammarSpec {
         name: "java",
@@ -107,6 +129,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_java",
         has_scanner: false,
         language_fn: tree_sitter_java::LANGUAGE,
+        highlight_queries: &[tree_sitter_java::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "csharp",
@@ -115,6 +138,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_c_sharp",
         has_scanner: true,
         language_fn: tree_sitter_c_sharp::LANGUAGE,
+        highlight_queries: &[tree_sitter_c_sharp::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "bash",
@@ -123,6 +147,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_bash",
         has_scanner: true,
         language_fn: tree_sitter_bash::LANGUAGE,
+        highlight_queries: &[tree_sitter_bash::HIGHLIGHT_QUERY],
     },
     GrammarSpec {
         name: "ruby",
@@ -131,6 +156,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_ruby",
         has_scanner: true,
         language_fn: tree_sitter_ruby::LANGUAGE,
+        highlight_queries: &[tree_sitter_ruby::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "json",
@@ -139,6 +165,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_json",
         has_scanner: false,
         language_fn: tree_sitter_json::LANGUAGE,
+        highlight_queries: &[tree_sitter_json::HIGHLIGHTS_QUERY],
     },
     GrammarSpec {
         name: "dart",
@@ -147,6 +174,7 @@ const GRAMMARS: &[GrammarSpec] = &[
         c_symbol: "tree_sitter_dart",
         has_scanner: true,
         language_fn: tree_sitter_dart::LANGUAGE,
+        highlight_queries: &[tree_sitter_dart::HIGHLIGHTS_QUERY],
     },
 ];
 
@@ -736,6 +764,24 @@ fn main() {
         let tables_out = out_dir.join(format!("{}_tables.zlib", spec.name));
         write_if_changed(&tables_out, &compressed_tables);
 
+        // 1b. Compress upstream highlights.scm query text into OUT_DIR
+        let mut combined_query = String::new();
+        for (idx, part) in spec.highlight_queries.iter().enumerate() {
+            if idx > 0 && !combined_query.ends_with('\n') {
+                combined_query.push('\n');
+            }
+            combined_query.push_str(part);
+        }
+        let mut q_encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        q_encoder
+            .write_all(combined_query.as_bytes())
+            .unwrap_or_else(|e| panic!("{}: highlight query zlib write failed: {e}", spec.name));
+        let compressed_query = q_encoder
+            .finish()
+            .unwrap_or_else(|e| panic!("{}: highlight query zlib finish failed: {e}", spec.name));
+        let query_out = out_dir.join(format!("{}_highlights.zlib", spec.name));
+        write_if_changed(&query_out, &compressed_query);
+
         // 2. Verify parser.c matches host TSLanguage, strip parse tables, and compile for target
         let parser_c = fs::read_to_string(&parser_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", parser_path.display()));
@@ -765,8 +811,8 @@ fn main() {
         cfg.compile(&format!("ts-grammar-{}", spec.name));
 
         generated_rs.push_str(&format!(
-            "define_grammar!({}, {}_with_tables, \"/{}_tables.zlib\");\n",
-            spec.name, spec.c_symbol, spec.name
+            "define_grammar!({}, {}_with_tables, \"/{}_tables.zlib\", \"/{}_highlights.zlib\");\n",
+            spec.name, spec.c_symbol, spec.name, spec.name
         ));
     }
 

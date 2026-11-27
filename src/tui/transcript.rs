@@ -1,5 +1,6 @@
 //! Bounded transcript buffer, entry styling, and plain-text projection.
 use super::{
+    highlight::HighlightCache,
     inspector::{self, BlockId, BlockRowKind, ToolBlockStore},
     layout::{AfterTurnPolicy, HorizontalSplit},
     markdown::{self, Face},
@@ -173,6 +174,19 @@ impl Entry {
             // Count only lightweight summary overhead so heavy tool outputs never
             // prematurely evict conversation prose from the 128 KiB transcript budget.
             Entry::ToolBlock(_) => 64,
+        }
+    }
+
+    pub(super) fn render_with_highlights(
+        &self,
+        width: usize,
+        highlights: &HighlightCache,
+    ) -> (Vec<markdown::Line>, bool) {
+        match self {
+            Entry::Markdown(text) => {
+                markdown::lines_with_highlights(text, width, Some(highlights), true)
+            }
+            other => (other.render(width), false),
         }
     }
 
@@ -444,22 +458,33 @@ struct LineCache {
     width: usize,
     split_key: SplitCacheKey,
     block_layout_rev: u64,
+    highlight_rev: u64,
     rendered_items: usize,
     item_line_counts: Vec<usize>,
+    pending_highlight_items: Vec<usize>,
     items: Rc<Vec<markdown::Line>>,
     block_spans: Rc<Vec<BlockSpan>>,
     evicted_lines: u64,
     stream_text: String,
     stream: Rc<Vec<markdown::Line>>,
+    stream_pending_highlight: bool,
+    stream_highlight_rev: u64,
     visible_stream_len: usize,
 }
 
 impl LineCache {
-    fn reset(&mut self, width: usize, split_key: SplitCacheKey, block_layout_rev: u64) {
+    fn reset(
+        &mut self,
+        width: usize,
+        split_key: SplitCacheKey,
+        block_layout_rev: u64,
+        highlight_rev: u64,
+    ) {
         *self = Self {
             width,
             split_key,
             block_layout_rev,
+            highlight_rev,
             ..Self::default()
         };
     }
@@ -517,6 +542,14 @@ impl Transcript {
                         cache.item_line_counts.drain(..drained_rendered).sum();
                     cache.evicted_lines = cache.evicted_lines.saturating_add(drained_lines as u64);
                     cache.rendered_items -= drained_rendered;
+                    cache.pending_highlight_items.retain_mut(|idx| {
+                        if *idx < drained_rendered {
+                            false
+                        } else {
+                            *idx -= drained_rendered;
+                            true
+                        }
+                    });
                     if cache.rendered_items == 0 {
                         cache.items = Rc::new(Vec::new());
                         cache.block_spans = Rc::new(Vec::new());
@@ -546,8 +579,13 @@ impl Transcript {
         self.bytes = 0;
         self.revision = self.revision.wrapping_add(1);
         let cache = self.cache.get_mut();
-        let (width, split_key, rev) = (cache.width, cache.split_key, cache.block_layout_rev);
-        cache.reset(width, split_key, rev);
+        let (width, split_key, rev, hl_rev) = (
+            cache.width,
+            cache.split_key,
+            cache.block_layout_rev,
+            cache.highlight_rev,
+        );
+        cache.reset(width, split_key, rev, hl_rev);
     }
 
     /// Wrapped lines for `width`, reusing previously wrapped sealed items and
@@ -563,23 +601,63 @@ impl Transcript {
         inline_split: Option<HorizontalSplit>,
         viewport: usize,
         spinner: &str,
+        highlights: &HighlightCache,
     ) -> TranscriptLines {
         let w = width.saturating_sub(1);
         let block_layout_rev = tool_blocks.layout_rev();
+        let hl_rev = highlights.rev();
         let mut cache_ref = self.cache.borrow_mut();
         let cache = &mut *cache_ref;
         if cache.width != w
             || cache.split_key != split_key
             || cache.block_layout_rev != block_layout_rev
         {
-            cache.reset(w, split_key, block_layout_rev);
+            cache.reset(w, split_key, block_layout_rev, hl_rev);
+        }
+        // Refresh only sealed items that were waiting on async syntax highlights.
+        if cache.highlight_rev != hl_rev {
+            cache.highlight_rev = hl_rev;
+            if !cache.pending_highlight_items.is_empty() {
+                let pending = std::mem::take(&mut cache.pending_highlight_items);
+                let items = Rc::make_mut(&mut cache.items);
+                let spans = Rc::make_mut(&mut cache.block_spans);
+                let mut still_pending = Vec::new();
+                for idx in pending {
+                    if idx >= cache.rendered_items || idx >= self.items.len() {
+                        continue;
+                    }
+                    let start_line: usize = cache.item_line_counts[..idx].iter().sum();
+                    let old_len = cache.item_line_counts[idx];
+                    let (new_lines, needs_more) =
+                        self.items[idx].entry.render_with_highlights(w, highlights);
+                    let new_len = new_lines.len();
+                    if start_line + old_len <= items.len() {
+                        items.splice(start_line..start_line + old_len, new_lines);
+                        cache.item_line_counts[idx] = new_len;
+                        if new_len != old_len {
+                            let end_old = start_line + old_len;
+                            for span in spans.iter_mut() {
+                                if span.start_line >= end_old {
+                                    span.start_line = span.start_line + new_len - old_len;
+                                    span.end_line = span.end_line + new_len - old_len;
+                                }
+                            }
+                        }
+                    }
+                    if needs_more {
+                        still_pending.push(idx);
+                    }
+                }
+                cache.pending_highlight_items = still_pending;
+            }
         }
         if cache.rendered_items < self.items.len() {
             let start = cache.rendered_items;
             let items = Rc::make_mut(&mut cache.items);
             let spans = Rc::make_mut(&mut cache.block_spans);
             let empty_approvals = VecDeque::new();
-            for item in &self.items[start..] {
+            for (offset, item) in self.items[start..].iter().enumerate() {
+                let item_idx = start + offset;
                 let before = items.len();
                 match &item.entry {
                     Entry::ToolBlock(block_id) => {
@@ -594,6 +672,7 @@ impl Transcript {
                                 viewport,
                                 None,
                                 spinner,
+                                highlights,
                             );
                             items.extend(rendered.lines);
                             let after = items.len();
@@ -609,22 +688,34 @@ impl Transcript {
                         }
                     }
                     other => {
-                        items.extend(other.render(w));
+                        let (rendered_lines, needs_hl) =
+                            other.render_with_highlights(w, highlights);
+                        items.extend(rendered_lines);
+                        if needs_hl {
+                            cache.pending_highlight_items.push(item_idx);
+                        }
                     }
                 }
                 cache.item_line_counts.push(items.len() - before);
             }
             cache.rendered_items = self.items.len();
         }
-        if cache.stream_text != stream {
+        let stream_hl_dirty =
+            cache.stream_pending_highlight && cache.stream_highlight_rev != hl_rev;
+        if cache.stream_text != stream || stream_hl_dirty {
             if stream.is_empty() {
                 cache.stream = Rc::new(Vec::new());
                 cache.visible_stream_len = 0;
+                cache.stream_pending_highlight = false;
             } else {
                 let prose = crate::tool_codec::visible_prose(stream);
                 cache.visible_stream_len = prose.len();
-                cache.stream = Rc::new(markdown::lines(&prose, w));
+                let (rendered_stream, needs_hl) =
+                    markdown::lines_with_highlights(&prose, w, Some(highlights), false);
+                cache.stream = Rc::new(rendered_stream);
+                cache.stream_pending_highlight = needs_hl;
             }
+            cache.stream_highlight_rev = hl_rev;
             cache.stream_text.clear();
             cache.stream_text.push_str(stream);
         }
@@ -648,6 +739,7 @@ impl Transcript {
                     viewport,
                     Some(active_min),
                     spinner,
+                    highlights,
                 );
                 let tail_start = cache.items.len();
                 let tail_end = tail_start + rendered.lines.len();
@@ -679,6 +771,7 @@ impl Transcript {
     pub(super) fn lines(&self, stream: &str, width: usize) -> TranscriptLines {
         let empty_store = ToolBlockStore::default();
         let empty_approvals = VecDeque::new();
+        let empty_hl = HighlightCache::default();
         self.lines_with_blocks(
             stream,
             width,
@@ -688,6 +781,7 @@ impl Transcript {
             None,
             24,
             "⠋",
+            &empty_hl,
         )
     }
 
@@ -721,6 +815,7 @@ mod tests {
     ) -> Vec<markdown::Line> {
         let w = width.saturating_sub(1);
         let empty_approvals = VecDeque::new();
+        let empty_hl = HighlightCache::default();
         let mut lines = Vec::new();
         for item in &t.items {
             match &item.entry {
@@ -737,6 +832,7 @@ mod tests {
                                 24,
                                 None,
                                 "⠋",
+                                &empty_hl,
                             )
                             .lines,
                         );
@@ -763,6 +859,7 @@ mod tests {
         let mut t = Transcript::default();
         let mut blocks = ToolBlockStore::default();
         let empty_approvals = VecDeque::new();
+        let empty_hl = HighlightCache::default();
         let max = 1 << 20;
         let render = |t: &Transcript, stream: &str, w: usize, blocks: &ToolBlockStore| {
             let split_key = SplitCacheKey {
@@ -778,6 +875,7 @@ mod tests {
                 None,
                 24,
                 "⠋",
+                &empty_hl,
             )
         };
 
@@ -928,5 +1026,102 @@ mod tests {
         // 한(2) + 글(2) = 4, a(1) = 5
         assert_eq!(clip(ansi, 5), "한글a");
         assert_eq!(clip(ansi, 3), "한");
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn markdown_fenced_code_and_diff_upgrade_asynchronously_without_reflow() {
+        use super::super::{
+            highlight::HighlightWorker,
+            markdown::{DiffBg, SyntaxRole},
+            worker::Update,
+        };
+        use std::time::{Duration, Instant};
+
+        let plain_of = |lines: &[markdown::Line]| -> String {
+            lines
+                .iter()
+                .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut hl = HighlightCache::default();
+        hl.attach_worker(HighlightWorker::spawn(tx));
+
+        let md = concat!(
+            "Summary:\n",
+            "```rust\n",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+            "```\n",
+            "```diff\n",
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "@@ -1 +1 @@\n",
+            "-let x = 1;\n",
+            "+let x = \"hi\";\n",
+            "```"
+        );
+        let mut t = Transcript::default();
+        t.push(md, Entry::Markdown(md.into()), 1 << 20);
+        let blocks = ToolBlockStore::default();
+        let empty_approvals = VecDeque::new();
+
+        // First render: plain text immediately (zero blocking), schedules both fences in parallel.
+        let first = t
+            .lines_with_blocks(
+                "",
+                44,
+                &blocks,
+                &empty_approvals,
+                SplitCacheKey::default(),
+                None,
+                24,
+                "⠋",
+                &hl,
+            )
+            .to_vec();
+        let first_text = plain_of(&first);
+        assert!(
+            first
+                .iter()
+                .flatten()
+                .all(|s| s.face.syntax == SyntaxRole::None),
+            "first render must not block for syntax tokens"
+        );
+
+        // Wait for both background jobs (rust + diff) to finish.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && hl.rev() < 2 {
+            while let Ok(Update::HighlightReady { key, doc }) = rx.try_recv() {
+                hl.apply_result(key, doc);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(hl.rev() >= 2);
+
+        // Second render: splices highlighted lines in place with identical line count & text!
+        let second = t
+            .lines_with_blocks(
+                "",
+                44,
+                &blocks,
+                &empty_approvals,
+                SplitCacheKey::default(),
+                None,
+                24,
+                "⠋",
+                &hl,
+            )
+            .to_vec();
+        assert_eq!(second.len(), first.len(), "no reflow on highlight landing");
+        assert_eq!(plain_of(&second), first_text, "exact text preserved");
+        assert!(second
+            .iter()
+            .flatten()
+            .any(|s| s.text == "fn" && s.face.syntax == SyntaxRole::Keyword));
+        assert!(second.iter().flatten().any(|s| s.text.contains("hi")
+            && s.face.syntax == SyntaxRole::String
+            && s.face.diff_bg == DiffBg::Added));
     }
 }

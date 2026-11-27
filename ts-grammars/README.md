@@ -8,8 +8,8 @@ Tree-sitter's generated `parser.c` files embed two large, mostly-zero `uint16_t`
 
 By declaring the upstream `tree-sitter-*` crates solely under `[build-dependencies]`:
 - **Nothing is vendored into git:** `ts-grammars/` contains only 4 small text files (`Cargo.toml`, `build.rs`, `src/lib.rs`, `README.md`). Upgrading a grammar never bloats `.git` history with binary diffs.
-- **Uncompressed binary drops by ~15.4 MiB:** `build.rs` extracts and zlib-compresses the two tables (`16.39 MiB → 1.02 MiB`, `-93.8%`) into `OUT_DIR` and compiles a table-stripped `parser_slim.c` for the target. The full `[build-dependencies]` crates are never linked into the final `anticrumb` executable.
-- **Lazy RAM & zero runtime parse slowdown:** Each language decompresses its table once on first use via `OnceLock` (a few milliseconds). Unused languages consume zero RAM; once loaded, parsing runs at 100% native speed.
+- **Uncompressed binary drops by ~15.4 MiB:** `build.rs` extracts and zlib-compresses the two tables (`16.39 MiB → 1.02 MiB`, `-93.8%`) and each language's upstream `highlights.scm` query into `OUT_DIR`, and compiles a table-stripped `parser_slim.c` for the target. The full `[build-dependencies]` crates are never linked into the final `anticrumb` executable.
+- **Lazy RAM & zero runtime parse slowdown:** Each language decompresses its table and highlight query once on first use via `OnceLock` (a few milliseconds). Unused languages consume zero RAM; once loaded, parsing runs at 100% native speed.
 
 ## How It Works
 

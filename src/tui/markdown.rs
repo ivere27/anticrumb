@@ -2,11 +2,39 @@
 //! Styling is generated locally; terminal control sequences in content are discarded.
 mod table;
 
-use super::theme::Theme;
+use super::{
+    highlight::{self, HighlightCache, HighlightLang, Lookup},
+    theme::Theme,
+};
 use crossterm::{queue, style};
 use std::borrow::Cow;
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
+
+#[cfg_attr(not(feature = "tree-sitter"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SyntaxRole {
+    #[default]
+    None,
+    Plain,
+    Keyword,
+    String,
+    Comment,
+    Type,
+    Function,
+    Constant,
+    Operator,
+    Property,
+    Macro,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum DiffBg {
+    #[default]
+    None,
+    Added,
+    Removed,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Face {
@@ -20,6 +48,9 @@ pub(super) struct Face {
     pub accent: bool,
     pub highlight: bool,
     pub danger: bool,
+    pub search_match: bool,
+    pub syntax: SyntaxRole,
+    pub diff_bg: DiffBg,
     /// Optional theme-independent foreground RGB override (e.g. fixed-palette artwork).
     pub fg: Option<(u8, u8, u8)>,
 }
@@ -36,8 +67,27 @@ impl Face {
         accent: false,
         highlight: false,
         danger: false,
+        search_match: false,
+        syntax: SyntaxRole::None,
+        diff_bg: DiffBg::None,
         fg: None,
     };
+    pub const SEARCH_MATCH: Self = Self {
+        bold: true,
+        search_match: true,
+        ..Self::TEXT
+    };
+    pub const fn syntax(role: SyntaxRole) -> Self {
+        Self {
+            italic: matches!(role, SyntaxRole::Comment),
+            syntax: role,
+            ..Self::TEXT
+        }
+    }
+    pub const fn with_diff_bg(mut self, diff_bg: DiffBg) -> Self {
+        self.diff_bg = diff_bg;
+        self
+    }
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self {
             fg: Some((r, g, b)),
@@ -320,42 +370,37 @@ fn wrap(spans: Line, width: usize, lines: &mut Vec<Line>) {
 }
 
 pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
+    lines_with_highlights(text, width, None, false).0
+}
+
+pub(super) fn lines_with_highlights(
+    text: &str,
+    width: usize,
+    highlights: Option<&HighlightCache>,
+    allow_unclosed_fences: bool,
+) -> (Vec<Line>, bool) {
     let text = clean_cow(text);
     let mut result = Vec::new();
-    let mut fence = None::<(char, usize)>;
+    let mut had_pending = false;
     let source: Vec<_> = text.split('\n').collect();
     let mut index = 0;
     while index < source.len() {
         let line = source[index];
-        if fence.is_none() {
-            if let Some((consumed, rendered)) = table::render(&source[index..], width) {
-                result.extend(rendered);
-                index += consumed;
-                continue;
-            }
+        if let Some((consumed, rendered)) = table::render(&source[index..], width) {
+            result.extend(rendered);
+            index += consumed;
+            continue;
         }
         index += 1;
         let trimmed = line.trim_start_matches(' ');
         let leading = line.len() - trimmed.len();
         let mark = trimmed.chars().next().unwrap_or(' ');
         let count = trimmed.chars().take_while(|ch| *ch == mark).count();
-        let mut spans = Vec::new();
-        let mut budget = 64;
-        if let Some((opened, length)) = fence {
-            if leading <= 3
-                && mark == opened
-                && count >= length
-                && trimmed[count..].trim().is_empty()
-            {
-                fence = None;
-                continue;
-            }
-            push(&mut spans, line, Face::CODE);
-        } else if leading <= 3 && matches!(mark, '`' | '~') && count >= 3 {
-            fence = Some((mark, count));
+        if leading <= 3 && matches!(mark, '`' | '~') && count >= 3 {
             let language = trimmed[count..].trim();
+            let mut hdr_spans = Vec::new();
             push(
-                &mut spans,
+                &mut hdr_spans,
                 if language.is_empty() {
                     "code"
                 } else {
@@ -363,7 +408,102 @@ pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
                 },
                 Face::MUTED,
             );
-        } else if leading <= 3 && mark == '#' && count <= 6 && trimmed[count..].starts_with(' ') {
+            wrap(hdr_spans, width, &mut result);
+
+            let body_start = index;
+            let mut closed = false;
+            while index < source.len() {
+                let candidate = source[index];
+                let cand_trimmed = candidate.trim_start_matches(' ');
+                let cand_leading = candidate.len() - cand_trimmed.len();
+                let cand_mark = cand_trimmed.chars().next().unwrap_or(' ');
+                let cand_count = cand_trimmed
+                    .chars()
+                    .take_while(|ch| *ch == cand_mark)
+                    .count();
+                if cand_leading <= 3
+                    && cand_mark == mark
+                    && cand_count >= count
+                    && cand_trimmed[cand_count..].trim().is_empty()
+                {
+                    closed = true;
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            let body_end = if closed { index - 1 } else { index };
+            let body_lines = &source[body_start..body_end];
+            if body_lines.is_empty() {
+                continue;
+            }
+
+            let hl_lang = highlights.and_then(|_| highlight::lang_from_fence_tag(language));
+            match (hl_lang, highlights) {
+                (Some(HighlightLang::UnifiedDiff), Some(cache)) => {
+                    let joined = body_lines.join("\n");
+                    let doc = if closed || allow_unclosed_fences {
+                        match cache.lookup_or_schedule(HighlightLang::UnifiedDiff, &joined) {
+                            Lookup::Ready(doc) => Some(doc),
+                            Lookup::Pending => {
+                                had_pending = true;
+                                None
+                            }
+                            Lookup::Unsupported => None,
+                        }
+                    } else {
+                        None
+                    };
+                    highlight::push_unified_diff(&mut result, &joined, doc.as_deref(), width);
+                }
+                (Some(HighlightLang::Code(ts_lang)), Some(cache))
+                    if closed || allow_unclosed_fences =>
+                {
+                    let joined = body_lines.join("\n");
+                    match cache.lookup_or_schedule(HighlightLang::Code(ts_lang), &joined) {
+                        Lookup::Ready(doc) => {
+                            let token_lines = doc.code_lines().unwrap_or(&[]);
+                            for (i, body_line) in body_lines.iter().enumerate() {
+                                let tokens = token_lines.get(i).map_or(&[][..], Vec::as_slice);
+                                let parts = highlight::line_spans(body_line, tokens, DiffBg::None);
+                                let mut line_spans = Vec::new();
+                                for (seg, face) in parts {
+                                    push(&mut line_spans, seg, face);
+                                }
+                                wrap(line_spans, width, &mut result);
+                            }
+                        }
+                        Lookup::Pending => {
+                            had_pending = true;
+                            for body_line in body_lines {
+                                let mut spans = Vec::new();
+                                push(&mut spans, body_line, Face::CODE);
+                                wrap(spans, width, &mut result);
+                            }
+                        }
+                        Lookup::Unsupported => {
+                            for body_line in body_lines {
+                                let mut spans = Vec::new();
+                                push(&mut spans, body_line, Face::CODE);
+                                wrap(spans, width, &mut result);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    for body_line in body_lines {
+                        let mut spans = Vec::new();
+                        push(&mut spans, body_line, Face::CODE);
+                        wrap(spans, width, &mut result);
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut spans = Vec::new();
+        let mut budget = 64;
+        if leading <= 3 && mark == '#' && count <= 6 && trimmed[count..].starts_with(' ') {
             inline(
                 trimmed[count..].trim_start(),
                 Face::HEADING,
@@ -376,7 +516,7 @@ pub(super) fn lines(text: &str, width: usize) -> Vec<Line> {
         }
         wrap(spans, width, &mut result);
     }
-    result
+    (result, had_pending)
 }
 
 pub(super) fn literal(text: &str, face: Face, width: usize) -> Vec<Line> {
@@ -415,6 +555,24 @@ pub(super) fn prefixed(
     result
 }
 
+pub(super) fn prefixed_spans(
+    prefix: &str,
+    prefix_face: Face,
+    body_spans: &[(&str, Face)],
+    width: usize,
+) -> Vec<Line> {
+    let prefix = clean_cow(prefix);
+    let mut line = Vec::new();
+    push(&mut line, &prefix, prefix_face);
+    for (text, face) in body_spans {
+        let cleaned = clean_cow(text);
+        push(&mut line, &cleaned, *face);
+    }
+    let mut result = Vec::new();
+    wrap(line, width, &mut result);
+    result
+}
+
 pub(super) fn spans(parts: &[(&str, Face)], width: usize) -> Vec<Line> {
     let mut line = Vec::new();
     for (text, face) in parts {
@@ -442,11 +600,39 @@ fn is_dark_color(color: style::Color) -> bool {
     }
 }
 
+fn syntax_color(role: SyntaxRole, theme: Theme) -> style::Color {
+    match role {
+        SyntaxRole::None | SyntaxRole::Plain => theme.text,
+        SyntaxRole::Keyword => theme.syntax.keyword,
+        SyntaxRole::String => theme.syntax.string,
+        SyntaxRole::Comment => theme.syntax.comment,
+        SyntaxRole::Type => theme.syntax.ty,
+        SyntaxRole::Function => theme.syntax.function,
+        SyntaxRole::Constant => theme.syntax.constant,
+        SyntaxRole::Operator => theme.syntax.operator,
+        SyntaxRole::Property => theme.syntax.property,
+        SyntaxRole::Macro => theme.syntax.macro_call,
+    }
+}
+
+fn diff_bg_color(diff_bg: DiffBg, theme: Theme) -> style::Color {
+    match diff_bg {
+        DiffBg::Added => theme.syntax.diff_added_bg,
+        DiffBg::Removed => theme.syntax.diff_removed_bg,
+        DiffBg::None => theme.background,
+    }
+}
+
 fn span_colors(face: Face, theme: Theme, selected: bool) -> (style::Color, style::Color) {
     let custom_fg = face.fg.map(|(r, g, b)| style::Color::Rgb { r, g, b });
     if !selected {
+        if face.search_match {
+            return (theme.syntax.match_fg, theme.syntax.match_bg);
+        }
         let fg = if let Some(rgb) = custom_fg {
             rgb
+        } else if face.syntax != SyntaxRole::None {
+            syntax_color(face.syntax, theme)
         } else if face.danger {
             theme.danger
         } else if face.highlight {
@@ -464,10 +650,19 @@ fn span_colors(face: Face, theme: Theme, selected: bool) -> (style::Color, style
         } else {
             theme.text
         };
-        return (fg, theme.background);
+        return (fg, diff_bg_color(face.diff_bg, theme));
     }
     let semantic = if let Some(rgb) = custom_fg {
         Some(rgb)
+    } else if face.search_match {
+        Some(theme.syntax.match_bg)
+    } else if face.syntax != SyntaxRole::None {
+        match face.syntax {
+            SyntaxRole::None | SyntaxRole::Plain | SyntaxRole::Comment | SyntaxRole::Operator => {
+                None
+            }
+            role => Some(syntax_color(role, theme)),
+        }
     } else if face.danger {
         Some(theme.danger)
     } else if face.highlight {
@@ -643,13 +838,35 @@ pub(super) fn write_clipped_padded_line(
             used += cw;
         }
     }
+    let fill = pad_to.min(max_width).saturating_sub(used);
+    let trailing_diff_bg = line
+        .last()
+        .map(|s| s.face.diff_bg)
+        .filter(|bg| *bg != DiffBg::None);
+    if fill > 0 {
+        if let Some(diff_bg) = trailing_diff_bg {
+            queue!(
+                out,
+                style::SetAttribute(style::Attribute::Reset),
+                style::SetBackgroundColor(diff_bg_color(diff_bg, theme)),
+                style::SetForegroundColor(theme.text)
+            )?;
+            write_spaces(out, fill)?;
+            queue!(
+                out,
+                style::SetAttribute(style::Attribute::Reset),
+                style::SetBackgroundColor(theme.background),
+                style::SetForegroundColor(theme.text)
+            )?;
+            return Ok(used);
+        }
+    }
     queue!(
         out,
         style::SetAttribute(style::Attribute::Reset),
         style::SetBackgroundColor(theme.background),
         style::SetForegroundColor(theme.text)
     )?;
-    let fill = pad_to.min(max_width).saturating_sub(used);
     if fill > 0 {
         write_spaces(out, fill)?;
     }
@@ -919,5 +1136,45 @@ mod tests {
         assert!(result[1][0].face.bold);
         assert!(result[2].is_empty());
         assert!(result[3][0].face.accent);
+    }
+
+    #[test]
+    fn syntax_and_diff_bg_faces_adapt_dynamically_across_dark_and_light_themes() {
+        let monokai = super::super::theme::find("monokai").unwrap();
+        let latte = super::super::theme::find("catppuccin-latte").unwrap();
+        let line = vec![
+            Span {
+                text: "+ ".into(),
+                face: Face::HIGHLIGHT_BOLD.with_diff_bg(DiffBg::Added),
+            },
+            Span {
+                text: "fn".into(),
+                face: Face::syntax(SyntaxRole::Keyword).with_diff_bg(DiffBg::Added),
+            },
+        ];
+
+        let mut mono_out = Vec::new();
+        write_clipped_padded_line(&mut mono_out, &line, false, 12, 12, monokai).unwrap();
+        let mono_str = String::from_utf8(mono_out).unwrap();
+        assert!(mono_str.contains(&format!(
+            "{}",
+            style::SetBackgroundColor(monokai.syntax.diff_added_bg)
+        )));
+        assert!(mono_str.contains(&format!(
+            "{}",
+            style::SetForegroundColor(monokai.syntax.keyword)
+        )));
+
+        let mut latte_out = Vec::new();
+        write_clipped_padded_line(&mut latte_out, &line, false, 12, 12, latte).unwrap();
+        let latte_str = String::from_utf8(latte_out).unwrap();
+        assert!(latte_str.contains(&format!(
+            "{}",
+            style::SetBackgroundColor(latte.syntax.diff_added_bg)
+        )));
+        assert!(latte_str.contains(&format!(
+            "{}",
+            style::SetForegroundColor(latte.syntax.keyword)
+        )));
     }
 }

@@ -4,6 +4,7 @@ mod clipboard;
 mod commands;
 mod debug_log;
 mod editor;
+mod highlight;
 mod input_loop;
 mod inspector;
 mod layout;
@@ -6997,10 +6998,7 @@ mod tests {
         // Even on an 80-col terminal (or 120-col with long quota), `? for shortcuts` remains visible.
         let idle_80 = state.status_text(80);
         assert!(idle_80.contains("? for shortcuts  D:local"), "{idle_80}");
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(idle_80.as_str()),
-            80
-        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(idle_80.as_str()), 80);
 
         // Typing into the composer hides the idle shortcut hint.
         state.editor.set("hello".into());
@@ -7020,8 +7018,8 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_toggles_shortcuts_panel_supports_wide_narrow_layout_scroll_and_mid_draft_typing()
-    {
+    fn question_mark_toggles_shortcuts_panel_supports_wide_narrow_layout_scroll_and_mid_draft_typing(
+    ) {
         let press = |code, modifiers| {
             event::Event::Key(event::KeyEvent::new_with_kind(
                 code,
@@ -7097,8 +7095,12 @@ mod tests {
         assert_eq!(state.shortcuts_scroll, 1);
         state.scroll_wheel_at(false, 10, 5, 76, 14);
         assert_eq!(state.shortcuts_scroll, 4);
-        super::input_loop::handle_input(&mut state, press(KeyCode::End, KeyModifiers::NONE), &mut tx)
-            .unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::End, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
         assert!(state.shortcuts_scroll > 4);
         super::input_loop::handle_input(
             &mut state,
@@ -7135,8 +7137,12 @@ mod tests {
         )
         .unwrap();
         assert!(state.shortcuts_open);
-        super::input_loop::handle_input(&mut state, press(KeyCode::Esc, KeyModifiers::NONE), &mut tx)
-            .unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Esc, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
         assert!(!state.shortcuts_open);
 
         super::input_loop::handle_input(
