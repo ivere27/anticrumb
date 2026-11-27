@@ -279,9 +279,55 @@ pub(super) fn handle_input(
                 }
                 return Ok(false);
             }
+            // Priority 1b: Shortcuts panel overlay modal routing.
+            if state.shortcuts_open {
+                match key.code {
+                    KeyCode::Esc => state.close_shortcuts(),
+                    KeyCode::Char('?' | 'q' | 'Q')
+                        if !ctrl && !alt && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.close_shortcuts();
+                    }
+                    KeyCode::Char('c' | 'C') if ctrl => state.close_shortcuts(),
+                    KeyCode::Char('o' | 'O') if ctrl && !alt => {
+                        state.toggle_inspector_zoom();
+                    }
+                    KeyCode::Up => state.scroll_shortcuts(true, 1, None),
+                    KeyCode::Down => state.scroll_shortcuts(false, 1, None),
+                    KeyCode::Char('k' | 'K') if !ctrl && !alt => {
+                        state.scroll_shortcuts(true, 1, None);
+                    }
+                    KeyCode::Char('j' | 'J') if !ctrl && !alt => {
+                        state.scroll_shortcuts(false, 1, None);
+                    }
+                    KeyCode::PageUp => state.scroll_shortcuts(true, 10, None),
+                    KeyCode::PageDown => state.scroll_shortcuts(false, 10, None),
+                    KeyCode::Home => state.scroll_shortcuts(true, 0, Some(true)),
+                    KeyCode::End => state.scroll_shortcuts(false, 0, Some(false)),
+                    KeyCode::Char(ch @ ('y' | 'Y' | 'n' | 'N'))
+                        if !ctrl
+                            && !alt
+                            && !state.tool_approvals.is_empty()
+                            && key.kind == event::KeyEventKind::Press =>
+                    {
+                        state.respond_tool_approval(matches!(ch, 'y' | 'Y'), sink);
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
             // Ctrl+O opens fullscreen Inspector overlay (works even with draft text in composer).
             if ctrl && !alt && matches!(key.code, KeyCode::Char('o' | 'O')) {
                 state.toggle_inspector_zoom();
+                return Ok(false);
+            }
+            if !ctrl
+                && !alt
+                && key.code == KeyCode::Char('?')
+                && key.kind == event::KeyEventKind::Press
+                && state.can_open_shortcuts()
+            {
+                state.open_shortcuts();
                 return Ok(false);
             }
             if !state.tool_approvals.is_empty()
@@ -529,6 +575,9 @@ pub(super) fn handle_input(
                         .take(32_usize.saturating_sub(confirmation.typed.chars().count())),
                 );
             } else {
+                if state.shortcuts_open {
+                    state.close_shortcuts();
+                }
                 state.paste(&text);
             }
         }

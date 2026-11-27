@@ -400,9 +400,7 @@ impl TranscriptLines {
     }
 
     pub(super) fn block_spans(&self) -> impl Iterator<Item = &BlockSpan> {
-        self.block_spans
-            .iter()
-            .chain(self.active_tail_span.iter())
+        self.block_spans.iter().chain(self.active_tail_span.iter())
     }
 
     pub(super) fn clear(&mut self) {
@@ -771,7 +769,16 @@ mod tests {
                 block_left_width: w.saturating_sub(1),
                 ..SplitCacheKey::default()
             };
-            t.lines_with_blocks(stream, w, blocks, &empty_approvals, split_key, None, 24, "⠋")
+            t.lines_with_blocks(
+                stream,
+                w,
+                blocks,
+                &empty_approvals,
+                split_key,
+                None,
+                24,
+                "⠋",
+            )
         };
 
         push_md(
@@ -779,13 +786,18 @@ mod tests {
             "first **bold** paragraph that wraps at narrow widths",
             max,
         );
-        assert_eq!(render(&t, "", 40, &blocks).to_vec(), uncached(&t, "", 40, &blocks));
+        assert_eq!(
+            render(&t, "", 40, &blocks).to_vec(),
+            uncached(&t, "", 40, &blocks)
+        );
 
         // Incremental append while the previous snapshot is still held.
         let held = render(&t, "", 40, &blocks);
         blocks.on_tool_started(1, 0, "run_shell".into(), json!({"command": "ls -la"}), true);
         blocks.on_tool_finished(1, 0, "run_shell", true, "file.rs".into(), 5);
-        let (bid, plain) = blocks.seal_active_block(AfterTurnPolicy::Fit, false).unwrap();
+        let (bid, plain) = blocks
+            .seal_active_block(AfterTurnPolicy::Fit, false)
+            .unwrap();
         t.push(&plain, Entry::ToolBlock(bid), max);
         push_md(&mut t, "second", max);
         let full = uncached(&t, "", 40, &blocks);
@@ -840,7 +852,11 @@ mod tests {
             assert_eq!(held.to_vec(), held_copy, "held snapshot after push {i}");
             drop(held);
             let lines = t.lines("", 30);
-            assert_eq!(lines.to_vec(), uncached(&t, "", 30, &blocks), "after push {i}");
+            assert_eq!(
+                lines.to_vec(),
+                uncached(&t, "", 30, &blocks),
+                "after push {i}"
+            );
             assert_eq!(
                 lines.evicted_lines() + lines.len() as u64,
                 total_pushed_lines,

@@ -1,14 +1,12 @@
 //! Terminal frame, status bar, and subagent banner rendering.
 use super::{
-    commands::Selection,
+    commands::{Selection, ShortcutSection, SHORTCUT_QUICK_COMMANDS, SHORTCUT_SECTIONS},
     debug_log::DebugLogger,
-    inspector::{
-        self, BlockId, BlockRowKind, PaintedInspectorPane, PaintedToolBlock,
-    },
+    inspector::{self, BlockId, BlockRowKind, PaintedInspectorPane, PaintedToolBlock},
     layout::{ColSpan, FrameLayout, Rect, RowSpan},
     markdown::{self, Face, Span},
     reducer::{PendingToolApproval, SelectionTarget, State, SubagentView},
-    transcript::{BlockSpan, clip},
+    transcript::{clip, BlockSpan},
     usage,
 };
 use crate::domain::*;
@@ -63,6 +61,161 @@ fn clip_spans(parts: Vec<(String, Face)>, max_width: usize) -> Vec<(String, Face
 }
 
 pub(super) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+const SHORTCUTS_TWO_COL_MIN_WIDTH: usize = 96;
+
+fn shortcut_section_lines(section: &ShortcutSection, col_w: usize) -> Vec<markdown::Line> {
+    if col_w == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::with_capacity(section.items.len() + 1);
+    let mut heading = Vec::new();
+    let title = clip(&format!(" {}", section.title), col_w);
+    let title_w = title.width();
+    if !title.is_empty() {
+        heading.push(Span {
+            text: title,
+            face: Face::HEADING,
+        });
+    }
+    if let Some(sub) = section.subtitle {
+        let sub_text = format!("  ({sub})");
+        let rem = col_w.saturating_sub(title_w);
+        if rem >= sub_text.width() {
+            heading.push(Span {
+                text: sub_text,
+                face: Face::MUTED,
+            });
+        }
+    }
+    rows.push(heading);
+
+    let key_face = if section.highlight_key {
+        Face::HIGHLIGHT_BOLD
+    } else {
+        Face::ACCENT_BOLD
+    };
+    let key_col = if col_w >= 42 {
+        15
+    } else {
+        12.min(col_w.saturating_sub(4))
+    };
+    for &(key, desc) in section.items {
+        let mut line = Vec::new();
+        let mut used = 0usize;
+        if col_w >= 2 {
+            line.push(Span {
+                text: "  ".into(),
+                face: Face::TEXT,
+            });
+            used = 2;
+        }
+        let key_budget = col_w.saturating_sub(used);
+        let clipped_key = clip(key, key_budget);
+        let kw = clipped_key.width();
+        if !clipped_key.is_empty() {
+            line.push(Span {
+                text: clipped_key,
+                face: key_face,
+            });
+            used += kw;
+        }
+        let pad_len = key_col
+            .saturating_sub(kw)
+            .saturating_add(1)
+            .min(col_w.saturating_sub(used));
+        if pad_len > 0 {
+            line.push(Span {
+                text: " ".repeat(pad_len),
+                face: Face::TEXT,
+            });
+            used += pad_len;
+        }
+        let desc_budget = col_w.saturating_sub(used);
+        if desc_budget > 0 {
+            let clipped_desc = clip(desc, desc_budget);
+            if !clipped_desc.is_empty() {
+                line.push(Span {
+                    text: clipped_desc,
+                    face: Face::TEXT,
+                });
+            }
+        }
+        rows.push(line);
+    }
+    rows
+}
+
+fn shortcuts_panel_rows(width: usize) -> Vec<markdown::Line> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if width >= SHORTCUTS_TWO_COL_MIN_WIDTH {
+        let left_w = width.saturating_sub(1) / 2;
+        let right_w = width.saturating_sub(left_w + 1);
+        let mut left_rows = Vec::new();
+        for (i, section) in SHORTCUT_SECTIONS[..2].iter().enumerate() {
+            if i > 0 {
+                left_rows.push(Vec::new());
+            }
+            left_rows.extend(shortcut_section_lines(section, left_w));
+        }
+        let mut right_rows = Vec::new();
+        for (i, section) in SHORTCUT_SECTIONS[2..].iter().enumerate() {
+            if i > 0 {
+                right_rows.push(Vec::new());
+            }
+            right_rows.extend(shortcut_section_lines(section, right_w));
+        }
+        right_rows.push(Vec::new());
+        right_rows.extend(shortcut_section_lines(&SHORTCUT_QUICK_COMMANDS, right_w));
+
+        let total = left_rows.len().max(right_rows.len());
+        let mut combined = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut row = Vec::new();
+            let mut lw = 0usize;
+            if let Some(l) = left_rows.get(i) {
+                for span in l {
+                    lw += span.text.width();
+                    row.push(span.clone());
+                }
+            }
+            if lw < left_w {
+                row.push(Span {
+                    text: " ".repeat(left_w - lw),
+                    face: Face::TEXT,
+                });
+            }
+            row.push(Span {
+                text: "│".into(),
+                face: Face::SUBTLE,
+            });
+            if let Some(r) = right_rows.get(i) {
+                row.extend(r.iter().cloned());
+            }
+            combined.push(row);
+        }
+        combined
+    } else {
+        let mut rows = Vec::new();
+        for (i, section) in SHORTCUT_SECTIONS.iter().enumerate() {
+            if i > 0 {
+                rows.push(Vec::new());
+            }
+            rows.extend(shortcut_section_lines(section, width));
+        }
+        rows.push(Vec::new());
+        rows.extend(shortcut_section_lines(&SHORTCUT_QUICK_COMMANDS, width));
+        rows
+    }
+}
+
+pub(super) fn shortcuts_panel_metrics(width: usize, avail_rows: usize) -> (usize, usize) {
+    let total = shortcuts_panel_rows(width).len();
+    let visible = total.min(avail_rows.saturating_sub(1));
+    (total, visible)
+}
 
 impl State {
     fn spinner(&self) -> &'static str {
@@ -279,13 +432,45 @@ impl State {
         if left_max == 0 {
             return vec![(right_text, daemon_face)];
         }
-        let mut left = clip_spans(parts, left_max);
+        let full_left_w = spans_width(&parts);
+        let chosen_hint: Option<&'static str> = if self.show_footer_shortcut_hint() {
+            const CANDIDATES: [&str; 3] = ["? for shortcuts", "? shortcuts", "? help"];
+            if full_left_w <= left_max {
+                let spare = width.saturating_sub(full_left_w + right_w);
+                CANDIDATES
+                    .into_iter()
+                    .find(|label| spare >= label.len() + 4)
+            } else {
+                let min_left = priority_w.max(44);
+                CANDIDATES.into_iter().find(|label| {
+                    let reserve = label.len() + 4 + right_w;
+                    width >= reserve && width - reserve >= min_left
+                })
+            }
+        } else {
+            None
+        };
+        let effective_left_max = match chosen_hint {
+            Some(label) => width.saturating_sub(right_w + label.len() + 4),
+            None => left_max,
+        };
+        let mut left = clip_spans(parts, effective_left_max);
         let left_w = spans_width(&left);
-        let pad = width.saturating_sub(left_w + right_w);
-        if pad > 0 {
-            left.push((" ".repeat(pad), Face::MUTED));
+        if let Some(label) = chosen_hint {
+            let pad_before_hint = width.saturating_sub(left_w + label.len() + 2 + right_w);
+            if pad_before_hint > 0 {
+                left.push((" ".repeat(pad_before_hint), Face::MUTED));
+            }
+            left.push((label.into(), Face::MUTED));
+            left.push(("  ".into(), Face::MUTED));
+            left.push((right_text, daemon_face));
+        } else {
+            let pad = width.saturating_sub(left_w + right_w);
+            if pad > 0 {
+                left.push((" ".repeat(pad), Face::MUTED));
+            }
+            left.push((right_text, daemon_face));
         }
-        left.push((right_text, daemon_face));
         left
     }
 
@@ -699,11 +884,8 @@ impl State {
                 } else {
                     None
                 };
-                let spans: Vec<BlockSpan> = self
-                    .painted_all_transcript
-                    .block_spans()
-                    .cloned()
-                    .collect();
+                let spans: Vec<BlockSpan> =
+                    self.painted_all_transcript.block_spans().cloned().collect();
                 (
                     start,
                     eff,
@@ -855,26 +1037,13 @@ impl State {
 
             if preserve_right {
                 Self::write_clipped_padded_cell(
-                    out,
-                    0,
-                    y,
-                    line,
-                    false,
-                    col_limit,
-                    col_limit,
-                    self.theme,
+                    out, 0, y, line, false, col_limit, col_limit, self.theme,
                 )?;
             } else {
                 queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
-                let line_width = markdown::write_clipped_padded_line(
-                    out,
-                    line,
-                    false,
-                    col_limit,
-                    0,
-                    self.theme,
-                )
-                .map_err(ServiceError::storage)?;
+                let line_width =
+                    markdown::write_clipped_padded_line(out, line, false, col_limit, 0, self.theme)
+                        .map_err(ServiceError::storage)?;
                 if line_width < w {
                     queue!(
                         out,
@@ -892,10 +1061,8 @@ impl State {
                 .and_then(|selection| selection.fragment_spans(start + row))
             {
                 if !selected.is_empty() && column < col_limit {
-                    let clipped_sel = inspector::clip_rendered_line(
-                        &selected,
-                        col_limit.saturating_sub(column),
-                    );
+                    let clipped_sel =
+                        inspector::clip_rendered_line(&selected, col_limit.saturating_sub(column));
                     if !clipped_sel.is_empty() {
                         queue!(out, cursor::MoveTo(column as u16, y))
                             .map_err(ServiceError::storage)?;
@@ -1267,20 +1434,20 @@ impl State {
         }
 
         let mut hint_is_live = false;
-        let hint = if self.history_clear_confirmation.is_some() {
-            " Type DELETE + Enter to confirm · Esc cancels".into()
+        let hint: Option<String> = if self.history_clear_confirmation.is_some() {
+            Some(" Type DELETE + Enter to confirm · Esc cancels".into())
         } else if self.selection.is_some() {
-            " Drag to select · Release to copy · Esc cancels".into()
+            Some(" Drag to select · Release to copy · Esc cancels".into())
         } else if let Some(notice) = resume_notice {
-            format!(" {notice}")
+            Some(format!(" {notice}"))
         } else if self.history_index < self.history.len() {
-            format!(
+            Some(format!(
                 " History {}/{} · ↑↓ edit/history · Enter send",
                 self.history_index + 1,
                 self.history.len()
-            )
+            ))
         } else if !self.files.is_empty() {
-            format!(
+            Some(format!(
                 " {} file(s): {} · Enter to send",
                 self.files.len(),
                 self.files
@@ -1288,9 +1455,9 @@ impl State {
                     .map(|f| f.file_name().unwrap_or_default().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )
+            ))
         } else if let Some(c) = &self.completion {
-            format!(
+            Some(format!(
                 " Tab → {}",
                 c.values
                     .iter()
@@ -1298,7 +1465,7 @@ impl State {
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join("  ")
-            )
+            ))
         } else if self.busy() {
             hint_is_live = true;
             let spinner = self.spinner();
@@ -1328,13 +1495,45 @@ impl State {
                 ""
             };
             if !suffix.is_empty() && w > live_text.width() + suffix.width() + 5 {
-                format!(" {spinner} {live_text}{suffix}")
+                Some(format!(" {spinner} {live_text}{suffix}"))
             } else {
-                format!(" {spinner} {live_text}")
+                Some(format!(" {spinner} {live_text}"))
             }
         } else {
-            " Shift+Tab mode · Alt+Enter newline · ↑↓ edit/history · Alt+E expand paste · Wheel/PgUp scroll · /help"
-                .into()
+            None
+        };
+        let Some(hint) = hint else {
+            let mut line = Vec::new();
+            if let Some((badge, badge_face)) = right_badge {
+                let badge_clipped = clip(&badge, safe_w);
+                let badge_w = badge_clipped.width();
+                let rule_w = safe_w.saturating_sub(badge_w + 1);
+                if rule_w > 0 {
+                    line.push(Span {
+                        text: "─".repeat(rule_w),
+                        face: Face::SUBTLE,
+                    });
+                }
+                let pad = safe_w.saturating_sub(rule_w + badge_w);
+                if pad > 0 {
+                    line.push(Span {
+                        text: " ".repeat(pad),
+                        face: Face::MUTED,
+                    });
+                }
+                if !badge_clipped.is_empty() {
+                    line.push(Span {
+                        text: badge_clipped,
+                        face: badge_face,
+                    });
+                }
+            } else if safe_w > 0 {
+                line.push(Span {
+                    text: "─".repeat(safe_w),
+                    face: Face::SUBTLE,
+                });
+            }
+            return (line, None);
         };
         let hint_face = if hint_is_live {
             Face::ACCENT
@@ -1986,6 +2185,105 @@ impl State {
         Ok(())
     }
 
+    fn render_shortcuts_overlay(&self, out: &mut impl Write, layout: FrameLayout) -> Result<()> {
+        if !self.shortcuts_open
+            || self.menu.is_some()
+            || self.history_clear_confirmation.is_some()
+            || self.inspector_zoom
+            || layout.transcript.len < 2
+        {
+            return Ok(());
+        }
+        let anchor = layout.transcript.end();
+        let avail_rows = usize::from(layout.transcript.len);
+        let safe_w = Self::safe_row_width(layout.transcript.start, layout.width, layout.height);
+        if safe_w == 0 {
+            return Ok(());
+        }
+        let rows = shortcuts_panel_rows(safe_w);
+        let total_body = rows.len();
+        let visible_body = total_body.min(avail_rows.saturating_sub(1));
+        if visible_body == 0 {
+            return Ok(());
+        }
+        let max_scroll = total_body.saturating_sub(visible_body);
+        let scroll = self.shortcuts_scroll.min(max_scroll);
+        let panel_height = 1 + visible_body;
+        let top = anchor.saturating_sub(panel_height as u16);
+
+        // Top border row: `─ Shortcuts ─────────────── [range · ↑↓ scroll · ]Esc / ? close ─`
+        let header_w = Self::safe_row_width(top, layout.width, layout.height);
+        let title = " Shortcuts ";
+        let controls = if max_scroll > 0 {
+            format!(
+                " {}-{}/{} · ↑↓ scroll · Esc/? close ",
+                scroll + 1,
+                scroll + visible_body,
+                total_body
+            )
+        } else {
+            " Esc / ? close ".to_owned()
+        };
+        let mut header_line: markdown::Line = Vec::new();
+        let title_w = title.width();
+        let ctrl_w = controls.width();
+        if header_w >= title_w + ctrl_w + 4 {
+            let mid_rules = header_w - title_w - ctrl_w - 2;
+            header_line.push(Span {
+                text: "─".into(),
+                face: Face::SUBTLE,
+            });
+            header_line.push(Span {
+                text: title.into(),
+                face: Face::ACCENT_BOLD,
+            });
+            header_line.push(Span {
+                text: "─".repeat(mid_rules),
+                face: Face::SUBTLE,
+            });
+            header_line.push(Span {
+                text: controls,
+                face: Face::MUTED,
+            });
+            header_line.push(Span {
+                text: "─".into(),
+                face: Face::SUBTLE,
+            });
+        } else if header_w >= title_w + 2 {
+            let right_rules = header_w - title_w - 1;
+            header_line.push(Span {
+                text: "─".into(),
+                face: Face::SUBTLE,
+            });
+            header_line.push(Span {
+                text: title.into(),
+                face: Face::ACCENT_BOLD,
+            });
+            header_line.push(Span {
+                text: "─".repeat(right_rules),
+                face: Face::SUBTLE,
+            });
+        } else {
+            header_line.push(Span {
+                text: clip(" Shortcuts", header_w),
+                face: Face::ACCENT_BOLD,
+            });
+        }
+        let header_rendered_w: usize = header_line.iter().map(|s| s.text.width()).sum();
+        queue!(out, cursor::MoveTo(0, top)).map_err(ServiceError::storage)?;
+        markdown::write_line(out, &header_line, self.theme).map_err(ServiceError::storage)?;
+        Self::pad_and_clear_row(out, top, header_rendered_w, layout, self.theme)?;
+
+        for (i, line) in rows.iter().skip(scroll).take(visible_body).enumerate() {
+            let y = top + 1 + i as u16;
+            let rendered_w: usize = line.iter().map(|s| s.text.width()).sum();
+            queue!(out, cursor::MoveTo(0, y)).map_err(ServiceError::storage)?;
+            markdown::write_line(out, line, self.theme).map_err(ServiceError::storage)?;
+            Self::pad_and_clear_row(out, y, rendered_w, layout, self.theme)?;
+        }
+        Ok(())
+    }
+
     fn render_history_clear_overlay(
         &self,
         out: &mut impl Write,
@@ -2226,6 +2524,7 @@ impl State {
         self.render_composer(out, layout, &editor_rows)?;
         self.render_completion(out, layout)?;
         self.render_menu_overlay(out, layout)?;
+        self.render_shortcuts_overlay(out, layout)?;
         let cursor_position = self
             .render_history_clear_overlay(out, layout)?
             .unwrap_or(layout.cursor);

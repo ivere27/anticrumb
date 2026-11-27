@@ -103,7 +103,10 @@ impl FfiApi {
     ) -> synurang_call::Result<()> {
         let host = self.host.clone();
         let path = path.to_owned();
-        let mut task = AbortTask(self.runtime.spawn(async move { request.open(host, path).await }));
+        let mut task = AbortTask(
+            self.runtime
+                .spawn(async move { request.open(host, path).await }),
+        );
         let mut receiver = tokio::select! {
             error=context.cancelled()=>return Err(error),
             result=&mut task.0=>result.map_err(|e|synurang_call::RpcError::new(13,e.to_string()))?.map_err(codec::module_error)?,

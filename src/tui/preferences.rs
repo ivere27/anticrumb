@@ -320,7 +320,12 @@ mod tests {
 
         // Partial JSON recovers defaults for omitted fields via #[serde(default)].
         a.store
-            .put("ui", "settings", "inspector", &serde_json::json!({"mode": "off"}))
+            .put(
+                "ui",
+                "settings",
+                "inspector",
+                &serde_json::json!({"mode": "off"}),
+            )
             .unwrap();
         let partial = b.inspector_config();
         assert_eq!(partial.mode, InspectorMode::Off);

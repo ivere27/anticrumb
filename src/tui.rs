@@ -1932,6 +1932,33 @@ mod tests {
         assert!(rendered.contains(&format!("({commit})")));
         assert!(rendered.contains("Gemini Web · default"));
         assert!(rendered.contains("/tmp/fixture-proj"));
+
+        // Logo uses theme-independent RGB colors regardless of the active theme.
+        let crust_top_ansi = format!(
+            "{}",
+            crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb {
+                r: 0xD9,
+                g: 0x88,
+                b: 0x38,
+            })
+        );
+        let crumb_honey_ansi = format!(
+            "{}",
+            crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb {
+                r: 0xED,
+                g: 0x9F,
+                b: 0x38,
+            })
+        );
+        assert!(rendered.contains(&crust_top_ansi));
+        assert!(rendered.contains(&crumb_honey_ansi));
+
+        state.theme = super::theme::find("catppuccin-latte").unwrap();
+        let mut latte_frame = Vec::new();
+        state.render_frame(&mut latte_frame, 100, 24).unwrap();
+        let latte_rendered = String::from_utf8(latte_frame).unwrap();
+        assert!(latte_rendered.contains(&crust_top_ansi));
+        assert!(latte_rendered.contains(&crumb_honey_ansi));
     }
 
     #[test]
@@ -5567,7 +5594,13 @@ mod tests {
         let div_x = painted.divider_x.expect("inline divider x");
 
         // 2. Right Inspector mouse wheel scrolls ONLY Inspector (scroll_from_bottom > 0, transcript scroll stays 0).
-        state.scroll_wheel_at(true, insp_rect.col.start + 2, insp_rect.row.start + 2, 120, 24);
+        state.scroll_wheel_at(
+            true,
+            insp_rect.col.start + 2,
+            insp_rect.row.start + 2,
+            120,
+            24,
+        );
         assert!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom > 0);
         assert_eq!(state.scroll, 0);
         out.clear();
@@ -5575,8 +5608,17 @@ mod tests {
         assert!(String::from_utf8_lossy(&out).contains("[▶ Follow "));
 
         // 3. Scroll Inspector back to bottom (scroll_from_bottom == 0): follow_tool MUST STAY false!
-        state.scroll_wheel_at(false, insp_rect.col.start + 2, insp_rect.row.start + 2, 120, 24);
-        assert_eq!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom, 0);
+        state.scroll_wheel_at(
+            false,
+            insp_rect.col.start + 2,
+            insp_rect.row.start + 2,
+            120,
+            24,
+        );
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
         assert!(!state.tool_blocks.get(block_id).unwrap().follow_tool);
 
         // New tool starts -> selection must NOT jump away from tool #0!
@@ -5606,12 +5648,18 @@ mod tests {
         });
         assert!(state.tool_blocks.get(block_id).unwrap().follow_tool);
         assert_eq!(state.tool_blocks.get(block_id).unwrap().selected, 2);
-        assert_eq!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom, 0);
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
 
         // 4. Left pane mouse wheel scrolls Transcript without touching Inspector scroll_from_bottom.
         state.scroll_wheel_at(true, 2, insp_rect.row.start + 1, 120, 24);
         assert!(state.scroll > 0);
-        assert_eq!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom, 0);
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
         state.reset_scroll();
         state.render_frame(&mut out, 120, 24).unwrap();
 
@@ -5757,7 +5805,10 @@ mod tests {
             &mut tx,
         )
         .unwrap();
-        assert_eq!(state.tool_blocks.get(block_id).unwrap().scroll_from_bottom, 0);
+        assert_eq!(
+            state.tool_blocks.get(block_id).unwrap().scroll_from_bottom,
+            0
+        );
 
         // Alt+L resumes Follow -> jumps to latest tool #1; Alt+L again pins manual mode.
         super::input_loop::handle_input(
@@ -5783,7 +5834,10 @@ mod tests {
             &mut tx,
         )
         .unwrap();
-        assert_eq!(state.layout.inspector.mode, super::layout::InspectorMode::Off);
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Off
+        );
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT)),
@@ -5799,7 +5853,10 @@ mod tests {
         state.editor.set("keep draft".into());
         super::input_loop::handle_input(
             &mut state,
-            event::Event::Key(event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            event::Event::Key(event::KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+            )),
             &mut tx,
         )
         .unwrap();
@@ -5866,7 +5923,10 @@ mod tests {
         .unwrap();
         assert!(!state.inspector_zoom);
         assert_eq!(state.editor.text, "keep draft");
-        assert!(rx.try_recv().is_err(), "Esc must close overlay before cancelling run");
+        assert!(
+            rx.try_recv().is_err(),
+            "Esc must close overlay before cancelling run"
+        );
         state.editor.set(String::new());
 
         // SelectionTarget::Inspector drag selects Inspector body text (single-tool view on tool #0).
@@ -5909,7 +5969,10 @@ mod tests {
         let text_row = state
             .painted_transcript
             .iter()
-            .position(|l| l.iter().any(|s| s.text.contains("selectable transcript text")))
+            .position(|l| {
+                l.iter()
+                    .any(|s| s.text.contains("selectable transcript text"))
+            })
             .expect("selectable transcript row") as u16
             + layout.transcript.start;
         state.transcript_mouse(event::MouseEvent {
@@ -6029,8 +6092,13 @@ mod tests {
 
     #[test]
     fn inspector_resume_cjk_divider_alignment_and_menu_preview_revert() {
-        use crate::agent::{AgentRunResult, AgentStatus, AgentStepRecord, ToolCallRequest, ToolOutput};
-        use crate::domain::{AgentRecord, AgentRequest, ConversationRecord, ConversationSummary, SessionMode, SessionRetention, ToolApprovalMode};
+        use crate::agent::{
+            AgentRunResult, AgentStatus, AgentStepRecord, ToolCallRequest, ToolOutput,
+        };
+        use crate::domain::{
+            AgentRecord, AgentRequest, ConversationRecord, ConversationSummary, SessionMode,
+            SessionRetention, ToolApprovalMode,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let prefs = super::preferences::Preferences::open(dir.path()).unwrap();
@@ -6182,7 +6250,10 @@ mod tests {
         state.render_frame(&mut out, 110, 26).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("Details pruned after retention"));
-        assert!(!rendered.contains("\x1b[31m한글결과"), "raw ANSI escapes must be cleaned before rendering");
+        assert!(
+            !rendered.contains("\x1b[31m한글결과"),
+            "raw ANSI escapes must be cleaned before rendering"
+        );
 
         // Verify cancelled item status on turn 2's block.
         let has_cancelled = (1..=3).any(|raw| {
@@ -6190,18 +6261,28 @@ mod tests {
                 .tool_blocks
                 .get(super::inspector::BlockId(raw))
                 .is_some_and(|b| {
-                    b.items
-                        .iter()
-                        .any(|i| i.tool == "write_file" && i.status == super::inspector::ToolStatus::Cancelled)
+                    b.items.iter().any(|i| {
+                        i.tool == "write_file"
+                            && i.status == super::inspector::ToolStatus::Cancelled
+                    })
                 })
         });
-        assert!(has_cancelled, "cancelled turn missing observation must restore as ToolStatus::Cancelled");
+        assert!(
+            has_cancelled,
+            "cancelled turn missing observation must restore as ToolStatus::Cancelled"
+        );
 
         // Verify `/inspector` command args + interactive menu live preview & Esc revert + Enter save.
         state.editor.set("/inspector side".into());
         state.submit(&mut tx);
-        assert_eq!(state.layout.inspector.mode, super::layout::InspectorMode::Side);
-        assert_eq!(prefs.inspector_config().mode, super::layout::InspectorMode::Side);
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Side
+        );
+        assert_eq!(
+            prefs.inspector_config().mode,
+            super::layout::InspectorMode::Side
+        );
 
         state.editor.set("/inspector".into());
         state.submit(&mut tx);
@@ -6213,15 +6294,24 @@ mod tests {
             &mut tx,
         )
         .unwrap();
-        assert_eq!(state.layout.inspector.mode, super::layout::InspectorMode::Off);
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Off
+        );
         super::input_loop::handle_input(
             &mut state,
             event::Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             &mut tx,
         )
         .unwrap();
-        assert_eq!(state.layout.inspector.mode, super::layout::InspectorMode::Side);
-        assert_eq!(prefs.inspector_config().mode, super::layout::InspectorMode::Side);
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Side
+        );
+        assert_eq!(
+            prefs.inspector_config().mode,
+            super::layout::InspectorMode::Side
+        );
 
         // Open menu again, shift right (Side -> Off), press Enter -> saved!
         state.editor.set("/inspector".into());
@@ -6238,8 +6328,14 @@ mod tests {
             &mut tx,
         )
         .unwrap();
-        assert_eq!(state.layout.inspector.mode, super::layout::InspectorMode::Off);
-        assert_eq!(prefs.inspector_config().mode, super::layout::InspectorMode::Off);
+        assert_eq!(
+            state.layout.inspector.mode,
+            super::layout::InspectorMode::Off
+        );
+        assert_eq!(
+            prefs.inspector_config().mode,
+            super::layout::InspectorMode::Off
+        );
     }
 
     #[test]
@@ -6323,7 +6419,9 @@ mod tests {
         let mut state = State::new(PromptOptions::default());
         state.layout.inspector.mode = super::layout::InspectorMode::Side;
         for i in 1..=40 {
-            state.log(&format!("conversation entry {i:02} with plenty of prose text"));
+            state.log(&format!(
+                "conversation entry {i:02} with plenty of prose text"
+            ));
         }
 
         // Before any tool block exists, Side mode keeps 100% full transcript width.
@@ -6356,8 +6454,14 @@ mod tests {
         let layout_after = state.painted_layout.unwrap();
         assert!(layout_after.inspector_rect.is_some());
         assert!(layout_after.transcript_left.len < 120);
-        assert!(state.scroll > 0, "scroll position must remain scrolled up across Side split activation");
-        assert!(state.has_unread_below, "new tool arrival must mark unread below across width change");
+        assert!(
+            state.scroll > 0,
+            "scroll position must remain scrolled up across Side split activation"
+        );
+        assert!(
+            state.has_unread_below,
+            "new tool arrival must mark unread below across width change"
+        );
         assert_eq!(state.scroll_bottom_badge(), ScrollBottomBadge::Streaming);
     }
 
@@ -6385,10 +6489,8 @@ mod tests {
         state.load_model_preference();
         let (mut tx, rx) = mpsc::sync_channel(8);
 
-        let backtab = event::Event::Key(event::KeyEvent::new(
-            KeyCode::BackTab,
-            KeyModifiers::SHIFT,
-        ));
+        let backtab =
+            event::Event::Key(event::KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         let shift_tab = event::Event::Key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
         let repeat_backtab = event::Event::Key(event::KeyEvent::new_with_kind(
             KeyCode::BackTab,
@@ -6520,10 +6622,8 @@ mod tests {
     fn shift_tab_toggles_chat_and_yolo_only_when_explicitly_opted_in() {
         let dir = tempfile::tempdir().unwrap();
         let (mut tx, rx) = mpsc::sync_channel(8);
-        let backtab = event::Event::Key(event::KeyEvent::new(
-            KeyCode::BackTab,
-            KeyModifiers::SHIFT,
-        ));
+        let backtab =
+            event::Event::Key(event::KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
         // 1. Explicit CLI `--yolo` arms CHAT <-> YOLO toggle.
         let yolo_opts = PromptOptions::parse(&[
@@ -6547,7 +6647,10 @@ mod tests {
             panic!("expected Start");
         };
         assert!(chat_req.chat_only);
-        assert_eq!(chat_req.tool_approval, crate::domain::ToolApprovalMode::Unspecified);
+        assert_eq!(
+            chat_req.tool_approval,
+            crate::domain::ToolApprovalMode::Unspecified
+        );
         cli_yolo.active = None;
         cli_yolo.pending = None;
         cli_yolo.phase = "ready".into();
@@ -6565,7 +6668,10 @@ mod tests {
             panic!("expected Start");
         };
         assert!(!yolo_req.chat_only);
-        assert_eq!(yolo_req.tool_approval, crate::domain::ToolApprovalMode::Auto);
+        assert_eq!(
+            yolo_req.tool_approval,
+            crate::domain::ToolApprovalMode::Auto
+        );
         cli_yolo.active = None;
         cli_yolo.pending = None;
         cli_yolo.phase = "ready".into();
@@ -6816,5 +6922,240 @@ mod tests {
             markdown::Face::MUTED
         );
         assert!(author_rendered[base_prefix_len + 3].is_empty());
+    }
+
+    #[test]
+    fn idle_hint_renders_full_solid_rule_and_preserves_copy_badge_and_contextual_hints() {
+        let mut state = State::new(PromptOptions::default());
+        let mut out = Vec::new();
+
+        // 1. Idle state: full-width solid horizontal rule using SUBTLE face, no /help or key hints.
+        state.render_frame(&mut out, 80, 20).expect("idle frame");
+        assert_eq!(state.painted_hint.len(), 1);
+        assert_eq!(state.painted_hint[0].len(), 1);
+        assert_eq!(state.painted_hint[0][0].text, "─".repeat(80));
+        assert_eq!(state.painted_hint[0][0].face, markdown::Face::SUBTLE);
+
+        // 2. Idle state with clipboard copy badge: rule fills left side, followed by space + badge.
+        state.clipboard_notice = Some("Copied 12 chars".into());
+        out.clear();
+        state
+            .render_frame(&mut out, 80, 20)
+            .expect("idle frame with copy badge");
+        let hint_text: String = state.painted_hint[0]
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(hint_text.chars().count(), 80);
+        assert!(hint_text.starts_with("────"));
+        assert!(hint_text.ends_with(" ✓ Copied 12 chars "));
+        assert_eq!(state.painted_hint[0][0].face, markdown::Face::SUBTLE);
+        assert_eq!(
+            state.painted_hint[0].last().unwrap().face,
+            markdown::Face::HIGHLIGHT
+        );
+
+        // 3. Non-idle contextual hint (e.g. attached file) replaces the idle rule.
+        state.clipboard_notice = None;
+        state.files.push(std::path::PathBuf::from("notes.md"));
+        out.clear();
+        state
+            .render_frame(&mut out, 80, 20)
+            .expect("contextual hint frame");
+        let file_hint: String = state.painted_hint[0]
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(file_hint.contains("1 file(s): notes.md"));
+        assert!(!file_hint.contains('─'));
+    }
+
+    #[test]
+    fn footer_shows_shortcuts_hint_when_idle_and_empty_and_hides_otherwise() {
+        let mut state = State::new(PromptOptions {
+            account: "default".into(),
+            workspace: "/tmp/project".into(),
+            ..Default::default()
+        });
+        state.update(Update::Status(json!({
+            "accounts": [{"id": "default", "state": "ready"}],
+            "browser_connection": {"transport": "local", "endpoint": "", "connected": true}
+        })));
+
+        // Idle + empty composer shows `? for shortcuts` before right-aligned `  D:local`.
+        let idle_120 = state.status_text(120);
+        assert!(idle_120.contains("? for shortcuts  D:local"), "{idle_120}");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(idle_120.as_str()),
+            120
+        );
+        assert_eq!(
+            state.status_spans(120).last().unwrap().1,
+            markdown::Face::MUTED
+        );
+
+        // Even on an 80-col terminal (or 120-col with long quota), `? for shortcuts` remains visible.
+        let idle_80 = state.status_text(80);
+        assert!(idle_80.contains("? for shortcuts  D:local"), "{idle_80}");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(idle_80.as_str()),
+            80
+        );
+
+        // Typing into the composer hides the idle shortcut hint.
+        state.editor.set("hello".into());
+        assert!(!state.status_text(120).contains("? for shortcuts"));
+        assert!(!state.status_text(120).contains("? help"));
+
+        // Clearing composer restores it; busy state hides it.
+        state.editor.set(String::new());
+        assert!(state.status_text(120).contains("? for shortcuts"));
+        state.active = Some("turn-1".into());
+        assert!(!state.status_text(120).contains("? for shortcuts"));
+        state.active = None;
+
+        // Opening the shortcuts overlay hides the footer prompt (the panel itself shows Esc/? close).
+        state.open_shortcuts();
+        assert!(!state.status_text(120).contains("? for shortcuts"));
+    }
+
+    #[test]
+    fn question_mark_toggles_shortcuts_panel_supports_wide_narrow_layout_scroll_and_mid_draft_typing()
+    {
+        let press = |code, modifiers| {
+            event::Event::Key(event::KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                event::KeyEventKind::Press,
+            ))
+        };
+        let mut state = State::new(PromptOptions::default());
+        let (mut tx, _) = mpsc::sync_channel(4);
+
+        // 1. Typing `?` inside non-empty draft inserts `?` normally without opening overlay.
+        state.editor.set("what".into());
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+        assert_eq!(state.editor.text, "what?");
+
+        // 2. Pressing `?` on empty composer opens the shortcuts panel (works with Shift modifier too).
+        state.editor.set(String::new());
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.shortcuts_open);
+        assert!(state.editor.text.is_empty());
+
+        // 3. Wide terminal renders 2-column grid with vertical divider `│` and all sections.
+        let mut out = Vec::new();
+        state
+            .render_frame(&mut out, 120, 30)
+            .expect("wide shortcuts frame");
+        let wide = String::from_utf8_lossy(&out);
+        assert!(wide.contains("Shortcuts"));
+        assert!(wide.contains("Composer & Editing"));
+        assert!(wide.contains("Mentions & Completion"));
+        assert!(wide.contains("Modes & Session"));
+        assert!(wide.contains("Scroll & Tool Inspector"));
+        assert!(wide.contains("Quick Commands"));
+        assert!(wide.contains("Esc / ? close"));
+        assert!(wide.contains('│'));
+
+        // 4. Plain keys inside overlay do not leak into the composer.
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.editor.text.is_empty());
+        assert!(state.shortcuts_open);
+
+        // 5. Short/narrow terminal renders 1-column scrollable overlay and responds to key + wheel scroll.
+        out.clear();
+        state
+            .render_frame(&mut out, 76, 14)
+            .expect("narrow shortcuts frame");
+        let narrow = String::from_utf8_lossy(&out);
+        assert!(narrow.contains("↑↓ scroll"));
+        assert!(!narrow.contains('│'));
+
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Down, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.shortcuts_scroll, 1);
+        state.scroll_wheel_at(false, 10, 5, 76, 14);
+        assert_eq!(state.shortcuts_scroll, 4);
+        super::input_loop::handle_input(&mut state, press(KeyCode::End, KeyModifiers::NONE), &mut tx)
+            .unwrap();
+        assert!(state.shortcuts_scroll > 4);
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Home, KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert_eq!(state.shortcuts_scroll, 0);
+
+        // 6. Mouse clicks while shortcuts overlay is open do not select transcript underneath.
+        state.transcript_mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.selection.is_none());
+
+        // 7. `?`, `Esc`, and `q` all close the panel cleanly and reset scroll.
+        state.shortcuts_scroll = 3;
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+        assert_eq!(state.shortcuts_scroll, 0);
+
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(state.shortcuts_open);
+        super::input_loop::handle_input(&mut state, press(KeyCode::Esc, KeyModifiers::NONE), &mut tx)
+            .unwrap();
+        assert!(!state.shortcuts_open);
+
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        super::input_loop::handle_input(
+            &mut state,
+            press(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut tx,
+        )
+        .unwrap();
+        assert!(!state.shortcuts_open);
+
+        // 8. `/help` stays synchronized with the shared shortcut list (includes `?`).
+        state.editor.set("/help".into());
+        state.submit(&mut tx);
+        assert!(state.logs().contains("Toggle shortcuts panel"));
     }
 }

@@ -9,12 +9,7 @@ use crate::agent::{AgentStepRecord, OutputStream};
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::cell::Cell;
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    rc::Rc,
-    time::Instant,
-};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
 use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LIVE_BYTES: usize = 64 * 1024;
@@ -93,12 +88,18 @@ fn json_value_bytes(val: &Value) -> usize {
         Value::Bool(false) => 5,
         Value::Number(_) => 8,
         Value::String(s) => s.len().saturating_add(2),
-        Value::Array(arr) => {
-            2usize.saturating_add(arr.iter().map(|v| json_value_bytes(v).saturating_add(1)).sum())
-        }
+        Value::Array(arr) => 2usize.saturating_add(
+            arr.iter()
+                .map(|v| json_value_bytes(v).saturating_add(1))
+                .sum(),
+        ),
         Value::Object(map) => 2usize.saturating_add(
             map.iter()
-                .map(|(k, v)| k.len().saturating_add(4).saturating_add(json_value_bytes(v)))
+                .map(|(k, v)| {
+                    k.len()
+                        .saturating_add(4)
+                        .saturating_add(json_value_bytes(v))
+                })
                 .sum(),
         ),
     }
@@ -256,7 +257,9 @@ impl ToolItem {
                     .or_else(|| args["key"].as_str())
                     .or_else(|| args["text"].as_str())
                     .filter(|s| !s.is_empty());
-                detail.map(|d| format!(" {}", clip(d, 24))).unwrap_or_default()
+                detail
+                    .map(|d| format!(" {}", clip(d, 24)))
+                    .unwrap_or_default()
             }
             "spawn_agent" => {
                 if args["read_only"].as_bool() == Some(false) {
@@ -407,9 +410,7 @@ impl ToolBlock {
     }
 
     pub(super) fn selected_item(&self) -> Option<&ToolItem> {
-        self.items
-            .get(self.selected)
-            .or_else(|| self.items.last())
+        self.items.get(self.selected).or_else(|| self.items.last())
     }
 
     pub(super) fn step_range_label(&self) -> String {
@@ -902,10 +903,9 @@ impl ToolBlockStore {
                 .iter()
                 .rposition(|item| item.source.is_none() && item.step == step && item.index == index)
                 .or_else(|| {
-                    block
-                        .items
-                        .iter()
-                        .rposition(|item| item.source.is_none() && item.status == ToolStatus::Running)
+                    block.items.iter().rposition(|item| {
+                        item.source.is_none() && item.status == ToolStatus::Running
+                    })
                 });
             if let Some(pos) = pos {
                 let item = &mut block.items[pos];
@@ -970,10 +970,9 @@ impl ToolBlockStore {
                         && matches!(item.status, ToolStatus::Running | ToolStatus::Pending)
                 })
                 .or_else(|| {
-                    block
-                        .items
-                        .iter()
-                        .rposition(|item| item.source.is_none() && item.step == step && item.index == index)
+                    block.items.iter().rposition(|item| {
+                        item.source.is_none() && item.step == step && item.index == index
+                    })
                 })
                 .or_else(|| {
                     block.items.iter().rposition(|item| {
@@ -1455,10 +1454,7 @@ impl ToolBlockStore {
                 .copied()
                 .find(|id| {
                     Some(*id) != self.focused
-                        && self
-                            .blocks
-                            .get(id)
-                            .is_some_and(|b| !b.active && !b.pruned)
+                        && self.blocks.get(id).is_some_and(|b| !b.active && !b.pruned)
                 })
                 .or_else(|| {
                     self.order
@@ -1518,7 +1514,10 @@ impl ToolBlockStore {
                 map.clear();
             }
         }
-        map.insert((block_id, idx), (item.rev, inner_width, Rc::clone(&rendered)));
+        map.insert(
+            (block_id, idx),
+            (item.rev, inner_width, Rc::clone(&rendered)),
+        );
         rendered
     }
 
@@ -1635,10 +1634,8 @@ impl ToolBlockStore {
                 header_parts.push((format!(" ({el})"), Face::MUTED));
             }
             header_parts.push((" ──".into(), Face::SUBTLE));
-            let refs: Vec<(&str, Face)> = header_parts
-                .iter()
-                .map(|(t, f)| (t.as_str(), *f))
-                .collect();
+            let refs: Vec<(&str, Face)> =
+                header_parts.iter().map(|(t, f)| (t.as_str(), *f)).collect();
             out.push(clip_line_spans(&refs, w));
 
             // Per-item cached lines (0 re-wraps of completed items); abbreviate only very long
@@ -1769,12 +1766,7 @@ pub(super) fn render_block_left(
     // Item rows (plus inline single-column approval preview when !split_active)
     let selected_idx = block.selected.min(block.items.len().saturating_sub(1));
     for (idx, item) in block.items.iter().enumerate() {
-        lines.push(render_tool_item_row(
-            item,
-            idx == selected_idx,
-            w,
-            spinner,
-        ));
+        lines.push(render_tool_item_row(item, idx == selected_idx, w, spinner));
         row_kinds.push(BlockRowKind::ToolItem(idx));
 
         if !split_active && item.status == ToolStatus::Pending {
@@ -1979,7 +1971,10 @@ fn render_single_col_approval_preview(item: &ToolItem, width: usize) -> Vec<mark
             Face::TEXT
         };
         let detail = preview.detail.trim_start_matches(": ").trim_start();
-        out.push(clip_line_spans(&[("      ", Face::MUTED), (detail, face)], width));
+        out.push(clip_line_spans(
+            &[("      ", Face::MUTED), (detail, face)],
+            width,
+        ));
     }
     for block in preview.blocks {
         let face = match block.kind {
@@ -1997,7 +1992,10 @@ fn render_single_col_approval_preview(item: &ToolItem, width: usize) -> Vec<mark
             ));
         } else {
             for line in all_lines.iter().take(cap) {
-                out.push(clip_line_spans(&[(block.prefix, face), (*line, face)], width));
+                out.push(clip_line_spans(
+                    &[(block.prefix, face), (*line, face)],
+                    width,
+                ));
             }
             if all_lines.len() > cap {
                 let rem = format!("… ({} more line(s))", all_lines.len() - cap);
@@ -2110,7 +2108,11 @@ pub(super) fn inspector_footer_line(
             } else {
                 "[▶ Follow]".to_owned()
             };
-            (label, Face::ACCENT_BOLD, Some(InspectorBadgeAction::ToggleFollow))
+            (
+                label,
+                Face::ACCENT_BOLD,
+                Some(InspectorBadgeAction::ToggleFollow),
+            )
         } else if eff_scroll > 0 {
             (
                 format!("[↓ Live {pct}%]"),
@@ -2259,8 +2261,9 @@ fn push_prenumbered_or_plain_code(
 ) {
     let cleaned = markdown::clean(text);
     let has_own_nums = cleaned.lines().next().is_some_and(|l| {
-        l.split_once(" | ")
-            .is_some_and(|(num, _)| !num.trim().is_empty() && num.trim().bytes().all(|b| b.is_ascii_digit()))
+        l.split_once(" | ").is_some_and(|(num, _)| {
+            !num.trim().is_empty() && num.trim().bytes().all(|b| b.is_ascii_digit())
+        })
     });
     if !has_own_nums {
         push_numbered_code(out, &cleaned, start_line, width);
@@ -2273,7 +2276,13 @@ fn push_prenumbered_or_plain_code(
             let trimmed = num.trim();
             if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
                 let prefix = format!("{trimmed:>4} │ ");
-                out.extend(markdown::prefixed(&prefix, Face::MUTED, code, Face::CODE, width));
+                out.extend(markdown::prefixed(
+                    &prefix,
+                    Face::MUTED,
+                    code,
+                    Face::CODE,
+                    width,
+                ));
             } else {
                 out.extend(markdown::literal(raw_line, Face::CODE, width));
             }
@@ -2332,7 +2341,13 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
             }
             if let Some(old_text) = args["old_text"].as_str() {
                 for line in markdown::clean(old_text).split('\n') {
-                    out.extend(markdown::prefixed("- ", Face::DANGER_BOLD, line, Face::DANGER, w));
+                    out.extend(markdown::prefixed(
+                        "- ",
+                        Face::DANGER_BOLD,
+                        line,
+                        Face::DANGER,
+                        w,
+                    ));
                 }
             }
             if let Some(new_text) = args["new_text"].as_str() {
@@ -2438,7 +2453,13 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
             let cmd = args["command"].as_str().unwrap_or("");
             for (idx, line) in markdown::clean(cmd).split('\n').enumerate() {
                 let pfx = if idx == 0 { "$ " } else { "  " };
-                out.extend(markdown::prefixed(pfx, Face::ACCENT_BOLD, line, Face::CODE_BOLD, w));
+                out.extend(markdown::prefixed(
+                    pfx,
+                    Face::ACCENT_BOLD,
+                    line,
+                    Face::CODE_BOLD,
+                    w,
+                ));
             }
             let mut shell_opts = Vec::new();
             if let Some(cwd) = args["cwd"].as_str().filter(|s| !s.is_empty()) {
@@ -2463,7 +2484,9 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                             out.extend(markdown::literal(raw_line, Face::MUTED, w));
                             continue;
                         }
-                        let face = if in_stderr || item.ok == Some(false) && raw_line.starts_with("error") {
+                        let face = if in_stderr
+                            || item.ok == Some(false) && raw_line.starts_with("error")
+                        {
                             Face::DANGER
                         } else {
                             Face::TEXT
@@ -2481,7 +2504,13 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
         }
         "start_process" | "process_output" | "stop_process" => {
             if let Some(cmd) = args["command"].as_str() {
-                out.extend(markdown::prefixed("$ ", Face::ACCENT_BOLD, cmd, Face::CODE_BOLD, w));
+                out.extend(markdown::prefixed(
+                    "$ ",
+                    Face::ACCENT_BOLD,
+                    cmd,
+                    Face::CODE_BOLD,
+                    w,
+                ));
             } else if let Some(pid) = args["id"].as_u64() {
                 let wait = args["wait_secs"]
                     .as_u64()
@@ -2529,7 +2558,10 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
             if let Some(ctx) = args["context"].as_u64() {
                 meta.push(format!("context={ctx}"));
             }
-            if let Some(lim) = args["head_limit"].as_u64().or_else(|| args["limit"].as_u64()) {
+            if let Some(lim) = args["head_limit"]
+                .as_u64()
+                .or_else(|| args["limit"].as_u64())
+            {
                 meta.push(format!("limit={lim}"));
             }
             if let Some(output) = &item.output {
@@ -2633,7 +2665,13 @@ fn render_item_detail_lines(item: &ToolItem, width: usize) -> Vec<markdown::Line
                 out.push(Vec::new());
                 out.extend(markdown::literal("Progress", Face::HEADING, w));
                 for entry in &item.subagent_logs {
-                    out.extend(markdown::prefixed("  · ", Face::ACCENT, entry, Face::TEXT, w));
+                    out.extend(markdown::prefixed(
+                        "  · ",
+                        Face::ACCENT,
+                        entry,
+                        Face::TEXT,
+                        w,
+                    ));
                 }
             }
             append_output_section(&mut out, item, w, "Summary");
@@ -2905,8 +2943,14 @@ mod tests {
 
         // Main-agent approval keeps items Pending until ToolStarted promotes them.
         store.on_approval_resolved("apr_1", true);
-        assert_eq!(store.get(block_id).unwrap().items[0].status, ToolStatus::Pending);
-        assert_eq!(store.get(block_id).unwrap().items[1].status, ToolStatus::Pending);
+        assert_eq!(
+            store.get(block_id).unwrap().items[0].status,
+            ToolStatus::Pending
+        );
+        assert_eq!(
+            store.get(block_id).unwrap().items[1].status,
+            ToolStatus::Pending
+        );
 
         // Out-of-order parallel starts promote exact indices with zero duplicate rows.
         store.on_tool_started(1, 2, "read_file".into(), json!({"path": "b.rs"}), true);
@@ -3123,7 +3167,10 @@ mod tests {
             .into_iter()
             .map(|s| s.text)
             .collect();
-        assert!(hdr_after.contains("lines 100..=102 of 644"), "{hdr_after:?}");
+        assert!(
+            hdr_after.contains("lines 100..=102 of 644"),
+            "{hdr_after:?}"
+        );
 
         let body_text: String = store
             .detail_lines(b, 80)
@@ -3145,7 +3192,13 @@ mod tests {
 
         // Default read_file (no explicit start/end args) still shows explicit default range before
         // output and actual resolved range after output.
-        let b2 = store.on_tool_started(2, 0, "read_file".into(), json!({"path": "Cargo.toml"}), true);
+        let b2 = store.on_tool_started(
+            2,
+            0,
+            "read_file".into(),
+            json!({"path": "Cargo.toml"}),
+            true,
+        );
         let default_item = &store.get(b2).unwrap().items[1];
         assert_eq!(default_item.compact_option_suffix(), ":1-500");
         assert_eq!(
@@ -3176,7 +3229,13 @@ mod tests {
             true,
         );
         assert_eq!(
-            store.get(grep_b).unwrap().items.last().unwrap().compact_option_suffix(),
+            store
+                .get(grep_b)
+                .unwrap()
+                .items
+                .last()
+                .unwrap()
+                .compact_option_suffix(),
             " (in src/tui, *.rs, files)"
         );
     }
@@ -3190,7 +3249,13 @@ mod tests {
             .join("\n");
         let b = store.on_tool_started(1, 0, "read_file".into(), json!({"path": "a.rs"}), true);
         store.on_tool_finished(1, 0, "read_file", true, big_read, 5);
-        store.on_tool_started(2, 0, "run_shell".into(), json!({"command": "cargo test"}), true);
+        store.on_tool_started(
+            2,
+            0,
+            "run_shell".into(),
+            json!({"command": "cargo test"}),
+            true,
+        );
 
         // First Feed render wraps both items once (wrap_count == 2), abbreviates the 80-line
         // earlier item in Live Feed to keep CPU/RAM light, keeping head & tail visible.
@@ -3244,7 +3309,13 @@ mod tests {
     fn tool_finish_frees_live_chunks_and_active_mutations_keep_layout_rev_stable() {
         let mut store = ToolBlockStore::default();
         let rev0 = store.layout_rev();
-        let b = store.on_tool_started(1, 0, "run_shell".into(), json!({"command": "echo hi"}), true);
+        let b = store.on_tool_started(
+            1,
+            0,
+            "run_shell".into(),
+            json!({"command": "echo hi"}),
+            true,
+        );
         assert_eq!(
             store.layout_rev(),
             rev0,
@@ -3266,7 +3337,9 @@ mod tests {
             store.payload_bytes()
         );
 
-        assert!(store.seal_active_block(AfterTurnPolicy::Fit, false).is_some());
+        assert!(store
+            .seal_active_block(AfterTurnPolicy::Fit, false)
+            .is_some());
         assert_eq!(
             store.layout_rev(),
             rev0,
@@ -3300,7 +3373,10 @@ mod tests {
             .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(sym_text.contains("Grep::execute · path=src · include_body=true"), "{sym_text}");
+        assert!(
+            sym_text.contains("Grep::execute · path=src · include_body=true"),
+            "{sym_text}"
+        );
         assert!(sym_text.contains("Found 1 definition(s)"), "{sym_text}");
         assert!(sym_text.contains("  40 │ fn execute() {"), "{sym_text}");
         assert!(
@@ -3313,7 +3389,13 @@ mod tests {
         );
 
         // 2. code_outline structured rendering
-        store.on_tool_started(1, 1, "code_outline".into(), json!({"path": "src/lib.rs"}), false);
+        store.on_tool_started(
+            1,
+            1,
+            "code_outline".into(),
+            json!({"path": "src/lib.rs"}),
+            false,
+        );
         store.on_tool_finished(
             1,
             1,
@@ -3334,7 +3416,8 @@ mod tests {
             outline_lines.iter().any(|l| l
                 .iter()
                 .any(|s| s.text == "10-30  " && s.face == Face::MUTED)
-                && l.iter().any(|s| s.text == "pub struct App" && s.face == Face::CODE)),
+                && l.iter()
+                    .any(|s| s.text == "pub struct App" && s.face == Face::CODE)),
             "code_outline entries should split line span and signature faces"
         );
 
@@ -3366,7 +3449,8 @@ mod tests {
             ref_lines.iter().any(|l| l
                 .iter()
                 .any(|s| s.text.contains("[fn main]") && s.face == Face::ACCENT)
-                && l.iter().any(|s| s.text.contains("grep.execute()") && s.face == Face::CODE)),
+                && l.iter()
+                    .any(|s| s.text.contains("grep.execute()") && s.face == Face::CODE)),
             "find_references rows should highlight enclosing scope and call line"
         );
     }

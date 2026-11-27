@@ -1971,8 +1971,18 @@ impl AgentTool for ShellTool {
                     || pending_len >= SHELL_STREAM_COALESCE_BYTES
                     || (pending_len > 0 && last_flush.elapsed() >= SHELL_STREAM_FLUSH_INTERVAL);
                 if should_flush && pending_len > 0 {
-                    emit_stream_buf(cb, OutputStream::Stdout, &mut pending_out, &mut emitted_bytes);
-                    emit_stream_buf(cb, OutputStream::Stderr, &mut pending_err, &mut emitted_bytes);
+                    emit_stream_buf(
+                        cb,
+                        OutputStream::Stdout,
+                        &mut pending_out,
+                        &mut emitted_bytes,
+                    );
+                    emit_stream_buf(
+                        cb,
+                        OutputStream::Stderr,
+                        &mut pending_err,
+                        &mut emitted_bytes,
+                    );
                     last_flush = Instant::now();
                 }
                 if !force_flush || !got_any || emitted_bytes >= SHELL_STREAM_MAX_BYTES {

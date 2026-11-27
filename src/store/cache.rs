@@ -260,9 +260,9 @@ fn compact_tool_args(args: &serde_json::Value) -> serde_json::Value {
         };
         let compacted = match val {
             serde_json::Value::String(s) => serde_json::Value::String(clip_summary_str(s, 256)),
-            serde_json::Value::Bool(_)
-            | serde_json::Value::Number(_)
-            | serde_json::Value::Null => val.clone(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::Null => {
+                val.clone()
+            }
             _ => continue,
         };
         out.insert(key.to_owned(), compacted);
@@ -1053,7 +1053,9 @@ mod tests {
 
     #[test]
     fn cache_retention_prunes_old_non_ownership_events_compacts_aged_steps_and_preserves_recent() {
-        use crate::agent::{AgentRunResult, AgentStatus, AgentStepRecord, ToolCallRequest, ToolOutput};
+        use crate::agent::{
+            AgentRunResult, AgentStatus, AgentStepRecord, ToolCallRequest, ToolOutput,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -1106,34 +1108,37 @@ mod tests {
             ..Default::default()
         };
 
-        let make_record = |id: &str, conv: &str, state: &str, updated_at: i64, res: Option<AgentRunResult>| AgentRecord {
-            id: id.into(),
-            conversation_id: conv.into(),
-            state: state.into(),
-            request: AgentRequest {
-                environment: None,
-                task: "test task".into(),
-                workspace: dir.path().to_path_buf(),
-                account_id: "default".into(),
-                model: None,
-                thinking: None,
-                session_mode: SessionMode::Chat,
-                no_shell: false,
-                max_steps: 4,
-                knowledge: None,
-                mcp_config: None,
-                artifacts: vec![],
-                conversation_id: Some(conv.into()),
-                chat_only: false,
-                permissions: None,
-                session_retention: SessionRetention::Retain,
-                tool_approval: ToolApprovalMode::Auto,
-            },
-            result: res,
-            error: None,
-            created_at: updated_at - 1000,
-            updated_at,
-        };
+        let make_record =
+            |id: &str, conv: &str, state: &str, updated_at: i64, res: Option<AgentRunResult>| {
+                AgentRecord {
+                    id: id.into(),
+                    conversation_id: conv.into(),
+                    state: state.into(),
+                    request: AgentRequest {
+                        environment: None,
+                        task: "test task".into(),
+                        workspace: dir.path().to_path_buf(),
+                        account_id: "default".into(),
+                        model: None,
+                        thinking: None,
+                        session_mode: SessionMode::Chat,
+                        no_shell: false,
+                        max_steps: 4,
+                        knowledge: None,
+                        mcp_config: None,
+                        artifacts: vec![],
+                        conversation_id: Some(conv.into()),
+                        chat_only: false,
+                        permissions: None,
+                        session_retention: SessionRetention::Retain,
+                        tool_approval: ToolApprovalMode::Auto,
+                    },
+                    result: res,
+                    error: None,
+                    created_at: updated_at - 1000,
+                    updated_at,
+                }
+            };
 
         // 1. Old completed turn (10 days old) + non-ownership & ownership events.
         store
@@ -1141,7 +1146,13 @@ mod tests {
                 "local",
                 "agent",
                 "turn-old",
-                &make_record("turn-old", "conv-old", "completed", old_ts, Some(make_heavy_result())),
+                &make_record(
+                    "turn-old",
+                    "conv-old",
+                    "completed",
+                    old_ts,
+                    Some(make_heavy_result()),
+                ),
             )
             .unwrap();
         // 2. Old still-running turn (10 days old) — events must NOT be deleted.
@@ -1159,16 +1170,33 @@ mod tests {
                 "local",
                 "agent",
                 "turn-recent",
-                &make_record("turn-recent", "conv-recent", "completed", recent_ts, Some(make_heavy_result())),
+                &make_record(
+                    "turn-recent",
+                    "conv-recent",
+                    "completed",
+                    recent_ts,
+                    Some(make_heavy_result()),
+                ),
             )
             .unwrap();
 
         // Insert events and backdate old ones explicitly.
-        for kind in ["tool_started", "tool_finished", "step_started", "browser_turn", "browser_session", "subagent_browser_session"] {
+        for kind in [
+            "tool_started",
+            "tool_finished",
+            "step_started",
+            "browser_turn",
+            "browser_session",
+            "subagent_browser_session",
+        ] {
             store.event("turn-old", kind, json!({"k": kind})).unwrap();
         }
-        store.event("turn-active", "tool_started", json!({"tool": "read_file"})).unwrap();
-        store.event("turn-recent", "tool_started", json!({"tool": "read_file"})).unwrap();
+        store
+            .event("turn-active", "tool_started", json!({"tool": "read_file"}))
+            .unwrap();
+        store
+            .event("turn-recent", "tool_started", json!({"tool": "read_file"}))
+            .unwrap();
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
@@ -1234,7 +1262,11 @@ mod tests {
             .collect();
         assert_eq!(
             old_events,
-            vec!["browser_turn", "browser_session", "subagent_browser_session"]
+            vec![
+                "browser_turn",
+                "browser_session",
+                "subagent_browser_session"
+            ]
         );
         assert_eq!(store.events("turn-active", 0).unwrap().len(), 1);
         assert_eq!(store.events("turn-recent", 0).unwrap().len(), 1);
@@ -1250,8 +1282,14 @@ mod tests {
         assert_eq!(old_res.steps[0].tool_calls[0].tool, "edit_file");
         assert_eq!(old_res.steps[0].tool_calls[0].args["path"], "src/main.rs");
         assert_eq!(old_res.steps[0].tool_calls[0].args["replace_all"], true);
-        assert!(old_res.steps[0].tool_calls[0].args.get("old_text").is_none());
-        assert!(old_res.steps[0].tool_calls[0].args.get("new_text").is_none());
+        assert!(old_res.steps[0].tool_calls[0]
+            .args
+            .get("old_text")
+            .is_none());
+        assert!(old_res.steps[0].tool_calls[0]
+            .args
+            .get("new_text")
+            .is_none());
         assert_eq!(
             old_res.steps[0].tool_calls[1].args["command"],
             "cargo test --lib"

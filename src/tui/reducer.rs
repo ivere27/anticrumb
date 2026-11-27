@@ -205,6 +205,8 @@ pub(super) struct State {
     pub tool_blocks: ToolBlockStore,
     pub inspector_zoom: bool,
     pub inspector_zoom_scroll: usize,
+    pub shortcuts_open: bool,
+    pub shortcuts_scroll: usize,
     pub inspector_preview_origin: Option<InspectorConfig>,
     pub inspector_last_active_mode: InspectorMode,
     pub divider_drag: bool,
@@ -312,6 +314,8 @@ impl State {
             tool_blocks: ToolBlockStore::default(),
             inspector_zoom: false,
             inspector_zoom_scroll: 0,
+            shortcuts_open: false,
+            shortcuts_scroll: 0,
             inspector_preview_origin: None,
             inspector_last_active_mode: InspectorMode::Inline,
             divider_drag: false,
@@ -469,9 +473,26 @@ impl State {
         let model_label = format!("{} ({})", self.model_label(), self.thinking_label());
         let workspace_label = Self::format_workspace_home(&self.options.workspace);
 
+        // Theme-independent baked cookie + falling crumbs palette,
+        // tuned for contrast on both dark and light terminal themes.
+        const CRUST_TOP: Face = Face::rgb_bold(0xD9, 0x88, 0x38);
+        const CRUST_LEFT: Face = Face::rgb(0xC4, 0x71, 0x2B);
+        const CRUST_RIGHT: Face = Face::rgb(0xA8, 0x58, 0x20);
+        const CRUST_BOTTOM: Face = Face::rgb(0x9E, 0x51, 0x1E);
+        const DOUGH: Face = Face::rgb(0xEA, 0xB6, 0x5B);
+        const DOUGH_SHADE: Face = Face::rgb(0xDC, 0xA0, 0x45);
+        const CHIP: Face = Face::rgb(0x6B, 0x3A, 0x1E);
+        const CHUNK_GOLD: Face = Face::rgb_bold(0xF2, 0xBC, 0x57);
+        const CHUNK_CRUST: Face = Face::rgb_bold(0xD6, 0x7B, 0x29);
+        const CRUMB_HONEY: Face = Face::rgb_bold(0xED, 0x9F, 0x38);
+        const CRUMB_OAT: Face = Face::rgb(0xD9, 0xA7, 0x60);
+        const CRUMB_CINNAMON: Face = Face::rgb(0xB8, 0x6B, 0x35);
+        const CRUMB_AMBER: Face = Face::rgb_bold(0xDF, 0x86, 0x2F);
+        const CRUMB_COCOA: Face = Face::rgb_bold(0x8F, 0x4B, 0x24);
+
         let mut row0 = vec![
             ("    ".into(), Face::TEXT),
-            ("▄██████▄".into(), Face::HEADING),
+            ("▄██████▄".into(), CRUST_TOP),
             ("      ".into(), Face::TEXT),
             (format!("anticrumb {version}"), Face::BOLD),
         ];
@@ -481,41 +502,46 @@ impl State {
 
         let row1 = vec![
             ("   ".into(), Face::TEXT),
-            ("██".into(), Face::HEADING),
-            ("▀████▀".into(), Face::CODE),
-            ("█▌".into(), Face::HEADING),
+            ("██".into(), CRUST_LEFT),
+            ("▀█".into(), DOUGH),
+            ("█".into(), CHIP),
+            ("██▀".into(), DOUGH),
+            ("█▌".into(), CRUST_RIGHT),
             ("     ".into(), Face::TEXT),
             (account_label.clone(), Face::MUTED),
         ];
 
         let row2 = vec![
             ("   ".into(), Face::TEXT),
-            ("██".into(), Face::HEADING),
-            ("▄████".into(), Face::CODE),
+            ("██".into(), CRUST_LEFT),
+            ("▄██".into(), DOUGH_SHADE),
+            ("█".into(), CHIP),
+            ("█".into(), DOUGH_SHADE),
             ("  ".into(), Face::TEXT),
-            ("▀▄".into(), Face::ACCENT_BOLD),
+            ("▀".into(), CHUNK_GOLD),
+            ("▄".into(), CHUNK_CRUST),
             ("    ".into(), Face::TEXT),
             (model_label.clone(), Face::TEXT),
         ];
 
         let row3 = vec![
             ("    ".into(), Face::TEXT),
-            ("▀████▀".into(), Face::HEADING),
+            ("▀████▀".into(), CRUST_BOTTOM),
             ("  ".into(), Face::TEXT),
-            ("▪".into(), Face::CODE),
+            ("▪".into(), CRUMB_HONEY),
             (" ".into(), Face::TEXT),
-            ("·".into(), Face::HIGHLIGHT_BOLD),
+            ("·".into(), CRUMB_OAT),
             ("   ".into(), Face::TEXT),
             (workspace_label.clone(), Face::MUTED),
         ];
 
         let row4 = vec![
             ("      ".into(), Face::TEXT),
-            ("·".into(), Face::MUTED),
+            ("·".into(), CRUMB_CINNAMON),
             ("  ".into(), Face::TEXT),
-            ("▪".into(), Face::ACCENT_BOLD),
+            ("▪".into(), CRUMB_AMBER),
             ("   ".into(), Face::TEXT),
-            ("▪".into(), Face::CODE),
+            ("▪".into(), CRUMB_COCOA),
         ];
 
         self.log_spans("", Vec::new());
@@ -595,7 +621,8 @@ impl State {
             return false;
         };
         self.answered_approvals.insert(approval.id.clone());
-        self.tool_blocks.on_approval_resolved(&approval.id, approved);
+        self.tool_blocks
+            .on_approval_resolved(&approval.id, approved);
         self.phase = if !self.tool_approvals.is_empty() {
             "approval (Y/N)".into()
         } else if approved {
@@ -955,6 +982,8 @@ impl State {
         self.answered_approvals.clear();
         self.inspector_zoom = false;
         self.inspector_zoom_scroll = 0;
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
         self.seal_active_tool_block(true);
         self.reset_scroll();
         self.clear_selection();
@@ -1833,6 +1862,8 @@ impl State {
         self.answered_approvals.clear();
         self.inspector_zoom = false;
         self.inspector_zoom_scroll = 0;
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
         self.reset_scroll();
         self.clear_selection();
         self.clear_painted_regions();
@@ -2722,14 +2753,8 @@ impl State {
                 let elapsed = event.data["elapsed_ms"].as_u64().unwrap_or(0);
                 let tool = event.data["tool"].as_str().unwrap_or("tool");
                 let out = event.data["output"].as_str().unwrap_or("");
-                self.tool_blocks.on_tool_finished(
-                    step,
-                    index,
-                    tool,
-                    ok,
-                    out.to_owned(),
-                    elapsed,
-                );
+                self.tool_blocks
+                    .on_tool_finished(step, index, tool, ok, out.to_owned(), elapsed);
                 if self.debug.level >= 2 {
                     let header =
                         format!("{tool} · {} · {elapsed}ms", if ok { "ok" } else { "err" });
@@ -2877,6 +2902,8 @@ impl State {
     }
 
     pub(super) fn toggle_inspector_zoom(&mut self) {
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
         if self.inspector_zoom {
             self.inspector_zoom = false;
             self.inspector_zoom_scroll = 0;
@@ -2885,6 +2912,59 @@ impl State {
             self.inspector_zoom_scroll = 0;
             self.clear_selection();
         }
+    }
+
+    pub(super) fn can_open_shortcuts(&self) -> bool {
+        self.editor.text.is_empty()
+            && self.history_clear_confirmation.is_none()
+            && self.menu.is_none()
+            && !self.inspector_zoom
+            && self.tool_approvals.is_empty()
+            && self.completion.is_none()
+            && self.mention.is_none()
+    }
+
+    pub(super) fn show_footer_shortcut_hint(&self) -> bool {
+        !self.busy() && !self.shortcuts_open && self.can_open_shortcuts()
+    }
+
+    pub(super) fn open_shortcuts(&mut self) {
+        self.shortcuts_open = true;
+        self.shortcuts_scroll = 0;
+        self.clear_selection();
+    }
+
+    pub(super) fn close_shortcuts(&mut self) {
+        self.shortcuts_open = false;
+        self.shortcuts_scroll = 0;
+    }
+
+    pub(super) fn scroll_shortcuts(&mut self, up: bool, lines: usize, to_edge: Option<bool>) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let width = self
+            .painted_layout
+            .map(|l| usize::from(l.width))
+            .unwrap_or_else(|| usize::from(self.painted_size.0.max(80)));
+        let avail_rows = self
+            .painted_layout
+            .map(|l| usize::from(l.transcript.len))
+            .unwrap_or(16);
+        let (total_rows, visible_rows) = super::render::shortcuts_panel_metrics(width, avail_rows);
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+        self.shortcuts_scroll = match to_edge {
+            Some(true) => 0,
+            Some(false) => max_scroll,
+            None => {
+                let current = self.shortcuts_scroll.min(max_scroll);
+                if up {
+                    current.saturating_sub(lines)
+                } else {
+                    current.saturating_add(lines).min(max_scroll)
+                }
+            }
+        };
     }
 
     pub(super) fn select_prev_next_tool(&mut self, next: bool) -> bool {
@@ -2926,14 +3006,17 @@ impl State {
             let width = self.painted_size.0.max(80);
             let split = HorizontalSplit::compute(width, &self.layout.inspector);
             let right_w = split.map_or(usize::from(width), |s| usize::from(s.right.len));
-            let detail = self.tool_blocks.detail_lines(block_id, right_w.saturating_sub(1).max(1));
-            let rows = self
-                .painted_layout
-                .map_or(10, |l| usize::from(l.transcript.len).saturating_sub(2).max(1));
+            let detail = self
+                .tool_blocks
+                .detail_lines(block_id, right_w.saturating_sub(1).max(1));
+            let rows = self.painted_layout.map_or(10, |l| {
+                usize::from(l.transcript.len).saturating_sub(2).max(1)
+            });
             (detail.len(), rows)
         };
         let max_scroll = total.saturating_sub(body_rows.max(1));
-        self.tool_blocks.scroll_block(block_id, up, lines, max_scroll);
+        self.tool_blocks
+            .scroll_block(block_id, up, lines, max_scroll);
     }
 
     pub(super) fn scroll_zoom_overlay(&mut self, up: bool, lines: usize, to_edge: Option<bool>) {
@@ -2947,9 +3030,9 @@ impl State {
             let detail = self
                 .tool_blocks
                 .detail_lines(block_id, usize::from(width).saturating_sub(2).max(1));
-            let rows = self
-                .painted_layout
-                .map_or(16, |l| usize::from(l.transcript.len).saturating_sub(2).max(1));
+            let rows = self.painted_layout.map_or(16, |l| {
+                usize::from(l.transcript.len).saturating_sub(2).max(1)
+            });
             (detail.len(), rows)
         };
         let max_scroll = total.saturating_sub(body_rows.max(1));
@@ -3177,12 +3260,7 @@ impl State {
                 } else {
                     usize::from(layout.width)
                 };
-                (
-                    all.len(),
-                    all.evicted_lines(),
-                    all.visible_stream_len(),
-                    w,
-                )
+                (all.len(), all.evicted_lines(), all.visible_stream_len(), w)
             } else {
                 let empty_approvals = VecDeque::new();
                 let split_key = SplitCacheKey {
@@ -3257,6 +3335,8 @@ impl State {
             self.move_menu(up);
         } else if self.inspector_zoom {
             self.scroll_zoom_overlay(up, 3, None);
+        } else if self.shortcuts_open {
+            self.scroll_shortcuts(up, 3, None);
         } else {
             self.scroll_transcript(up, 3, width, height);
         }
@@ -3285,6 +3365,13 @@ impl State {
             self.last_click = None;
             self.clipboard_notice = None;
             self.scroll_zoom_overlay(up, 3, None);
+            return;
+        }
+        if self.shortcuts_open {
+            self.clear_selection();
+            self.last_click = None;
+            self.clipboard_notice = None;
+            self.scroll_shortcuts(up, 3, None);
             return;
         }
         if self.selection.is_some() && self.selection_target == SelectionTarget::Transcript {
@@ -3419,13 +3506,11 @@ impl State {
         }
     }
 
-    fn active_inspector_selection_metrics(&self) -> Option<(super::layout::Rect, u16, usize, usize)> {
+    fn active_inspector_selection_metrics(
+        &self,
+    ) -> Option<(super::layout::Rect, u16, usize, usize)> {
         if let Some(target_id) = self.painted_inline_inspector_target {
-            if let Some(pb) = self
-                .painted_blocks
-                .iter()
-                .find(|p| p.block_id == target_id)
-            {
+            if let Some(pb) = self.painted_blocks.iter().find(|p| p.block_id == target_id) {
                 if let Some(rect) = pb.inspector_rect {
                     return Some((
                         rect,
@@ -3436,14 +3521,9 @@ impl State {
                 }
             }
         }
-        self.painted_inspector.as_ref().map(|pane| {
-            (
-                pane.rect,
-                pane.header_rows,
-                pane.body_rows,
-                pane.body_start,
-            )
-        })
+        self.painted_inspector
+            .as_ref()
+            .map(|pane| (pane.rect, pane.header_rows, pane.body_rows, pane.body_start))
     }
 
     fn extend_inspector_selection(&mut self, column: u16, row: u16) {
@@ -3633,7 +3713,10 @@ impl State {
     }
 
     pub(super) fn transcript_mouse(&mut self, mouse: event::MouseEvent) -> Option<String> {
-        if self.menu.is_some() || self.history_clear_confirmation.is_some() {
+        if self.menu.is_some()
+            || self.history_clear_confirmation.is_some()
+            || self.shortcuts_open
+        {
             self.clear_selection();
             self.divider_drag = false;
             self.last_click = None;

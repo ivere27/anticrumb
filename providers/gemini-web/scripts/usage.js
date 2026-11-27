@@ -20,10 +20,16 @@
     const number = match ? Number(match[1].replace(',', '.')) : NaN;
     return Number.isFinite(number) && number >= 0 && number <= 100 ? number : null;
   };
+  const LABELS = new Map([
+    ['current-usage', 'Current usage'],
+    ['weekly-usage', 'Weekly limit'],
+  ]);
   const rows = [...root.querySelectorAll('li[data-testid$="-usage"]')].filter(visible);
   const limits = rows.map(row => {
     const strong = [...row.querySelectorAll('strong')].filter(visible);
-    const label = text(strong[0]);
+    const testId = (row.getAttribute('data-testid') || '').trim();
+    const domLabel = text(strong[0]);
+    const label = domLabel ? (LABELS.get(testId) || domLabel) : '';
     const used = text(strong[1]);
     const reset = [...row.querySelectorAll('span,time,p')].filter(visible).filter(el =>
       !el.children.length && !el.closest('button,strong,[aria-hidden="true"]') && text(el)

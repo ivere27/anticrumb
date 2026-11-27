@@ -20,6 +20,8 @@ pub(super) struct Face {
     pub accent: bool,
     pub highlight: bool,
     pub danger: bool,
+    /// Optional theme-independent foreground RGB override (e.g. fixed-palette artwork).
+    pub fg: Option<(u8, u8, u8)>,
 }
 
 impl Face {
@@ -34,7 +36,21 @@ impl Face {
         accent: false,
         highlight: false,
         danger: false,
+        fg: None,
     };
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            fg: Some((r, g, b)),
+            ..Self::TEXT
+        }
+    }
+    pub const fn rgb_bold(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            bold: true,
+            fg: Some((r, g, b)),
+            ..Self::TEXT
+        }
+    }
     pub const BOLD: Self = Self {
         bold: true,
         ..Self::TEXT
@@ -427,8 +443,11 @@ fn is_dark_color(color: style::Color) -> bool {
 }
 
 fn span_colors(face: Face, theme: Theme, selected: bool) -> (style::Color, style::Color) {
+    let custom_fg = face.fg.map(|(r, g, b)| style::Color::Rgb { r, g, b });
     if !selected {
-        let fg = if face.danger {
+        let fg = if let Some(rgb) = custom_fg {
+            rgb
+        } else if face.danger {
             theme.danger
         } else if face.highlight {
             theme.highlight
@@ -447,7 +466,9 @@ fn span_colors(face: Face, theme: Theme, selected: bool) -> (style::Color, style
         };
         return (fg, theme.background);
     }
-    let semantic = if face.danger {
+    let semantic = if let Some(rgb) = custom_fg {
+        Some(rgb)
+    } else if face.danger {
         Some(theme.danger)
     } else if face.highlight {
         Some(theme.highlight)

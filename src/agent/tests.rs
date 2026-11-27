@@ -1986,7 +1986,9 @@ fn shell_tool_streams_output_chunks_with_coalescing_and_64kib_cap() {
         "streamed ok".into(),
     ]);
     let mut agent = CodingAgent::new(mock, cfg(&ws));
-    let chunks = Arc::new(Mutex::new(Vec::<(usize, usize, OutputStream, String)>::new()));
+    let chunks = Arc::new(Mutex::new(
+        Vec::<(usize, usize, OutputStream, String)>::new(),
+    ));
     let chunks_ref = Arc::clone(&chunks);
     let control = RunControl {
         cancel: CancelToken::new(),

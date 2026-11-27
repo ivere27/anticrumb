@@ -1081,7 +1081,10 @@ impl AgentManager {
                 // Detect late subscriber / reconnect after ring-buffer eviction:
                 // backfill any evicted durable SQLite events and notify the client of the gap.
                 let gap_info = {
-                    let logs = manager.live_events.lock().unwrap_or_else(|e| e.into_inner());
+                    let logs = manager
+                        .live_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     logs.get(&run_id).and_then(|log| {
                         (cursor < log.evicted_through_seq).then(|| {
                             let earliest_durable_at = log
@@ -1153,7 +1156,10 @@ impl AgentManager {
                     }
                     let notified = Arc::clone(&notify).notified_owned();
                     let (batch, has_more, finished) = {
-                        let logs = manager.live_events.lock().unwrap_or_else(|e| e.into_inner());
+                        let logs = manager
+                            .live_events
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         match logs.get(&run_id) {
                             Some(log) => {
                                 let mut out = Vec::new();
@@ -1185,7 +1191,10 @@ impl AgentManager {
                     if finished {
                         // Drain any last events that may have raced with finished_at.
                         let tail = {
-                            let logs = manager.live_events.lock().unwrap_or_else(|e| e.into_inner());
+                            let logs = manager
+                                .live_events
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             logs.get(&run_id)
                                 .map(|log| {
                                     log.entries
@@ -1441,7 +1450,8 @@ impl AgentManager {
         }
         self.validate_artifacts(&job.request.account_id, &job.request.artifacts)?;
         let steer_payload = json!({"message":message,"artifacts":artifacts});
-        self.store.event(id, "steer_received", steer_payload.clone())?;
+        self.store
+            .event(id, "steer_received", steer_payload.clone())?;
         {
             let mut logs = self.live_events.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(log) = logs.get_mut(id) {
@@ -2781,10 +2791,18 @@ mod tests {
         }
         assert_eq!(
             db_kinds,
-            vec!["tool_started", "tool_finished", "browser_session", "agent_terminal"]
+            vec![
+                "tool_started",
+                "tool_finished",
+                "browser_session",
+                "agent_terminal"
+            ]
         );
         // Durable tool_finished output in SQLite is bounded by DURABLE_TOOL_EVENT_OUTPUT_MAX.
-        let finished_ev = db_events.iter().find(|e| e.kind == "tool_finished").unwrap();
+        let finished_ev = db_events
+            .iter()
+            .find(|e| e.kind == "tool_finished")
+            .unwrap();
         assert!(
             finished_ev.data["output"].as_str().unwrap().chars().count()
                 < DURABLE_TOOL_EVENT_OUTPUT_MAX + 128
@@ -2834,7 +2852,10 @@ mod tests {
         let kinds: Vec<&str> = log.entries.iter().map(|e| e.event.kind.as_str()).collect();
         assert!(kinds.contains(&"tool_approval_requested"));
         assert!(kinds.contains(&"tool_started"));
-        assert!(log.entries.len() < 47, "oldest ephemeral chunks must be evicted");
+        assert!(
+            log.entries.len() < 47,
+            "oldest ephemeral chunks must be evicted"
+        );
     }
 
     #[tokio::test]

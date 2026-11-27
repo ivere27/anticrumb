@@ -623,8 +623,7 @@ mod tests {
 
         // 3. Side mode with tool blocks splits Band::Transcript cleanly.
         let side_active =
-            FrameLayout::compute_with_inspector(&side_cfg, 120, 26, 1, (0, 0), 0, 0, true)
-                .unwrap();
+            FrameLayout::compute_with_inspector(&side_cfg, 120, 26, 1, (0, 0), 0, 0, true).unwrap();
         let insp = side_active.inspector_rect.expect("side inspector rect");
         let div = side_active.divider_x.expect("side divider");
         assert_eq!(side_active.transcript_left.start, 0);

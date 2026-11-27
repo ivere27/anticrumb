@@ -83,6 +83,80 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Exit and stop this application's running work"),
 ];
 
+pub(super) struct ShortcutSection {
+    pub title: &'static str,
+    pub subtitle: Option<&'static str>,
+    pub highlight_key: bool,
+    pub items: &'static [(&'static str, &'static str)],
+}
+
+pub(super) const SHORTCUT_SECTIONS: &[ShortcutSection] = &[
+    ShortcutSection {
+        title: "Composer & Editing",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Enter", "Send message or steer active turn"),
+            ("Alt/Shift+Enter", "Insert newline (Ctrl+J also works)"),
+            ("↑ / ↓", "Move line, or recall prompt history"),
+            ("Ctrl+A / E", "Line start / end (Home / End)"),
+            ("Ctrl/Alt+←/→", "Word/path move (Alt+B / Alt+F)"),
+            ("Ctrl+U / K", "Delete to line start / end"),
+            ("Ctrl+W", "Delete word (Ctrl/Alt+Bksp block)"),
+            ("Ctrl+V", "Paste clipboard (folds >1,000c)"),
+            ("Alt+E", "Expand folded paste block at cursor"),
+        ],
+    },
+    ShortcutSection {
+        title: "Mentions & Completion",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Tab", "Complete /command or @path mention"),
+            ("@path", "Attach file (@\"path with spaces\")"),
+            ("@git:diff[+]", "Unstaged git diff (+ AST context)"),
+            ("@git:staged[+]", "Staged git diff (+ AST context)"),
+            ("@git:<ref>[+]", "Commit patch (+ AST context)"),
+        ],
+    },
+    ShortcutSection {
+        title: "Modes & Session",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Shift+Tab", "Toggle Chat / Agent (or --yolo)"),
+            ("Y / N", "Approve / reject tool (empty input)"),
+            ("Esc", "Close popup/sel or interrupt turn"),
+            ("Ctrl+C", "Interrupt, clear draft, or 2× exit"),
+            ("Ctrl+D", "Exit when empty / delete forward"),
+            ("?", "Toggle shortcuts panel (empty input)"),
+        ],
+    },
+    ShortcutSection {
+        title: "Scroll & Tool Inspector",
+        subtitle: None,
+        highlight_key: true,
+        items: &[
+            ("Wheel / PgUp·Dn", "Scroll pane; drag to select & copy"),
+            ("← / → (empty)", "Prev / next tool (→ resumes Follow)"),
+            ("Ctrl+O", "Fullscreen Inspector (←/→ ↑↓ f Esc)"),
+            ("Alt+I / Alt+L", "Toggle Inspector / live Follow feed"),
+            ("Alt+↑ / ↓", "Scroll Inspector (Alt+PgUp / PgDn)"),
+        ],
+    },
+];
+
+pub(super) const SHORTCUT_QUICK_COMMANDS: ShortcutSection = ShortcutSection {
+    title: "Quick Commands",
+    subtitle: Some("/help for full list"),
+    highlight_key: false,
+    items: &[
+        ("/mode /model", "Switch mode, model, /temp, /permissions"),
+        ("/resume /new", "Reopen, /clear, or /copy last reply"),
+        ("/inspector", "Layout, /status, /usage, /theme"),
+    ],
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PermissionKind {
     Read,
@@ -668,81 +742,10 @@ impl State {
             self.log_command(&format!("{command:<14}"), description);
         }
         self.log_heading("Input & Shortcuts");
-        for (key, description) in [
-            (
-                "@path",
-                "Attach file through Gemini's picker (@\"path with spaces\")",
-            ),
-            ("@git:diff", "Attach unstaged git diff as a patch file"),
-            (
-                "@git:diff+",
-                "Attach unstaged git diff with tree-sitter AST context",
-            ),
-            ("@git:staged", "Attach staged git diff as a patch file"),
-            (
-                "@git:staged+",
-                "Attach staged git diff with tree-sitter AST context",
-            ),
-            (
-                "@git:<commit>",
-                "Attach a specific git commit as a patch file",
-            ),
-            (
-                "@git:<commit>+",
-                "Attach a specific git commit with tree-sitter AST context",
-            ),
-            ("Tab", "Complete slash commands or @path"),
-            (
-                "Shift+Tab",
-                "Toggle Chat / Agent mode (Chat / YOLO when explicitly in --yolo)",
-            ),
-            (
-                "Up / Down",
-                "Move within input, or recall history at top/bottom row",
-            ),
-            (
-                "Wheel / PgUp",
-                "Scroll transcript (or right Inspector pane); drag to select & copy",
-            ),
-            (
-                "← / → (empty)",
-                "Switch previous / next tool (→ past last tool resumes live Follow)",
-            ),
-            (
-                "Ctrl+O",
-                "Toggle fullscreen Tool Inspector overlay (←/→ tool, ↑↓ scroll, f follow, Esc close)",
-            ),
-            (
-                "Alt+L / Alt+I",
-                "Toggle Inspector live Follow feed / toggle Inspector panel on or off",
-            ),
-            (
-                "Alt+↑ / Alt+↓",
-                "Scroll focused Tool Inspector (Alt+PgUp / Alt+PgDn for pages)",
-            ),
-            ("/copy", "Copy last assistant response with Markdown"),
-            (
-                "Ctrl+A/E/U/K/W",
-                "Editing shortcuts · Left/Right/Home/End move cursor",
-            ),
-            (
-                "Ctrl/Alt+←/→",
-                "Move by word/path component · Alt+B/F also works · paste is one block",
-            ),
-            (
-                "Alt/Shift+Enter",
-                "Insert newline · Enter sends or steers active turn",
-            ),
-            (
-                "Paste (>1,000c)",
-                "Folds long paste into a block · Alt+E expands · Ctrl+V pastes",
-            ),
-            (
-                "Esc / Ctrl+C",
-                "Interrupt · Ctrl+D / /exit leaves and stops active jobs",
-            ),
-        ] {
-            self.log_shortcut(&format!("{key:<15}"), description);
+        for section in SHORTCUT_SECTIONS {
+            for (key, description) in section.items {
+                self.log_shortcut(&format!("{key:<15}"), description);
+            }
         }
         self.log("Character counts are measured; exact Gemini token usage is unavailable.");
     }
